@@ -1,0 +1,21 @@
+[package]
+name = "mcp-pty"
+edition.workspace = true
+version.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+mcp-types = { path = "../mcp-types" }
+mcp-policy = { path = "../mcp-policy" }
+async-trait.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["time", "sync"] }
+
+[target.'cfg(unix)'.dependencies]
+# Already in the dependency tree via core-foundation-sys; using it directly
+# costs no extra build output and beats hand-declaring termios/ioctl constants.
+libc = "0.2"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros", "time", "sync"] }

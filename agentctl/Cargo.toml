@@ -1,0 +1,41 @@
+[package]
+name = "agentctl"
+edition.workspace = true
+version.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "agentctl"
+path = "src/main.rs"
+
+[dependencies]
+mcp-types = { path = "../crates/mcp-types" }
+mcp-policy = { path = "../crates/mcp-policy" }
+mcp-core = { path = "../crates/mcp-core" }
+mcp-a11y = { path = "../crates/mcp-a11y" }
+mcp-input = { path = "../crates/mcp-input" }
+# Browser/CDP engine is OS-independent (talks CDP over TCP) — always wired in.
+mcp-browser = { path = "../crates/mcp-browser" }
+# Commodity engines — all OS-independent, wired on every platform.
+mcp-fs = { path = "../crates/mcp-fs" }
+mcp-proc = { path = "../crates/mcp-proc" }
+mcp-net = { path = "../crates/mcp-net" }
+mcp-sys = { path = "../crates/mcp-sys" }
+mcp-sec = { path = "../crates/mcp-sec" }
+mcp-pty = { path = "../crates/mcp-pty" }
+mcp-pkg = { path = "../crates/mcp-pkg" }
+mcp-memory = { path = "../crates/mcp-memory" }
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+serde_json.workspace = true
+async-trait.workspace = true
+
+# Real macOS backend (AXUIElement) — only on macOS.
+[target.'cfg(target_os = "macos")'.dependencies]
+mcp-macos = { path = "../crates/mcp-macos" }
+mcp-window = { path = "../crates/mcp-window" }
+mcp-vision = { path = "../crates/mcp-vision" }
+# Desktop session/power control is macOS-only for now (no Windows/Linux backend).
+mcp-desktop = { path = "../crates/mcp-desktop" }

@@ -1,0 +1,154 @@
+# agentctl configuration.
+#
+# Copy to ~/.agentctl/config.toml (or point $AGENTCTL_CONFIG at it).
+#
+# EVERY engine is closed by default. With no roots / commands / hosts / services
+# listed here, those engines refuse everything rather than falling open. A file
+# that exists but fails to parse aborts startup — silently reverting to defaults
+# could *widen* a policy stricter than the built-in one.
+
+[policy]
+# Only these categories are advertised and callable.
+#   vision input window browser system terminal filesystem network credentials
+#   memory desktop packages
+categories = ["vision", "input", "window", "browser", "system"]
+
+# Dangerous-tier tools must be named here to be callable at all. This is the
+# operator's pre-approval; in interactive mode a human is *also* asked per call.
+enable = []
+
+# interactive = ask a human (macOS dialog) before risky actions.
+# autonomous  = nobody to ask, so anything needing consent is denied.
+mode = "interactive"
+
+# Cap on how often one session may interrupt a human. Past this, further
+# requests are denied without prompting — unlimited dialogs train people to
+# click Allow (consent fatigue).
+max_consent_prompts = 20
+
+# Session aborts after this many denials (anti-spin).
+max_denials = 5
+
+# GUI apps the agent may launch or drive.
+allowed_apps = ["TextEdit", "Finder"]
+
+[input]
+# Apps whose typed input is screened for destructive shell commands.
+# Editors are included by default because their *integrated terminals* run the
+# same shell — the accessibility API cannot tell an editor pane from a terminal
+# pane, so the whole app is screened. Over-triggering on a source file that
+# merely contains "rm -rf" is the safe direction to be wrong in: it asks, it
+# does not refuse. Setting this replaces the default list.
+# terminal_apps = ["Terminal", "iTerm", "Code", "Zed", "Cursor"]
+
+[fs]
+# Directories the filesystem engine may touch. Paths are fully resolved and
+# checked against these roots, so `..` and symlinks cannot escape.
+# Credential stores (~/.ssh, keychains, .netrc, ...) are denied even inside a root.
+roots = []
+
+[terminal]
+# Binaries `exec` may run, matched on basename.
+allowed_commands = []
+# Allow `shell: true` on exec, AND `pty_spawn` at all. One switch, because a PTY
+# is a real shell: gating `exec --shell` while leaving PTYs open would be theatre.
+allow_shell = "false"
+# Shells `pty_spawn` may start, by absolute path.
+allowed_shells = ["/bin/zsh", "/bin/bash", "/bin/sh"]
+# Concurrent PTY sessions, and how much output each one buffers before the
+# oldest is dropped (the tail is kept — the end answers the question).
+max_pty_sessions = 4
+max_pty_buffer = 262144
+
+[network]
+# Hosts `http_request` may reach. A leading dot matches subdomains:
+#   ".example.com" matches example.com and api.example.com
+allowed_hosts = []
+# Permit private/loopback/link-local targets. Off by default — this is what
+# blocks cloud metadata (169.254.169.254) and internal admin panels.
+allow_private = "false"
+
+[credentials]
+# Keychain services the agent may touch. Secret values are NEVER returned to
+# the agent regardless of this setting; there is no plaintext read.
+allowed_services = []
+
+[packages]
+# Package managers the install/uninstall engine may use. Empty = it refuses
+# everything. This is the most dangerous category in the product: an install is
+# arbitrary code execution plus persistence.
+allowed_sources = []
+# Permit installing from a URL, local file or third-party tap. Off by default —
+# that path is indistinguishable from malware delivery.
+allow_arbitrary_source = "false"
+# If non-empty, only these package ids may be installed.
+allowlist = []
+denylist = []
+# A protected set (this agent, the package manager, security tooling) can never
+# be uninstalled and is deliberately not configurable.
+
+[memory]
+# Where recorded sequences live, and how many are kept. Off unless the `memory`
+# category is enabled.
+# store = "~/.agentctl/memory.json"
+max_recipes = 500
+
+[browser]
+# URL prefixes `browser_navigate` may go to. Empty = unrestricted.
+allowed_origins = []
+
+[vision]
+# Screen-capture cost/legibility trade-offs. These are not security controls —
+# they decide how much of your image budget a capture spends. Image cost tracks
+# *pixel area*, not file size, so shrinking the longest edge is the only thing
+# that actually reduces spend; compressing harder does not.
+
+# Longest delivered edge for each `detail` tier, in pixels (160-4096).
+detail_low_px = 768         # layout/state checks — "did the dialog appear?"
+detail_balanced_px = 1024   # most interactions
+detail_full_px = 1568       # small text stays legible
+
+# The tier used when a call names neither `detail` nor `max_edge`. Lower this to
+# make every capture cheaper without touching a single call site.
+default_detail = "full"
+
+# Pixels per image token, for the cost estimate reported alongside each capture.
+pixels_per_token = 750
+
+# Two consecutive frames whose mean absolute difference (0-255) is below this
+# count as visually identical, and the second is reported as `unchanged` instead
+# of being re-sent — a polling loop otherwise re-sends the same megabyte every
+# iteration. Measured idle noise on real hardware is ~0.002, so the default sits
+# far above the noise floor while still catching any change worth acting on.
+# Raise it to dedup more aggressively; set 0 to disable dedup entirely.
+unchanged_mad = 1.0
+
+# Soft advisory cap: a larger capture is still returned, but flagged so the
+# agent knows to capture a region instead.
+max_image_bytes = 8000000
+
+[http]
+# Optional HTTP transport. OFF by default, and stdio remains the primary
+# transport — over stdio the client *is* the parent process, so the OS does the
+# authentication for you. A listening socket has to earn that back, which is
+# what everything below is for.
+enabled = "false"
+
+# Listen address. Loopback only: the transport refuses to bind anything else,
+# because it speaks plaintext and would otherwise put the bearer token on the
+# wire on every request.
+bind = "127.0.0.1:8765"
+
+# Bearer token, required on every request. Leave empty and one is generated per
+# run and printed to stderr; set it here to keep a stable token across restarts.
+# There is no anonymous mode and no short-token mode.
+token = ""
+
+# Browser origins allowed to call the endpoint, matched exactly. Empty — the
+# default — means any request carrying an `Origin` header is refused.
+#
+# This is not CORS pedantry. Any web page can make your browser POST to
+# 127.0.0.1, so a local port is not a private one; a real MCP client sends no
+# Origin header at all. Only set this if you are deliberately fronting the
+# server with a local web UI.
+allowed_origins = []

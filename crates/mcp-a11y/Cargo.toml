@@ -1,0 +1,13 @@
+[package]
+name = "mcp-a11y"
+edition.workspace = true
+version.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+mcp-types = { path = "../mcp-types" }
+serde.workspace = true
+serde_json.workspace = true
+async-trait.workspace = true
+tracing.workspace = true

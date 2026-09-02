@@ -1,0 +1,448 @@
+//! Configuration loading (`config.toml` + environment).
+//!
+//! Deliberately a *small, strict* parser for the flat subset the config
+//! actually uses — sections, `key = "string"`, `key = 123`, `key = ["a", "b"]`,
+//! `#` comments — rather than a full TOML dependency. This matches the
+//! project's disk-conscious pattern (see `docs/planning.md` §12) and keeps the
+//! security-relevant config path dependency-free.
+//!
+//! **Fail-closed:** a config file that exists but does not parse is an error
+//! that stops startup. Silently falling back to defaults would be fail-*open*
+//! whenever an operator's file was *more* restrictive than the built-in
+//! defaults (e.g. `allowed_apps = []`).
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+
+use mcp_types::Category;
+
+use crate::config::{default_agentctl_dir, Mode, PolicyConfig};
+
+/// One parsed value from the config file.
+#[derive(Debug, Clone, PartialEq)]
+enum Val {
+    Str(String),
+    Int(i64),
+    Float(f64),
+    List(Vec<String>),
+}
+
+/// Parse the supported TOML subset into `section.key -> value`.
+fn parse(text: &str) -> Result<HashMap<String, Val>, String> {
+    let mut out = HashMap::new();
+    let mut section = String::new();
+    for (n, raw) in text.lines().enumerate() {
+        let line = strip_comment(raw).trim();
+        if line.is_empty() {
+            continue;
+        }
+        let lineno = n + 1;
+        if let Some(inner) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+            let name = inner.trim();
+            if name.is_empty() || !name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                return Err(format!("line {lineno}: bad section header '{line}'"));
+            }
+            section = name.to_ascii_lowercase();
+            continue;
+        }
+        let Some((k, v)) = line.split_once('=') else {
+            return Err(format!(
+                "line {lineno}: expected 'key = value', got '{line}'"
+            ));
+        };
+        let key = k.trim().to_ascii_lowercase();
+        if key.is_empty() {
+            return Err(format!("line {lineno}: empty key"));
+        }
+        let val = parse_value(v.trim()).map_err(|e| format!("line {lineno}: {e}"))?;
+        let full = if section.is_empty() {
+            key
+        } else {
+            format!("{section}.{key}")
+        };
+        out.insert(full, val);
+    }
+    Ok(out)
+}
+
+/// Strip a trailing `#` comment, respecting quoted strings.
+fn strip_comment(line: &str) -> &str {
+    let mut in_str = false;
+    for (i, c) in line.char_indices() {
+        match c {
+            '"' => in_str = !in_str,
+            '#' if !in_str => return &line[..i],
+            _ => {}
+        }
+    }
+    line
+}
+
+fn parse_value(s: &str) -> Result<Val, String> {
+    if let Some(inner) = s.strip_prefix('[') {
+        let inner = inner
+            .strip_suffix(']')
+            .ok_or_else(|| format!("unterminated array '{s}'"))?;
+        let mut items = Vec::new();
+        for part in split_top(inner) {
+            let p = part.trim();
+            if p.is_empty() {
+                continue;
+            }
+            items.push(unquote(p)?);
+        }
+        return Ok(Val::List(items));
+    }
+    if s.starts_with('"') {
+        return Ok(Val::Str(unquote(s)?));
+    }
+    if let Ok(i) = s.parse::<i64>() {
+        return Ok(Val::Int(i));
+    }
+    // Floats are accepted only in finite form: `inf`/`nan` would propagate
+    // into a comparison threshold and silently disable it.
+    if let Ok(f) = s.parse::<f64>() {
+        if f.is_finite() {
+            return Ok(Val::Float(f));
+        }
+        return Err(format!("value must be a finite number: '{s}'"));
+    }
+    if s == "true" || s == "false" {
+        return Ok(Val::Str(s.to_string()));
+    }
+    Err(format!(
+        "value must be a quoted string, number, or array: '{s}'"
+    ))
+}
+
+/// Split on commas that are not inside a quoted string.
+fn split_top(s: &str) -> Vec<String> {
+    let (mut out, mut cur, mut in_str) = (Vec::new(), String::new(), false);
+    for c in s.chars() {
+        match c {
+            '"' => {
+                in_str = !in_str;
+                cur.push(c);
+            }
+            ',' if !in_str => out.push(std::mem::take(&mut cur)),
+            _ => cur.push(c),
+        }
+    }
+    out.push(cur);
+    out
+}
+
+fn unquote(s: &str) -> Result<String, String> {
+    let t = s.trim();
+    let inner = t
+        .strip_prefix('"')
+        .and_then(|x| x.strip_suffix('"'))
+        .ok_or_else(|| format!("expected a quoted string, got '{t}'"))?;
+    if inner.contains('"') {
+        return Err(format!("unescaped quote in string '{t}'"));
+    }
+    Ok(inner.to_string())
+}
+
+/// Where the config lives: `$AGENTCTL_CONFIG`, else `~/.agentctl/config.toml`.
+pub fn config_path() -> PathBuf {
+    std::env::var_os("AGENTCTL_CONFIG")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| default_agentctl_dir().join("config.toml"))
+}
+
+impl PolicyConfig {
+    /// Layer a config file's contents onto the secure defaults.
+    pub fn from_toml_str(text: &str) -> Result<PolicyConfig, String> {
+        let map = parse(text)?;
+        let mut cfg = PolicyConfig::default();
+
+        for (key, val) in &map {
+            match (key.as_str(), val) {
+                ("policy.categories", Val::List(v)) => {
+                    let mut cats = Vec::new();
+                    for slug in v {
+                        cats.push(Category::from_slug(slug).ok_or_else(|| {
+                            format!("unknown category '{slug}' in policy.categories")
+                        })?);
+                    }
+                    cfg.categories = cats;
+                }
+                ("policy.enable", Val::List(v)) => cfg.enable = v.clone(),
+                ("policy.allowed_apps", Val::List(v)) => cfg.allowed_apps = v.clone(),
+                ("browser.allowed_origins", Val::List(v)) => cfg.allowed_origins = v.clone(),
+                ("fs.roots", Val::List(v)) => cfg.fs_roots = v.iter().map(PathBuf::from).collect(),
+                ("terminal.allowed_commands", Val::List(v)) => cfg.allowed_commands = v.clone(),
+                ("network.allowed_hosts", Val::List(v)) => cfg.allowed_hosts = v.clone(),
+                ("credentials.allowed_services", Val::List(v)) => cfg.allowed_services = v.clone(),
+                ("input.terminal_apps", Val::List(v)) => cfg.terminal_apps = v.clone(),
+                ("terminal.allowed_shells", Val::List(v)) => cfg.allowed_shells = v.clone(),
+                ("packages.allowed_sources", Val::List(v)) => cfg.allowed_sources = v.clone(),
+                ("packages.allowlist", Val::List(v)) => cfg.package_allowlist = v.clone(),
+                ("packages.denylist", Val::List(v)) => cfg.package_denylist = v.clone(),
+                ("packages.allow_arbitrary_source", Val::Str(s)) => {
+                    cfg.allow_arbitrary_source = s == "true"
+                }
+                ("terminal.max_pty_sessions", Val::Int(i)) if *i >= 0 => {
+                    cfg.max_pty_sessions = *i as usize
+                }
+                ("terminal.max_pty_buffer", Val::Int(i)) if *i >= 0 => {
+                    cfg.max_pty_buffer = *i as usize
+                }
+                ("vision.detail_low_px", Val::Int(i)) if *i > 0 => {
+                    cfg.vision_detail_low_px = *i as u32
+                }
+                ("vision.detail_balanced_px", Val::Int(i)) if *i > 0 => {
+                    cfg.vision_detail_balanced_px = *i as u32
+                }
+                ("vision.detail_full_px", Val::Int(i)) if *i > 0 => {
+                    cfg.vision_detail_full_px = *i as u32
+                }
+                ("vision.pixels_per_token", Val::Int(i)) if *i > 0 => {
+                    cfg.vision_pixels_per_token = *i as u32
+                }
+                ("vision.max_image_bytes", Val::Int(i)) if *i > 0 => {
+                    cfg.vision_max_image_bytes = *i as usize
+                }
+                ("vision.default_detail", Val::Str(s)) => {
+                    if !matches!(s.as_str(), "low" | "balanced" | "medium" | "full" | "high") {
+                        return Err(format!(
+                            "unknown vision.default_detail '{s}' \
+                             (expected low, balanced, or full)"
+                        ));
+                    }
+                    cfg.vision_default_detail = s.clone();
+                }
+                // An integer is a perfectly reasonable spelling of a threshold,
+                // so accept both rather than making the operator write `1.0`.
+                ("vision.unchanged_mad", Val::Float(f)) if *f >= 0.0 => {
+                    cfg.vision_unchanged_mad = *f
+                }
+                ("vision.unchanged_mad", Val::Int(i)) if *i >= 0 => {
+                    cfg.vision_unchanged_mad = *i as f64
+                }
+                ("http.enabled", Val::Str(s)) => cfg.http_enabled = s == "true",
+                ("http.bind", Val::Str(s)) => cfg.http_bind = s.clone(),
+                ("http.token", Val::Str(s)) => cfg.http_token = s.clone(),
+                ("http.allowed_origins", Val::List(v)) => cfg.http_allowed_origins = v.clone(),
+                ("memory.store", Val::Str(s)) => cfg.memory_store = PathBuf::from(s),
+                ("memory.max_recipes", Val::Int(i)) if *i >= 0 => cfg.max_recipes = *i as usize,
+                ("terminal.allow_shell", Val::Str(s)) => cfg.allow_shell = s == "true",
+                ("network.allow_private", Val::Str(s)) => cfg.allow_private_network = s == "true",
+                ("policy.mode", Val::Str(s)) => {
+                    cfg.mode = match s.as_str() {
+                        "interactive" => Mode::Interactive,
+                        "autonomous" => Mode::Autonomous,
+                        other => return Err(format!("unknown policy.mode '{other}'")),
+                    }
+                }
+                ("policy.max_denials", Val::Int(i)) if *i >= 0 => cfg.max_denials = *i as usize,
+                ("policy.max_consent_prompts", Val::Int(i)) if *i >= 0 => {
+                    cfg.max_consent_prompts = *i as usize
+                }
+                ("policy.kill_switch_file", Val::Str(s)) => cfg.kill_switch_file = PathBuf::from(s),
+                ("policy.audit_dir", Val::Str(s)) => cfg.audit_dir = PathBuf::from(s),
+                // Unknown keys are tolerated for forward-compatibility, but a
+                // *known* key with the wrong type is a hard error.
+                (
+                    "policy.categories"
+                    | "policy.enable"
+                    | "policy.allowed_apps"
+                    | "browser.allowed_origins"
+                    | "input.terminal_apps"
+                    | "terminal.allowed_shells"
+                    | "packages.allowed_sources"
+                    | "packages.allowlist"
+                    | "packages.denylist"
+                    | "http.allowed_origins",
+                    _,
+                ) => return Err(format!("{key} must be an array of strings")),
+                (
+                    "terminal.max_pty_sessions" | "terminal.max_pty_buffer" | "memory.max_recipes",
+                    _,
+                ) => return Err(format!("{key} must be a non-negative integer")),
+                (
+                    "vision.detail_low_px"
+                    | "vision.detail_balanced_px"
+                    | "vision.detail_full_px"
+                    | "vision.pixels_per_token"
+                    | "vision.max_image_bytes",
+                    _,
+                ) => return Err(format!("{key} must be a positive integer")),
+                ("vision.unchanged_mad", _) => {
+                    return Err(format!("{key} must be a non-negative number"))
+                }
+                ("vision.default_detail", _) => return Err(format!("{key} must be a string")),
+                ("http.enabled" | "http.bind" | "http.token", _) => {
+                    return Err(format!("{key} must be a string"))
+                }
+                ("memory.store", _) => return Err(format!("{key} must be a string")),
+                ("policy.mode" | "policy.kill_switch_file" | "policy.audit_dir", _) => {
+                    return Err(format!("{key} must be a string"))
+                }
+                ("policy.max_denials" | "policy.max_consent_prompts", _) => {
+                    return Err(format!("{key} must be a non-negative integer"))
+                }
+                _ => tracing::warn!(key = %key, "ignoring unknown config key"),
+            }
+        }
+        Ok(cfg)
+    }
+
+    /// Load from [`config_path`]. Missing file → secure defaults. Present but
+    /// unparseable → `Err` (startup should abort; see the module docs).
+    pub fn load() -> Result<PolicyConfig, String> {
+        Self::load_from(&config_path())
+    }
+
+    pub fn load_from(path: &Path) -> Result<PolicyConfig, String> {
+        match std::fs::read_to_string(path) {
+            Ok(text) => Self::from_toml_str(&text).map_err(|e| format!("{}: {e}", path.display())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(PolicyConfig::default()),
+            Err(e) => Err(format!("{}: {e}", path.display())),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_sections_arrays_ints_and_comments() {
+        let cfg = PolicyConfig::from_toml_str(
+            r#"
+            # leading comment
+            [policy]
+            categories = ["vision", "browser"]   # trailing comment
+            allowed_apps = ["Safari", "Notes"]
+            mode = "autonomous"
+            max_denials = 9
+
+            [browser]
+            allowed_origins = ["https://ok.example"]
+            "#,
+        )
+        .expect("parses");
+        assert_eq!(cfg.categories, vec![Category::Vision, Category::Browser]);
+        assert_eq!(cfg.allowed_apps, vec!["Safari", "Notes"]);
+        assert_eq!(cfg.mode, Mode::Autonomous);
+        assert_eq!(cfg.max_denials, 9);
+        assert_eq!(cfg.allowed_origins, vec!["https://ok.example"]);
+    }
+
+    #[test]
+    fn empty_allowlist_is_honoured_not_replaced_by_defaults() {
+        // The fail-open case this design exists to prevent.
+        let cfg = PolicyConfig::from_toml_str("[policy]\nallowed_apps = []\n").unwrap();
+        assert!(cfg.allowed_apps.is_empty());
+    }
+
+    #[test]
+    fn hash_inside_a_string_is_not_a_comment() {
+        let cfg = PolicyConfig::from_toml_str("[browser]\nallowed_origins = [\"https://a/#/x\"]\n")
+            .unwrap();
+        assert_eq!(cfg.allowed_origins, vec!["https://a/#/x"]);
+    }
+
+    #[test]
+    fn malformed_input_is_rejected() {
+        for bad in [
+            "[policy]\ncategories = vision\n",       // unquoted
+            "[policy]\ncategories = [\"nope\"]\n",   // unknown category
+            "[policy]\nmode = \"sideways\"\n",       // unknown mode
+            "[policy]\nmax_denials = \"five\"\n",    // wrong type
+            "[policy]\nallowed_apps = \"Safari\"\n", // scalar where list required
+            "not a key value line\n",
+            "[policy\ncategories = []\n", // bad header
+        ] {
+            assert!(
+                PolicyConfig::from_toml_str(bad).is_err(),
+                "should have rejected: {bad:?}"
+            );
+        }
+    }
+
+    /// The capture tunables round-trip, including the float threshold that
+    /// motivated teaching the parser about non-integers.
+    #[test]
+    fn vision_section_is_parsed() {
+        let cfg = PolicyConfig::from_toml_str(
+            r#"
+            [vision]
+            detail_low_px = 640
+            detail_balanced_px = 960
+            detail_full_px = 1400
+            default_detail = "balanced"
+            unchanged_mad = 2.5
+            pixels_per_token = 800
+            max_image_bytes = 4000000
+            "#,
+        )
+        .expect("parses");
+        assert_eq!(cfg.vision_detail_low_px, 640);
+        assert_eq!(cfg.vision_detail_balanced_px, 960);
+        assert_eq!(cfg.vision_detail_full_px, 1400);
+        assert_eq!(cfg.vision_default_detail, "balanced");
+        assert_eq!(cfg.vision_unchanged_mad, 2.5);
+        assert_eq!(cfg.vision_pixels_per_token, 800);
+        assert_eq!(cfg.vision_max_image_bytes, 4_000_000);
+    }
+
+    /// An integer is a reasonable way to write a threshold; requiring `1.0`
+    /// would be a papercut with no upside.
+    #[test]
+    fn a_float_field_also_accepts_an_integer() {
+        let cfg = PolicyConfig::from_toml_str("[vision]\nunchanged_mad = 3\n").unwrap();
+        assert_eq!(cfg.vision_unchanged_mad, 3.0);
+    }
+
+    /// Defaults must reproduce the previously compiled-in constants, or moving
+    /// them into config would be a silent behaviour change for every operator
+    /// who has no `[vision]` section.
+    #[test]
+    fn vision_defaults_match_the_former_constants() {
+        let cfg = PolicyConfig::default();
+        assert_eq!(cfg.vision_detail_low_px, 768);
+        assert_eq!(cfg.vision_detail_balanced_px, 1024);
+        assert_eq!(cfg.vision_detail_full_px, 1568);
+        assert_eq!(cfg.vision_default_detail, "full");
+        assert_eq!(cfg.vision_unchanged_mad, 1.0);
+        assert_eq!(cfg.vision_pixels_per_token, 750);
+        assert_eq!(cfg.vision_max_image_bytes, 8_000_000);
+    }
+
+    /// A threshold of `inf` or `nan` would disable the comparison it controls
+    /// while looking like a configured value, so both are refused outright.
+    #[test]
+    fn non_finite_and_malformed_vision_values_are_rejected() {
+        for bad in [
+            "[vision]\nunchanged_mad = nan\n",
+            "[vision]\nunchanged_mad = inf\n",
+            "[vision]\nunchanged_mad = -1.0\n",
+            "[vision]\nunchanged_mad = \"lots\"\n",
+            "[vision]\ndetail_full_px = \"big\"\n",
+            "[vision]\ndetail_full_px = 0\n",
+            "[vision]\npixels_per_token = 0\n",
+            "[vision]\ndefault_detail = \"enormous\"\n",
+            "[vision]\ndefault_detail = 3\n",
+        ] {
+            assert!(
+                PolicyConfig::from_toml_str(bad).is_err(),
+                "should have rejected: {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_keys_are_tolerated() {
+        let cfg = PolicyConfig::from_toml_str("[policy]\nfuture_option = \"x\"\n").unwrap();
+        assert_eq!(cfg.categories, PolicyConfig::default().categories);
+    }
+
+    #[test]
+    fn missing_file_yields_defaults() {
+        let cfg = PolicyConfig::load_from(Path::new("/nonexistent/agentctl/config.toml")).unwrap();
+        assert_eq!(cfg.allowed_apps, PolicyConfig::default().allowed_apps);
+    }
+}

@@ -1,0 +1,28 @@
+[package]
+name = "mcp-macos"
+edition.workspace = true
+version.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+mcp-types = { path = "../mcp-types" }
+mcp-a11y = { path = "../mcp-a11y" }
+mcp-input = { path = "../mcp-input" }
+mcp-window = { path = "../mcp-window" }
+mcp-vision = { path = "../mcp-vision" }
+async-trait.workspace = true
+tracing.workspace = true
+# `time` only: drags need real gaps between motion events, and blocking the
+# runtime with `thread::sleep` would stall every other in-flight call.
+tokio = { workspace = true, features = ["time"] }
+
+# Native frameworks — only on macOS. On other targets this crate is empty.
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = "0.10"
+core-foundation-sys = "0.8"
+core-graphics = { version = "0.24", features = ["highsierra"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros"] }
+serde_json = { workspace = true }

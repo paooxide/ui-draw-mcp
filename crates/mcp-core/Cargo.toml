@@ -1,0 +1,22 @@
+[package]
+name = "mcp-core"
+edition.workspace = true
+version.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+mcp-types = { path = "../mcp-types" }
+mcp-policy = { path = "../mcp-policy" }
+serde.workspace = true
+serde_json.workspace = true
+# `net` is not in the workspace tokio feature set; the optional HTTP
+# transport needs a TcpListener. No new external dependency — the browser
+# engine already compiles this feature.
+tokio = { workspace = true, features = ["net"] }
+tracing.workspace = true
+async-trait.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros", "net", "io-util", "time"] }
+tempfile = "3"

@@ -1,0 +1,16 @@
+[package]
+name = "mcp-memory"
+edition.workspace = true
+version.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+mcp-types = { path = "../mcp-types" }
+mcp-policy = { path = "../mcp-policy" }
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros"] }

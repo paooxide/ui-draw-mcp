@@ -1,0 +1,19 @@
+[package]
+name = "mcp-input"
+edition.workspace = true
+version.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+mcp-types = { path = "../mcp-types" }
+mcp-a11y = { path = "../mcp-a11y" }
+# Pure `is_destructive` helper only — not the policy gate (which runs in mcp-core).
+mcp-policy = { path = "../mcp-policy" }
+serde.workspace = true
+serde_json.workspace = true
+async-trait.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros", "sync"] }

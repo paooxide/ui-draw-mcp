@@ -1,0 +1,127 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # So the scheduled jobs can be triggered by hand when something looks off.
+  workflow_dispatch:
+  schedule:
+    # Weekly, for the jobs that are too slow to gate a pull request on: a long
+    # fuzz run and a fresh advisory-database check. Both find things that were
+    # already merged, so a nightly cadence is the right place for them.
+    - cron: "17 4 * * 1"
+
+# Cancel superseded runs on the same ref.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+  # Skip tests that shell out to a real browser or package manager. They are the
+  # point of a developer's machine and an availability gamble on a hosted
+  # runner: `brew search` reaches the network, and Chrome may not be installed.
+  # Without this the suite is flaky for reasons that have nothing to do with the
+  # change under test — which trains everyone to ignore a red run.
+  AGENTCTL_SKIP_LIVE: "1"
+
+jobs:
+  # Build/lint/test the OS-independent crates on both Linux and macOS.
+  #
+  # The desktop engines (perception, input, window, vision, session/power) are
+  # `#[cfg(target_os = "macos")]`, so on Linux this compiles the portable half:
+  # core, policy, browser, fs, proc, net, sys, sec, pty, pkg, memory. That is
+  # exactly what the cross-platform work needs to keep honest — the portable
+  # crates must not quietly grow a macOS assumption.
+  #
+  # Capability jobs that drive real AX/capture/input against a live desktop are
+  # deliberately not here: they need a logged-in session with Accessibility and
+  # Screen Recording granted, which a hosted runner cannot provide. They belong
+  # on a self-hosted runner.
+  test:
+    name: fmt · clippy · test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace
+
+      # Called out separately from the suite above so a security regression is
+      # legible in the job list rather than buried in a thousand-line log.
+      - name: Hardening suites (fuzz · red-team · transport)
+        run: |
+          cargo test -p mcp-core --test fuzz_jsonrpc
+          cargo test -p mcp-core --test transport
+          cargo test -p mcp-core --test http_transport
+          cargo test -p mcp-policy --test redteam_destructive
+          cargo test -p mcp-policy --test example_config
+          cargo test -p mcp-net --test redteam_ssrf
+          cargo test -p mcp-fs --test redteam_jail
+
+      # The example config is what operators copy. Prove the shipped binary
+      # accepts it, not just that the parser does.
+      - name: Example config is accepted by the built binary
+        run: |
+          cargo build -p agentctl
+          AGENTCTL_CONFIG=config.example.toml ./target/debug/agentctl config print
+
+  # Supply-chain gate: advisories, licenses, bans, sources (see deny.toml).
+  cargo-deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --locked
+
+      - name: cargo deny check
+        run: cargo deny check
+
+  # A longer fuzz run than a pull request should wait for. The in-repo fuzzer is
+  # deterministic, so this is not "the same test again, slower" — a different
+  # seed reaches inputs the pull-request run never generates.
+  fuzz-extended:
+    name: extended fuzz
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Fuzz the JSON-RPC parser (release, extended)
+        env:
+          AGENTCTL_FUZZ_ITERATIONS: "2000000"
+        run: cargo test --release -p mcp-core --test fuzz_jsonrpc -- --nocapture

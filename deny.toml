@@ -1,0 +1,46 @@
+# cargo-deny configuration (v2 schema).
+# Supply-chain gate for agentctl-mcp: advisories, licenses, bans, sources.
+# Run locally with `cargo deny check`; enforced in CI (.github/workflows/ci.yml).
+
+[graph]
+# Check all targets; the engines are cfg-gated per OS and we want every
+# platform's dependency tree considered.
+all-features = true
+
+[advisories]
+# Deny known-vulnerable and unmaintained crates. `cargo deny` fetches the
+# RustSec advisory DB at check time.
+version = 2
+yanked = "deny"
+ignore = []
+
+[licenses]
+version = 2
+# The project is licensed Apache-2.0. Allow a conservative set of common
+# permissive licenses for dependencies.
+allow = [
+    "Apache-2.0",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+]
+# Require reasonably high confidence when inferring a license from text.
+confidence-threshold = 0.9
+
+[bans]
+# Duplicate versions of the same crate bloat the tree and the audit surface;
+# warn so they stay visible without blocking builds during early development.
+multiple-versions = "warn"
+wildcard = "deny"
+# Prefer the highest semver-compatible version when several are in the graph.
+highlight = "all"
+
+[sources]
+# All dependencies should come from crates.io. Warn (not deny) on unknown
+# registries/git sources so a deliberate override is noticed in review.
+unknown-registry = "warn"
+unknown-git = "warn"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

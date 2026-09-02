@@ -1,0 +1,21 @@
+[package]
+name = "mcp-fs"
+edition.workspace = true
+version.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+mcp-types = { path = "../mcp-types" }
+# For the shared AppleScript escaper: `fs_delete` routes through Finder so the
+# Trash gets real Put-Back metadata, and the path is agent-supplied.
+mcp-policy = { path = "../mcp-policy" }
+serde.workspace = true
+serde_json.workspace = true
+async-trait.workspace = true
+tracing.workspace = true
+
+tokio = { workspace = true, features = ["process", "time", "rt"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros", "process", "time"] }

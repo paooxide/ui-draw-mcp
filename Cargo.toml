@@ -1,0 +1,56 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/mcp-types",
+    "crates/mcp-policy",
+    "crates/mcp-core",
+    "crates/mcp-a11y",
+    "crates/mcp-vision",
+    "crates/mcp-input",
+    "crates/mcp-window",
+    "crates/mcp-browser",
+    "crates/mcp-fs",
+    "crates/mcp-proc",
+    "crates/mcp-net",
+    "crates/mcp-sys",
+    "crates/mcp-sec",
+    "crates/mcp-desktop",
+    "crates/mcp-memory",
+    "crates/mcp-pty",
+    "crates/mcp-pkg",
+    "crates/mcp-macos",
+    "agentctl",
+]
+
+[workspace.package]
+edition = "2021"
+version = "0.0.1"
+rust-version = "1.78"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+async-trait = "0.1"
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "io-std",
+    "io-util",
+    "sync",
+    "time",
+] }
+toml = "0.8"
+
+# --- SSD-conscious build profiles ---------------------------------------------
+# Skip debuginfo entirely: it is usually the majority of target/ size and we have
+# little disk. Re-enable per-package when you actually need to debug.
+[profile.dev]
+debug = 0
+
+[profile.dev.package."*"]
+opt-level = 0
+debug = 0
