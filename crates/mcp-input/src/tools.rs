@@ -613,7 +613,7 @@ impl ToolModule for InputModule {
                 Tier::Standard,
                 "Read the clipboard.",
                 json!({"type":"object","properties":{"format":{"type":"string","enum":["text","html","image","files"]}},"required":[]}),
-            ),
+            ).untrusted_output(),
             ToolDescriptor::new(
                 "clipboard_write",
                 Category::Input,

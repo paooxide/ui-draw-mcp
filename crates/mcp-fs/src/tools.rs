@@ -1048,14 +1048,14 @@ impl ToolModule for FsModule {
                 Tier::Read,
                 "Read a UTF-8 text file inside the allowed roots.",
                 p(json!({}), json!(["path"])),
-            ),
+            ).untrusted_output(),
             ToolDescriptor::new(
                 "fs_list",
                 Category::Filesystem,
                 Tier::Read,
                 "List a directory inside the allowed roots.",
                 p(json!({}), json!([])),
-            ),
+            ).untrusted_output(),
             ToolDescriptor::new(
                 "fs_metadata",
                 Category::Filesystem,
@@ -1099,7 +1099,7 @@ impl ToolModule for FsModule {
                     "src":{"type":"string"},"dst":{"type":"string"},
                     "format":{"type":"string","enum":["zip","tar.gz","tar.xz"]}},
                     "required":["action","src","dst"]}),
-            ),
+            ).untrusted_output(),
             ToolDescriptor::new(
                 "fs_watch",
                 Category::Filesystem,
@@ -1138,7 +1138,7 @@ impl ToolModule for FsModule {
                           "names_only": { "type": "boolean" } }),
                     json!(["query"]),
                 ),
-            ),
+            ).untrusted_output(),
             ToolDescriptor::new(
                 "fs_write",
                 Category::Filesystem,

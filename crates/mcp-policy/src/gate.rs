@@ -148,6 +148,22 @@ impl Policy {
         self.budget.count()
     }
 
+    /// Mark a result as carrying content from outside the trust boundary.
+    ///
+    /// Applied centrally, after redaction, to any tool whose descriptor says
+    /// its output contains third-party text. Doing it here rather than in each
+    /// engine means the marker cannot be forgotten when a tool is added, and
+    /// cannot be spoofed by the content itself.
+    pub fn mark_untrusted(&self, mut env: Envelope) -> Envelope {
+        if !env.ok {
+            return env;
+        }
+        if let Some(data) = env.data.as_mut() {
+            crate::injection::flag_untrusted(data);
+        }
+        env
+    }
+
     /// Redact secrets in a JSON value in place (results and audit payloads).
     pub fn redact(&self, value: &mut Value) {
         self.redactor.redact_value(value);

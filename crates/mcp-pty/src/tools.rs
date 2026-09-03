@@ -374,7 +374,8 @@ impl ToolModule for PtyModule {
                     "shell":{"type":"string","description":"absolute path; must be allowlisted"},
                     "cwd":{"type":"string"},"cols":{"type":"integer"},"rows":{"type":"integer"},
                     "env":{"type":"object"}},"required":[]}),
-            ),
+            )
+            .untrusted_output(),
             ToolDescriptor::new(
                 "pty_write",
                 Category::Terminal,
@@ -384,7 +385,8 @@ impl ToolModule for PtyModule {
                 json!({"type":"object","properties":{
                     "session_id":sid,"data":{"type":"string"},
                     "read_timeout_ms":{"type":"integer"}},"required":["session_id","data"]}),
-            ),
+            )
+            .untrusted_output(),
             ToolDescriptor::new(
                 "pty_read",
                 Category::Terminal,
@@ -392,7 +394,8 @@ impl ToolModule for PtyModule {
                 "Read pending output without sending anything.",
                 json!({"type":"object","properties":{
                     "session_id":sid,"timeout_ms":{"type":"integer"}},"required":["session_id"]}),
-            ),
+            )
+            .untrusted_output(),
             ToolDescriptor::new(
                 "pty_resize",
                 Category::Terminal,

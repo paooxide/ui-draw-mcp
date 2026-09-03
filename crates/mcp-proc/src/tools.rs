@@ -663,7 +663,7 @@ impl ToolModule for ProcModule {
                     },
                     "required": ["command"]
                 }),
-            ),
+            ).untrusted_output(),
             ToolDescriptor::new(
                 "command_info",
                 Category::Terminal,
@@ -671,7 +671,7 @@ impl ToolModule for ProcModule {
                 "Resolve a command and capture its own --help and --version. Use this before \
                  guessing at flags; it also reports whether exec would be allowed to run it.",
                 json!({"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}),
-            ),
+            ).untrusted_output(),
             ToolDescriptor::new(
                 "man_page",
                 Category::Terminal,
@@ -681,7 +681,7 @@ impl ToolModule for ProcModule {
                 json!({"type":"object","properties":{
                     "name":{"type":"string"},"section":{"type":"integer"},
                     "search":{"type":"boolean"}},"required":["name"]}),
-            ),
+            ).untrusted_output(),
             ToolDescriptor::new(
                 "service_control",
                 Category::Terminal,
@@ -712,7 +712,7 @@ impl ToolModule for ProcModule {
                 Tier::Read,
                 "List running processes (pid, ppid, cpu%, mem%, command).",
                 json!({ "type": "object", "properties": { "filter": { "type": "string" } }, "required": [] }),
-            ),
+            ).untrusted_output(),
             ToolDescriptor::new(
                 "process_signal",
                 Category::Terminal,

@@ -299,7 +299,7 @@ impl ToolModule for WindowModule {
                 Tier::Read,
                 "List windows of an app (or the focused app).",
                 json!({"type":"object","properties":{"app":{"type":"string"}},"required":[]}),
-            ),
+            ).untrusted_output(),
             ToolDescriptor::new(
                 "focus_app",
                 Category::Window,
@@ -316,7 +316,7 @@ impl ToolModule for WindowModule {
                 Tier::Read,
                 "List running applications.",
                 json!({"type":"object","properties":{},"required":[]}),
-            ),
+            ).untrusted_output(),
             ToolDescriptor::new(
                 "launch",
                 Category::Window,
@@ -369,7 +369,7 @@ impl ToolModule for WindowModule {
                     "app":{"type":"string"},
                     "scope":{"type":"string","enum":["app","system"]}
                 },"required":[]}),
-            ),
+            ).untrusted_output(),
             ToolDescriptor::new(
                 "menu_list",
                 Category::Window,
@@ -383,7 +383,7 @@ impl ToolModule for WindowModule {
                             "description":"menu to enumerate, e.g. [\"File\"]; omit for the menu bar"},
                     "depth":{"type":"integer","description":"levels to descend, 1-5 (default 1)"}
                 },"required":[]}),
-            ),
+            ).untrusted_output(),
             ToolDescriptor::new(
                 "wait_for",
                 Category::Window,

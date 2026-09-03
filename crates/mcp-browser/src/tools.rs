@@ -329,7 +329,7 @@ impl ToolModule for BrowserModule {
                     }),
                     json!(["browser_id", "action"]),
                 ),
-            ),
+            ).untrusted_output(),
             ToolDescriptor::new(
                 "browser_navigate",
                 Category::Browser,
@@ -343,7 +343,7 @@ impl ToolModule for BrowserModule {
                     }),
                     json!(["target_id", "action"]),
                 ),
-            ),
+            ).untrusted_output(),
             ToolDescriptor::new(
                 "browser_snapshot",
                 Category::Browser,
@@ -357,7 +357,7 @@ impl ToolModule for BrowserModule {
                     }),
                     json!(["target_id"]),
                 ),
-            ),
+            ).untrusted_output(),
             ToolDescriptor::new(
                 "browser_query",
                 Category::Browser,
@@ -372,7 +372,7 @@ impl ToolModule for BrowserModule {
                     }),
                     json!(["target_id", "query"]),
                 ),
-            ),
+            ).untrusted_output(),
             ToolDescriptor::new(
                 "browser_act",
                 Category::Browser,
@@ -387,7 +387,7 @@ impl ToolModule for BrowserModule {
                     }),
                     json!(["target_id", "ref", "action"]),
                 ),
-            ),
+            ).untrusted_output(),
             ToolDescriptor::new(
                 "browser_wait",
                 Category::Browser,
@@ -403,7 +403,7 @@ impl ToolModule for BrowserModule {
                     }),
                     json!(["target_id"]),
                 ),
-            ),
+            ).untrusted_output(),
             ToolDescriptor::new(
                 "browser_screenshot",
                 Category::Browser,
@@ -429,7 +429,7 @@ impl ToolModule for BrowserModule {
                     }),
                     json!(["target_id", "expression"]),
                 ),
-            ),
+            ).untrusted_output(),
             ToolDescriptor::new(
                 "browser_dialog",
                 Category::Browser,
@@ -448,7 +448,7 @@ impl ToolModule for BrowserModule {
                     },
                     "required": ["target_id"]
                 }),
-            ),
+            ).untrusted_output(),
             ToolDescriptor::new(
                 "browser_network",
                 Category::Browser,
@@ -469,7 +469,7 @@ impl ToolModule for BrowserModule {
                     }),
                     json!(["target_id", "action"]),
                 ),
-            ),
+            ).untrusted_output(),
             ToolDescriptor::new(
                 "browser_cookies",
                 Category::Browser,

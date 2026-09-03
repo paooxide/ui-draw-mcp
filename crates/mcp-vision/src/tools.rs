@@ -261,7 +261,7 @@ impl ToolModule for VisionModule {
                     },
                     "required": []
                 }),
-            ),
+            ).untrusted_output(),
             ToolDescriptor::new(
                 "capture_window",
                 Category::Vision,
@@ -278,7 +278,7 @@ impl ToolModule for VisionModule {
                     },
                     "required": ["window_id"]
                 }),
-            ),
+            ).untrusted_output(),
         ]
     }
 

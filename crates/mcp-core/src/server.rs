@@ -87,6 +87,9 @@ impl Server {
             );
         };
         let tier = enum_str(&descriptor.tier);
+        // Copied before the await, like `tier`: the descriptor borrow ends when
+        // the module is called.
+        let untrusted_output = descriptor.untrusted_output;
 
         // 3. Shallow arg-shape check (deep validation is the engine's job).
         if !(args.is_object() || args.is_null()) {
@@ -184,8 +187,16 @@ impl Server {
         let ctx = CallCtx::new(self.session_id.clone(), CancelToken::new());
         let result = module.call(name, args, &ctx).await;
 
-        // 6. Redact result.
+        // 6. Redact the result, then mark its provenance.
+        //
+        //    Order matters: redaction first, so the injection scan never reads
+        //    a secret, and the markers it adds are never themselves scanned.
         let result = self.policy.redact_envelope(result);
+        let result = if untrusted_output {
+            self.policy.mark_untrusted(result)
+        } else {
+            result
+        };
 
         // 7. Post-audit.
         let mut post = AuditRecord::post(&self.session_id, name);

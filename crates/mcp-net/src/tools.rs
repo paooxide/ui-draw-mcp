@@ -682,7 +682,7 @@ impl ToolModule for NetModule {
                     },
                     "required": ["url"]
                 }),
-            ),
+            ).untrusted_output(),
             ToolDescriptor::new(
                 "dns_lookup",
                 Category::Network,

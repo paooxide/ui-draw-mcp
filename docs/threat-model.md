@@ -150,9 +150,21 @@ not a defect in it.
 
 **Content is not instructions — but the agent may read it as such.**
 Every perception tool returns text an attacker may have written: page text, file contents, terminal
-output, even an application's accessibility labels. The server does not currently mark such results as
-untrusted, so nothing downstream distinguishes them from the agent's own reasoning. Marking provenance and
-flagging injection-shaped phrases is planned.
+output, even an application's accessibility labels. Results from those tools now carry
+`provenance: "untrusted"`, and text that reads as an instruction aimed at a model is additionally flagged
+with `suspicious_instructions` and the phrases that matched.
+
+Both are advisory and neither blocks. A blocking heuristic would be bypassable in one direction and, on a
+false positive, would let a web page deny service to the agent reading it. What the marker buys is that a
+model reading a flagged result can be told, truthfully, that this text is not from its operator.
+
+The scan reads literal text, in English, in one tool result. It therefore misses encoded payloads,
+translations, homoglyphs, paraphrase, an instruction stored behind a pointer, a payload split across two
+calls, and anything rendered as an image. All of those are asserted as passing in
+`crates/mcp-policy/tests/redteam_injection.rs::documented_known_bypasses`. Closing them would mean
+understanding the text, which is the model's job rather than a string matcher's — which is exactly why the
+controls that matter are the ones that do not depend on reading intent. **An injection that succeeds
+completely still cannot call a tool the operator did not enable.**
 
 ## 8. Out of scope, by choice
 

@@ -13,6 +13,7 @@ mod consent;
 mod decision;
 mod destructive;
 mod gate;
+mod injection;
 mod killswitch;
 mod load;
 mod redact;
@@ -23,6 +24,7 @@ pub use config::{default_agentctl_dir, Mode, PolicyConfig};
 pub use decision::Decision;
 pub use destructive::{default_destructive_patterns, is_destructive};
 pub use gate::Policy;
+pub use injection::{flag_untrusted, suspicious_instructions};
 pub use killswitch::KillSwitch;
 pub use redact::Redactor;
 

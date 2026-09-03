@@ -301,7 +301,8 @@ impl ToolModule for PkgModule {
                 "Search the package index.",
                 json!({"type":"object","properties":{
                     "query":{"type":"string"},"source":src},"required":["query"]}),
-            ),
+            )
+            .untrusted_output(),
             ToolDescriptor::new(
                 "app_list_installed",
                 Category::Packages,
@@ -316,7 +317,8 @@ impl ToolModule for PkgModule {
                 "Version, description, licence, homepage and declared dependencies.",
                 json!({"type":"object","properties":{
                     "id":{"type":"string"},"source":src},"required":["id"]}),
-            ),
+            )
+            .untrusted_output(),
             ToolDescriptor::new(
                 "app_install_plan",
                 Category::Packages,

@@ -677,7 +677,7 @@ impl ToolModule for SysModule {
                     },
                     "required": ["query"]
                 }),
-            ),
+            ).untrusted_output(),
         ]
     }
 

@@ -194,7 +194,7 @@ impl ToolModule for A11yModule {
                     },
                     "required": []
                 }),
-            ),
+            ).untrusted_output(),
             ToolDescriptor::new(
                 "get_element",
                 Category::Vision,
@@ -212,7 +212,7 @@ impl ToolModule for A11yModule {
                     },
                     "required": ["ref"]
                 }),
-            ),
+            ).untrusted_output(),
         ]
     }
 
