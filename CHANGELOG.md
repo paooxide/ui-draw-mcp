@@ -34,6 +34,16 @@ All notable changes to this project are documented here. The format follows
 - `policy.mode = "dry_run"` — a rehearsal in which read-tier tools run normally
   and anything that would change something reports what it would have done,
   including whether a human would have been asked.
+- `agentctl bridge` — a reference MCP client driven by Gemini, which spawns
+  `agentctl serve` as a child and runs the whole call/response loop over the
+  real transport. It doubles as a schema conformance test: every descriptor is
+  asserted to be a fixed point of the declaration sanitizer, so a tool that
+  grows a keyword the API rejects fails in CI rather than taking every other
+  declaration down with it. The API key is read from the environment, `.env` or
+  `~/.agentctl/gemini.key`, never from an argument.
+- `agentctl transcript --from-audit` — rebuild the same session record for a
+  client that does not cooperate with us, from the audit log. Recordings in
+  `docs/fixtures/` are validated against the live tool list in CI.
 - `browser_disconnect`, and a shutdown hook so browsers this session launched
   are stopped on exit rather than leaked.
 - `notifications/progress` on stdio, driven by `_meta.progressToken`. A wait is
@@ -67,6 +77,19 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- `expect` was declared beside the arguments rather than among them on all five
+  action tools. Valid JSON, and invisible to any client that reads the schema
+  to learn what a tool takes — so the act-and-confirm round trip could only be
+  used by someone who had read the source.
+- `list_apps` returned every process on the machine, including daemons and
+  shells that `launch` and `focus_app` would never accept. It now names the
+  applications that own windows.
+- `list_windows` with no `app` resolved to the frontmost application, so the
+  obvious opening question — what is open? — returned one app's windows, or
+  none, with nothing to say it had been narrowed. It now covers the machine
+  unless an app is named or `focus_app` has pinned one, and reads the
+  CoreGraphics window list rather than walking accessibility trees, because
+  Chromium exposes no tree until something asks it to.
 - `keyboard_type` inherited latched modifier flags, so with Command held every
   character became a menu shortcut: nothing was typed and the call reported
   success.

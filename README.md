@@ -131,6 +131,19 @@ Then ask the agent to do something a shell cannot: *"Open TextEdit, type today's
 Desktop."* Per-client setup for Claude Desktop, Cursor and Gemini is in
 [`docs/clients.md`](docs/clients.md).
 
+Or drive it without a client at all. `agentctl bridge` is a complete MCP client: it spawns the server as
+a child process and runs the whole loop against Gemini.
+
+```sh
+printf 'GEMINI_API_KEY=%s\n' "$KEY" > .env && chmod 600 .env
+agentctl bridge --list-models
+agentctl bridge --task "What application windows are open right now?"
+```
+
+Tool calls are traced as they happen. [`docs/demo.md`](docs/demo.md) covers both routes and the recorded
+transcripts; the first two runs of this bridge found two real defects the whole test suite had passed
+over, which is roughly what it is for.
+
 To check the protocol without a client, pipe newline-delimited JSON-RPC at it:
 
 ```sh
@@ -241,6 +254,7 @@ See [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
 - [`docs/tools.md`](docs/tools.md) — every tool, its tier and its arguments (generated).
 - [`docs/clients.md`](docs/clients.md) — connecting Claude Code, Claude Desktop, Cursor and Gemini.
+- [`docs/demo.md`](docs/demo.md) — driving the server with a real model, and the recorded transcripts.
 - [`docs/threat-model.md`](docs/threat-model.md) — actors, abuse cases, controls, and known gaps.
 - [`docs/planning.md`](docs/planning.md) — design source of truth: decisions, tool catalog, implementation log.
 - [`docs/architecture.md`](docs/architecture.md) — crate decomposition, layering rules, security architecture.
