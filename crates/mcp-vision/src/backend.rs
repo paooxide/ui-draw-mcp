@@ -127,6 +127,83 @@ pub trait VisionBackend: Send + Sync {
         opts: CaptureOpts,
     ) -> Result<CaptureResult, VisionError>;
     fn platform(&self) -> &'static str;
+
+    /// Read text off the screen.
+    ///
+    /// The fallback for surfaces that expose no accessibility tree — canvases,
+    /// games, custom-drawn and some Electron UI — where today the only advice
+    /// is "take a screenshot and look at it", which costs vision tokens on
+    /// every turn and gives back no coordinates to act on.
+    ///
+    /// Default: not available. A backend that cannot do this must say so
+    /// rather than have every caller check first.
+    async fn ocr(&self, _target: OcrTarget, _opts: &OcrOpts) -> Result<OcrResult, VisionError> {
+        Err(VisionError::Unsupported(
+            "text recognition is not available on this platform".into(),
+        ))
+    }
+}
+
+/// What to read text from.
+#[derive(Debug, Clone, Copy)]
+pub enum OcrTarget {
+    /// A whole display (`None` = the main one).
+    Display(Option<u32>),
+    /// A screen rectangle, in points.
+    Region((f64, f64, f64, f64)),
+    /// One window, by the id `list_windows` reports.
+    Window(u32),
+}
+
+/// Recognition options.
+#[derive(Debug, Clone, Default)]
+pub struct OcrOpts {
+    /// BCP-47 languages to recognise. Empty = the system default.
+    pub languages: Vec<String>,
+    /// Trade accuracy for speed, and skip language correction with it.
+    pub fast: bool,
+    /// Drop lines the recogniser is less sure about than this (0.0–1.0).
+    pub min_confidence: f64,
+}
+
+/// One recognised line, in **image pixels** with a top-left origin.
+#[derive(Debug, Clone)]
+pub struct OcrLine {
+    pub text: String,
+    pub confidence: f64,
+    /// `(x, y, w, h)` in image pixels.
+    pub px: (f64, f64, f64, f64),
+}
+
+/// Recognised text plus everything needed to map it back to the screen.
+#[derive(Debug, Clone)]
+pub struct OcrResult {
+    pub lines: Vec<OcrLine>,
+    pub width: u32,
+    pub height: u32,
+    /// Screen coordinate of the image's top-left corner.
+    pub origin: (f64, f64),
+    /// Size, in screen coordinates, of the area the image covers.
+    pub screen_size: (f64, f64),
+}
+
+impl OcrResult {
+    /// Same mapping as [`CaptureResult`]: image pixels are not screen points,
+    /// and on a Retina display they differ by a factor of two.
+    pub fn scale_x(&self) -> f64 {
+        if self.width == 0 {
+            1.0
+        } else {
+            self.screen_size.0 / self.width as f64
+        }
+    }
+    pub fn scale_y(&self) -> f64 {
+        if self.height == 0 {
+            1.0
+        } else {
+            self.screen_size.1 / self.height as f64
+        }
+    }
 }
 
 #[cfg(test)]

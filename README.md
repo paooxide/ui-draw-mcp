@@ -49,12 +49,12 @@ heuristic.
 
 ## What it does
 
-106 tools across 12 categories. The full reference, generated from the server's own descriptors, is
+107 tools across 12 categories. The full reference, generated from the server's own descriptors, is
 [`docs/tools.md`](docs/tools.md).
 
 | Category | Tools | Names | Dangerous |
 |---|---|---|---|
-| vision | 6 | `capture_screen`, `capture_window`, `find_elements`, `get_element`, `get_ui_tree`, `list_displays` | 0 |
+| vision | 7 | `capture_screen`, `capture_window`, `find_elements`, `get_element`, `get_ui_tree`, `list_displays`, `ocr_region` | 0 |
 | input | 10 | `clipboard_read`, `clipboard_write`, `drag_drop`, `hover`, `keyboard_shortcut`, `keyboard_type`, `mouse_action`, `scroll`, `set_value`, `ui_action` | 0 |
 | window | 11 | `close_app`, `control_window`, `focus_app`, `handle_dialogs`, `launch`, `list_apps`, `list_windows`, `menu_invoke`, `menu_list`, `menu_open`, `wait_for` | 0 |
 | desktop | 8 | `idle_status`, `lock_screen`, `media_control`, `notify_user`, `play_audio`, `power_control`, `speak`, `system_settings` | 1 |
@@ -69,9 +69,13 @@ heuristic.
 
 Only `vision`, `input` and `window` are enabled out of the box, and only their non-dangerous tools.
 
-**The cheapest way to observe is `get_ui_tree`** — plain text, no image, no vision tokens. Screen capture is
-the documented fallback for surfaces with no accessibility tree (canvases, games, some Electron apps).
-Captures deduplicate against the previous frame, so polling an unchanged screen costs nothing.
+**The cheapest way to observe is `get_ui_tree`** — plain text, no image, no vision tokens. Ask it for a
+delta with `since` and a follow-up observation costs only what changed. `find_elements` is cheaper still
+when the question is narrow, and `expect` on an input tool folds act-wait-verify into one call.
+
+For surfaces with no accessibility tree — canvases, games, some Electron apps — `ocr_region` reads the text
+and returns a clickable box for each line. Screen capture remains the last resort; captures deduplicate
+against the previous frame, so polling an unchanged screen costs nothing.
 
 ---
 
@@ -210,7 +214,7 @@ than test doubles — there are no fake backends in this repository by policy.
 | Terminal, filesystem, network, system, credentials, PTY, packages, recall | Shipped |
 | Hardening: fuzzing, red-team suites, HTTP transport, CI | Shipped; six real defects found and fixed |
 | Linux and Windows desktop backends | Not started |
-| `ocr_region`, `capture_audio`, `virtual_desktop` | Deferred by design |
+| `capture_audio`, `virtual_desktop` | Deferred by design |
 | `privilege_run` | Deliberately never — root defeats every other control |
 
 [`PROGRESS.md`](PROGRESS.md) is the running log, including what each validation run actually proved and the

@@ -597,3 +597,98 @@ async fn a_human_taking_the_mouse_is_detected_and_agentctl_moving_it_is_not() {
     // Leave the pointer somewhere harmless.
     let _ = CGDisplay::warp_mouse_cursor_position(CGPoint::new(400.0, 400.0));
 }
+
+/// Reading text off the screen, with coordinates that can be clicked.
+///
+/// This is the fallback for surfaces the accessibility tree does not describe.
+/// The assertion that matters is not "text came back" but that the box for a
+/// known piece of text lands where that text actually is, because a box in
+/// image pixels would be off by the Retina factor and every click would miss.
+#[tokio::test(flavor = "multi_thread")]
+async fn ocr_reads_a_window_and_returns_clickable_coordinates() {
+    if !ready() {
+        return;
+    }
+    if !mcp_macos::permissions().screen_recording {
+        eprintln!("skipping: Screen Recording is not granted");
+        return;
+    }
+    let c = client("live-ocr");
+    c.initialize().await;
+    c.ok("launch", json!({ "app": "TextEdit" })).await;
+    if !settle_on(&c, "TextEdit").await {
+        return;
+    }
+    if !guarded_key(&c, "TextEdit", "cmd+n").await {
+        return;
+    }
+    tokio::time::sleep(Duration::from_millis(700)).await;
+
+    // Something distinctive that OCR should find, in a large enough size to be
+    // read reliably.
+    let nonce = format!("OCRCHECK{}", mcp_policy::now_ms() % 100_000);
+    if !guarded_type(&c, "TextEdit", &nonce).await {
+        return;
+    }
+    let settled = c
+        .call(
+            "wait_for",
+            json!({ "app": "TextEdit", "text": &nonce, "timeout_ms": 5000 }),
+        )
+        .await;
+    if !settled.ok {
+        eprintln!("skipping: the text never landed");
+        return;
+    }
+
+    let windows = c.ok("list_windows", json!({ "app": "TextEdit" })).await;
+    let bounds = windows["windows"][0]["bounds"].clone();
+    let (wx, wy, ww, wh) = (
+        bounds["x"].as_f64().unwrap(),
+        bounds["y"].as_f64().unwrap(),
+        bounds["w"].as_f64().unwrap(),
+        bounds["h"].as_f64().unwrap(),
+    );
+
+    let env = c.call("ocr_region", json!({ "window_id": 0 })).await;
+    if !env.ok {
+        let msg = env.error.unwrap().message;
+        // No Command Line Tools is a legitimate answer, and it must say so.
+        assert!(
+            msg.contains("Command Line Tools"),
+            "unexpected OCR failure: {msg}"
+        );
+        eprintln!("skipping: {msg}");
+        return;
+    }
+    let d = env.data.unwrap();
+    assert_eq!(d["coordinate_space"], json!("screen"));
+    assert!(d["line_count"].as_u64().unwrap() > 0);
+
+    let found = d["lines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|l| l["text"].as_str().is_some_and(|t| t.contains(&nonce)))
+        .unwrap_or_else(|| {
+            panic!(
+                "OCR should have read the typed text; it read: {}",
+                d["text"].as_str().unwrap_or_default()
+            )
+        });
+
+    // The point of returning boxes: they are in the same space mouse_action
+    // takes, so they land on the thing that was read.
+    let cx = found["center"]["x"].as_f64().unwrap();
+    let cy = found["center"]["y"].as_f64().unwrap();
+    assert!(
+        cx > wx && cx < wx + ww && cy > wy && cy < wy + wh,
+        "the text's centre ({cx}, {cy}) must fall inside the window \
+         ({wx}, {wy}, {ww}x{wh}) — a box left in image pixels would not"
+    );
+
+    // Provenance still applies: screen text is somebody else's content.
+    assert_eq!(d["provenance"], json!("untrusted"));
+
+    let _ = c.call("close_app", json!({ "app": "TextEdit" })).await;
+}

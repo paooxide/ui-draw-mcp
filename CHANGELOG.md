@@ -17,6 +17,12 @@ All notable changes to this project are documented here. The format follows
 - `since` on `get_ui_tree` — return what changed rather than the whole tree.
 - `gone` and `focused` conditions on `wait_for`, which now shares its evaluator
   with `expect`.
+- `ocr_region` — read text off the screen through Apple's Vision framework,
+  returning a box per line in screen coordinates. The fallback for surfaces the
+  accessibility tree does not describe, and unlike a screenshot it hands back
+  coordinates that can be clicked. No longer deferred: a small Swift helper is
+  compiled on first use rather than linking a framework or requiring the Xcode
+  toolchain at build time.
 - `find_elements` — query the accessibility tree by role, name substring or
   proximity to a screen point instead of reading all of it. On a busy
   application a targeted query is an order of magnitude smaller than the full

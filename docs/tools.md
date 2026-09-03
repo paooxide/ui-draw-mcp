@@ -8,7 +8,7 @@ Tiers gate what an agent may call: `read` and `standard` tools are available ins
 enabled category, while a `dangerous` tool additionally has to be named in
 `policy.enable`. Enabling a category never enables its dangerous tools.
 
-**106 tools across 12 categories.**
+**107 tools across 12 categories.**
 
 | Tool | Category | Tier | Summary |
 |---|---|---|---|
@@ -18,6 +18,7 @@ enabled category, while a `dangerous` tool additionally has to be named in
 | [`get_element`](#get-element) | vision | read | Read one property of an element by ref from the latest snapshot. |
 | [`get_ui_tree`](#get-ui-tree) | vision | read | Observe the UI. |
 | [`list_displays`](#list-displays) | vision | read | List displays (monitors) with geometry, scale, and which is primary. |
+| [`ocr_region`](#ocr-region) | vision | read | Read text off the screen, with a box for each line in screen coordinates. |
 | [`clipboard_read`](#clipboard-read) | input | standard | Read the clipboard. |
 | [`clipboard_write`](#clipboard-write) | input | standard | Write the clipboard. |
 | [`drag_drop`](#drag-drop) | input | standard | Press-move-release drag from one point/ref to another. |
@@ -204,6 +205,25 @@ Observe the UI. Returns interactive elements with refs (@e1, @e2…) as flattene
 List displays (monitors) with geometry, scale, and which is primary.
 
 No arguments.
+
+### ocr-region
+
+`ocr_region` · read tier
+
+Read text off the screen, with a box for each line in screen coordinates. The fallback when get_ui_tree comes back sparse — a canvas, a game, a custom-drawn or Electron UI — where the text is visible but not in the accessibility tree. Cheaper than a screenshot for reading, and unlike a screenshot it hands back coordinates you can click.
+
+| Argument | Type | Required | Description |
+|---|---|---|---|
+| `display` | integer |  | which display, when no region or window is given |
+| `lang` | array&lt;string&gt; |  | BCP-47 languages, e.g. ["en-US"]; default is the system's |
+| `level` | one of: accurate, fast |  | accuracy versus speed (default accurate) |
+| `min_confidence` | number |  | drop lines below this confidence, 0-1 (default 0.3) |
+| `region` | object |  | screen rectangle in points; omit for a whole display |
+| `region.h` | number |  |  |
+| `region.w` | number |  |  |
+| `region.x` | number |  |  |
+| `region.y` | number |  |  |
+| `window_id` | integer |  | read one window (id from list_windows) |
 
 ## input
 

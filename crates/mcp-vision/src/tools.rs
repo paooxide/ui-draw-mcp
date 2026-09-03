@@ -8,7 +8,9 @@ use serde_json::{json, Value};
 
 use std::sync::Mutex;
 
-use crate::backend::{CaptureOpts, CaptureResult, Detail, VisionBackend, VisionError};
+use crate::backend::{
+    CaptureOpts, CaptureResult, Detail, OcrLine, OcrOpts, OcrTarget, VisionBackend, VisionError,
+};
 use crate::config::VisionConfig;
 
 /// The `vision` capture engine: `list_displays`, `capture_screen`,
@@ -221,6 +223,165 @@ impl VisionModule {
     }
 }
 
+impl VisionModule {
+    /// Read text off the screen.
+    async fn ocr_region(&self, args: &Value) -> Envelope {
+        let tool = "ocr_region";
+        let region = args.get("region").and_then(|r| {
+            let f = |k: &str| r.get(k).and_then(Value::as_f64);
+            match (f("x"), f("y"), f("w"), f("h")) {
+                (Some(x), Some(y), Some(w), Some(h)) => Some((x, y, w, h)),
+                _ => None,
+            }
+        });
+        if args.get("region").is_some() && region.is_none() {
+            return Envelope::fail(
+                tool,
+                ErrorCode::InvalidArgs,
+                "'region' needs numeric x, y, w and h",
+            );
+        }
+        if let Some((_, _, w, h)) = region {
+            if w <= 0.0 || h <= 0.0 {
+                return Envelope::fail(
+                    tool,
+                    ErrorCode::InvalidArgs,
+                    "'region' must have positive width and height",
+                );
+            }
+        }
+        let window_id = args.get("window_id").and_then(Value::as_u64);
+        let target = match (region, window_id) {
+            (Some(r), _) => OcrTarget::Region(r),
+            (None, Some(id)) => OcrTarget::Window(id as u32),
+            (None, None) => OcrTarget::Display(
+                args.get("display")
+                    .and_then(Value::as_u64)
+                    .map(|d| d as u32),
+            ),
+        };
+
+        let level = args
+            .get("level")
+            .and_then(Value::as_str)
+            .unwrap_or("accurate");
+        let fast = match level {
+            "accurate" => false,
+            "fast" => true,
+            other => {
+                return Envelope::fail(
+                    tool,
+                    ErrorCode::InvalidArgs,
+                    format!("unknown level '{other}' (accurate|fast)"),
+                )
+            }
+        };
+        let opts = OcrOpts {
+            languages: args
+                .get("lang")
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default(),
+            fast,
+            min_confidence: args
+                .get("min_confidence")
+                .and_then(Value::as_f64)
+                .unwrap_or(0.3)
+                .clamp(0.0, 1.0),
+        };
+
+        let mut res = match self.backend.ocr(target, &opts).await {
+            Ok(r) => r,
+            Err(e) => return vision_err(tool, e),
+        };
+        order_lines(&mut res.lines);
+        let (sx, sy) = (res.scale_x(), res.scale_y());
+        let lines: Vec<Value> = res
+            .lines
+            .iter()
+            .map(|l| {
+                let (x, y, w, h) = px_to_screen(l.px, res.origin, sx, sy);
+                json!({
+                    "text": l.text,
+                    "confidence": (l.confidence * 1000.0).round() / 1000.0,
+                    "bounds": { "x": x, "y": y, "w": w, "h": h },
+                    // Pre-computed because it is what a click needs, and
+                    // computing it from bounds is a step an agent can get wrong.
+                    "center": { "x": x + w / 2.0, "y": y + h / 2.0 },
+                })
+            })
+            .collect();
+        let text = res
+            .lines
+            .iter()
+            .map(|l| l.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        Envelope::ok(
+            tool,
+            json!({
+                "text": text,
+                "lines": lines,
+                "line_count": lines.len(),
+                // Said explicitly, because the obvious assumption — that these
+                // are image pixels — would put every click in the wrong place.
+                "coordinate_space": "screen",
+                "region": { "x": res.origin.0, "y": res.origin.1,
+                            "w": res.screen_size.0, "h": res.screen_size.1 },
+                "image": { "width": res.width, "height": res.height },
+                "engine": "apple-vision",
+            }),
+        )
+    }
+}
+
+/// Group recognised lines into reading order: rows by vertical overlap, then
+/// left to right within a row.
+///
+/// Vision returns observations in its own order, which is not the order a
+/// person reads them in. An agent handed a jumbled transcript has to reason
+/// about geometry it cannot see.
+fn order_lines(lines: &mut [OcrLine]) {
+    lines.sort_by(|a, b| {
+        let row_height = a.px.3.max(b.px.3).max(1.0);
+        let dy = (a.px.1 - b.px.1).abs();
+        if dy < row_height * 0.5 {
+            a.px.0
+                .partial_cmp(&b.px.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        } else {
+            a.px.1
+                .partial_cmp(&b.px.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        }
+    });
+}
+
+/// Map an image-pixel box to screen points.
+///
+/// Image pixels are not screen points: a Retina capture is already twice the
+/// logical space. Returning pixel boxes would give an agent coordinates that
+/// land in the wrong place when passed to `mouse_action`, which is the whole
+/// reason to return boxes at all.
+fn px_to_screen(
+    px: (f64, f64, f64, f64),
+    origin: (f64, f64),
+    sx: f64,
+    sy: f64,
+) -> (f64, f64, f64, f64) {
+    (
+        origin.0 + px.0 * sx,
+        origin.1 + px.1 * sy,
+        px.2 * sx,
+        px.3 * sy,
+    )
+}
+
 #[async_trait]
 impl ToolModule for VisionModule {
     fn descriptors(&self) -> Vec<ToolDescriptor> {
@@ -263,6 +424,46 @@ impl ToolModule for VisionModule {
                 }),
             ).untrusted_output(),
             ToolDescriptor::new(
+                "ocr_region",
+                Category::Vision,
+                Tier::Read,
+                "Read text off the screen, with a box for each line in screen coordinates. \
+                 The fallback when get_ui_tree comes back sparse — a canvas, a game, a \
+                 custom-drawn or Electron UI — where the text is visible but not in the \
+                 accessibility tree. Cheaper than a screenshot for reading, and unlike a \
+                 screenshot it hands back coordinates you can click.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "region": {
+                            "type": "object",
+                            "description": "screen rectangle in points; omit for a whole display",
+                            "properties": {
+                                "x": { "type": "number" }, "y": { "type": "number" },
+                                "w": { "type": "number" }, "h": { "type": "number" }
+                            }
+                        },
+                        "window_id": { "type": "integer", "description": "read one window (id from list_windows)" },
+                        "display": { "type": "integer", "description": "which display, when no region or window is given" },
+                        "lang": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "BCP-47 languages, e.g. [\"en-US\"]; default is the system's"
+                        },
+                        "level": {
+                            "type": "string",
+                            "enum": ["accurate", "fast"],
+                            "description": "accuracy versus speed (default accurate)"
+                        },
+                        "min_confidence": {
+                            "type": "number",
+                            "description": "drop lines below this confidence, 0-1 (default 0.3)"
+                        }
+                    },
+                    "required": []
+                }),
+            ).untrusted_output(),
+            ToolDescriptor::new(
                 "capture_window",
                 Category::Vision,
                 Tier::Read,
@@ -290,6 +491,7 @@ impl ToolModule for VisionModule {
             },
             "capture_screen" => self.capture_screen(&args).await,
             "capture_window" => self.capture_window(&args).await,
+            "ocr_region" => self.ocr_region(&args).await,
             other => Envelope::fail(other, ErrorCode::InvalidArgs, "unknown tool"),
         }
     }
@@ -312,6 +514,61 @@ fn vision_err(tool: &str, e: VisionError) -> Envelope {
         VisionError::Failed(m) => (ErrorCode::ActionFailed, m),
     };
     Envelope::fail(tool, code, msg)
+}
+
+#[cfg(test)]
+mod ocr_tests {
+    use super::*;
+
+    fn line(text: &str, px: (f64, f64, f64, f64)) -> OcrLine {
+        OcrLine {
+            text: text.into(),
+            confidence: 1.0,
+            px,
+        }
+    }
+
+    /// The mapping that makes OCR boxes clickable. On a Retina display the
+    /// capture is twice the logical space, so returning pixel coordinates
+    /// would put every click at double the intended offset.
+    #[test]
+    fn boxes_map_from_image_pixels_to_screen_points() {
+        // A 400x300 region captured at 800x600: scale 0.5 both ways.
+        let (x, y, w, h) = px_to_screen((100.0, 40.0, 200.0, 20.0), (250.0, 102.0), 0.5, 0.5);
+        assert_eq!((x, y, w, h), (300.0, 122.0, 100.0, 10.0));
+    }
+
+    #[test]
+    fn a_non_retina_capture_maps_one_to_one() {
+        let out = px_to_screen((10.0, 20.0, 30.0, 40.0), (0.0, 0.0), 1.0, 1.0);
+        assert_eq!(out, (10.0, 20.0, 30.0, 40.0));
+    }
+
+    /// Vision returns observations in its own order. An agent handed a jumbled
+    /// transcript has to reason about geometry it cannot see.
+    #[test]
+    fn lines_come_back_in_reading_order() {
+        let mut lines = vec![
+            line("world", (200.0, 10.0, 50.0, 12.0)),
+            line("second row", (10.0, 40.0, 90.0, 12.0)),
+            line("hello", (10.0, 10.0, 50.0, 12.0)),
+        ];
+        order_lines(&mut lines);
+        let got: Vec<&str> = lines.iter().map(|l| l.text.as_str()).collect();
+        assert_eq!(got, vec!["hello", "world", "second row"]);
+    }
+
+    /// Text on the same visual row is one row even when the baselines differ
+    /// slightly, which they always do.
+    #[test]
+    fn a_small_vertical_difference_is_still_the_same_row() {
+        let mut lines = vec![
+            line("right", (200.0, 12.0, 40.0, 12.0)),
+            line("left", (10.0, 10.0, 40.0, 12.0)),
+        ];
+        order_lines(&mut lines);
+        assert_eq!(lines[0].text, "left");
+    }
 }
 
 #[cfg(test)]

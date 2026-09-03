@@ -6,6 +6,9 @@ mod backend;
 mod config;
 mod tools;
 
-pub use backend::{CaptureOpts, CaptureResult, Detail, DisplayInfo, VisionBackend, VisionError};
+pub use backend::{
+    CaptureOpts, CaptureResult, Detail, DisplayInfo, OcrLine, OcrOpts, OcrResult, OcrTarget,
+    VisionBackend, VisionError,
+};
 pub use config::VisionConfig;
 pub use tools::VisionModule;

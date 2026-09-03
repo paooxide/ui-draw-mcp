@@ -290,6 +290,8 @@ fn doctor() {
         println!("    -> no http.token set; one is generated per run and printed to stderr");
     }
     print_permissions();
+    #[cfg(target_os = "macos")]
+    print_ocr_helper(&cfg);
 }
 
 /// Report the TCC grants the desktop engines depend on.
@@ -298,6 +300,37 @@ fn doctor() {
 /// wallpaper — so an unchecked permission looks like an empty desktop rather
 /// than a setup problem. Preflight only: a diagnostic must not raise a system
 /// permission dialog as a side effect.
+#[cfg(target_os = "macos")]
+fn print_ocr_helper(cfg: &PolicyConfig) {
+    let dir = cfg
+        .kill_switch_file
+        .parent()
+        .map(|p| p.join("bin"))
+        .unwrap_or_else(std::env::temp_dir);
+    let tools_ok = std::process::Command::new("/usr/bin/xcode-select")
+        .arg("-p")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    let state = if !tools_ok {
+        "needs the Xcode Command Line Tools (xcode-select --install)".to_string()
+    } else if dir.exists()
+        && std::fs::read_dir(&dir)
+            .map(|mut d| {
+                d.any(|e| {
+                    e.map(|e| e.file_name().to_string_lossy().starts_with("agentctl-ocr-"))
+                        .unwrap_or(false)
+                })
+            })
+            .unwrap_or(false)
+    {
+        format!("compiled ({})", dir.display())
+    } else {
+        "not compiled yet (the first ocr_region call builds it)".to_string()
+    };
+    println!("  ocr helper:      {state}");
+}
+
 fn print_permissions() {
     #[cfg(target_os = "macos")]
     {

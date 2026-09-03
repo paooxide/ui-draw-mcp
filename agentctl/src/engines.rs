@@ -201,7 +201,15 @@ pub fn build_stack(cfg: &PolicyConfig) -> (Vec<Arc<dyn ToolModule>>, Wiring) {
         use mcp_vision::VisionModule;
         use mcp_window::WindowModule;
 
-        let backend = Arc::new(MacosBackend::new());
+        // The OCR helper is cached beside the rest of the agentctl state, next to
+        // the config and the audit log, rather than in a temp directory that a
+        // reboot would clear.
+        let helper_dir = cfg
+            .kill_switch_file
+            .parent()
+            .map(|p| p.join("bin"))
+            .unwrap_or_else(std::env::temp_dir);
+        let backend = Arc::new(MacosBackend::new().with_helper_dir(helper_dir));
         let a11y = A11yModule::new(backend.clone(), 12_000);
         let arena = a11y.arena();
         let input_policy = InputPolicy {

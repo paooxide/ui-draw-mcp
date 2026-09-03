@@ -309,8 +309,21 @@ struct AppTarget {
 /// Real macOS backend implementing perception (`A11yBackend`) and semantic input
 /// (`InputBackend`). Element handles are not stored across snapshots; each node
 /// keeps a child-index *path* from the app root (Send-safe), re-walked to act.
+/// `~/.agentctl/bin`, or the temp directory when there is no home.
+fn default_helper_dir() -> std::path::PathBuf {
+    std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join(".agentctl")
+        .join("bin")
+}
+
 pub struct MacosBackend {
     state: Mutex<State>,
+    /// Where the compiled OCR helper is cached. Passed in rather than derived
+    /// here: a backend must not depend on the policy crate to find out where
+    /// the agentctl state directory is.
+    pub(crate) helper_dir: std::path::PathBuf,
     /// Set when something asks in-flight work to stop — the human-override
     /// watcher, for instance. Checked between the steps of a drag, which would
     /// otherwise keep the button held while the person moves the mouse.
@@ -328,7 +341,14 @@ impl MacosBackend {
         MacosBackend {
             state: Mutex::new(State::default()),
             cancel: std::sync::atomic::AtomicBool::new(false),
+            helper_dir: default_helper_dir(),
         }
+    }
+
+    /// Cache the compiled OCR helper somewhere other than the default.
+    pub fn with_helper_dir(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
+        self.helper_dir = dir.into();
+        self
     }
 
     /// Resolve which app to drive, and remember it.

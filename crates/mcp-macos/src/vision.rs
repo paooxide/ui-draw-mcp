@@ -112,6 +112,34 @@ fn signature_of(src: &std::path::Path) -> Vec<u8> {
     bytes.get(off..).map(<[u8]>::to_vec).unwrap_or_default()
 }
 
+/// Capture straight to a PNG file: no downscale, no base64, no thumbnail.
+///
+/// OCR needs the pixels, and none of the token-cost machinery applies to text
+/// that comes back as text.
+fn capture_to_file(args: &[String]) -> Result<(std::path::PathBuf, u32, u32), VisionError> {
+    let file = temp_png();
+    let mut full = args.to_vec();
+    full.push(file.to_string_lossy().into_owned());
+    let status = std::process::Command::new("/usr/sbin/screencapture")
+        .args(&full)
+        .status()
+        .map_err(|e| VisionError::Failed(format!("screencapture: {e}")))?;
+    if !status.success() {
+        let _ = std::fs::remove_file(&file);
+        return Err(VisionError::Failed("screencapture failed".into()));
+    }
+    let bytes =
+        std::fs::read(&file).map_err(|e| VisionError::Failed(format!("read capture: {e}")))?;
+    if bytes.is_empty() {
+        let _ = std::fs::remove_file(&file);
+        return Err(VisionError::PermissionDenied(
+            "capture was empty — grant Screen Recording permission".into(),
+        ));
+    }
+    let (w, h) = png_dimensions(&bytes).unwrap_or((0, 0));
+    Ok((file, w, h))
+}
+
 fn run_screencapture(args: &[String], max_edge: u32) -> Result<CaptureResult, VisionError> {
     let file = temp_png();
     let mut full = args.to_vec();
@@ -160,6 +188,59 @@ fn run_screencapture(args: &[String], max_edge: u32) -> Result<CaptureResult, Vi
     })
 }
 
+impl MacosBackend {
+    /// The `screencapture` arguments for a target, and the screen area the
+    /// resulting image will cover. Shared by capture and OCR so the two cannot
+    /// disagree about what a display index or a region means.
+    async fn capture_args(
+        &self,
+        display: Option<u32>,
+        region: Option<(f64, f64, f64, f64)>,
+    ) -> Result<(Vec<String>, (f64, f64, f64, f64)), VisionError> {
+        let mut args = vec!["-x".to_string(), "-t".to_string(), "png".to_string()];
+        if let Some((x, y, w, h)) = region {
+            args.push("-R".into());
+            args.push(format!(
+                "{},{},{},{}",
+                x as i64, y as i64, w as i64, h as i64
+            ));
+            return Ok((args, (x, y, w, h)));
+        }
+        let displays = VisionBackend::list_displays(self).await?;
+        let chosen = match display {
+            Some(d) => displays
+                .iter()
+                .find(|x| x.index == d)
+                .ok_or_else(|| VisionError::NotFound(format!("no display with index {d}")))?,
+            None => displays
+                .iter()
+                .find(|d| d.primary)
+                .or_else(|| displays.first())
+                .ok_or_else(|| VisionError::Failed("no displays".into()))?,
+        };
+        if let Some(d) = display {
+            // screencapture -D is 1-based.
+            args.push("-D".into());
+            args.push((d + 1).to_string());
+        }
+        Ok((args, (chosen.x, chosen.y, chosen.w, chosen.h)))
+    }
+
+    /// A window's screen rectangle.
+    async fn window_region(&self, window_id: u32) -> Result<(f64, f64, f64, f64), VisionError> {
+        unsafe {
+            let app = focused_app_element().map_err(win_to_vision)?;
+            let wins = get_windows(app.as_CFTypeRef());
+            let w = wins
+                .get(window_id as usize)
+                .ok_or_else(|| VisionError::NotFound(format!("window {window_id} not found")))?;
+            read_bounds(w.as_CFTypeRef())
+                .map(|b| (b.x, b.y, b.w, b.h))
+                .ok_or_else(|| VisionError::Failed("window has no bounds".into()))
+        }
+    }
+}
+
 #[async_trait]
 impl VisionBackend for MacosBackend {
     async fn list_displays(&self) -> Result<Vec<DisplayInfo>, VisionError> {
@@ -201,41 +282,42 @@ impl VisionBackend for MacosBackend {
         opts: CaptureOpts,
     ) -> Result<CaptureResult, VisionError> {
         let max_edge = opts.max_edge.unwrap_or(MAX_EDGE).clamp(160, 4096);
-        let mut args = vec!["-x".to_string(), "-t".to_string(), "png".to_string()];
-        // The screen area the image will cover, in logical coordinates — this
-        // is what makes image pixels mappable back to `mouse_action` points.
-        let area: (f64, f64, f64, f64);
-        if let Some((x, y, w, h)) = region {
-            args.push("-R".into());
-            args.push(format!(
-                "{},{},{},{}",
-                x as i64, y as i64, w as i64, h as i64
-            ));
-            area = (x, y, w, h);
-        } else {
-            let displays = self.list_displays().await?;
-            let chosen = match display {
-                Some(d) => displays
-                    .iter()
-                    .find(|x| x.index == d)
-                    .ok_or_else(|| VisionError::NotFound(format!("no display with index {d}")))?,
-                None => displays
-                    .iter()
-                    .find(|d| d.primary)
-                    .or_else(|| displays.first())
-                    .ok_or_else(|| VisionError::Failed("no displays".into()))?,
-            };
-            if let Some(d) = display {
-                // screencapture -D is 1-based.
-                args.push("-D".into());
-                args.push((d + 1).to_string());
-            }
-            area = (chosen.x, chosen.y, chosen.w, chosen.h);
-        }
+        let (args, area) = self.capture_args(display, region).await?;
         let mut cap = run_screencapture(&args, max_edge)?;
         cap.origin = (area.0, area.1);
         cap.screen_size = (area.2, area.3);
         Ok(cap)
+    }
+
+    async fn ocr(
+        &self,
+        target: mcp_vision::OcrTarget,
+        opts: &mcp_vision::OcrOpts,
+    ) -> Result<mcp_vision::OcrResult, VisionError> {
+        use mcp_vision::OcrTarget;
+        let helper = crate::ocr::ensure_helper(&self.helper_dir)?;
+        let (args, area) = match target {
+            OcrTarget::Display(d) => self.capture_args(d, None).await?,
+            OcrTarget::Region(r) => self.capture_args(None, Some(r)).await?,
+            OcrTarget::Window(id) => {
+                let r = self.window_region(id).await?;
+                self.capture_args(None, Some(r)).await?
+            }
+        };
+        // Full resolution, no downscale and no thumbnail: OCR needs the pixels,
+        // and none of the token-cost machinery applies to text that comes back
+        // as text.
+        let (file, width, height) = capture_to_file(&args)?;
+        let result = crate::ocr::ocr_png(&helper, &file, opts).await;
+        let _ = std::fs::remove_file(&file);
+        let (lines, w, h) = result?;
+        Ok(mcp_vision::OcrResult {
+            lines,
+            width: if w > 0 { w } else { width },
+            height: if h > 0 { h } else { height },
+            origin: (area.0, area.1),
+            screen_size: (area.2, area.3),
+        })
     }
 
     async fn capture_window(
@@ -244,16 +326,7 @@ impl VisionBackend for MacosBackend {
         opts: CaptureOpts,
     ) -> Result<CaptureResult, VisionError> {
         // Resolve the AX window's bounds and capture that region.
-        let region = unsafe {
-            let app = focused_app_element().map_err(win_to_vision)?;
-            let wins = get_windows(app.as_CFTypeRef());
-            let w = wins
-                .get(window_id as usize)
-                .ok_or_else(|| VisionError::NotFound(format!("window {window_id} not found")))?;
-            read_bounds(w.as_CFTypeRef())
-                .map(|b| (b.x, b.y, b.w, b.h))
-                .ok_or_else(|| VisionError::Failed("window has no bounds".into()))?
-        };
+        let region = self.window_region(window_id).await?;
         let mut cap = self.capture_screen(None, Some(region), opts).await?;
         cap.origin = (region.0, region.1);
         cap.screen_size = (region.2, region.3);
