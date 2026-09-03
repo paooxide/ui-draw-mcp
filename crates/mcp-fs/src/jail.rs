@@ -241,6 +241,7 @@ mod tests {
 
     /// A symlink pointing out of the jail must not become an exit.
     #[test]
+    #[cfg(unix)]
     fn blocks_symlink_escape() {
         let (j, root) = jail();
         let link = root.join("escape-link");
@@ -260,6 +261,7 @@ mod tests {
     /// Writing through a symlinked *parent* is the escape that a naive
     /// "canonicalize only if it exists" check misses.
     #[test]
+    #[cfg(unix)]
     fn blocks_symlinked_parent_on_a_path_that_does_not_exist_yet() {
         let (j, root) = jail();
         let link = root.join("outdir");

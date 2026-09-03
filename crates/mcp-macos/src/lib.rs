@@ -19,7 +19,7 @@ mod vision;
 #[cfg(target_os = "macos")]
 pub use imp::{permissions, MacosBackend, Permissions};
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 mod permission_tests {
     /// Both grants fail silently when missing — AX returns nothing, capture
     /// returns the wallpaper — so the check must be a real preflight rather

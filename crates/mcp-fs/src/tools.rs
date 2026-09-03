@@ -386,7 +386,17 @@ impl FsModule {
                 format!("'{}' already exists", link.display()),
             );
         }
-        match std::os::unix::fs::symlink(&target, &link) {
+        // Windows splits the call by target kind and needs the distinction up
+        // front, so the target is classified before the link is created.
+        #[cfg(unix)]
+        let made = std::os::unix::fs::symlink(&target, &link);
+        #[cfg(windows)]
+        let made = if target.is_dir() {
+            std::os::windows::fs::symlink_dir(&target, &link)
+        } else {
+            std::os::windows::fs::symlink_file(&target, &link)
+        };
+        match made {
             Ok(()) => Envelope::ok(
                 tool,
                 json!({ "link": link.display().to_string(), "target": target.display().to_string() }),
