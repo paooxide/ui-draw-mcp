@@ -1,0 +1,140 @@
+{
+  "client": "gemini-bridge",
+  "model": "gemini-3.8-flash",
+  "schema": "agentctl-demo-transcript/1",
+  "started_ms": 1788420065798,
+  "task": "Using the browser tools: connect to a browser, open this page, type the word 'pollinator' into the field with id=q, click the button, and tell me what the page then says. The page is: data:text/html,<form onsubmit=\"document.getElementById('out').textContent='you searched for '+document.getElementById('q').value;return false\"><input id=q><button>Go</button></form><p id=out>nothing yet</p> . When you are done, disconnect from the browser with kill set to true.",
+  "turns": [
+    {
+      "role": "user",
+      "text": "Using the browser tools: connect to a browser, open this page, type the word 'pollinator' into the field with id=q, click the button, and tell me what the page then says. The page is: data:text/html,<form onsubmit=\"document.getElementById('out').textContent='you searched for '+document.getElementById('q').value;return false\"><input id=q><button>Go</button></form><p id=out>nothing yet</p> . When you are done, disconnect from the browser with kill set to true."
+    },
+    {
+      "args": {
+        "launch": {
+          "headless": true
+        }
+      },
+      "result": {
+        "excerpt": "{\"browser\":\"Chrome/152.0.7977.65\",\"browser_id\":1,\"host\":\"127.0.0.1\",\"port\":9333,\"protocol\":\"1.3\"}",
+        "latency_ms": 1714,
+        "ok": true
+      },
+      "role": "tool",
+      "tool": "browser_connect"
+    },
+    {
+      "args": {
+        "action": "list",
+        "browser_id": 1
+      },
+      "result": {
+        "excerpt": "{\"provenance\":\"untrusted\",\"tabs\":[{\"target_id\":\"95D67908AB523BEC65EF93D18A2546EC\",\"title\":\"New tab\",\"url\":\"chrome://newtab/\"}]}",
+        "latency_ms": 2,
+        "ok": true
+      },
+      "role": "tool",
+      "tool": "browser_tabs"
+    },
+    {
+      "args": {
+        "action": "goto",
+        "target_id": "95D67908AB523BEC65EF93D18A2546EC",
+        "url": "data:text/html,<form onsubmit=\"document.getElementById('out').textContent='you searched for '+document.getElementById('q').value;return false\"><input id=q><button>Go</button></form><p id=out>nothing yet</p>"
+      },
+      "result": {
+        "excerpt": "{\"frameId\":\"95D67908AB523BEC65EF93D18A2546EC\",\"provenance\":\"untrusted\",\"url\":\"data:text/html,<form onsubmit=\\\"document.getElementById('out').textContent='you searched for '+document.getElementById('q'…",
+        "latency_ms": 10,
+        "ok": true
+      },
+      "role": "tool",
+      "tool": "browser_navigate"
+    },
+    {
+      "args": {
+        "mode": "dom",
+        "target_id": "95D67908AB523BEC65EF93D18A2546EC"
+      },
+      "result": {
+        "excerpt": "{\"mode\":\"dom\",\"nodes\":[{\"h\":21,\"name\":\"\",\"ref\":\"//*[@id=\\\"q\\\"]\",\"role\":null,\"tag\":\"input\",\"w\":153,\"x\":8,\"y\":8},{\"h\":21,\"name\":\"Go\",\"ref\":\"/html/body[1]/form[1]/button[1]\",\"role\":null,\"tag\":\"button\",\"w…",
+        "latency_ms": 6,
+        "ok": true
+      },
+      "role": "tool",
+      "tool": "browser_snapshot"
+    },
+    {
+      "args": {
+        "action": "type",
+        "ref": "//*[@id=\"q\"]",
+        "target_id": "95D67908AB523BEC65EF93D18A2546EC",
+        "value": "pollinator"
+      },
+      "result": {
+        "excerpt": "{\"action\":\"type\",\"ok\":true,\"provenance\":\"untrusted\"}",
+        "latency_ms": 11,
+        "ok": true
+      },
+      "role": "tool",
+      "tool": "browser_act"
+    },
+    {
+      "args": {
+        "action": "click",
+        "ref": "/html/body[1]/form[1]/button[1]",
+        "target_id": "95D67908AB523BEC65EF93D18A2546EC"
+      },
+      "result": {
+        "excerpt": "{\"action\":\"click\",\"ok\":true,\"provenance\":\"untrusted\"}",
+        "latency_ms": 15,
+        "ok": true
+      },
+      "role": "tool",
+      "tool": "browser_act"
+    },
+    {
+      "args": {
+        "mode": "text",
+        "target_id": "95D67908AB523BEC65EF93D18A2546EC"
+      },
+      "result": {
+        "excerpt": "{\"provenance\":\"untrusted\",\"text\":\"Go\\n\\nyou searched for pollinator\",\"title\":\"\",\"url\":\"data:text/html,<form onsubmit=\\\"document.getElementById('out').textContent='you searched for '+document.getElemen…",
+        "latency_ms": 7,
+        "ok": true
+      },
+      "role": "tool",
+      "tool": "browser_snapshot"
+    },
+    {
+      "args": {
+        "expression": "document.getElementById('out').textContent",
+        "target_id": "95D67908AB523BEC65EF93D18A2546EC"
+      },
+      "result": {
+        "error_code": "POLICY_DENIED",
+        "excerpt": "{\"error\":{\"code\":\"POLICY_DENIED\",\"message\":\"dangerous tool 'browser_eval' is not enabled (add it to policy.enable)\"},\"ok\":false,\"tool\":\"browser_eval\"}",
+        "latency_ms": 0,
+        "ok": false
+      },
+      "role": "tool",
+      "tool": "browser_eval"
+    },
+    {
+      "args": {
+        "browser_id": 1,
+        "kill": true
+      },
+      "result": {
+        "excerpt": "{\"disconnected\":1,\"killed\":true,\"profile_removed\":true}",
+        "latency_ms": 88,
+        "ok": true
+      },
+      "role": "tool",
+      "tool": "browser_disconnect"
+    },
+    {
+      "role": "model",
+      "text": "I connected to a browser instance, navigated to the specified page, typed `pollinator` into `#q`, and clicked the \"Go\" button. \n\nThe page updated to display:\n**`you searched for pollinator`**\n\nAfter reading the result, I disconnected from the browser with `kill: true`."
+    }
+  ]
+}

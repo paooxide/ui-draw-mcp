@@ -28,6 +28,8 @@ async fn main() -> std::io::Result<()> {
             tools(&args);
             Ok(())
         }
+        "bridge" => bridge(&args).await,
+        "transcript" => transcript_cmd(&args),
         "config" if args.get(2).map(String::as_str) == Some("print") => {
             config_print();
             Ok(())
@@ -236,6 +238,98 @@ fn tools(args: &[String]) {
     }
 }
 
+/// The value of `--name value`, if present.
+fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
+    args.iter()
+        .position(|a| a == name)
+        .and_then(|i| args.get(i + 1))
+        .map(String::as_str)
+}
+
+fn has(args: &[String], name: &str) -> bool {
+    args.iter().any(|a| a == name)
+}
+
+/// Where per-user state lives, derived from the configured kill-switch path so
+/// a custom state directory is honoured.
+fn state_dir(cfg: &PolicyConfig) -> std::path::PathBuf {
+    cfg.kill_switch_file
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(std::env::temp_dir)
+}
+
+fn fail(msg: String) -> std::io::Error {
+    std::io::Error::other(msg)
+}
+
+/// Drive this server with Gemini, end to end.
+async fn bridge(args: &[String]) -> std::io::Result<()> {
+    let cfg = config_or_exit();
+    let dir = state_dir(&cfg);
+    if has(args, "--list-models") {
+        return agentctl::bridge::list_models(&dir).await.map_err(fail);
+    }
+    let Some(task) = flag(args, "--task") else {
+        eprintln!(
+            "agentctl bridge: --task is required.\n\n\
+             \x20   agentctl bridge --task \"open TextEdit and type hello\"\n\
+             \x20   agentctl bridge --list-models"
+        );
+        std::process::exit(2);
+    };
+    let defaults = agentctl::bridge::BridgeOpts::default();
+    let opts = agentctl::bridge::BridgeOpts {
+        task: task.to_string(),
+        model: flag(args, "--model")
+            .map(str::to_string)
+            .or_else(|| std::env::var("GEMINI_MODEL").ok())
+            .unwrap_or(defaults.model),
+        max_turns: flag(args, "--max-turns")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(defaults.max_turns),
+        mode: flag(args, "--mode").unwrap_or("AUTO").to_string(),
+        thinking_level: flag(args, "--thinking-level").map(str::to_string),
+        record: flag(args, "--record").map(std::path::PathBuf::from),
+        config: flag(args, "--config").map(std::path::PathBuf::from),
+        system: flag(args, "--system").map(str::to_string),
+    };
+    let transcript = agentctl::bridge::run(opts, &dir).await.map_err(fail)?;
+    let (ok, total) = transcript.tally();
+    println!("{ok}/{total} tool calls succeeded");
+    Ok(())
+}
+
+/// Rebuild a transcript from an audit log — how a session driven by a client
+/// we do not control (Claude Code, Cursor) gets recorded.
+fn transcript_cmd(args: &[String]) -> std::io::Result<()> {
+    let Some(path) = flag(args, "--from-audit") else {
+        eprintln!(
+            "agentctl transcript: --from-audit <session.jsonl> is required.\n\n\
+             \x20   agentctl transcript --from-audit ~/.agentctl/audit/sess-123.jsonl \\\n\
+             \x20       --task \"write a note in TextEdit\" --out docs/fixtures/claude-code.json"
+        );
+        std::process::exit(2);
+    };
+    let jsonl = std::fs::read_to_string(path)?;
+    let t = agentctl::transcript::from_audit(
+        &jsonl,
+        flag(args, "--client").unwrap_or("claude-code"),
+        flag(args, "--task").unwrap_or("(task not recorded)"),
+    )
+    .map_err(fail)?;
+    let json = serde_json::to_string_pretty(&t.to_json()).map_err(|e| fail(e.to_string()))?;
+    match flag(args, "--out") {
+        Some(out) => {
+            std::fs::write(out, json + "\n")?;
+            let (ok, total) = t.tally();
+            eprintln!("wrote {out} — {ok}/{total} tool calls succeeded");
+        }
+        None => println!("{json}"),
+    }
+    Ok(())
+}
+
 fn doctor() {
     let cfg = config_or_exit();
     println!("agentctl doctor");
@@ -387,6 +481,8 @@ fn print_help() {
          \x20   doctor           Print environment & permission status\n\
          \x20   config print     Print the effective configuration\n\
          \x20   tools            Print the tool reference (--all, --json)\n\
+         \x20   bridge           Drive this server with Gemini (--task, --list-models)\n\
+         \x20   transcript       Rebuild a session record from an audit log\n\
          \x20   help             Show this help\n",
         env!("CARGO_PKG_VERSION")
     );

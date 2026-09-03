@@ -9,10 +9,12 @@ use std::sync::Arc;
 use mcp_core::{Registry, Server};
 use mcp_policy::{AuditSink, Policy, PolicyConfig, Redactor};
 
+pub mod bridge;
 pub mod engines;
 pub mod override_watch;
 pub mod tools_doc;
 pub mod tools_system;
+pub mod transcript;
 
 pub use engines::{build_modules, build_stack, EngineConfig, Wiring};
 

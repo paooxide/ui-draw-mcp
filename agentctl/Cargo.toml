@@ -39,9 +39,12 @@ mcp-pty = { path = "../crates/mcp-pty" }
 mcp-pkg = { path = "../crates/mcp-pkg" }
 mcp-memory = { path = "../crates/mcp-memory" }
 mcp-window = { path = "../crates/mcp-window" }
-tokio = { workspace = true, features = ["signal"] }
+# "process" is for the bridge subcommand, which spawns `agentctl serve`
+# as a child and talks MCP to it over pipes.
+tokio = { workspace = true, features = ["signal", "process"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 async-trait.workspace = true
 
