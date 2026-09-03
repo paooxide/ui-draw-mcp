@@ -81,6 +81,14 @@ jobs:
 
       # The example config is what operators copy. Prove the shipped binary
       # accepts it, not just that the parser does.
+      # The reference is generated from the descriptors the server actually
+      # serves, so a schema change that skips the regeneration is a doc that
+      # lies to whoever writes an agent against it. macOS only: the desktop
+      # engines do not exist on the Linux leg, so it would render 70 tools.
+      - name: Tool reference is up to date
+        if: runner.os == 'macOS'
+        run: cargo run -q -p agentctl -- tools --markdown --all | diff -u docs/tools.md -
+
       - name: Example config is accepted by the built binary
         run: |
           cargo build -p agentctl

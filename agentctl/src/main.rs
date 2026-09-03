@@ -4,12 +4,10 @@
 
 use std::sync::Arc;
 
+use agentctl::{build_modules, consent_provider, new_session_id, tools_doc};
 use mcp_core::{HttpConfig, HttpTransport, Registry, Server, PROTOCOL_VERSION};
 use mcp_policy::{AuditSink, Mode, Policy, PolicyConfig, Redactor};
-use mcp_types::{Category, ToolModule};
-
-mod tools_system;
-use tools_system::SystemModule;
+use mcp_types::Category;
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
@@ -24,6 +22,10 @@ async fn main() -> std::io::Result<()> {
         "serve" => serve(force_http).await,
         "doctor" => {
             doctor();
+            Ok(())
+        }
+        "tools" => {
+            tools(&args);
             Ok(())
         }
         "config" if args.get(2).map(String::as_str) == Some("print") => {
@@ -78,40 +80,14 @@ fn config_or_exit() -> PolicyConfig {
     }
 }
 
-/// The out-of-band human-approval channel.
-///
-/// On macOS this is a real native dialog (default button **Deny**, and the
-/// timeout denies). Elsewhere there is no channel yet, so consent requests are
-/// refused rather than silently allowed.
-fn consent_provider() -> Arc<dyn mcp_policy::ConsentProvider> {
-    #[cfg(target_os = "macos")]
-    {
-        Arc::new(mcp_policy::DialogConsent::default())
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        Arc::new(mcp_policy::NoConsent)
-    }
-}
-
-fn new_session_id() -> String {
-    let pid = std::process::id();
-    let ms = mcp_policy::now_ms();
-    format!("sess-{pid}-{ms}")
-}
-
 async fn serve(force_http: bool) -> std::io::Result<()> {
     let cfg = config_or_exit();
     let session_id = new_session_id();
     let audit = AuditSink::file(cfg.audit_dir.clone(), &session_id)?;
-    let autonomous = matches!(cfg.mode, Mode::Autonomous);
-    let allowed_apps = cfg.allowed_apps.clone();
-    let terminal_apps = cfg.terminal_apps.clone();
-    let engines = EngineConfig::from(&cfg);
     let http = (force_http || cfg.http_enabled).then(|| http_config(&cfg));
+    let modules = build_modules(&cfg);
     let policy =
         Arc::new(Policy::new(cfg, audit, Redactor::empty()).with_consent(consent_provider()));
-    let modules = build_modules(autonomous, allowed_apps, terminal_apps, engines);
     let registry = Registry::build(modules)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     let server = Server::new(registry, policy, session_id.clone());
@@ -217,197 +193,31 @@ fn http_config(c: &PolicyConfig) -> HttpConfig {
     }
 }
 
-/// Assemble the enabled engines. On macOS the real AXUIElement backend
-/// (perception plus semantic input) is wired in; elsewhere only the diagnostic
-/// tools are present. The a11y and input engines share one snapshot arena so
-/// input can act on refs from `get_ui_tree`.
-/// The slice of config the OS-independent engines need.
-struct EngineConfig {
-    allowed_origins: Vec<String>,
-    fs_roots: Vec<std::path::PathBuf>,
-    allowed_commands: Vec<String>,
-    allow_shell: bool,
-    allowed_hosts: Vec<String>,
-    allow_private_network: bool,
-    allowed_services: Vec<String>,
-    allowed_shells: Vec<String>,
-    max_pty_sessions: usize,
-    max_pty_buffer: usize,
-    allowed_sources: Vec<String>,
-    allow_arbitrary_source: bool,
-    package_allowlist: Vec<String>,
-    package_denylist: Vec<String>,
-    memory_store: std::path::PathBuf,
-    max_recipes: usize,
-    autonomous: bool,
-    // The vision engine only exists where there is a capture backend.
-    #[cfg(target_os = "macos")]
-    vision: mcp_vision::VisionConfig,
-}
-
-impl From<&PolicyConfig> for EngineConfig {
-    fn from(c: &PolicyConfig) -> Self {
-        EngineConfig {
-            allowed_origins: c.allowed_origins.clone(),
-            fs_roots: c.fs_roots.clone(),
-            allowed_commands: c.allowed_commands.clone(),
-            allow_shell: c.allow_shell,
-            allowed_hosts: c.allowed_hosts.clone(),
-            allow_private_network: c.allow_private_network,
-            allowed_services: c.allowed_services.clone(),
-            allowed_shells: c.allowed_shells.clone(),
-            max_pty_sessions: c.max_pty_sessions,
-            max_pty_buffer: c.max_pty_buffer,
-            allowed_sources: c.allowed_sources.clone(),
-            allow_arbitrary_source: c.allow_arbitrary_source,
-            package_allowlist: c.package_allowlist.clone(),
-            package_denylist: c.package_denylist.clone(),
-            memory_store: c.memory_store.clone(),
-            max_recipes: c.max_recipes,
-            autonomous: matches!(c.mode, Mode::Autonomous),
-            #[cfg(target_os = "macos")]
-            vision: vision_config(c),
-        }
+/// Print the tool catalog. `--all` ignores `policy.categories` so the document
+/// covers every tool the build contains, which is what a reference is for;
+/// without it the output is what an agent would actually be offered.
+fn tools(args: &[String]) {
+    let all = args.iter().any(|a| a == "--all");
+    let as_json = args.iter().any(|a| a == "--json");
+    let cfg = if all {
+        // Never the operator's config: the committed reference must not depend
+        // on whose machine generated it.
+        PolicyConfig::default()
+    } else {
+        config_or_exit()
+    };
+    let mut descriptors: Vec<_> = build_modules(&cfg)
+        .iter()
+        .flat_map(|m| m.descriptors())
+        .collect();
+    if !all {
+        descriptors.retain(|d| cfg.categories.contains(&d.category));
     }
-}
-
-/// Map the operator's `[vision]` settings onto the capture engine's own config.
-///
-///
-/// `mcp-policy` carries these as plain numbers so it need not depend on an
-/// engine; the translation — including turning `default_detail` from a string
-/// into a `Detail` — happens here, at the composition root.
-#[cfg(target_os = "macos")]
-fn vision_config(c: &PolicyConfig) -> mcp_vision::VisionConfig {
-    mcp_vision::VisionConfig {
-        detail_low_px: c.vision_detail_low_px,
-        detail_balanced_px: c.vision_detail_balanced_px,
-        detail_full_px: c.vision_detail_full_px,
-        // The string was validated at load; fall back rather than panic if a
-        // future spelling slips through.
-        default_detail: mcp_vision::Detail::parse(&c.vision_default_detail)
-            .unwrap_or(mcp_vision::Detail::Full),
-        unchanged_mad: c.vision_unchanged_mad,
-        pixels_per_token: c.vision_pixels_per_token,
-        max_image_bytes: c.vision_max_image_bytes,
+    if as_json {
+        println!("{}", tools_doc::render_json(&descriptors));
+    } else {
+        print!("{}", tools_doc::render_markdown(&descriptors));
     }
-}
-
-#[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
-fn build_modules(
-    autonomous: bool,
-    allowed_apps: Vec<String>,
-    terminal_apps: Vec<String>,
-    engines: EngineConfig,
-) -> Vec<Arc<dyn ToolModule>> {
-    let mut modules: Vec<Arc<dyn ToolModule>> = vec![Arc::new(SystemModule)];
-    #[cfg(target_os = "macos")]
-    let audio_roots = engines.fs_roots.clone();
-
-    // OS-independent engines — wired on every platform. Each one is closed by
-    // default: with no roots/commands/hosts/services configured it refuses
-    // everything rather than falling open.
-    {
-        use mcp_browser::{BrowserModule, CdpBackend};
-        use mcp_fs::{default_denied, FsModule, Jail};
-        use mcp_memory::{MemoryModule, Store as MemoryStore};
-        use mcp_net::{NetModule, NetPolicy};
-        use mcp_pkg::{PkgModule, PkgPolicy};
-        use mcp_proc::{ExecPolicy, ProcModule};
-        use mcp_pty::{PtyModule, PtyPolicy};
-        use mcp_sec::SecModule;
-        use mcp_sys::SysModule;
-
-        modules.push(Arc::new(BrowserModule::new(Arc::new(CdpBackend::new(
-            engines.allowed_origins,
-        )))));
-
-        let jail = Jail::new(engines.fs_roots.clone(), default_denied());
-        modules.push(Arc::new(FsModule::new(jail, 1_000_000, 500)));
-
-        let exec_policy = ExecPolicy {
-            allowed: engines.allowed_commands,
-            allow_shell: engines.allow_shell,
-            ..ExecPolicy::default()
-        };
-        modules.push(Arc::new(ProcModule::new(
-            exec_policy,
-            engines.fs_roots.clone(),
-        )));
-
-        modules.push(Arc::new(NetModule::new(
-            NetPolicy {
-                allowed_hosts: engines.allowed_hosts,
-                allow_private: engines.allow_private_network,
-            },
-            20,
-            200_000,
-        )));
-
-        modules.push(Arc::new(SysModule::default()));
-        modules.push(Arc::new(SecModule::new(engines.allowed_services)));
-
-        // Interactive shells. `allow_shell` gates this for the same reason it
-        // gates `exec --shell`: a PTY *is* a shell, and gating one but not the
-        // other would be theatre.
-        modules.push(Arc::new(PtyModule::new(PtyPolicy {
-            allowed_shells: engines.allowed_shells,
-            allow_shell: engines.allow_shell,
-            roots: engines.fs_roots.clone(),
-            max_sessions: engines.max_pty_sessions,
-            max_buffer: engines.max_pty_buffer,
-            autonomous: engines.autonomous,
-            ..PtyPolicy::default()
-        })));
-
-        modules.push(Arc::new(PkgModule::new(PkgPolicy {
-            allowed_sources: engines.allowed_sources,
-            allow_arbitrary_source: engines.allow_arbitrary_source,
-            allowlist: engines.package_allowlist,
-            denylist: engines.package_denylist,
-            ..PkgPolicy::default()
-        })));
-
-        modules.push(Arc::new(MemoryModule::new(MemoryStore::new(
-            engines.memory_store,
-            engines.max_recipes,
-            200,
-        ))));
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        use mcp_a11y::A11yModule;
-        use mcp_desktop::{DesktopModule, MacosDesktop};
-        use mcp_input::{InputModule, InputPolicy};
-        use mcp_macos::MacosBackend;
-        use mcp_vision::VisionModule;
-        use mcp_window::WindowModule;
-
-        let backend = Arc::new(MacosBackend::new());
-        let a11y = A11yModule::new(backend.clone(), 12_000);
-        let arena = a11y.arena();
-        let input_policy = InputPolicy {
-            autonomous,
-            terminal_apps,
-            ..InputPolicy::default()
-        };
-        let input = InputModule::new(backend.clone(), arena, input_policy);
-        let vision = VisionModule::new(backend.clone(), engines.vision);
-        let window = WindowModule::new(backend.clone(), backend, allowed_apps);
-        modules.push(Arc::new(a11y));
-        modules.push(Arc::new(input));
-        modules.push(Arc::new(vision));
-        modules.push(Arc::new(window));
-        // `play_audio` is bounded by the same roots as the filesystem engine:
-        // an agent able to name any path could use the speakers to read out a
-        // file it was never allowed to open.
-        modules.push(Arc::new(DesktopModule::new(
-            Arc::new(MacosDesktop::new()),
-            audio_roots,
-        )));
-    }
-    modules
 }
 
 fn doctor() {
@@ -523,6 +333,7 @@ fn print_help() {
          \x20   serve --http     Serve MCP over loopback HTTP with bearer auth\n\
          \x20   doctor           Print environment & permission status\n\
          \x20   config print     Print the effective configuration\n\
+         \x20   tools            Print the tool reference (--all, --json)\n\
          \x20   help             Show this help\n",
         env!("CARGO_PKG_VERSION")
     );

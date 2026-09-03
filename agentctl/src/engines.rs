@@ -1,0 +1,210 @@
+//! Engine wiring: which capability engines exist, and how the operator's
+//! config maps onto each one's own policy type.
+//!
+//! Split out of `main.rs` so tests, the tool-reference generator and the
+//! reference-client bridge can build the *same* module set the server serves,
+//! rather than a lookalike that drifts.
+
+use std::sync::Arc;
+
+use mcp_policy::{Mode, PolicyConfig};
+use mcp_types::ToolModule;
+
+use crate::tools_system::SystemModule;
+
+/// Assemble the enabled engines. On macOS the real AXUIElement backend
+/// (perception plus semantic input) is wired in; elsewhere only the diagnostic
+/// tools are present. The a11y and input engines share one snapshot arena so
+/// input can act on refs from `get_ui_tree`.
+/// The slice of config the OS-independent engines need.
+pub struct EngineConfig {
+    pub allowed_origins: Vec<String>,
+    pub fs_roots: Vec<std::path::PathBuf>,
+    pub allowed_commands: Vec<String>,
+    pub allow_shell: bool,
+    pub allowed_hosts: Vec<String>,
+    pub allow_private_network: bool,
+    pub allowed_services: Vec<String>,
+    pub allowed_shells: Vec<String>,
+    pub max_pty_sessions: usize,
+    pub max_pty_buffer: usize,
+    pub allowed_sources: Vec<String>,
+    pub allow_arbitrary_source: bool,
+    pub package_allowlist: Vec<String>,
+    pub package_denylist: Vec<String>,
+    pub memory_store: std::path::PathBuf,
+    pub max_recipes: usize,
+    pub autonomous: bool,
+    // The vision engine only exists where there is a capture backend.
+    #[cfg(target_os = "macos")]
+    pub vision: mcp_vision::VisionConfig,
+}
+
+impl From<&PolicyConfig> for EngineConfig {
+    fn from(c: &PolicyConfig) -> Self {
+        EngineConfig {
+            allowed_origins: c.allowed_origins.clone(),
+            fs_roots: c.fs_roots.clone(),
+            allowed_commands: c.allowed_commands.clone(),
+            allow_shell: c.allow_shell,
+            allowed_hosts: c.allowed_hosts.clone(),
+            allow_private_network: c.allow_private_network,
+            allowed_services: c.allowed_services.clone(),
+            allowed_shells: c.allowed_shells.clone(),
+            max_pty_sessions: c.max_pty_sessions,
+            max_pty_buffer: c.max_pty_buffer,
+            allowed_sources: c.allowed_sources.clone(),
+            allow_arbitrary_source: c.allow_arbitrary_source,
+            package_allowlist: c.package_allowlist.clone(),
+            package_denylist: c.package_denylist.clone(),
+            memory_store: c.memory_store.clone(),
+            max_recipes: c.max_recipes,
+            autonomous: matches!(c.mode, Mode::Autonomous),
+            #[cfg(target_os = "macos")]
+            vision: vision_config(c),
+        }
+    }
+}
+
+/// Map the operator's `[vision]` settings onto the capture engine's own config.
+///
+///
+/// `mcp-policy` carries these as plain numbers so it need not depend on an
+/// engine; the translation — including turning `default_detail` from a string
+/// into a `Detail` — happens here, at the composition root.
+#[cfg(target_os = "macos")]
+pub fn vision_config(c: &PolicyConfig) -> mcp_vision::VisionConfig {
+    mcp_vision::VisionConfig {
+        detail_low_px: c.vision_detail_low_px,
+        detail_balanced_px: c.vision_detail_balanced_px,
+        detail_full_px: c.vision_detail_full_px,
+        // The string was validated at load; fall back rather than panic if a
+        // future spelling slips through.
+        default_detail: mcp_vision::Detail::parse(&c.vision_default_detail)
+            .unwrap_or(mcp_vision::Detail::Full),
+        unchanged_mad: c.vision_unchanged_mad,
+        pixels_per_token: c.vision_pixels_per_token,
+        max_image_bytes: c.vision_max_image_bytes,
+    }
+}
+
+/// Wire every engine the config enables.
+///
+/// Takes the whole `PolicyConfig` rather than a handful of extracted fields so
+/// there is exactly one place a new setting has to be threaded through, and so
+/// callers cannot build a *nearly* correct server by forgetting an argument.
+#[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
+pub fn build_modules(cfg: &PolicyConfig) -> Vec<Arc<dyn ToolModule>> {
+    let engines = EngineConfig::from(cfg);
+    let autonomous = matches!(cfg.mode, Mode::Autonomous);
+    let allowed_apps = cfg.allowed_apps.clone();
+    let terminal_apps = cfg.terminal_apps.clone();
+    let mut modules: Vec<Arc<dyn ToolModule>> = vec![Arc::new(SystemModule)];
+    #[cfg(target_os = "macos")]
+    let audio_roots = engines.fs_roots.clone();
+
+    // OS-independent engines — wired on every platform. Each one is closed by
+    // default: with no roots/commands/hosts/services configured it refuses
+    // everything rather than falling open.
+    {
+        use mcp_browser::{BrowserModule, CdpBackend};
+        use mcp_fs::{default_denied, FsModule, Jail};
+        use mcp_memory::{MemoryModule, Store as MemoryStore};
+        use mcp_net::{NetModule, NetPolicy};
+        use mcp_pkg::{PkgModule, PkgPolicy};
+        use mcp_proc::{ExecPolicy, ProcModule};
+        use mcp_pty::{PtyModule, PtyPolicy};
+        use mcp_sec::SecModule;
+        use mcp_sys::SysModule;
+
+        modules.push(Arc::new(BrowserModule::new(Arc::new(CdpBackend::new(
+            engines.allowed_origins,
+        )))));
+
+        let jail = Jail::new(engines.fs_roots.clone(), default_denied());
+        modules.push(Arc::new(FsModule::new(jail, 1_000_000, 500)));
+
+        let exec_policy = ExecPolicy {
+            allowed: engines.allowed_commands,
+            allow_shell: engines.allow_shell,
+            ..ExecPolicy::default()
+        };
+        modules.push(Arc::new(ProcModule::new(
+            exec_policy,
+            engines.fs_roots.clone(),
+        )));
+
+        modules.push(Arc::new(NetModule::new(
+            NetPolicy {
+                allowed_hosts: engines.allowed_hosts,
+                allow_private: engines.allow_private_network,
+            },
+            20,
+            200_000,
+        )));
+
+        modules.push(Arc::new(SysModule::default()));
+        modules.push(Arc::new(SecModule::new(engines.allowed_services)));
+
+        // Interactive shells. `allow_shell` gates this for the same reason it
+        // gates `exec --shell`: a PTY *is* a shell, and gating one but not the
+        // other would be theatre.
+        modules.push(Arc::new(PtyModule::new(PtyPolicy {
+            allowed_shells: engines.allowed_shells,
+            allow_shell: engines.allow_shell,
+            roots: engines.fs_roots.clone(),
+            max_sessions: engines.max_pty_sessions,
+            max_buffer: engines.max_pty_buffer,
+            autonomous: engines.autonomous,
+            ..PtyPolicy::default()
+        })));
+
+        modules.push(Arc::new(PkgModule::new(PkgPolicy {
+            allowed_sources: engines.allowed_sources,
+            allow_arbitrary_source: engines.allow_arbitrary_source,
+            allowlist: engines.package_allowlist,
+            denylist: engines.package_denylist,
+            ..PkgPolicy::default()
+        })));
+
+        modules.push(Arc::new(MemoryModule::new(MemoryStore::new(
+            engines.memory_store,
+            engines.max_recipes,
+            200,
+        ))));
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        use mcp_a11y::A11yModule;
+        use mcp_desktop::{DesktopModule, MacosDesktop};
+        use mcp_input::{InputModule, InputPolicy};
+        use mcp_macos::MacosBackend;
+        use mcp_vision::VisionModule;
+        use mcp_window::WindowModule;
+
+        let backend = Arc::new(MacosBackend::new());
+        let a11y = A11yModule::new(backend.clone(), 12_000);
+        let arena = a11y.arena();
+        let input_policy = InputPolicy {
+            autonomous,
+            terminal_apps,
+            ..InputPolicy::default()
+        };
+        let input = InputModule::new(backend.clone(), arena, input_policy);
+        let vision = VisionModule::new(backend.clone(), engines.vision);
+        let window = WindowModule::new(backend.clone(), backend, allowed_apps);
+        modules.push(Arc::new(a11y));
+        modules.push(Arc::new(input));
+        modules.push(Arc::new(vision));
+        modules.push(Arc::new(window));
+        // `play_audio` is bounded by the same roots as the filesystem engine:
+        // an agent able to name any path could use the speakers to read out a
+        // file it was never allowed to open.
+        modules.push(Arc::new(DesktopModule::new(
+            Arc::new(MacosDesktop::new()),
+            audio_roots,
+        )));
+    }
+    modules
+}
