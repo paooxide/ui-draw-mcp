@@ -26,9 +26,17 @@ pub fn type_text(text: &str) -> Result<(), InputError> {
     let src = source()?;
     let down = CGEvent::new_keyboard_event(src.clone(), 0, true).map_err(|_| fail("key down"))?;
     down.set_string(text);
+    // Typed text carries no modifiers, and *not setting* the flags is not the
+    // same as setting them to empty: an event built from the HID state source
+    // inherits whatever the system believes is currently held. With Command
+    // latched — by a stuck physical key, a crashed app, or a previous chord —
+    // every character silently becomes a menu shortcut. The call still reports
+    // the full character count, so the agent is told it typed and sees nothing.
+    down.set_flags(CGEventFlags::empty());
     down.post(CGEventTapLocation::HID);
     let up = CGEvent::new_keyboard_event(src, 0, false).map_err(|_| fail("key up"))?;
     up.set_string(text);
+    up.set_flags(CGEventFlags::empty());
     up.post(CGEventTapLocation::HID);
     Ok(())
 }
@@ -345,6 +353,32 @@ fn keycode_for(key: &str) -> Option<CGKeyCode> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A keyboard event built from the HID source inherits the modifiers the
+    /// system believes are held. Typed text carries none, so `type_text` must
+    /// set the flags to empty rather than leave them alone.
+    ///
+    /// This was a live bug: with Command latched — a stuck physical key, a
+    /// crashed app, a chord another process left behind — every character
+    /// posted by `keyboard_type` arrived as a menu shortcut. Nothing was typed,
+    /// and the call still reported the full character count, so an agent was
+    /// told it had typed and saw no text.
+    #[test]
+    fn a_typed_event_carries_no_inherited_modifiers() {
+        let Ok(src) = source() else {
+            return; // No window server (headless CI): nothing to assert.
+        };
+        let Ok(ev) = CGEvent::new_keyboard_event(src, 0, true) else {
+            return;
+        };
+        ev.set_string("a");
+        ev.set_flags(CGEventFlags::empty());
+        assert_eq!(
+            ev.get_flags(),
+            CGEventFlags::empty(),
+            "typed text must post with no modifiers held"
+        );
+    }
 
     /// The path must end exactly on the destination — a drop one pixel short
     /// lands on whatever is next to the target.

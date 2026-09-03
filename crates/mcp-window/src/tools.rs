@@ -214,7 +214,7 @@ impl WindowModule {
         let start = Instant::now();
         loop {
             let matched = if let Some(t) = &window {
-                self.window_matches(t).await
+                self.window_matches(app.as_deref(), t).await
             } else if let Some(t) = &text {
                 self.tree_contains(app.as_deref(), t).await
             } else if let Some(t) = &element {
@@ -236,9 +236,9 @@ impl WindowModule {
         }
     }
 
-    async fn window_matches(&self, title: &str) -> bool {
+    async fn window_matches(&self, app: Option<&str>, title: &str) -> bool {
         self.backend
-            .list_windows(None)
+            .list_windows(app)
             .await
             .map(|ws| {
                 ws.iter()

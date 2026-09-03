@@ -32,6 +32,15 @@ tracing-subscriber.workspace = true
 serde_json.workspace = true
 async-trait.workspace = true
 
+[dev-dependencies]
+test-support = { path = "../crates/test-support" }
+mcp-browser = { path = "../crates/mcp-browser" }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+mcp-macos = { path = "../crates/mcp-macos" }
+mcp-input = { path = "../crates/mcp-input" }
+
 # Real macOS backend (AXUIElement) — only on macOS.
 [target.'cfg(target_os = "macos")'.dependencies]
 mcp-macos = { path = "../crates/mcp-macos" }

@@ -1342,9 +1342,13 @@ fn run(cmd: &str, args: &[&str]) -> Result<std::process::Output, WindowError> {
 
 #[async_trait]
 impl WindowBackend for MacosBackend {
-    async fn list_windows(&self, _app: Option<&str>) -> Result<Vec<WindowInfo>, WindowError> {
+    async fn list_windows(&self, app_name: Option<&str>) -> Result<Vec<WindowInfo>, WindowError> {
         unsafe {
-            let app = self.target_app_element(None)?;
+            // Honour the requested app. Resolving `None` here would silently
+            // answer about whatever happens to be frontmost, so
+            // `list_windows { app: "TextEdit" }` returned the caller's own
+            // terminal — wrong, and wrong without saying so.
+            let app = self.target_app_element(app_name)?;
             let name = copy_attr_string(app.as_CFTypeRef(), "AXTitle");
             Ok(get_windows(app.as_CFTypeRef())
                 .iter()
@@ -1553,6 +1557,32 @@ mod tests {
     /// An unknown app name must be a clean NotFound, never a panic or a
     /// silent fall-through to whatever app happens to be frontmost (which
     /// would let a typo drive the wrong application).
+    /// `list_windows { app }` must answer about *that* app.
+    ///
+    /// It used to discard the argument and resolve whatever was frontmost, so
+    /// asking about TextEdit returned the caller's own terminal window — the
+    /// wrong answer, given confidently. `wait_for { window }` is built on this,
+    /// so it could never match a window of an app that was not already in
+    /// front.
+    #[tokio::test]
+    async fn list_windows_answers_about_the_requested_app() {
+        let b = MacosBackend::new();
+        match mcp_window::WindowBackend::list_windows(&b, Some("Finder")).await {
+            Ok(ws) => {
+                for w in &ws {
+                    assert_eq!(
+                        w.app.as_deref(),
+                        Some("Finder"),
+                        "every window returned must belong to the app that was asked about"
+                    );
+                }
+            }
+            // No permission, or Finder has no windows open: both are answers.
+            Err(WindowError::PermissionDenied(_)) | Err(WindowError::NotFound(_)) => {}
+            Err(e) => panic!("unexpected error: {e:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn unknown_app_target_is_not_found_not_a_fallback() {
         let backend = MacosBackend::new();

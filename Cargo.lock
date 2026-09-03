@@ -26,6 +26,7 @@ dependencies = [
  "mcp-vision",
  "mcp-window",
  "serde_json",
+ "test-support",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -595,6 +596,17 @@ dependencies = [
  "once_cell",
  "rustix",
  "windows-sys",
+]
+
+[[package]]
+name = "test-support"
+version = "0.0.1"
+dependencies = [
+ "mcp-core",
+ "mcp-policy",
+ "mcp-types",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

@@ -19,6 +19,7 @@ members = [
     "crates/mcp-pty",
     "crates/mcp-pkg",
     "crates/mcp-macos",
+    "crates/test-support",
     "agentctl",
 ]
 
