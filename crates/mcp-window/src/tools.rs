@@ -1,19 +1,19 @@
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use mcp_a11y::{flatten, A11yBackend, FlattenConfig, SnapshotRequest};
+use mcp_a11y::A11yBackend;
 use mcp_types::{CallCtx, Category, Envelope, ErrorCode, Tier, ToolDescriptor, ToolModule};
 use serde_json::{json, Value};
 
 use crate::backend::{DialogScope, Rect, WindowAction, WindowBackend, WindowError};
+use crate::wait::{default_wait_timeout, parse_wait_spec, wait_schema, WaitEvaluator};
 
 /// The `window` engine: window/app/menu control and the `wait_for` settle
-/// primitive. `wait_for` re-observes via the a11y backend (text/element) or the
-/// window backend (window).
+/// primitive. `wait_for` delegates to the shared [`WaitEvaluator`], which also
+/// backs the `expect` clause on every input tool.
 pub struct WindowModule {
     backend: Arc<dyn WindowBackend>,
-    a11y: Arc<dyn A11yBackend>,
+    evaluator: WaitEvaluator,
     allowed_apps: Vec<String>,
 }
 
@@ -24,8 +24,8 @@ impl WindowModule {
         allowed_apps: Vec<String>,
     ) -> Self {
         WindowModule {
+            evaluator: WaitEvaluator::new(backend.clone(), a11y),
             backend,
-            a11y,
             allowed_apps,
         }
     }
@@ -194,76 +194,30 @@ impl WindowModule {
         }
     }
 
-    async fn wait_for(&self, args: &Value) -> Envelope {
-        let timeout_ms = args
-            .get("timeout_ms")
-            .and_then(Value::as_u64)
-            .unwrap_or(5000)
-            .min(30_000);
-        let text = str_arg(args, "text");
-        let window = str_arg(args, "window");
-        let element = str_arg(args, "element");
-        if text.is_none() && window.is_none() && element.is_none() {
-            return Envelope::fail(
-                "wait_for",
-                ErrorCode::InvalidArgs,
-                "need one of text|window|element",
-            );
-        }
-        let app = str_arg(args, "app");
-        let start = Instant::now();
-        loop {
-            let matched = if let Some(t) = &window {
-                self.window_matches(app.as_deref(), t).await
-            } else if let Some(t) = &text {
-                self.tree_contains(app.as_deref(), t).await
-            } else if let Some(t) = &element {
-                self.tree_contains(app.as_deref(), t).await
-            } else {
-                false
-            };
-            if matched {
-                return Envelope::ok("wait_for", json!({ "ok": true }));
-            }
-            if start.elapsed().as_millis() as u64 >= timeout_ms {
-                return Envelope::fail(
-                    "wait_for",
-                    ErrorCode::Timeout,
-                    "condition not met before timeout",
-                );
-            }
-            tokio::time::sleep(Duration::from_millis(200)).await;
-        }
-    }
-
-    async fn window_matches(&self, app: Option<&str>, title: &str) -> bool {
-        self.backend
-            .list_windows(app)
-            .await
-            .map(|ws| {
-                ws.iter()
-                    .any(|w| w.title.as_deref().is_some_and(|t| t.contains(title)))
-            })
-            .unwrap_or(false)
-    }
-
-    async fn tree_contains(&self, app: Option<&str>, needle: &str) -> bool {
-        let req = SnapshotRequest {
-            app: app.map(str::to_string),
-            ..Default::default()
+    /// Wait for the UI to settle.
+    ///
+    /// Synthetic input is asynchronous — the app processes it on its own run
+    /// loop — so this is the primitive that makes observe-after-act reliable.
+    /// The same evaluator backs every `expect` clause on an input tool, so the
+    /// two cannot drift apart.
+    async fn wait_for(&self, args: &Value, ctx: &CallCtx) -> Envelope {
+        let spec = match parse_wait_spec(args, default_wait_timeout()) {
+            Ok(s) => s,
+            Err(msg) => return Envelope::fail("wait_for", ErrorCode::InvalidArgs, msg),
         };
-        match self.a11y.snapshot(&req).await {
-            Ok(raw) => {
-                let f = flatten(
-                    &raw.root,
-                    raw.app.as_deref(),
-                    raw.window.as_deref(),
-                    "wait",
-                    &FlattenConfig::default(),
-                );
-                f.text.contains(needle)
-            }
-            Err(_) => false,
+        let outcome = self.evaluator.wait(&spec, ctx).await;
+        if outcome.met {
+            Envelope::ok(
+                "wait_for",
+                json!({ "ok": true, "waited_ms": outcome.waited_ms }),
+            )
+        } else {
+            Envelope::fail_with(
+                "wait_for",
+                ErrorCode::Timeout,
+                format!("condition not met after {}ms", outcome.waited_ms),
+                "observe with get_ui_tree to see the current state",
+            )
         }
     }
 }
@@ -388,15 +342,16 @@ impl ToolModule for WindowModule {
                 "wait_for",
                 Category::Window,
                 Tier::Read,
-                "Block until text appears, a window appears, or an element exists (settle signal).",
-                json!({"type":"object","properties":{
-                    "text":{"type":"string"},"window":{"type":"string"},"element":{"type":"string"},
-                    "app":{"type":"string"},"timeout_ms":{"type":"integer"}},"required":[]}),
+                "Block until the UI settles: text appears, a window appears, text is gone, \
+                 or an element takes focus. Synthetic input is asynchronous, so observing \
+                 straight after acting reads the previous state — wait first. Several \
+                 conditions must all hold at once.",
+                wait_schema("what to wait for; all given conditions must hold together"),
             ),
         ]
     }
 
-    async fn call(&self, name: &str, args: Value, _ctx: &CallCtx) -> Envelope {
+    async fn call(&self, name: &str, args: Value, ctx: &CallCtx) -> Envelope {
         match name {
             "list_windows" => self.list_windows(&args).await,
             "list_apps" => self.list_apps().await,
@@ -407,7 +362,7 @@ impl ToolModule for WindowModule {
             "menu_invoke" => self.menu("menu_invoke", &args, true).await,
             "handle_dialogs" => self.handle_dialogs(&args).await,
             "menu_list" => self.menu_list(&args).await,
-            "wait_for" => self.wait_for(&args).await,
+            "wait_for" => self.wait_for(&args, ctx).await,
             "focus_app" => self.focus_app(&args).await,
             other => Envelope::fail(other, ErrorCode::InvalidArgs, "unknown tool"),
         }

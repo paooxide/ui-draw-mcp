@@ -8,6 +8,9 @@ license.workspace = true
 [dependencies]
 mcp-types = { path = "../mcp-types" }
 mcp-a11y = { path = "../mcp-a11y" }
+# For the shared wait evaluator: an `expect` clause and `wait_for` must not be
+# two different opinions about when the UI has settled.
+mcp-window = { path = "../mcp-window" }
 # Pure `is_destructive` helper only — not the policy gate (which runs in mcp-core).
 mcp-policy = { path = "../mcp-policy" }
 serde.workspace = true

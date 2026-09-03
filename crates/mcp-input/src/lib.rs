@@ -5,10 +5,12 @@
 //! the destructive-input gate and coordinate clamp (`docs/planning.md` §5.2).
 
 mod backend;
+mod postcondition;
 mod tools;
 
 pub use backend::{
     valid_combo, valid_modifier, ClipData, ClipFormat, InputBackend, InputError, MouseKind,
     ScrollDir, SemanticAction,
 };
+pub use postcondition::Verifier;
 pub use tools::{InputModule, InputPolicy};

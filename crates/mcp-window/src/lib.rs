@@ -4,9 +4,14 @@
 
 mod backend;
 mod tools;
+mod wait;
 
 pub use backend::{
     DialogInfo, DialogScope, MenuItemInfo, Rect, WindowAction, WindowBackend, WindowError,
     WindowInfo,
 };
 pub use tools::WindowModule;
+pub use wait::{
+    default_wait_timeout, parse_wait_spec, poll_until, text_condition_holds, wait_schema,
+    window_condition_holds, WaitCondition, WaitEvaluator, WaitOutcome, WaitSpec, EXPECT_TIMEOUT_MS,
+};

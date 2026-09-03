@@ -131,10 +131,23 @@ impl Default for InputPolicy {
 
 /// The `input` engine. Shares the `mcp-a11y` arena so it can act on refs from
 /// the latest `get_ui_tree`.
+/// Tools that accept an `expect` clause: the ones that change the UI and whose
+/// effect is therefore worth confirming in the same call.
+const EXPECTING: &[&str] = &[
+    "ui_action",
+    "set_value",
+    "keyboard_type",
+    "keyboard_shortcut",
+    "mouse_action",
+];
+
 pub struct InputModule {
     backend: Arc<dyn InputBackend>,
     arena: Arc<Mutex<SnapshotArena>>,
     policy: InputPolicy,
+    /// Runs `expect` clauses. `None` where there is no window backend to
+    /// observe with, in which case an `expect` is refused rather than ignored.
+    verifier: Option<std::sync::Arc<crate::postcondition::Verifier>>,
 }
 
 impl InputModule {
@@ -147,7 +160,14 @@ impl InputModule {
             backend,
             arena,
             policy,
+            verifier: None,
         }
+    }
+
+    /// Attach the postcondition verifier (composition root only).
+    pub fn with_verifier(mut self, v: std::sync::Arc<crate::postcondition::Verifier>) -> Self {
+        self.verifier = Some(v);
+        self
     }
 
     // ---- shared helpers -----------------------------------------------------
@@ -539,7 +559,8 @@ impl ToolModule for InputModule {
                     "ref":{"type":"string","description":"element ref @eN"},
                     "action":{"type":"string","enum":["click","double_click","right_click","focus","toggle","check","uncheck","expand","collapse","select","scroll_into_view"]},
                     "option":{"type":"string","description":"option label for select"}
-                },"required":["ref","action"]}),
+                },"expect": mcp_window::wait_schema("optional: wait for this to become true after the action, and return what changed"),
+                        "required":["ref","action"]}),
             ),
             ToolDescriptor::new(
                 "set_value",
@@ -547,7 +568,8 @@ impl ToolModule for InputModule {
                 Tier::Standard,
                 "Set the value of a text element by ref (accessibility SetValue).",
                 json!({"type":"object","properties":{
-                    "ref":{"type":"string"},"text":{"type":"string"}},"required":["ref","text"]}),
+                    "ref":{"type":"string"},"text":{"type":"string"}},"expect": mcp_window::wait_schema("optional: wait for this to become true after the action, and return what changed"),
+                        "required":["ref","text"]}),
             ).idempotent(true),
             ToolDescriptor::new(
                 "keyboard_type",
@@ -555,14 +577,16 @@ impl ToolModule for InputModule {
                 Tier::Standard,
                 "Type Unicode text. If 'ref' is given, focus it first. Does not press return.",
                 json!({"type":"object","properties":{
-                    "text":{"type":"string"},"ref":{"type":"string","description":"optional element to focus first"}},"required":["text"]}),
+                    "text":{"type":"string"},"ref":{"type":"string","description":"optional element to focus first"}},"expect": mcp_window::wait_schema("optional: wait for this to become true after the action, and return what changed"),
+                        "required":["text"]}),
             ),
             ToolDescriptor::new(
                 "keyboard_shortcut",
                 Category::Input,
                 Tier::Standard,
                 "Press a key or chord, e.g. return, escape, cmd+s, cmd+shift+n.",
-                json!({"type":"object","properties":{"combo":{"type":"string"}},"required":["combo"]}),
+                json!({"type":"object","properties":{"combo":{"type":"string"}},"expect": mcp_window::wait_schema("optional: wait for this to become true after the action, and return what changed"),
+                        "required":["combo"]}),
             ),
             ToolDescriptor::new(
                 "mouse_action",
@@ -576,7 +600,8 @@ impl ToolModule for InputModule {
                     "x":{"type":"number"},"y":{"type":"number"},
                     "button":{"type":"string","description":"left|right|middle"},
                     "modifiers":{"type":"array","items":{"type":"string","enum":["cmd","shift","opt","alt","ctrl","fn"]}}},
-                    "required":["type","x","y"]}),
+                    "expect": mcp_window::wait_schema("optional: wait for this to become true after the action, and return what changed"),
+                        "required":["type","x","y"]}),
             ),
             ToolDescriptor::new(
                 "scroll",
@@ -624,8 +649,32 @@ impl ToolModule for InputModule {
         ]
     }
 
-    async fn call(&self, name: &str, args: Value, _ctx: &CallCtx) -> Envelope {
-        match name {
+    async fn call(&self, name: &str, args: Value, ctx: &CallCtx) -> Envelope {
+        // An `expect` clause is parsed *before* the action: discovering the
+        // expectation was malformed after clicking is too late to be useful.
+        let spec = if EXPECTING.contains(&name) {
+            match crate::postcondition::Verifier::parse(name, &args) {
+                Ok(s) => s,
+                Err(e) => return *e,
+            }
+        } else {
+            None
+        };
+        if spec.is_some() && self.verifier.is_none() {
+            return Envelope::fail_with(
+                name,
+                ErrorCode::UnsupportedOs,
+                "postconditions need a UI to observe, and none is wired on this platform",
+                "drop 'expect' and confirm separately with wait_for",
+            );
+        }
+        // The comparison point has to be captured before the action, not after.
+        let before = match (&spec, self.verifier.as_ref()) {
+            (Some(_), Some(v)) => v.before(),
+            _ => None,
+        };
+
+        let env = match name {
             "ui_action" => self.ui_action(&args).await,
             "set_value" => self.set_value(&args).await,
             "keyboard_type" => self.keyboard_type(&args).await,
@@ -637,6 +686,14 @@ impl ToolModule for InputModule {
             "clipboard_read" => self.clipboard_read(&args).await,
             "clipboard_write" => self.clipboard_write(&args).await,
             other => Envelope::fail(other, ErrorCode::InvalidArgs, "unknown tool"),
+        };
+
+        match (spec, self.verifier.as_ref()) {
+            (Some(spec), Some(v)) => {
+                let verified = v.verify(&spec, before, ctx).await;
+                crate::postcondition::attach(env, name, verified)
+            }
+            _ => env,
         }
     }
 }

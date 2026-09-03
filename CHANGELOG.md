@@ -8,6 +8,15 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- `expect` postconditions on `ui_action`, `set_value`, `keyboard_type`,
+  `keyboard_shortcut` and `mouse_action`. The action runs, the condition is
+  waited for, and the result carries the delta against the snapshot taken
+  before it — so checking whether an action worked is one call rather than
+  four. A failed expectation still returns the delta, because the action
+  happened and what it did is what the agent needs to see.
+- `since` on `get_ui_tree` — return what changed rather than the whole tree.
+- `gone` and `focused` conditions on `wait_for`, which now shares its evaluator
+  with `expect`.
 - `find_elements` — query the accessibility tree by role, name substring or
   proximity to a screen point instead of reading all of it. On a busy
   application a targeted query is an order of magnitude smaller than the full

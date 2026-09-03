@@ -438,3 +438,95 @@ async fn a_delta_is_far_smaller_than_the_tree_and_names_what_changed() {
 
     let _ = c.call("close_app", json!({ "app": "TextEdit" })).await;
 }
+
+/// Act and confirm in one call.
+///
+/// Without `expect`, checking whether an action worked is observe, act, wait,
+/// observe — four round trips to a remote model, three of which carry no
+/// decision. And the naive version is *wrong*, because synthetic input is
+/// asynchronous and observing straight after acting reads the previous state.
+#[tokio::test(flavor = "multi_thread")]
+async fn expect_folds_act_wait_and_verify_into_one_call() {
+    if !ready() {
+        return;
+    }
+    let c = client("live-expect");
+    c.initialize().await;
+    c.ok("launch", json!({ "app": "TextEdit" })).await;
+    if !settle_on(&c, "TextEdit").await {
+        return;
+    }
+    if !guarded_key(&c, "TextEdit", "cmd+n").await {
+        return;
+    }
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    // Something to diff against.
+    c.ok("get_ui_tree", json!({ "app": "TextEdit" })).await;
+
+    let nonce = format!("expect-{}", mcp_policy::now_ms());
+    if !focused_is("TextEdit") {
+        return;
+    }
+    let env = c
+        .call(
+            "keyboard_type",
+            json!({
+                "text": &nonce,
+                "expect": { "app": "TextEdit", "text": &nonce, "timeout_ms": 5000 }
+            }),
+        )
+        .await;
+    assert!(
+        env.ok,
+        "the expectation should have been met: {:?}",
+        env.error
+    );
+    let d = env.data.unwrap();
+    assert_eq!(d["expect"]["met"], json!(true));
+    assert!(
+        d["expect"]["waited_ms"].as_u64().is_some(),
+        "the real settle time is reported, not assumed"
+    );
+    // The answer is what changed, not merely that the call returned.
+    let changed = d["delta"]["changed"].as_array().unwrap();
+    assert!(
+        changed
+            .iter()
+            .any(|e| e["value"].as_str().is_some_and(|v| v.contains(&nonce))),
+        "the delta must name the field that changed: {changed:?}"
+    );
+
+    // An expectation that cannot come true fails — and still returns the delta,
+    // because the action did happen and what it did is what the agent needs.
+    if !focused_is("TextEdit") {
+        return;
+    }
+    let env = c
+        .call(
+            "keyboard_type",
+            json!({
+                "text": "!",
+                "expect": { "app": "TextEdit", "text": "NEVER GOING TO APPEAR", "timeout_ms": 1200 }
+            }),
+        )
+        .await;
+    assert!(!env.ok);
+    assert_eq!(env.error.unwrap().code, mcp_types::ErrorCode::Timeout);
+    let d = env
+        .data
+        .expect("a failed expectation must still carry the delta");
+    assert_eq!(d["expect"]["met"], json!(false));
+    assert!(d["delta"]["counts"].is_object());
+
+    // A malformed clause is refused before anything is typed.
+    let env = c
+        .call(
+            "keyboard_type",
+            json!({"text": "x", "expect": {"app": "TextEdit"}}),
+        )
+        .await;
+    assert!(!env.ok);
+    assert_eq!(env.error.unwrap().code, mcp_types::ErrorCode::InvalidArgs);
+
+    let _ = c.call("close_app", json!({ "app": "TextEdit" })).await;
+}

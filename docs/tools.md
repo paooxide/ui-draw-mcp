@@ -38,7 +38,7 @@ enabled category, while a `dangerous` tool additionally has to be named in
 | [`menu_invoke`](#menu-invoke) | window | standard | Open and click a menu item by title path, e.g. |
 | [`menu_list`](#menu-list) | window | read | Enumerate an app's menu bar: titles, enabled state, and the keyboard equivalent of each item. |
 | [`menu_open`](#menu-open) | window | standard | Open a menu-bar menu by title path, e.g. |
-| [`wait_for`](#wait-for) | window | read | Block until text appears, a window appears, or an element exists (settle signal). |
+| [`wait_for`](#wait-for) | window | read | Block until the UI settles: text appears, a window appears, text is gone, or an element takes focus. |
 | [`idle_status`](#idle-status) | desktop | read | Seconds since the last human input, whether the screen is locked, and whether someone is plausibly present. |
 | [`lock_screen`](#lock-screen) | desktop | standard | Lock the session. |
 | [`media_control`](#media-control) | desktop | standard | Transport control for the running media player. |
@@ -441,15 +441,17 @@ Open a menu-bar menu by title path, e.g. ["File"].
 
 `wait_for` · read tier
 
-Block until text appears, a window appears, or an element exists (settle signal).
+Block until the UI settles: text appears, a window appears, text is gone, or an element takes focus. Synthetic input is asynchronous, so observing straight after acting reads the previous state — wait first. Several conditions must all hold at once.
 
 | Argument | Type | Required | Description |
 |---|---|---|---|
-| `app` | string |  |  |
-| `element` | string |  |  |
-| `text` | string |  |  |
-| `timeout_ms` | integer |  |  |
-| `window` | string |  |  |
+| `app` | string |  | which application to observe |
+| `element` | string |  | synonym for text |
+| `focused` | string |  | wait until an element matching this text has focus |
+| `gone` | string |  | wait until this text is no longer present |
+| `text` | string |  | wait until this text appears in the UI |
+| `timeout_ms` | integer |  | give up after this long (max 30000) |
+| `window` | string |  | wait until a window with this title exists |
 
 ## desktop
 

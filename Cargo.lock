@@ -255,6 +255,7 @@ dependencies = [
  "mcp-a11y",
  "mcp-policy",
  "mcp-types",
+ "mcp-window",
  "serde",
  "serde_json",
  "tokio",

@@ -191,7 +191,16 @@ pub fn build_modules(cfg: &PolicyConfig) -> Vec<Arc<dyn ToolModule>> {
             terminal_apps,
             ..InputPolicy::default()
         };
-        let input = InputModule::new(backend.clone(), arena, input_policy);
+        // The postcondition verifier shares the wait evaluator with wait_for,
+        // so `expect` and an explicit wait cannot disagree about when the UI
+        // has settled.
+        let evaluator = mcp_window::WaitEvaluator::new(backend.clone(), backend.clone());
+        let verifier = Arc::new(mcp_input::Verifier::new(
+            evaluator,
+            backend.clone(),
+            arena.clone(),
+        ));
+        let input = InputModule::new(backend.clone(), arena, input_policy).with_verifier(verifier);
         let vision = VisionModule::new(backend.clone(), engines.vision);
         let window = WindowModule::new(backend.clone(), backend, allowed_apps);
         modules.push(Arc::new(a11y));
