@@ -251,8 +251,13 @@ impl ToolModule for WindowModule {
                 "list_windows",
                 Category::Window,
                 Tier::Read,
-                "List windows of an app (or the focused app).",
-                json!({"type":"object","properties":{"app":{"type":"string"}},"required":[]}),
+                "List open windows: title, position, size, minimised state. With no \
+                 'app', lists every application's windows — start here to see what is \
+                 open. With 'app', lists just that one. After focus_app has pinned an \
+                 application, omitting 'app' means the pinned one. Desktop furniture \
+                 (the Dock, menu bar, overlays) is left out.",
+                json!({"type":"object","properties":{"app":{"type":"string",
+                    "description":"application name, as list_apps reports it"}},"required":[]}),
             ).untrusted_output(),
             ToolDescriptor::new(
                 "focus_app",
@@ -268,7 +273,9 @@ impl ToolModule for WindowModule {
                 "list_apps",
                 Category::Window,
                 Tier::Read,
-                "List running applications.",
+                "List the applications that are running, by the name launch, focus_app, \
+                 list_windows and get_ui_tree expect. Background daemons and the desktop's \
+                 own interface are left out. Use list_windows to see what each one has open.",
                 json!({"type":"object","properties":{},"required":[]}),
             ).untrusted_output(),
             ToolDescriptor::new(

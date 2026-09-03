@@ -12,8 +12,9 @@ use core_foundation::number::{CFNumber, CFNumberRef};
 use core_foundation::string::{CFString, CFStringRef};
 use core_foundation_sys::base::Boolean;
 use core_graphics::window::{
-    copy_window_info, kCGNullWindowID, kCGWindowLayer, kCGWindowListExcludeDesktopElements,
-    kCGWindowListOptionOnScreenOnly, kCGWindowOwnerName, kCGWindowOwnerPID,
+    copy_window_info, kCGNullWindowID, kCGWindowBounds, kCGWindowIsOnscreen, kCGWindowLayer,
+    kCGWindowListExcludeDesktopElements, kCGWindowListOptionOnScreenOnly, kCGWindowName,
+    kCGWindowOwnerName, kCGWindowOwnerPID,
 };
 
 use mcp_a11y::{
@@ -831,6 +832,62 @@ unsafe fn window_owners() -> Vec<(c_int, String)> {
     out
 }
 
+/// Processes that draw the desktop itself. They own normal-layer windows —
+/// the Dock's icon surfaces, the window manager's gesture overlays — and none
+/// of them is an application anyone means to drive.
+const SYSTEM_UI_OWNERS: &[&str] = &[
+    "Accessibility",
+    "AccessibilityUIServer",
+    "AutoFill",
+    "Control Centre",
+    "Control Center",
+    "CursorUIViewService",
+    "Dock",
+    "Notification Centre",
+    "Notification Center",
+    "Spotlight",
+    "ThemeWidgetControlViewService",
+    "UserNotificationCenter",
+    "Window Server",
+    "WindowManager",
+    "loginwindow",
+];
+
+/// Below this, a normal-layer surface is a tooltip, a badge or a shadow.
+const MIN_WINDOW_W: f64 = 120.0;
+const MIN_WINDOW_H: f64 = 80.0;
+
+/// Every window-owning process as `(pid, owner name)`, including ones whose
+/// windows are all minimised or on another Space.
+///
+/// `window_owners` asks only about what is on screen, which is right for
+/// "who is frontmost" and wrong for "what is running": an app the user
+/// minimised is still running, and is still something an agent can be asked
+/// to drive.
+unsafe fn window_owners_all() -> Vec<(c_int, String)> {
+    let mut out: Vec<(c_int, String)> = Vec::new();
+    let Some(arr) = copy_window_info(kCGWindowListExcludeDesktopElements, kCGNullWindowID) else {
+        return out;
+    };
+    for raw in arr.get_all_values() {
+        if raw.is_null() {
+            continue;
+        }
+        let dict = CFDictionary::wrap_under_get_rule(raw as _);
+        let (Some(pid), Some(name)) = (
+            dict_i64(&dict, kCGWindowOwnerPID),
+            dict_string(&dict, kCGWindowOwnerName),
+        ) else {
+            continue;
+        };
+        let pid = pid as c_int;
+        if !name.is_empty() && !out.iter().any(|(p, _)| *p == pid) {
+            out.push((pid, name));
+        }
+    }
+    out
+}
+
 /// Is this pid still alive?
 fn pid_alive(pid: c_int) -> bool {
     std::process::Command::new("/bin/ps")
@@ -874,6 +931,40 @@ unsafe fn dict_i64(dict: &CFDictionary, key: CFStringRef) -> Option<i64> {
         return None;
     }
     CFNumber::wrap_under_get_rule(raw as CFNumberRef).to_i64()
+}
+
+/// Read a boolean entry out of a CGWindowList dictionary.
+unsafe fn dict_bool(dict: &CFDictionary, key: CFStringRef) -> Option<bool> {
+    let raw = *dict.find(key.cast::<c_void>())?;
+    if raw.is_null() {
+        return None;
+    }
+    let v = CFType::wrap_under_get_rule(raw);
+    Some(v.as_CFTypeRef() == CFBoolean::true_value().as_CFTypeRef())
+}
+
+/// Read the `kCGWindowBounds` sub-dictionary, which is a CGRect in the window
+/// server's own coordinate space — the one every other tool here uses.
+unsafe fn dict_rect(dict: &CFDictionary, key: CFStringRef) -> Option<Rect> {
+    let raw = *dict.find(key.cast::<c_void>())?;
+    if raw.is_null() {
+        return None;
+    }
+    let bounds: CFDictionary = CFDictionary::wrap_under_get_rule(raw as _);
+    let number = |name: &str| -> Option<f64> {
+        let k = CFString::new(name);
+        let v: CFTypeRef = *bounds.find(k.as_concrete_TypeRef().cast::<c_void>())?;
+        if v.is_null() {
+            return None;
+        }
+        CFNumber::wrap_under_get_rule(v as CFNumberRef).to_f64()
+    };
+    Some(Rect {
+        x: number("X")?,
+        y: number("Y")?,
+        w: number("Width")?,
+        h: number("Height")?,
+    })
 }
 
 /// PID of the frontmost on-screen application, via the CoreGraphics window
@@ -937,6 +1028,96 @@ impl MacosBackend {
     /// The app element this session is driving: the sticky target when set and
     /// alive, else the frontmost app. Window/menu ops go through this so they
     /// stay on the same app as `get_ui_tree`.
+    /// The application this session was pinned to by `focus_app`, if any.
+    fn pinned_target(&self) -> Option<c_int> {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .target
+            .as_ref()
+            .map(|t| t.pid)
+    }
+
+    /// Every window of every application that has one.
+    ///
+    /// Read from the CoreGraphics window list rather than by walking each
+    /// application's accessibility tree. The window server is authoritative
+    /// about what exists — Chromium, for one, exposes no accessibility tree
+    /// at all until something asks it to, so an AX walk reports a running
+    /// browser as having no windows.
+    ///
+    /// Titles come from `kCGWindowName`, which is redacted without the Screen
+    /// Recording permission. A missing title is reported as absent rather than
+    /// guessed at.
+    ///
+    /// Ids are indexes within their own application, so an id here means what
+    /// it would mean in `list_windows { app }`.
+    unsafe fn every_window(&self) -> Result<Vec<WindowInfo>, WindowError> {
+        let Some(arr) = copy_window_info(kCGWindowListExcludeDesktopElements, kCGNullWindowID)
+        else {
+            return Err(WindowError::Failed(
+                "the window server returned no window list".into(),
+            ));
+        };
+        let mut raw_windows: Vec<(String, Option<String>, Option<Rect>, bool)> = Vec::new();
+        for raw in arr.get_all_values() {
+            if raw.is_null() {
+                continue;
+            }
+            let dict = CFDictionary::wrap_under_get_rule(raw as _);
+            // Layer 0 is the normal window layer. Everything else is the menu
+            // bar, the Dock, overlays and helper panels — present, but not
+            // what anyone means by "a window".
+            if dict_i64(&dict, kCGWindowLayer) != Some(0) {
+                continue;
+            }
+            let Some(owner) = dict_string(&dict, kCGWindowOwnerName) else {
+                continue;
+            };
+            if SYSTEM_UI_OWNERS.contains(&owner.as_str()) {
+                continue;
+            }
+            let bounds = dict_rect(&dict, kCGWindowBounds);
+            // Shadows, badges and tooltips live on the normal layer too.
+            if bounds.is_some_and(|b| b.w < MIN_WINDOW_W || b.h < MIN_WINDOW_H) {
+                continue;
+            }
+            raw_windows.push((
+                owner,
+                dict_string(&dict, kCGWindowName).filter(|t| !t.is_empty()),
+                bounds,
+                // Off-screen on the normal layer means minimised, or on
+                // another Space. Either way it is not in front of anyone.
+                !dict_bool(&dict, kCGWindowIsOnscreen).unwrap_or(true),
+            ));
+        }
+
+        // An application draws several full-size surfaces per visible window
+        // (the frame, the shadow, an overlay), and only the real one is
+        // titled. Dropping the untitled ones is what turns 169 entries into
+        // the two dozen a person would point at — but only when titles are
+        // readable at all. Without Screen Recording every title is redacted,
+        // and filtering on it would answer "nothing is open".
+        let titles_readable = raw_windows.iter().any(|(_, t, _, _)| t.is_some());
+        let mut out = Vec::new();
+        let mut per_app: HashMap<String, u32> = HashMap::new();
+        for (owner, title, bounds, minimized) in raw_windows {
+            if titles_readable && title.is_none() {
+                continue;
+            }
+            let index = per_app.entry(owner.clone()).or_insert(0);
+            out.push(WindowInfo {
+                id: *index,
+                app: Some(owner),
+                title,
+                bounds,
+                minimized,
+            });
+            *index += 1;
+        }
+        Ok(out)
+    }
+
     pub(crate) unsafe fn target_app_element(
         &self,
         app: Option<&str>,
@@ -1429,6 +1610,13 @@ fn run(cmd: &str, args: &[&str]) -> Result<std::process::Output, WindowError> {
 impl WindowBackend for MacosBackend {
     async fn list_windows(&self, app_name: Option<&str>) -> Result<Vec<WindowInfo>, WindowError> {
         unsafe {
+            // With no app named and no pinned target, answer about the whole
+            // machine. Resolving to the frontmost app instead makes the
+            // obvious opening question — "what is open?" — return one app's
+            // windows, or none at all, with nothing to say it was narrowed.
+            if app_name.is_none() && self.pinned_target().is_none() {
+                return self.every_window();
+            }
             // Honour the requested app. Resolving `None` here would silently
             // answer about whatever happens to be frontmost, so
             // `list_windows { app: "TextEdit" }` returned the caller's own
@@ -1443,22 +1631,22 @@ impl WindowBackend for MacosBackend {
         }
     }
 
+    /// Applications with windows, as a person would name them.
+    ///
+    /// This used to be `ps -Axo comm=`, which answered with every process on
+    /// the machine: `AudioComponentRegistrar`, `BTLEServer`, `-zsh`. An agent
+    /// asking what is running got several hundred names, almost none of which
+    /// `launch` or `focus_app` would accept, and the real applications were
+    /// indistinguishable from the daemons. The window server already knows
+    /// which processes own windows, and it knows them by their display names.
     async fn list_apps(&self) -> Result<Vec<String>, WindowError> {
-        let out = run("ps", &["-Axo", "comm="])?;
-        let text = String::from_utf8_lossy(&out.stdout);
-        let mut apps: Vec<String> = Vec::new();
-        for line in text.lines() {
-            let name = if let Some(idx) = line.find(".app/") {
-                let before = &line[..idx];
-                before.rsplit('/').next().unwrap_or(before).to_string()
-            } else {
-                line.rsplit('/').next().unwrap_or(line).to_string()
-            };
-            if !name.is_empty() && !apps.contains(&name) {
-                apps.push(name);
-            }
-        }
+        let mut apps: Vec<String> = unsafe { window_owners_all() }
+            .into_iter()
+            .map(|(_, name)| name)
+            .filter(|name| !SYSTEM_UI_OWNERS.contains(&name.as_str()))
+            .collect();
         apps.sort();
+        apps.dedup();
         Ok(apps)
     }
 
@@ -1666,6 +1854,94 @@ mod tests {
             Err(WindowError::PermissionDenied(_)) | Err(WindowError::NotFound(_)) => {}
             Err(e) => panic!("unexpected error: {e:?}"),
         }
+    }
+
+    /// `list_windows` with nothing pinned and no app named must answer about
+    /// the whole machine.
+    ///
+    /// It used to resolve the frontmost application, so the obvious opening
+    /// question — what is open? — came back as one app's windows, or as an
+    /// empty list when the front app had none, with nothing to say it had been
+    /// narrowed. A model given that answer starts guessing app names one at a
+    /// time, which is exactly what one did.
+    #[tokio::test]
+    async fn list_windows_with_no_app_covers_the_whole_machine() {
+        let b = MacosBackend::new();
+        let Ok(all) = mcp_window::WindowBackend::list_windows(&b, None).await else {
+            return; // Headless, or no permission.
+        };
+        if all.is_empty() {
+            return; // A desktop with nothing open is a legitimate answer.
+        }
+        for w in &all {
+            let app = w.app.as_deref().unwrap_or_default();
+            assert!(
+                !SYSTEM_UI_OWNERS.contains(&app),
+                "'{app}' is desktop furniture, not an application window"
+            );
+            if let Some(b) = w.bounds {
+                assert!(
+                    b.w >= MIN_WINDOW_W && b.h >= MIN_WINDOW_H,
+                    "{app} window {}x{} is a tooltip or a shadow",
+                    b.w,
+                    b.h
+                );
+            }
+        }
+        // Naming an app must narrow the answer, not change its meaning: every
+        // window it returns has to be one the machine-wide list would agree
+        // belongs to that app.
+        let one = all[0].app.clone().unwrap_or_default();
+        if let Ok(scoped) = mcp_window::WindowBackend::list_windows(&b, Some(&one)).await {
+            for w in &scoped {
+                assert!(
+                    w.app
+                        .as_deref()
+                        .is_some_and(|a| a.contains(&one) || one.contains(a)),
+                    "asked about '{one}', got a window belonging to {:?}",
+                    w.app
+                );
+            }
+        }
+    }
+
+    /// `list_apps` must name applications, not processes.
+    ///
+    /// It used to be `ps -Axo comm=`: several hundred entries, including
+    /// `AudioComponentRegistrar` and `-zsh`, almost none of which `launch` or
+    /// `focus_app` would accept.
+    #[tokio::test]
+    async fn list_apps_names_applications_not_processes() {
+        let b = MacosBackend::new();
+        let Ok(apps) = mcp_window::WindowBackend::list_apps(&b).await else {
+            return;
+        };
+        if apps.is_empty() {
+            return; // Headless.
+        }
+        assert!(
+            apps.len() < 100,
+            "{} entries — this is a process list again, not an app list",
+            apps.len()
+        );
+        for name in &apps {
+            assert!(!name.is_empty());
+            assert!(
+                !SYSTEM_UI_OWNERS.contains(&name.as_str()),
+                "'{name}' is part of the desktop, not an application"
+            );
+            assert!(
+                !name.starts_with('-') && !name.contains('/'),
+                "'{name}' looks like a process, not an application"
+            );
+        }
+        let mut sorted = apps.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(
+            sorted, apps,
+            "the list must be sorted and free of duplicates"
+        );
     }
 
     #[tokio::test]

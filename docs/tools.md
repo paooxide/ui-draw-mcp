@@ -34,8 +34,8 @@ enabled category, while a `dangerous` tool additionally has to be named in
 | [`focus_app`](#focus-app) | window | standard | Pin this session to an application: bring it forward and make every later get_ui_tree/action target it instead of whatever happens to be frontmost. |
 | [`handle_dialogs`](#handle-dialogs) | window | read | List open dialogs, sheets, popovers and menus, with their buttons, message text and which button Return/Escape activates. |
 | [`launch`](#launch) | window | standard | Launch or bring forward an application by name (allowlist-gated). |
-| [`list_apps`](#list-apps) | window | read | List running applications. |
-| [`list_windows`](#list-windows) | window | read | List windows of an app (or the focused app). |
+| [`list_apps`](#list-apps) | window | read | List the applications that are running, by the name launch, focus_app, list_windows and get_ui_tree expect. |
+| [`list_windows`](#list-windows) | window | read | List open windows: title, position, size, minimised state. |
 | [`menu_invoke`](#menu-invoke) | window | standard | Open and click a menu item by title path, e.g. |
 | [`menu_list`](#menu-list) | window | read | Enumerate an app's menu bar: titles, enabled state, and the keyboard equivalent of each item. |
 | [`menu_open`](#menu-open) | window | standard | Open a menu-bar menu by title path, e.g. |
@@ -449,7 +449,7 @@ Launch or bring forward an application by name (allowlist-gated).
 
 `list_apps` · read tier
 
-List running applications.
+List the applications that are running, by the name launch, focus_app, list_windows and get_ui_tree expect. Background daemons and the desktop's own interface are left out. Use list_windows to see what each one has open.
 
 No arguments.
 
@@ -457,11 +457,11 @@ No arguments.
 
 `list_windows` · read tier
 
-List windows of an app (or the focused app).
+List open windows: title, position, size, minimised state. With no 'app', lists every application's windows — start here to see what is open. With 'app', lists just that one. After focus_app has pinned an application, omitting 'app' means the pinned one. Desktop furniture (the Dock, menu bar, overlays) is left out.
 
 | Argument | Type | Required | Description |
 |---|---|---|---|
-| `app` | string |  |  |
+| `app` | string |  | application name, as list_apps reports it |
 
 ### menu-invoke
 
