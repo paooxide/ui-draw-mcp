@@ -1156,7 +1156,7 @@ impl ToolModule for FsModule {
                 Tier::Standard,
                 "Create a directory (and parents) inside the allowed roots.",
                 p(json!({}), json!(["path"])),
-            ),
+            ).idempotent(true),
             ToolDescriptor::new(
                 "fs_copy",
                 Category::Filesystem,

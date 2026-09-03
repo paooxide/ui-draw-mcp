@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use mcp_policy::{now_ms, AuditRecord, Decision, Policy};
-use mcp_types::{CallCtx, CancelToken, Envelope, ErrorCode};
+use mcp_types::{CallCtx, CancelToken, Category, Envelope, ErrorCode, Tier, ToolDescriptor};
 use serde::Serialize;
 use serde_json::{json, Value};
 
@@ -100,20 +100,51 @@ impl Server {
         // 4. Gate (category -> tier). An engine may additionally flag *this*
         //    invocation as risky (e.g. a destructive command), which upgrades an
         //    otherwise-allowed call to needing human approval.
-        let mut decision = self.policy.gate(descriptor);
+        let gated = self.policy.gate(descriptor);
+
+        // Pre-audit with redacted args.
+        let mut pre = AuditRecord::pre(&self.session_id, name);
+        pre.tier = Some(tier.clone());
+        let mut redacted_args = args.clone();
+        self.policy.redact(&mut redacted_args);
+        pre.args_redacted = Some(redacted_args.clone());
+
+        // 4a. Rehearsal. Reads still run — an agent cannot plan without
+        //     observing — but anything that would change something reports what
+        //     it would have done instead of doing it.
+        //
+        //     This sits *after* the gate, so the real refusals still show: a
+        //     disabled category and a dangerous tool nobody enabled are denied
+        //     exactly as they would be in earnest, which is most of what an
+        //     operator is trying to find out. It sits *before* consent, so the
+        //     answer includes "and this one would have asked you" rather than
+        //     collapsing to a denial and hiding that.
+        if self.policy.is_dry_run() && !matches!(descriptor.tier, Tier::Read) && gated.is_allow() {
+            pre.decision = Some("dry_run".into());
+            self.policy.audit(&pre);
+            return Envelope::ok(
+                name,
+                json!({
+                    "ok": true,
+                    "dry_run": true,
+                    "would_execute": {
+                        "tool": name,
+                        "tier": tier,
+                        "args_redacted": redacted_args,
+                        "consent_required": module.consent_prompt(name, &args).is_some(),
+                    },
+                    "note": "policy.mode = dry_run: this tool was not executed",
+                }),
+            );
+        }
+
+        let mut decision = gated;
         if decision.is_allow() {
             if let Some(prompt) = module.consent_prompt(name, &args) {
                 decision = Decision::NeedConsent { prompt };
             }
         }
         let decision = self.policy.resolve_consent(decision);
-
-        // Pre-audit with redacted args.
-        let mut pre = AuditRecord::pre(&self.session_id, name);
-        pre.tier = Some(tier);
-        let mut redacted_args = args.clone();
-        self.policy.redact(&mut redacted_args);
-        pre.args_redacted = Some(redacted_args);
 
         match &decision {
             Decision::Deny { code, reason } => {
@@ -176,8 +207,10 @@ impl Server {
             .map(|d| {
                 json!({
                     "name": d.name,
+                    "title": d.display_title(),
                     "description": d.description,
                     "inputSchema": d.input_schema,
+                    "annotations": annotations_for(d),
                     "x-tier": enum_str(&d.tier),
                     "x-category": d.category.slug(),
                 })
@@ -433,6 +466,28 @@ fn is_usable_id(id: &Value) -> bool {
 
 /// Serialize a simple serde enum to its string form (e.g. `Tier::Standard` ->
 /// `"standard"`, `ErrorCode::PolicyDenied` -> `"POLICY_DENIED"`).
+/// MCP tool annotations, derived from the tier the policy already gates on.
+///
+/// Clients use these to decide what to surface, what to confirm and what to
+/// batch, so they must agree with the gate rather than being a second,
+/// hand-maintained opinion about the same tool. A descriptor may override the
+/// two that a tier cannot know.
+fn annotations_for(d: &ToolDescriptor) -> Value {
+    let read_only = matches!(d.tier, Tier::Read);
+    json!({
+        "title": d.display_title(),
+        "readOnlyHint": read_only,
+        "destructiveHint": matches!(d.tier, Tier::Dangerous),
+        // A read is naturally repeatable; anything that changes state is
+        // assumed not to be unless the engine says otherwise.
+        "idempotentHint": d.idempotent.unwrap_or(read_only),
+        "openWorldHint": d.open_world.unwrap_or(matches!(
+            d.category,
+            Category::Browser | Category::Network | Category::Packages
+        )),
+    })
+}
+
 fn enum_str<T: Serialize>(value: &T) -> String {
     serde_json::to_value(value)
         .ok()

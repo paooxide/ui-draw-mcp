@@ -53,7 +53,7 @@ impl Policy {
         details: Option<String>,
     ) -> crate::ConsentOutcome {
         use crate::{ConsentOutcome, ConsentRequest};
-        if matches!(self.config.mode, Mode::Autonomous) {
+        if !self.config.mode.prompts_human() {
             return ConsentOutcome::Unavailable;
         }
         if !self.prompts.take() {
@@ -118,8 +118,25 @@ impl Policy {
                 code: ErrorCode::ConsentRequired,
                 reason: format!("consent required but running autonomously: {prompt}"),
             },
+            // Only a read tool can reach here in dry run — anything else was
+            // already short-circuited — and a read that wants consent is not
+            // something a rehearsal should approve on the operator's behalf.
+            (Mode::DryRun, Decision::NeedConsent { prompt }) => Decision::Deny {
+                code: ErrorCode::ConsentRequired,
+                reason: format!("consent required, and dry run never prompts: {prompt}"),
+            },
             (_, other) => other,
         }
+    }
+
+    /// The configured mode.
+    pub fn mode(&self) -> Mode {
+        self.config.mode
+    }
+
+    /// Whether mutations should be reported rather than performed.
+    pub fn is_dry_run(&self) -> bool {
+        matches!(self.config.mode, Mode::DryRun)
     }
 
     /// Record a denial against the anti-spin budget; returns `true` if exhausted.

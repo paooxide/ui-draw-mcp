@@ -19,6 +19,12 @@ enable = []
 
 # interactive = ask a human (macOS dialog) before risky actions.
 # autonomous  = nobody to ask, so anything needing consent is denied.
+# dry_run     = rehearsal. Read-tier tools run for real; anything that would
+#               change something reports what it *would* have done, including
+#               whether it would have asked you, and does not do it. The gate
+#               still refuses what it would normally refuse, so this is how you
+#               find out what an agent's prompt will actually try — against the
+#               real config and the real tool list — with nothing at risk.
 mode = "interactive"
 
 # Cap on how often one session may interrupt a human. Past this, further

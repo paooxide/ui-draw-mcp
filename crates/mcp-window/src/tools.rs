@@ -308,7 +308,8 @@ impl ToolModule for WindowModule {
                  get_ui_tree/action target it instead of whatever happens to be frontmost. \
                  Call once before driving an app. Omit 'app' to release the pin.",
                 json!({"type":"object","properties":{"app":{"type":"string"}},"required":[]}),
-            ),
+            )
+            .idempotent(true),
             ToolDescriptor::new(
                 "list_apps",
                 Category::Window,
@@ -322,7 +323,8 @@ impl ToolModule for WindowModule {
                 Tier::Standard,
                 "Launch or bring forward an application by name (allowlist-gated).",
                 json!({"type":"object","properties":{"app":{"type":"string"}},"required":["app"]}),
-            ),
+            )
+            .idempotent(true),
             ToolDescriptor::new(
                 "close_app",
                 Category::Window,

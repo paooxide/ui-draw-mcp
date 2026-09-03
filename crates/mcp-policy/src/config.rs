@@ -9,6 +9,40 @@ pub enum Mode {
     Interactive,
     /// No consent channel: `NeedConsent` becomes a denial.
     Autonomous,
+    /// Rehearsal. Read-tier tools run normally; anything that would change
+    /// something reports what it *would* have done and does not do it.
+    ///
+    /// This exists because the only way to find out what an agent will do to a
+    /// real machine was to let it. A prompt can now be exercised against the
+    /// real config, the real tool list and the real gate, with nothing at risk.
+    DryRun,
+}
+
+impl Mode {
+    /// The config spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Mode::Interactive => "interactive",
+            Mode::Autonomous => "autonomous",
+            Mode::DryRun => "dry_run",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Mode> {
+        match s {
+            "interactive" => Some(Mode::Interactive),
+            "autonomous" => Some(Mode::Autonomous),
+            "dry_run" | "dry-run" => Some(Mode::DryRun),
+            _ => None,
+        }
+    }
+
+    /// Whether a human can be asked. Only interactive mode has a channel;
+    /// dry run must not prompt, because nothing is going to happen anyway and
+    /// a dialog would train the operator to approve rehearsals.
+    pub fn prompts_human(self) -> bool {
+        matches!(self, Mode::Interactive)
+    }
 }
 
 /// The policy configuration. Secure defaults: only the three GUI categories are
@@ -190,4 +224,28 @@ pub fn default_agentctl_dir() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
     home.join(".agentctl")
+}
+
+#[cfg(test)]
+mod mode_tests {
+    use super::Mode;
+
+    #[test]
+    fn every_mode_round_trips_through_its_config_spelling() {
+        for m in [Mode::Interactive, Mode::Autonomous, Mode::DryRun] {
+            assert_eq!(Mode::parse(m.as_str()), Some(m));
+        }
+        // A hyphen is the obvious typo for the underscore spelling.
+        assert_eq!(Mode::parse("dry-run"), Some(Mode::DryRun));
+        assert_eq!(Mode::parse("nonsense"), None);
+    }
+
+    /// Only interactive mode has anyone to ask. Dry run must not prompt: there
+    /// is nothing to approve, and asking would teach the operator to approve.
+    #[test]
+    fn only_interactive_mode_prompts_a_human() {
+        assert!(Mode::Interactive.prompts_human());
+        assert!(!Mode::Autonomous.prompts_human());
+        assert!(!Mode::DryRun.prompts_human());
+    }
 }

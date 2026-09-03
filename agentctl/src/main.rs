@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use agentctl::{build_modules, consent_provider, new_session_id, tools_doc};
 use mcp_core::{HttpConfig, HttpTransport, Registry, Server, PROTOCOL_VERSION};
-use mcp_policy::{AuditSink, Mode, Policy, PolicyConfig, Redactor};
+use mcp_policy::{AuditSink, Policy, PolicyConfig, Redactor};
 use mcp_types::Category;
 
 #[tokio::main]
@@ -241,10 +241,7 @@ fn doctor() {
     println!(
         "  consent channel: {} ({} mode, max {} prompts)",
         consent_provider().kind(),
-        match cfg.mode {
-            Mode::Interactive => "interactive",
-            Mode::Autonomous => "autonomous",
-        },
+        cfg.mode.as_str(),
         cfg.max_consent_prompts
     );
     println!("  enabled cats:    {}", slugs(&cfg));
@@ -299,13 +296,7 @@ fn config_print() {
     println!("[policy]");
     println!("categories = [{}]", slugs(&cfg));
     println!("enable = {:?}", cfg.enable);
-    println!(
-        "mode = {}",
-        match cfg.mode {
-            Mode::Interactive => "interactive",
-            Mode::Autonomous => "autonomous",
-        }
-    );
+    println!("mode = {}", cfg.mode.as_str());
     println!("allowed_apps = {:?}", cfg.allowed_apps);
     println!("max_denials = {}", cfg.max_denials);
     println!("max_consent_prompts = {}", cfg.max_consent_prompts);

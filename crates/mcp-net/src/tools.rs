@@ -700,7 +700,7 @@ impl ToolModule for NetModule {
                     "proto":{"type":"string","enum":["all","tcp","udp"]},
                     "state":{"type":"string","description":"e.g. LISTEN, ESTABLISHED"}},
                     "required":[]}),
-            ),
+            ).open_world(false),
             ToolDescriptor::new(
                 "packet_diagnostics",
                 Category::Network,
@@ -755,7 +755,7 @@ impl ToolModule for NetModule {
                 Tier::Read,
                 "List local network interfaces and their addresses.",
                 json!({ "type": "object", "properties": {}, "required": [] }),
-            ),
+            ).open_world(false),
         ]
     }
 

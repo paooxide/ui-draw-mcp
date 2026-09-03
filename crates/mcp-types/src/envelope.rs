@@ -98,6 +98,31 @@ impl Envelope {
         }
     }
 
+    /// A failure that still carries data.
+    ///
+    /// A postcondition that was not met is the motivating case: the action ran,
+    /// so what changed is exactly what the agent needs to see, and reporting
+    /// only "timed out" throws that away.
+    pub fn fail_with_data(
+        tool: impl Into<String>,
+        code: ErrorCode,
+        message: impl Into<String>,
+        suggestion: impl Into<String>,
+        data: Value,
+    ) -> Self {
+        Envelope {
+            ok: false,
+            tool: tool.into(),
+            data: Some(data),
+            error: Some(ToolError {
+                code,
+                message: message.into(),
+                suggestion: Some(suggestion.into()),
+            }),
+            image: None,
+        }
+    }
+
     /// A failure with a recovery suggestion for the agent.
     pub fn fail_with(
         tool: impl Into<String>,

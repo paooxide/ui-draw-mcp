@@ -230,11 +230,8 @@ impl PolicyConfig {
                 ("terminal.allow_shell", Val::Str(s)) => cfg.allow_shell = s == "true",
                 ("network.allow_private", Val::Str(s)) => cfg.allow_private_network = s == "true",
                 ("policy.mode", Val::Str(s)) => {
-                    cfg.mode = match s.as_str() {
-                        "interactive" => Mode::Interactive,
-                        "autonomous" => Mode::Autonomous,
-                        other => return Err(format!("unknown policy.mode '{other}'")),
-                    }
+                    cfg.mode =
+                        Mode::parse(s).ok_or_else(|| format!("unknown policy.mode '{s}'"))?;
                 }
                 ("policy.max_denials", Val::Int(i)) if *i >= 0 => cfg.max_denials = *i as usize,
                 ("policy.max_consent_prompts", Val::Int(i)) if *i >= 0 => {

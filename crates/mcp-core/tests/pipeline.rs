@@ -449,3 +449,151 @@ async fn shutdown_reaches_every_module() {
         "shutdown must be idempotent and always reach the module"
     );
 }
+
+/// Annotations are derived from the tier the gate already enforces, so a client
+/// deciding what to confirm sees the same answer the policy would give. A
+/// second, hand-maintained opinion about the same tool would drift.
+#[tokio::test]
+async fn tools_list_annotations_follow_the_tier() {
+    let cfg = PolicyConfig {
+        categories: vec![Category::Vision, Category::Terminal],
+        enable: vec!["danger_op".into()],
+        ..PolicyConfig::default()
+    };
+    let (server, _calls, _policy) = server_with(cfg);
+    let out = server
+        .handle_line(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#)
+        .await
+        .unwrap();
+    let v: Value = serde_json::from_str(&out).unwrap();
+    let tools = v["result"]["tools"].as_array().unwrap();
+    let by = |n: &str| {
+        tools
+            .iter()
+            .find(|t| t["name"] == n)
+            .unwrap_or_else(|| panic!("{n} missing"))
+            .clone()
+    };
+
+    let read = by("vision_probe");
+    assert_eq!(read["annotations"]["readOnlyHint"], json!(true));
+    assert_eq!(read["annotations"]["destructiveHint"], json!(false));
+    assert_eq!(
+        read["annotations"]["idempotentHint"],
+        json!(true),
+        "a read is repeatable unless the engine says otherwise"
+    );
+
+    let danger = by("danger_op");
+    assert_eq!(danger["annotations"]["destructiveHint"], json!(true));
+    assert_eq!(danger["annotations"]["readOnlyHint"], json!(false));
+
+    // Every tool gets a human-readable title, and acronyms survive it.
+    assert_eq!(read["title"], json!("Vision Probe"));
+    assert!(tools.iter().all(|t| t["title"].is_string()));
+}
+
+/// Dry run is a rehearsal against the real config, the real tool list and the
+/// real gate: reads run, mutations report what they would have done, and the
+/// engine is never reached for them.
+#[tokio::test]
+async fn dry_run_executes_reads_and_only_describes_mutations() {
+    let cfg = PolicyConfig {
+        categories: vec![Category::Vision, Category::Terminal],
+        enable: vec!["danger_op".into()],
+        mode: Mode::DryRun,
+        ..PolicyConfig::default()
+    };
+    let (server, calls, _policy) = server_with(cfg);
+
+    // A read runs for real: an agent cannot plan without observing.
+    let env = server.dispatch_call("vision_probe", json!({})).await;
+    assert!(env.ok);
+    assert!(env.data.as_ref().unwrap().get("dry_run").is_none());
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "the read reached the engine"
+    );
+
+    // A standard-tier mutation is described, not performed.
+    let env = server
+        .dispatch_call("term_run", json!({"cmd": "rm -rf /"}))
+        .await;
+    assert!(env.ok, "a rehearsal reports rather than fails");
+    let d = env.data.unwrap();
+    assert_eq!(d["dry_run"], json!(true));
+    assert_eq!(d["would_execute"]["tool"], json!("term_run"));
+    assert_eq!(
+        d["would_execute"]["args_redacted"]["cmd"],
+        json!("rm -rf /")
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "the engine must not have been reached"
+    );
+
+    // An enabled dangerous tool is described too, and says a human would have
+    // been asked — which is the thing an operator wants to know in advance.
+    let env = server
+        .dispatch_call("danger_op", json!({"risky": true}))
+        .await;
+    assert!(env.ok);
+    let d = env.data.unwrap();
+    assert_eq!(d["dry_run"], json!(true));
+    assert_eq!(d["would_execute"]["consent_required"], json!(true));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+/// The real refusals still happen in a rehearsal. A disabled category and a
+/// dangerous tool that was never opted in are denied exactly as they would be
+/// in earnest — most of what an operator is trying to find out.
+#[tokio::test]
+async fn dry_run_still_reports_the_real_denials() {
+    let cfg = PolicyConfig {
+        categories: vec![Category::Vision],
+        mode: Mode::DryRun,
+        ..PolicyConfig::default()
+    };
+    let (server, calls, _policy) = server_with(cfg);
+
+    let env = server.dispatch_call("term_run", json!({})).await;
+    assert!(!env.ok);
+    assert_eq!(env.error.unwrap().code, ErrorCode::PolicyDenied);
+
+    let cfg = PolicyConfig {
+        categories: vec![Category::Terminal],
+        mode: Mode::DryRun,
+        ..PolicyConfig::default()
+    };
+    let (server2, _c, _p) = server_with(cfg);
+    let env = server2.dispatch_call("danger_op", json!({})).await;
+    assert!(!env.ok, "a dangerous tool nobody enabled is still denied");
+    assert_eq!(env.error.unwrap().code, ErrorCode::PolicyDenied);
+
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+/// Dry run never raises a dialog. Approving a rehearsal teaches an operator to
+/// approve, and there is nothing to approve: the call is not going to happen.
+#[tokio::test]
+async fn dry_run_never_prompts_a_human() {
+    let cfg = PolicyConfig {
+        categories: vec![Category::Vision],
+        mode: Mode::DryRun,
+        ..PolicyConfig::default()
+    };
+    let (server, _calls, human) = server_with_consent(cfg, mcp_policy::ConsentOutcome::Approved);
+    // vision_probe is read-tier, so it is not short-circuited; `risky` makes the
+    // engine ask for consent. Dry run must refuse rather than prompt.
+    let env = server
+        .dispatch_call("vision_probe", json!({"risky": true}))
+        .await;
+    assert!(!env.ok);
+    assert_eq!(env.error.unwrap().code, ErrorCode::ConsentRequired);
+    assert!(
+        human.seen.lock().unwrap().is_empty(),
+        "no human may be prompted during a rehearsal"
+    );
+}

@@ -548,7 +548,7 @@ impl ToolModule for InputModule {
                 "Set the value of a text element by ref (accessibility SetValue).",
                 json!({"type":"object","properties":{
                     "ref":{"type":"string"},"text":{"type":"string"}},"required":["ref","text"]}),
-            ),
+            ).idempotent(true),
             ToolDescriptor::new(
                 "keyboard_type",
                 Category::Input,
@@ -620,7 +620,7 @@ impl ToolModule for InputModule {
                 Tier::Standard,
                 "Write the clipboard.",
                 json!({"type":"object","properties":{"format":{"type":"string","enum":["text","html","image","files"]},"data":{"type":"string"}},"required":["data"]}),
-            ),
+            ).idempotent(true),
         ]
     }
 

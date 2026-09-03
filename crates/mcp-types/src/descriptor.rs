@@ -81,6 +81,24 @@ pub struct ToolDescriptor {
     pub tier: Tier,
     pub description: String,
     pub input_schema: Value,
+    /// Human-readable name for a client's tool list. Derived from `name` when
+    /// unset (see [`ToolDescriptor::display_title`]).
+    pub title: Option<String>,
+    /// Whether calling twice with the same arguments has the same effect as
+    /// calling once. Defaults to "read-tier tools are, others are not", which
+    /// is right often enough that only the exceptions are declared.
+    pub idempotent: Option<bool>,
+    /// Whether the tool touches things outside this machine. Defaults from the
+    /// category.
+    pub open_world: Option<bool>,
+    /// Whether this tool's results contain text from outside the trust
+    /// boundary — a web page, a file, terminal output, an application's own
+    /// accessibility labels.
+    ///
+    /// The driving model reads those results as part of its context, so they
+    /// are an injection surface. Engines set this because engines know what
+    /// their output contains; the core marks the result centrally.
+    pub untrusted_output: bool,
 }
 
 impl ToolDescriptor {
@@ -97,7 +115,65 @@ impl ToolDescriptor {
             tier,
             description: description.into(),
             input_schema,
+            title: None,
+            idempotent: None,
+            open_world: None,
+            untrusted_output: false,
         }
+    }
+
+    /// Override the derived display title.
+    pub fn titled(mut self, title: impl Into<String>) -> Self {
+        self.title = Some(title.into());
+        self
+    }
+
+    /// Declare idempotence explicitly, where the tier's default is wrong.
+    pub fn idempotent(mut self, yes: bool) -> Self {
+        self.idempotent = Some(yes);
+        self
+    }
+
+    /// Declare whether the tool reaches outside this machine.
+    pub fn open_world(mut self, yes: bool) -> Self {
+        self.open_world = Some(yes);
+        self
+    }
+
+    /// Mark this tool's results as carrying content from outside the trust
+    /// boundary.
+    pub fn untrusted_output(mut self) -> Self {
+        self.untrusted_output = true;
+        self
+    }
+
+    /// A display title: the explicit one, else derived from the tool name.
+    ///
+    /// `get_ui_tree` becomes "Get UI Tree" rather than "Get Ui Tree" — the
+    /// acronyms are spelled out because a client renders this to a person.
+    pub fn display_title(&self) -> String {
+        if let Some(t) = &self.title {
+            return t.clone();
+        }
+        const ACRONYMS: &[&str] = &[
+            "ui", "url", "dns", "http", "pty", "ssh", "gpg", "os", "id", "cpu", "js", "dom", "fs",
+            "ocr",
+        ];
+        self.name
+            .split('_')
+            .map(|w| {
+                if ACRONYMS.contains(&w) {
+                    w.to_uppercase()
+                } else {
+                    let mut c = w.chars();
+                    match c.next() {
+                        Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+                        None => String::new(),
+                    }
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 }
 
