@@ -282,6 +282,14 @@ Press a key or chord, e.g. return, escape, cmd+s, cmd+shift+n.
 | Argument | Type | Required | Description |
 |---|---|---|---|
 | `combo` | string | yes |  |
+| `expect` | object |  | optional: wait for this to become true after the action, and return what changed |
+| `expect.app` | string |  | which application to observe |
+| `expect.element` | string |  | synonym for text |
+| `expect.focused` | string |  | wait until an element matching this text has focus |
+| `expect.gone` | string |  | wait until this text is no longer present |
+| `expect.text` | string |  | wait until this text appears in the UI |
+| `expect.timeout_ms` | integer |  | give up after this long (max 30000) |
+| `expect.window` | string |  | wait until a window with this title exists |
 
 ### keyboard-type
 
@@ -291,6 +299,14 @@ Type Unicode text. If 'ref' is given, focus it first. Does not press return.
 
 | Argument | Type | Required | Description |
 |---|---|---|---|
+| `expect` | object |  | optional: wait for this to become true after the action, and return what changed |
+| `expect.app` | string |  | which application to observe |
+| `expect.element` | string |  | synonym for text |
+| `expect.focused` | string |  | wait until an element matching this text has focus |
+| `expect.gone` | string |  | wait until this text is no longer present |
+| `expect.text` | string |  | wait until this text appears in the UI |
+| `expect.timeout_ms` | integer |  | give up after this long (max 30000) |
+| `expect.window` | string |  | wait until a window with this title exists |
 | `ref` | string |  | optional element to focus first |
 | `text` | string | yes |  |
 
@@ -303,6 +319,14 @@ Coordinate pointer action (screen control). 'modifiers' holds keys down for the 
 | Argument | Type | Required | Description |
 |---|---|---|---|
 | `button` | string |  | left\|right\|middle |
+| `expect` | object |  | optional: wait for this to become true after the action, and return what changed |
+| `expect.app` | string |  | which application to observe |
+| `expect.element` | string |  | synonym for text |
+| `expect.focused` | string |  | wait until an element matching this text has focus |
+| `expect.gone` | string |  | wait until this text is no longer present |
+| `expect.text` | string |  | wait until this text appears in the UI |
+| `expect.timeout_ms` | integer |  | give up after this long (max 30000) |
+| `expect.window` | string |  | wait until a window with this title exists |
 | `modifiers` | array&lt;one of: cmd, shift, opt, alt, ctrl, fn&gt; |  |  |
 | `type` | one of: move, click, double, triple, right_click, down, up | yes |  |
 | `x` | number | yes |  |
@@ -330,6 +354,14 @@ Set the value of a text element by ref (accessibility SetValue).
 
 | Argument | Type | Required | Description |
 |---|---|---|---|
+| `expect` | object |  | optional: wait for this to become true after the action, and return what changed |
+| `expect.app` | string |  | which application to observe |
+| `expect.element` | string |  | synonym for text |
+| `expect.focused` | string |  | wait until an element matching this text has focus |
+| `expect.gone` | string |  | wait until this text is no longer present |
+| `expect.text` | string |  | wait until this text appears in the UI |
+| `expect.timeout_ms` | integer |  | give up after this long (max 30000) |
+| `expect.window` | string |  | wait until a window with this title exists |
 | `ref` | string | yes |  |
 | `text` | string | yes |  |
 
@@ -342,6 +374,14 @@ Perform a semantic action on an element by ref (accessibility action, no cursor)
 | Argument | Type | Required | Description |
 |---|---|---|---|
 | `action` | one of: click, double_click, right_click, focus, toggle, check, uncheck, expand, collapse, select, scroll_into_view | yes |  |
+| `expect` | object |  | optional: wait for this to become true after the action, and return what changed |
+| `expect.app` | string |  | which application to observe |
+| `expect.element` | string |  | synonym for text |
+| `expect.focused` | string |  | wait until an element matching this text has focus |
+| `expect.gone` | string |  | wait until this text is no longer present |
+| `expect.text` | string |  | wait until this text appears in the UI |
+| `expect.timeout_ms` | integer |  | give up after this long (max 30000) |
+| `expect.window` | string |  | wait until a window with this title exists |
 | `option` | string |  | option label for select |
 | `ref` | string | yes | element ref @eN |
 

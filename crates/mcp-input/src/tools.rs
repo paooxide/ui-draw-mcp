@@ -555,6 +555,18 @@ impl InputModule {
     }
 }
 
+/// The `expect` clause the action tools accept.
+///
+/// It belongs *inside* `properties`, next to the other arguments. Hoisting it
+/// to the top level of the schema — which is where it started — leaves it
+/// undeclared: a client reading the schema properly never learns the argument
+/// exists, and the act-and-confirm round trip silently goes unused.
+fn expect_schema() -> serde_json::Value {
+    mcp_window::wait_schema(
+        "optional: wait for this to become true after the action, and return what changed",
+    )
+}
+
 #[async_trait]
 impl ToolModule for InputModule {
     fn descriptors(&self) -> Vec<ToolDescriptor> {
@@ -568,9 +580,9 @@ impl ToolModule for InputModule {
                 json!({"type":"object","properties":{
                     "ref":{"type":"string","description":"element ref @eN"},
                     "action":{"type":"string","enum":["click","double_click","right_click","focus","toggle","check","uncheck","expand","collapse","select","scroll_into_view"]},
-                    "option":{"type":"string","description":"option label for select"}
-                },"expect": mcp_window::wait_schema("optional: wait for this to become true after the action, and return what changed"),
-                        "required":["ref","action"]}),
+                    "option":{"type":"string","description":"option label for select"},
+                    "expect": expect_schema()
+                },"required":["ref","action"]}),
             ),
             ToolDescriptor::new(
                 "set_value",
@@ -578,8 +590,8 @@ impl ToolModule for InputModule {
                 Tier::Standard,
                 "Set the value of a text element by ref (accessibility SetValue).",
                 json!({"type":"object","properties":{
-                    "ref":{"type":"string"},"text":{"type":"string"}},"expect": mcp_window::wait_schema("optional: wait for this to become true after the action, and return what changed"),
-                        "required":["ref","text"]}),
+                    "ref":{"type":"string"},"text":{"type":"string"},
+                    "expect": expect_schema()},"required":["ref","text"]}),
             ).idempotent(true),
             ToolDescriptor::new(
                 "keyboard_type",
@@ -587,16 +599,16 @@ impl ToolModule for InputModule {
                 Tier::Standard,
                 "Type Unicode text. If 'ref' is given, focus it first. Does not press return.",
                 json!({"type":"object","properties":{
-                    "text":{"type":"string"},"ref":{"type":"string","description":"optional element to focus first"}},"expect": mcp_window::wait_schema("optional: wait for this to become true after the action, and return what changed"),
-                        "required":["text"]}),
+                    "text":{"type":"string"},"ref":{"type":"string","description":"optional element to focus first"},
+                    "expect": expect_schema()},"required":["text"]}),
             ),
             ToolDescriptor::new(
                 "keyboard_shortcut",
                 Category::Input,
                 Tier::Standard,
                 "Press a key or chord, e.g. return, escape, cmd+s, cmd+shift+n.",
-                json!({"type":"object","properties":{"combo":{"type":"string"}},"expect": mcp_window::wait_schema("optional: wait for this to become true after the action, and return what changed"),
-                        "required":["combo"]}),
+                json!({"type":"object","properties":{"combo":{"type":"string"},
+                    "expect": expect_schema()},"required":["combo"]}),
             ),
             ToolDescriptor::new(
                 "mouse_action",
@@ -609,9 +621,8 @@ impl ToolModule for InputModule {
                     "type":{"type":"string","enum":["move","click","double","triple","right_click","down","up"]},
                     "x":{"type":"number"},"y":{"type":"number"},
                     "button":{"type":"string","description":"left|right|middle"},
-                    "modifiers":{"type":"array","items":{"type":"string","enum":["cmd","shift","opt","alt","ctrl","fn"]}}},
-                    "expect": mcp_window::wait_schema("optional: wait for this to become true after the action, and return what changed"),
-                        "required":["type","x","y"]}),
+                    "modifiers":{"type":"array","items":{"type":"string","enum":["cmd","shift","opt","alt","ctrl","fn"]}},
+                    "expect": expect_schema()},"required":["type","x","y"]}),
             ),
             ToolDescriptor::new(
                 "scroll",

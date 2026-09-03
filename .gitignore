@@ -5,3 +5,9 @@ Cargo.lock.bak
 # runtime artifacts
 /audit
 *.jsonl
+
+# secrets — never committed
+.env
+.env.*
+!.env.example
+*.key
