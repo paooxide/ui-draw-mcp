@@ -78,6 +78,23 @@ impl Policy {
         self.config.categories.contains(&category)
     }
 
+    /// Stop everything, and say why.
+    ///
+    /// Used by the pointer watcher when a human takes over the mouse. Audited
+    /// like any other decision so the log shows what ended the session.
+    pub fn trip_kill_switch(&self, session_id: &str, reason: &str) {
+        self.kill.trip(reason);
+        let mut rec = crate::AuditRecord::pre(session_id, "kill_switch");
+        rec.decision = Some(format!("tripped: {reason}"));
+        self.audit(&rec);
+        tracing::error!(reason, "kill switch tripped");
+    }
+
+    /// Why the kill switch is engaged, if it is.
+    pub fn kill_switch_reason(&self) -> Option<String> {
+        self.kill.reason()
+    }
+
     pub fn kill_switch_tripped(&self) -> bool {
         self.kill.tripped()
     }

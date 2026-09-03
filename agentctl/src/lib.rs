@@ -10,10 +10,11 @@ use mcp_core::{Registry, Server};
 use mcp_policy::{AuditSink, Policy, PolicyConfig, Redactor};
 
 pub mod engines;
+pub mod override_watch;
 pub mod tools_doc;
 pub mod tools_system;
 
-pub use engines::{build_modules, EngineConfig};
+pub use engines::{build_modules, build_stack, EngineConfig, Wiring};
 
 /// The out-of-band human-approval channel.
 ///
@@ -46,8 +47,24 @@ pub fn build_server(
     consent: Arc<dyn mcp_policy::ConsentProvider>,
     session_id: impl Into<String>,
 ) -> Result<Server, String> {
-    let modules = build_modules(&cfg);
+    Ok(build_server_with(cfg, audit, consent, session_id)?.0)
+}
+
+/// As [`build_server`], but also returning the handles the human-override
+/// watcher needs. Tests use the simpler form; only `serve` starts a watcher.
+pub fn build_server_with(
+    cfg: PolicyConfig,
+    audit: AuditSink,
+    consent: Arc<dyn mcp_policy::ConsentProvider>,
+    session_id: impl Into<String>,
+) -> Result<(Server, Arc<Policy>, engines::Wiring), String> {
+    let (modules, wiring) = build_stack(&cfg);
     let registry = Registry::build(modules)?;
     let policy = Arc::new(Policy::new(cfg, audit, Redactor::empty()).with_consent(consent));
-    Ok(Server::new(registry, policy, session_id.into()))
+    let session_id = session_id.into();
+    Ok((
+        Server::new(registry, policy.clone(), session_id),
+        policy,
+        wiring,
+    ))
 }

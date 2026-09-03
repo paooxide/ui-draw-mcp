@@ -148,6 +148,9 @@ pub struct InputModule {
     /// Runs `expect` clauses. `None` where there is no window backend to
     /// observe with, in which case an `expect` is refused rather than ignored.
     verifier: Option<std::sync::Arc<crate::postcondition::Verifier>>,
+    /// Marks the session as driving, so the human-override watcher only
+    /// samples the pointer when a divergence would mean something.
+    activity: Option<std::sync::Arc<crate::Activity>>,
 }
 
 impl InputModule {
@@ -161,7 +164,14 @@ impl InputModule {
             arena,
             policy,
             verifier: None,
+            activity: None,
         }
+    }
+
+    /// Attach the driving-activity marker (composition root only).
+    pub fn with_activity(mut self, a: std::sync::Arc<crate::Activity>) -> Self {
+        self.activity = Some(a);
+        self
     }
 
     /// Attach the postcondition verifier (composition root only).
@@ -650,6 +660,11 @@ impl ToolModule for InputModule {
     }
 
     async fn call(&self, name: &str, args: Value, ctx: &CallCtx) -> Envelope {
+        // Held for the whole call, including any `expect` wait: the pointer is
+        // ours for that entire window, so a divergence during it is somebody
+        // else's hand.
+        let _driving = self.activity.as_ref().map(crate::Activity::begin);
+
         // An `expect` clause is parsed *before* the action: discovering the
         // expectation was malformed after clicking is too late to be useful.
         let spec = if EXPECTING.contains(&name) {

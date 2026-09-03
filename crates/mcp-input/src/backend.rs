@@ -190,6 +190,25 @@ pub trait InputBackend: Send + Sync {
     fn input_target(&self) -> Option<String>;
     async fn clipboard_write(&self, format: ClipFormat, data: &str) -> Result<(), InputError>;
     fn platform(&self) -> &'static str;
+
+    /// Where the pointer actually is, in the same coordinate space `mouse`
+    /// uses. `None` means this backend cannot tell — which is never treated as
+    /// evidence that a human moved it.
+    async fn pointer_position(&self) -> Result<Option<(f64, f64)>, InputError> {
+        Ok(None)
+    }
+
+    /// Pointer positions this backend recently *set*, newest last.
+    ///
+    /// The watcher compares where the pointer is against where the server put
+    /// it; without this it could not tell its own movement from anyone else's.
+    fn recent_pointer_sets(&self) -> Vec<crate::SetPoint> {
+        Vec::new()
+    }
+
+    /// Abandon anything in flight — a drag mid-path, for instance, which would
+    /// otherwise keep the button held while the human moves the mouse.
+    fn cancel_pending(&self) {}
 }
 
 /// Modifier names accepted by pointer actions, matching `keyboard_shortcut`'s

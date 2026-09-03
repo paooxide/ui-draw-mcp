@@ -35,6 +35,14 @@ All notable changes to this project are documented here. The format follows
 
 ### Security
 
+- **Human override.** Reaching for the mouse now stops the agent. While
+  agentctl is driving, a sustained divergence between where the pointer is and
+  where the server put it trips the kill switch, cancels any drag in progress,
+  and posts a notification explaining how to resume. Configured under `[input]`;
+  keyboard has no equivalent signal and is deliberately not covered. The kill
+  switch now records *why* it engaged, and persists the reason so a restart
+  does not silently resume the agent.
+
 - Results from the tools that return third-party content now carry
   `provenance: "untrusted"`, with an advisory `suspicious_instructions` flag for
   text that reads as an instruction aimed at a model. Applied centrally so it

@@ -5,8 +5,8 @@
 use std::sync::Arc;
 
 use agentctl::{build_modules, consent_provider, new_session_id, tools_doc};
-use mcp_core::{HttpConfig, HttpTransport, Registry, Server, PROTOCOL_VERSION};
-use mcp_policy::{AuditSink, Policy, PolicyConfig, Redactor};
+use mcp_core::{HttpConfig, HttpTransport, PROTOCOL_VERSION};
+use mcp_policy::{AuditSink, PolicyConfig};
 use mcp_types::Category;
 
 #[tokio::main]
@@ -85,12 +85,28 @@ async fn serve(force_http: bool) -> std::io::Result<()> {
     let session_id = new_session_id();
     let audit = AuditSink::file(cfg.audit_dir.clone(), &session_id)?;
     let http = (force_http || cfg.http_enabled).then(|| http_config(&cfg));
-    let modules = build_modules(&cfg);
-    let policy =
-        Arc::new(Policy::new(cfg, audit, Redactor::empty()).with_consent(consent_provider()));
-    let registry = Registry::build(modules)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    let server = Server::new(registry, policy, session_id.clone());
+    let override_cfg = mcp_input::OverrideConfig {
+        enabled: cfg.human_override,
+        threshold_px: cfg.human_override_px as f64,
+        grace_ms: cfg.human_override_grace_ms,
+        ..mcp_input::OverrideConfig::default()
+    };
+    let (server, policy, wiring) =
+        agentctl::build_server_with(cfg, audit, consent_provider(), session_id.clone())
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+
+    // Reaching for the mouse is how people already interrupt something; this
+    // makes that gesture stop the agent.
+    if let (Some(input), Some(activity)) = (wiring.input.clone(), wiring.activity.clone()) {
+        agentctl::override_watch::spawn(
+            input,
+            activity,
+            override_cfg,
+            policy.clone(),
+            wiring.desktop.clone(),
+            session_id.clone(),
+        );
+    }
 
     let Some(http) = http else {
         tracing::info!(session = %session_id, protocol = PROTOCOL_VERSION, "agentctl serving on stdio");
@@ -230,6 +246,13 @@ fn doctor() {
         cfg.kill_switch_file.display(),
         cfg.kill_switch_file.exists()
     );
+    // If it is engaged, why matters more than that it is: a STOP file with no
+    // explanation looks like a bug rather than a decision.
+    if let Ok(first) = std::fs::read_to_string(&cfg.kill_switch_file) {
+        if let Some(line) = first.lines().next().filter(|l| !l.trim().is_empty()) {
+            println!("                   ENGAGED — {line}");
+        }
+    }
     println!("  audit dir:       {}", cfg.audit_dir.display());
     println!(
         "  config file:     {} (present: {})",
@@ -243,6 +266,12 @@ fn doctor() {
         consent_provider().kind(),
         cfg.mode.as_str(),
         cfg.max_consent_prompts
+    );
+    println!(
+        "  human override:  {} ({}px, grace {}ms)",
+        if cfg.human_override { "on" } else { "off" },
+        cfg.human_override_px,
+        cfg.human_override_grace_ms
     );
     println!("  enabled cats:    {}", slugs(&cfg));
     println!(

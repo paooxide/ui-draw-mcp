@@ -311,6 +311,10 @@ struct AppTarget {
 /// keeps a child-index *path* from the app root (Send-safe), re-walked to act.
 pub struct MacosBackend {
     state: Mutex<State>,
+    /// Set when something asks in-flight work to stop — the human-override
+    /// watcher, for instance. Checked between the steps of a drag, which would
+    /// otherwise keep the button held while the person moves the mouse.
+    cancel: std::sync::atomic::AtomicBool,
 }
 
 impl Default for MacosBackend {
@@ -323,6 +327,7 @@ impl MacosBackend {
     pub fn new() -> Self {
         MacosBackend {
             state: Mutex::new(State::default()),
+            cancel: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -642,6 +647,15 @@ impl InputBackend for MacosBackend {
     async fn scroll_at(&self, x: f64, y: f64, d: ScrollDir, a: i32) -> Result<(), InputError> {
         crate::event::scroll(x, y, d, a)
     }
+    async fn pointer_position(&self) -> Result<Option<(f64, f64)>, InputError> {
+        crate::event::pointer_position()
+    }
+    fn recent_pointer_sets(&self) -> Vec<mcp_input::SetPoint> {
+        crate::event::recent_sets()
+    }
+    fn cancel_pending(&self) {
+        self.cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
     async fn hover(&self, x: f64, y: f64) -> Result<(), InputError> {
         crate::event::hover(x, y)
     }
@@ -652,13 +666,26 @@ impl InputBackend for MacosBackend {
         modifiers: &[String],
         steps: u32,
     ) -> Result<(), InputError> {
+        use std::sync::atomic::Ordering;
         use tokio::time::{sleep, Duration};
+        self.cancel.store(false, Ordering::SeqCst);
         crate::event::drag_begin(from, modifiers)?;
         // Let the press register before motion starts; a drag that begins in
         // the same instant reads as a click to most targets.
         sleep(Duration::from_millis(30)).await;
+        let mut last = from;
         for p in crate::event::drag_path(from, to, steps) {
+            // A cancelled drag must release the button where it is. Returning
+            // with it still held would leave the human dragging a selection
+            // around with their own mouse.
+            if self.cancel.load(Ordering::SeqCst) {
+                let _ = crate::event::drag_end(last, modifiers);
+                return Err(InputError::Failed(
+                    "drag aborted: a human took over the pointer".into(),
+                ));
+            }
             crate::event::drag_to(p, modifiers)?;
+            last = p;
             sleep(Duration::from_millis(8)).await;
         }
         // Settle at the destination so the drop target can highlight and accept.

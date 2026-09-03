@@ -3,17 +3,109 @@
 //! the AX calls, `CGEvent::post` is fire-and-forget and cannot report a
 //! permission failure, so these return `Ok` even when the OS drops the event.
 
+use core_graphics::display::CGDisplay;
 use core_graphics::event::{
     CGEvent, CGEventFlags, CGEventTapLocation, CGEventType, CGKeyCode, CGMouseButton, EventField,
     ScrollEventUnit,
 };
 use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 use core_graphics::geometry::CGPoint;
+use std::collections::VecDeque;
+use std::sync::Mutex;
 
-use mcp_input::{InputError, MouseKind, ScrollDir};
+use mcp_input::{InputError, MouseKind, ScrollDir, SetPoint};
 
 fn fail(what: &str) -> InputError {
     InputError::Failed(format!("{what} failed"))
+}
+
+/// The pointer positions this process has set, newest last.
+///
+/// The human-override watcher compares where the pointer *is* against where the
+/// server *put* it; without this record it could not tell its own movement from
+/// anybody else's. Bounded, because a long drag would otherwise grow it without
+/// limit and only the recent past is an explanation for the present.
+static RECENT_SETS: Mutex<VecDeque<SetPoint>> = Mutex::new(VecDeque::new());
+const MAX_RECENT_SETS: usize = 64;
+
+/// Milliseconds since the epoch. Local rather than pulling in the policy crate:
+/// a backend has no business depending on the security kernel.
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn record_set(pt: CGPoint) {
+    let mut g = RECENT_SETS.lock().unwrap_or_else(|e| e.into_inner());
+    if g.len() >= MAX_RECENT_SETS {
+        g.pop_front();
+    }
+    g.push_back(SetPoint {
+        x: pt.x,
+        y: pt.y,
+        at_ms: now_ms(),
+    });
+}
+
+/// Positions this process recently set, newest last.
+pub fn recent_sets() -> Vec<SetPoint> {
+    RECENT_SETS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .copied()
+        .collect()
+}
+
+/// Where the pointer actually is, in the same global display space used for
+/// posting. Needs no permission: it reads the event system's own state.
+pub fn pointer_position() -> Result<Option<(f64, f64)>, InputError> {
+    let ev = CGEvent::new(source()?).map_err(|_| fail("read pointer"))?;
+    let p = ev.location();
+    Ok(Some((p.x, p.y)))
+}
+
+/// Clamp a point into the union of the displays.
+///
+/// Pure, and applied before recording: the OS silently clamps a click aimed
+/// past the screen edge, so recording the *requested* point would leave the
+/// watcher comparing against a position the pointer never occupied — and
+/// reporting the server's own click as a human takeover.
+pub fn clamp_point(pt: (f64, f64), rects: &[(f64, f64, f64, f64)]) -> (f64, f64) {
+    if rects.is_empty() {
+        return pt;
+    }
+    let inside = rects
+        .iter()
+        .any(|(x, y, w, h)| pt.0 >= *x && pt.0 <= x + w && pt.1 >= *y && pt.1 <= y + h);
+    if inside {
+        return pt;
+    }
+    let mut best = pt;
+    let mut best_d = f64::INFINITY;
+    for (x, y, w, h) in rects {
+        let cx = pt.0.clamp(*x, x + w);
+        let cy = pt.1.clamp(*y, y + h);
+        let d = ((cx - pt.0).powi(2) + (cy - pt.1).powi(2)).sqrt();
+        if d < best_d {
+            best_d = d;
+            best = (cx, cy);
+        }
+    }
+    best
+}
+
+fn display_rects() -> Vec<(f64, f64, f64, f64)> {
+    CGDisplay::active_displays()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|id| {
+            let b = CGDisplay::new(id).bounds();
+            (b.origin.x, b.origin.y, b.size.width, b.size.height)
+        })
+        .collect()
 }
 
 fn source() -> Result<CGEventSource, InputError> {
@@ -99,6 +191,13 @@ fn post_mouse_ex(
     flags: CGEventFlags,
     click_state: i64,
 ) -> Result<(), InputError> {
+    // The OS clamps a point past the screen edge; recording the unclamped
+    // request would have the watcher compare against a position the pointer
+    // never occupied, and read the server's own click as a human takeover.
+    let pt = {
+        let (x, y) = clamp_point((pt.x, pt.y), &display_rects());
+        CGPoint::new(x, y)
+    };
     let ev = CGEvent::new_mouse_event(source()?, ty, pt, btn).map_err(|_| fail("mouse event"))?;
     // Always set it, including for a single click. `CGEventCreateMouseEvent`
     // leaves the field at 0, which reaches AppKit as `clickCount == 0` — not
@@ -113,6 +212,9 @@ fn post_mouse_ex(
     // then behaves as shift-click and extends a selection instead of moving the
     // caret. Setting it explicitly clears the inherited state.
     ev.set_flags(flags);
+    // Record before posting: this is the only place the pointer is written, so
+    // it is the only place the override watcher can learn what was ours.
+    record_set(pt);
     ev.post(CGEventTapLocation::HID);
     Ok(())
 }
@@ -424,5 +526,52 @@ mod tests {
         let (_, d, u) = button_events("anything-else");
         assert!(matches!(d, CGEventType::LeftMouseDown));
         assert!(matches!(u, CGEventType::LeftMouseUp));
+    }
+}
+
+#[cfg(test)]
+mod pointer_tests {
+    use super::*;
+
+    /// A point already on a display is left alone.
+    #[test]
+    fn a_point_on_screen_is_not_moved() {
+        let screens = [(0.0, 0.0, 1512.0, 982.0)];
+        assert_eq!(clamp_point((100.0, 200.0), &screens), (100.0, 200.0));
+    }
+
+    /// A point past the edge is pulled to the nearest position the pointer can
+    /// actually occupy — which is where the OS will put it anyway. Recording
+    /// the unclamped request would make the server's own click look like
+    /// somebody else's.
+    #[test]
+    fn a_point_off_screen_is_clamped_to_the_nearest_display() {
+        let screens = [(0.0, 0.0, 1512.0, 982.0)];
+        assert_eq!(clamp_point((5000.0, 500.0), &screens), (1512.0, 500.0));
+        assert_eq!(clamp_point((-40.0, -40.0), &screens), (0.0, 0.0));
+    }
+
+    /// With two displays, the nearer one wins.
+    #[test]
+    fn clamping_picks_the_closest_of_several_displays() {
+        let screens = [(0.0, 0.0, 100.0, 100.0), (1000.0, 0.0, 100.0, 100.0)];
+        assert_eq!(clamp_point((1050.0, 500.0), &screens), (1050.0, 100.0));
+        assert_eq!(clamp_point((50.0, 500.0), &screens), (50.0, 100.0));
+    }
+
+    /// No display information means no clamping: guessing would be worse.
+    #[test]
+    fn with_no_displays_the_point_is_unchanged() {
+        assert_eq!(clamp_point((5000.0, 5000.0), &[]), (5000.0, 5000.0));
+    }
+
+    /// Reading the pointer needs no permission and must always answer.
+    #[test]
+    fn the_pointer_can_be_read_without_moving_it() {
+        // Headless CI has no window server, so `None` or an error is an answer
+        // too. What matters is that the call returns rather than blocking.
+        if let Ok(Some((x, y))) = pointer_position() {
+            assert!(x.is_finite() && y.is_finite());
+        }
     }
 }

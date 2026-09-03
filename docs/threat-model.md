@@ -79,7 +79,8 @@ gate would have refused.
 | Consent channel | `mcp-policy::consent` | Unattended high-impact actions. Native dialog, default button Deny, timeout denies. Engines *describe* risk; only the core may ask, so nothing approves itself. |
 | Prompt budget | `PromptBudget` | Consent fatigue. Past `max_consent_prompts`, further requests are denied without prompting. |
 | Denial budget | `DenialBudget` | An agent spinning against the gate. |
-| Kill switch | `mcp-policy::KillSwitch` | Everything, immediately. Checked before every policy decision. |
+| Kill switch | `mcp-policy::KillSwitch` | Everything, immediately. Checked before every policy decision. Trips on the STOP file, or from inside when a human takes the mouse; the reason is recorded and persisted. |
+| Human override | `mcp-input::human_override` + `agentctl::override_watch` | An agent doing the wrong thing while a person is watching. Reaching for the mouse is the reflex people already have, so it is the interrupt worth honouring: while agentctl is driving, a sustained divergence between where the pointer is and where the server put it trips the kill switch, cancels any drag, and posts a notification. Keyboard has no equivalent signal and is out of scope. |
 | Destructive-keystroke gate | `mcp-policy::is_destructive` + `input::screens_as_terminal` | `rm -rf /` typed into a shell. Asks the *live input target*, and an undeterminable target screens as a terminal — unknown destination is not evidence of safety. |
 | Path jail | `mcp-fs::Jail` | Reading or writing outside the roots. Resolves *then* checks, defeating `..` and symlinked parents. Credential paths and the server's own state directory are denied even inside a root. |
 | SSRF guard | `mcp-net::ssrf` | Reaching loopback, private ranges, link-local and cloud metadata. Judges the *resolved* address; redirects disabled. |
@@ -165,6 +166,14 @@ calls, and anything rendered as an image. All of those are asserted as passing i
 understanding the text, which is the model's job rather than a string matcher's — which is exactly why the
 controls that matter are the ones that do not depend on reading intent. **An injection that succeeds
 completely still cannot call a tool the operator did not enable.**
+
+**Human override is a convenience, not a containment boundary.**
+It notices a person taking the mouse. It cannot notice a person typing — that
+would need an event tap watching every keystroke on the machine — and it is
+disabled the moment a backend cannot read the pointer, because an unreadable
+sensor must never be treated as evidence of interference. It also cannot help
+when nobody is at the machine, which is exactly when an autonomous agent runs.
+The STOP file remains the control that always works.
 
 ## 8. Out of scope, by choice
 

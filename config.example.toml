@@ -39,6 +39,24 @@ max_denials = 5
 allowed_apps = ["TextEdit", "Finder"]
 
 [input]
+# Stop when a human takes over the mouse.
+#
+# Reaching for the mouse is the reflex people already have for interrupting
+# something; this makes that gesture stop the agent, without needing to
+# remember a key combination or find the STOP file. While agentctl is driving,
+# it compares where the pointer *is* against where it *put* it; a sustained
+# divergence trips the kill switch, cancels any drag in progress, and posts a
+# notification saying how to resume.
+#
+# Keyboard has no equivalent signal and is deliberately not covered: detecting
+# human typing would mean watching every keystroke on the machine.
+human_override = "true"
+# How far the pointer must be from anywhere agentctl put it, in points. Small
+# values trip on ordinary coordinate jitter.
+human_override_px = 12
+# How long after an action agentctl still counts as driving, so a divergence
+# between two calls is not missed.
+human_override_grace_ms = 1500
 # Apps whose typed input is screened for destructive shell commands.
 # Editors are included by default because their *integrated terminals* run the
 # same shell — the accessibility API cannot tell an editor pane from a terminal

@@ -227,6 +227,13 @@ impl PolicyConfig {
                 ("http.allowed_origins", Val::List(v)) => cfg.http_allowed_origins = v.clone(),
                 ("memory.store", Val::Str(s)) => cfg.memory_store = PathBuf::from(s),
                 ("memory.max_recipes", Val::Int(i)) if *i >= 0 => cfg.max_recipes = *i as usize,
+                ("input.human_override", Val::Str(s)) => cfg.human_override = s == "true",
+                ("input.human_override_px", Val::Int(i)) if *i > 0 => {
+                    cfg.human_override_px = *i as u32
+                }
+                ("input.human_override_grace_ms", Val::Int(i)) if *i >= 0 => {
+                    cfg.human_override_grace_ms = *i as u64
+                }
                 ("terminal.allow_shell", Val::Str(s)) => cfg.allow_shell = s == "true",
                 ("network.allow_private", Val::Str(s)) => cfg.allow_private_network = s == "true",
                 ("policy.mode", Val::Str(s)) => {

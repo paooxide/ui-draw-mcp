@@ -530,3 +530,70 @@ async fn expect_folds_act_wait_and_verify_into_one_call() {
 
     let _ = c.call("close_app", json!({ "app": "TextEdit" })).await;
 }
+
+/// Reaching for the mouse stops the agent.
+///
+/// The two halves are equally important. Driving the pointer repeatedly must
+/// *not* trip — a false stop is an agent that cannot work — and a person taking
+/// over must trip promptly. The "person" here warps the cursor from outside
+/// agentctl, exactly as a hand on a real mouse does: through a path the server
+/// never records as its own.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_human_taking_the_mouse_is_detected_and_agentctl_moving_it_is_not() {
+    use core_graphics::display::CGDisplay;
+    use core_graphics::geometry::CGPoint;
+    use mcp_input::{Detector, InputBackend, MouseKind, OverrideConfig, Verdict};
+
+    if !ready() {
+        return;
+    }
+    let backend = mcp_macos::MacosBackend::new();
+    let cfg = OverrideConfig::default();
+    let now = || mcp_policy::now_ms() as u64;
+
+    // Put the pointer somewhere known and let the detector settle on it.
+    let mut d = Detector::new();
+    backend
+        .mouse(MouseKind::Move, 400.0, 400.0, None, &[])
+        .await
+        .expect("move");
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    // The server driving its own pointer is never a takeover, however often.
+    for i in 0..8 {
+        let x = 400.0 + f64::from(i) * 15.0;
+        backend
+            .mouse(MouseKind::Move, x, 400.0, None, &[])
+            .await
+            .expect("move");
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        let observed = backend.pointer_position().await.expect("read pointer");
+        let v = d.observe(now(), true, &backend.recent_pointer_sets(), observed, &cfg);
+        assert!(
+            matches!(v, Verdict::Consistent),
+            "agentctl moving its own pointer must never look like a takeover, got {v:?}"
+        );
+    }
+
+    // Now a person grabs it. CGWarpMouseCursorPosition is not an event the
+    // server posts, so nothing records these positions as ours.
+    for i in 0..6 {
+        CGDisplay::warp_mouse_cursor_position(CGPoint::new(900.0 + f64::from(i) * 6.0, 700.0))
+            .expect("warp");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let observed = backend.pointer_position().await.expect("read pointer");
+    let recent = backend.recent_pointer_sets();
+    let first = d.observe(now(), true, &recent, observed, &cfg);
+    let second = d.observe(now(), true, &recent, observed, &cfg);
+    assert!(
+        matches!(first, Verdict::Suspicious) && matches!(second, Verdict::Tripped { .. }),
+        "a human on the mouse must trip after confirmation, got {first:?} then {second:?}"
+    );
+    if let Verdict::Tripped { distance, .. } = second {
+        assert!(distance > cfg.threshold_px);
+    }
+
+    // Leave the pointer somewhere harmless.
+    let _ = CGDisplay::warp_mouse_cursor_position(CGPoint::new(400.0, 400.0));
+}

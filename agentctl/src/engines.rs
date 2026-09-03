@@ -95,11 +95,29 @@ pub fn vision_config(c: &PolicyConfig) -> mcp_vision::VisionConfig {
 /// callers cannot build a *nearly* correct server by forgetting an argument.
 #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
 pub fn build_modules(cfg: &PolicyConfig) -> Vec<Arc<dyn ToolModule>> {
+    build_stack(cfg).0
+}
+
+/// What the composition root needs beyond the module list: the handles the
+/// human-override watcher joins together. An engine must never be able to trip
+/// the kill switch itself, so the engine exposes a sensor and the root wires it
+/// to the brake.
+#[derive(Default)]
+pub struct Wiring {
+    pub input: Option<Arc<dyn mcp_input::InputBackend>>,
+    pub activity: Option<Arc<mcp_input::Activity>>,
+    pub desktop: Option<Arc<dyn mcp_desktop::DesktopBackend>>,
+}
+
+/// Wire every engine, and hand back the extra handles.
+#[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
+pub fn build_stack(cfg: &PolicyConfig) -> (Vec<Arc<dyn ToolModule>>, Wiring) {
     let engines = EngineConfig::from(cfg);
     let autonomous = matches!(cfg.mode, Mode::Autonomous);
     let allowed_apps = cfg.allowed_apps.clone();
     let terminal_apps = cfg.terminal_apps.clone();
     let mut modules: Vec<Arc<dyn ToolModule>> = vec![Arc::new(SystemModule)];
+    let mut wiring = Wiring::default();
     #[cfg(target_os = "macos")]
     let audio_roots = engines.fs_roots.clone();
 
@@ -200,9 +218,12 @@ pub fn build_modules(cfg: &PolicyConfig) -> Vec<Arc<dyn ToolModule>> {
             backend.clone(),
             arena.clone(),
         ));
-        let input = InputModule::new(backend.clone(), arena, input_policy).with_verifier(verifier);
+        let activity = mcp_input::Activity::new();
+        let input = InputModule::new(backend.clone(), arena, input_policy)
+            .with_verifier(verifier)
+            .with_activity(activity.clone());
         let vision = VisionModule::new(backend.clone(), engines.vision);
-        let window = WindowModule::new(backend.clone(), backend, allowed_apps);
+        let window = WindowModule::new(backend.clone(), backend.clone(), allowed_apps);
         modules.push(Arc::new(a11y));
         modules.push(Arc::new(input));
         modules.push(Arc::new(vision));
@@ -210,10 +231,14 @@ pub fn build_modules(cfg: &PolicyConfig) -> Vec<Arc<dyn ToolModule>> {
         // `play_audio` is bounded by the same roots as the filesystem engine:
         // an agent able to name any path could use the speakers to read out a
         // file it was never allowed to open.
+        let desktop_backend = Arc::new(MacosDesktop::new());
         modules.push(Arc::new(DesktopModule::new(
-            Arc::new(MacosDesktop::new()),
+            desktop_backend.clone(),
             audio_roots,
         )));
+        wiring.input = Some(backend.clone());
+        wiring.activity = Some(activity);
+        wiring.desktop = Some(desktop_backend);
     }
-    modules
+    (modules, wiring)
 }

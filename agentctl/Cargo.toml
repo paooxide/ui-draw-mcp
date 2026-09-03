@@ -38,6 +38,7 @@ mcp-sec = { path = "../crates/mcp-sec" }
 mcp-pty = { path = "../crates/mcp-pty" }
 mcp-pkg = { path = "../crates/mcp-pkg" }
 mcp-memory = { path = "../crates/mcp-memory" }
+mcp-window = { path = "../crates/mcp-window" }
 tokio = { workspace = true, features = ["signal"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
@@ -52,6 +53,9 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
 [target.'cfg(target_os = "macos")'.dev-dependencies]
 mcp-macos = { path = "../crates/mcp-macos" }
 mcp-input = { path = "../crates/mcp-input" }
+# Used only by the human-override live test, to move the pointer the way a
+# person does: from outside agentctl, so it is never recorded as ours.
+core-graphics = "0.24"
 
 # Real macOS backend (AXUIElement) — only on macOS.
 [target.'cfg(target_os = "macos")'.dependencies]

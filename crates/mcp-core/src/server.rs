@@ -71,7 +71,16 @@ impl Server {
             let mut pre = AuditRecord::pre(&self.session_id, name);
             pre.decision = Some("kill_switch".into());
             self.policy.audit(&pre);
-            return Envelope::fail(name, ErrorCode::Timeout, "kill switch engaged");
+            let why = self.policy.kill_switch_reason();
+            return Envelope::fail_with(
+                name,
+                ErrorCode::Timeout,
+                match &why {
+                    Some(r) => format!("kill switch engaged: {r}"),
+                    None => "kill switch engaged".to_string(),
+                },
+                "remove the STOP file to resume",
+            );
         }
 
         // 2. Look up the tool.

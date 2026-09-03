@@ -84,6 +84,14 @@ pub struct PolicyConfig {
     /// destructive commands. Includes editors, because their integrated
     /// terminals run the same shell.
     pub terminal_apps: Vec<String>,
+    /// Stop when a human takes over the mouse. See `mcp_input::human_override`:
+    /// reaching for the mouse is the reflex people already have for
+    /// interrupting something, so it is the interrupt worth honouring.
+    pub human_override: bool,
+    /// How far the pointer must be from anywhere the server put it, in points.
+    pub human_override_px: u32,
+    /// How long after an action the server still counts as driving.
+    pub human_override_grace_ms: u64,
     /// Shells `pty_spawn` may start, by absolute path.
     pub allowed_shells: Vec<String>,
     pub max_pty_sessions: usize,
@@ -151,6 +159,9 @@ impl Default for PolicyConfig {
             allow_private_network: false,
             allowed_services: Vec::new(),
             terminal_apps: mcp_input_terminal_apps(),
+            human_override: true,
+            human_override_px: 12,
+            human_override_grace_ms: 1_500,
             allowed_shells: ["/bin/zsh", "/bin/bash", "/bin/sh"]
                 .iter()
                 .map(|s| s.to_string())
