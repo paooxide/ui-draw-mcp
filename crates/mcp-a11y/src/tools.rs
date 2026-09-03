@@ -8,6 +8,7 @@ use serde_json::{json, Value};
 use crate::arena::{RefError, SnapshotArena};
 use crate::backend::{A11yBackend, BackendError, SnapshotRequest};
 use crate::flatten::{flatten, FlattenConfig};
+use crate::query::{parse_query, query_schema, query_snapshot};
 
 /// The `vision` perception engine: `get_ui_tree` (observe) and `get_element`
 /// (read one property). Owns the [`SnapshotArena`] so refs from the latest
@@ -111,6 +112,64 @@ impl A11yModule {
         Envelope::ok("get_ui_tree", data)
     }
 
+    /// Search the UI instead of reading all of it.
+    ///
+    /// Takes a fresh snapshot and installs it, so every ref returned is valid
+    /// for `ui_action` until the next observation. Querying a *retained* older
+    /// snapshot would be cheaper and would hand back refs that resolve to
+    /// nothing — or, worse, to a different control.
+    async fn find_elements(&self, args: &Value) -> Envelope {
+        let q = match parse_query(args) {
+            Ok(q) => q,
+            Err(msg) => return Envelope::fail("find_elements", ErrorCode::InvalidArgs, msg),
+        };
+        let req = SnapshotRequest {
+            app: str_arg(args, "app"),
+            skeleton: false,
+            root_ref: None,
+            max_depth: None,
+            surface: str_arg(args, "surface"),
+        };
+        let raw = match self.backend.snapshot(&req).await {
+            Ok(r) => r,
+            Err(e) => return backend_err("find_elements", e),
+        };
+        let sid = self.next_snapshot_id();
+        // No character budget here: the text is never returned, and a truncated
+        // element map would silently drop matches.
+        let cfg = FlattenConfig {
+            max_chars: usize::MAX,
+            skeleton: false,
+            terminal_app: raw.terminal_app,
+            ..FlattenConfig::default()
+        };
+        let f = flatten(
+            &raw.root,
+            raw.app.as_deref(),
+            raw.window.as_deref(),
+            &sid,
+            &cfg,
+        );
+        let snapshot = f.snapshot;
+        let (hits, total) = query_snapshot(&snapshot, &q);
+        {
+            let mut arena = self.arena.lock().unwrap_or_else(|e| e.into_inner());
+            arena.install(snapshot);
+        }
+        Envelope::ok(
+            "find_elements",
+            json!({
+                "snapshot_id": sid,
+                "app": raw.app,
+                "window": raw.window,
+                "count": hits.len(),
+                "total_matched": total,
+                "truncated": total > hits.len(),
+                "elements": hits,
+            }),
+        )
+    }
+
     fn get_element(&self, args: &Value) -> Envelope {
         let Some(reff) = str_arg(args, "ref") else {
             return Envelope::fail("get_element", ErrorCode::InvalidArgs, "missing 'ref'");
@@ -196,6 +255,17 @@ impl ToolModule for A11yModule {
                 }),
             ).untrusted_output(),
             ToolDescriptor::new(
+                "find_elements",
+                Category::Vision,
+                Tier::Read,
+                "Find elements without reading the whole UI. Filter by role and/or a \
+                 case-insensitive substring of the name, or rank by distance from a \
+                 screen point. Much cheaper than get_ui_tree on a busy app. Takes a \
+                 fresh snapshot, so the refs it returns are usable by ui_action until \
+                 the next observation.",
+                query_schema(),
+            ).untrusted_output(),
+            ToolDescriptor::new(
                 "get_element",
                 Category::Vision,
                 Tier::Read,
@@ -219,6 +289,7 @@ impl ToolModule for A11yModule {
     async fn call(&self, name: &str, args: Value, _ctx: &CallCtx) -> Envelope {
         match name {
             "get_ui_tree" => self.get_ui_tree(&args).await,
+            "find_elements" => self.find_elements(&args).await,
             "get_element" => self.get_element(&args),
             other => Envelope::fail(other, ErrorCode::InvalidArgs, "unknown tool"),
         }

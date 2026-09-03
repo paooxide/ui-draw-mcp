@@ -8,11 +8,13 @@
 mod arena;
 mod backend;
 mod flatten;
+mod query;
 mod tools;
 mod tree;
 
 pub use arena::{ElementInfo, RefError, Snapshot, SnapshotArena};
 pub use backend::{A11yBackend, BackendError, RawSnapshot, SnapshotRequest};
 pub use flatten::{flatten, FlattenConfig, Flattened};
+pub use query::{parse_query, query_schema, query_snapshot, ElementHit, ElementQuery};
 pub use tools::A11yModule;
 pub use tree::{is_interactive_role, normalize_role, Bounds, UiNode};

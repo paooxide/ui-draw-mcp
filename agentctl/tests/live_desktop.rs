@@ -291,3 +291,63 @@ async fn the_input_target_is_reported_or_permission_is_denied() {
         );
     }
 }
+
+/// Querying beats reading the whole tree, and the refs it hands back are real.
+///
+/// The cost argument is the point: on a busy app `get_ui_tree` is thousands of
+/// characters the agent pays for every turn, when the actual question was
+/// "where is the Save button". This asserts both halves — that the answer is
+/// much smaller, and that it is still actionable.
+#[tokio::test(flavor = "multi_thread")]
+async fn find_elements_is_cheaper_than_the_tree_and_its_refs_work() {
+    if !ready() {
+        return;
+    }
+    let c = client("live-find");
+    c.initialize().await;
+    c.ok("launch", json!({ "app": "Calculator" })).await;
+    if !settle_on(&c, "Calculator").await {
+        return;
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let tree = c.ok("get_ui_tree", json!({ "app": "Calculator" })).await;
+    let tree_chars = tree["text"].as_str().unwrap_or_default().len();
+
+    let found = c
+        .ok(
+            "find_elements",
+            json!({ "app": "Calculator", "role": "button", "name": "All Clear" }),
+        )
+        .await;
+    assert_eq!(found["count"], json!(1), "one button is named All Clear");
+    let hit = &found["elements"][0];
+    assert_eq!(hit["actionable"], json!(true));
+    let found_chars = serde_json::to_string(&found).unwrap().len();
+    assert!(
+        found_chars * 4 < tree_chars,
+        "a targeted query should be far smaller than the tree \
+         ({found_chars} vs {tree_chars} chars)"
+    );
+
+    // The ref is usable, which is the whole reason the tool takes a fresh
+    // snapshot instead of querying a retained one.
+    let reff = hit["ref"].as_str().unwrap().to_string();
+    let clicked = c
+        .call("ui_action", json!({ "ref": reff, "action": "click" }))
+        .await;
+    assert!(
+        clicked.ok,
+        "the ref must be actionable: {:?}",
+        clicked.error
+    );
+
+    // Asking for nothing in particular is a mistake worth naming.
+    let bad = c
+        .call("find_elements", json!({ "app": "Calculator" }))
+        .await;
+    assert!(!bad.ok);
+    assert_eq!(bad.error.unwrap().code, mcp_types::ErrorCode::InvalidArgs);
+
+    let _ = c.call("close_app", json!({ "app": "Calculator" })).await;
+}

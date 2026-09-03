@@ -8,12 +8,13 @@ Tiers gate what an agent may call: `read` and `standard` tools are available ins
 enabled category, while a `dangerous` tool additionally has to be named in
 `policy.enable`. Enabling a category never enables its dangerous tools.
 
-**105 tools across 12 categories.**
+**106 tools across 12 categories.**
 
 | Tool | Category | Tier | Summary |
 |---|---|---|---|
 | [`capture_screen`](#capture-screen) | vision | read | Capture a display (or a region) as a PNG image. |
 | [`capture_window`](#capture-window) | vision | read | Capture a single window as a PNG image — prefer this over capture_screen when you only care about one app; fewer pixels means proportional… |
+| [`find_elements`](#find-elements) | vision | read | Find elements without reading the whole UI. |
 | [`get_element`](#get-element) | vision | read | Read one property of an element by ref from the latest snapshot. |
 | [`get_ui_tree`](#get-ui-tree) | vision | read | Observe the UI. |
 | [`list_displays`](#list-displays) | vision | read | List displays (monitors) with geometry, scale, and which is primary. |
@@ -150,6 +151,24 @@ Capture a single window as a PNG image — prefer this over capture_screen when 
 | `force` | boolean |  |  |
 | `max_edge` | integer |  |  |
 | `window_id` | integer | yes |  |
+
+### find-elements
+
+`find_elements` · read tier
+
+Find elements without reading the whole UI. Filter by role and/or a case-insensitive substring of the name, or rank by distance from a screen point. Much cheaper than get_ui_tree on a busy app. Takes a fresh snapshot, so the refs it returns are usable by ui_action until the next observation.
+
+| Argument | Type | Required | Description |
+|---|---|---|---|
+| `app` | string |  | target application name |
+| `interactive_only` | boolean |  | only elements ui_action can target (default true) |
+| `limit` | integer |  | max matches (default 20, cap 200) |
+| `name` | string |  | case-insensitive substring of the element name |
+| `near` | object |  | rank by distance from this screen point |
+| `near.x` | number |  |  |
+| `near.y` | number |  |  |
+| `role` | string |  | element role, e.g. button, textfield, checkbox |
+| `surface` | one of: window, focused, menu, menubar, sheet, popover, alert |  | which UI surface to search |
 
 ### get-element
 

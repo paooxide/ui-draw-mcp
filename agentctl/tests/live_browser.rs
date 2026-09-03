@@ -190,7 +190,10 @@ async fn a_hostile_page_is_marked_untrusted_and_flagged() {
     }
     let browser_id = conn.data.as_ref().unwrap()["browser_id"].as_u64().unwrap();
     let tabs = c
-        .ok("browser_tabs", json!({"browser_id": browser_id, "action": "list"}))
+        .ok(
+            "browser_tabs",
+            json!({"browser_id": browser_id, "action": "list"}),
+        )
         .await;
     let target = tabs["tabs"][0]["target_id"].as_str().unwrap().to_string();
 
@@ -204,7 +207,10 @@ async fn a_hostile_page_is_marked_untrusted_and_flagged() {
     .await;
 
     let text = c
-        .ok("browser_snapshot", json!({"target_id": target, "mode": "text"}))
+        .ok(
+            "browser_snapshot",
+            json!({"target_id": target, "mode": "text"}),
+        )
         .await;
     assert_eq!(
         text["provenance"],
@@ -227,7 +233,10 @@ async fn a_hostile_page_is_marked_untrusted_and_flagged() {
     )
     .await;
     let clean = c
-        .ok("browser_snapshot", json!({"target_id": target, "mode": "text"}))
+        .ok(
+            "browser_snapshot",
+            json!({"target_id": target, "mode": "text"}),
+        )
         .await;
     assert_eq!(clean["provenance"], json!("untrusted"));
     assert!(

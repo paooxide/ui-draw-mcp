@@ -6,6 +6,41 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- `find_elements` — query the accessibility tree by role, name substring or
+  proximity to a screen point instead of reading all of it. On a busy
+  application a targeted query is an order of magnitude smaller than the full
+  tree, and the refs it returns are usable by `ui_action` because it takes and
+  installs a fresh snapshot rather than querying a retained one.
+- MCP tool annotations (`readOnlyHint`, `destructiveHint`, `idempotentHint`,
+  `openWorldHint`) and display titles in `tools/list`, derived from the tier the
+  policy gate already enforces.
+- `policy.mode = "dry_run"` — a rehearsal in which read-tier tools run normally
+  and anything that would change something reports what it would have done,
+  including whether a human would have been asked.
+- `browser_disconnect`, and a shutdown hook so browsers this session launched
+  are stopped on exit rather than leaked.
+- `agentctl tools` and a generated tool reference at `docs/tools.md`, checked by
+  CI so it cannot drift from the descriptors.
+
+### Security
+
+- Results from the tools that return third-party content now carry
+  `provenance: "untrusted"`, with an advisory `suspicious_instructions` flag for
+  text that reads as an instruction aimed at a model. Applied centrally so it
+  cannot be forgotten or spoofed. `redteam_injection.rs` documents what the
+  heuristic misses.
+- The server's own state directory is denied inside any filesystem root.
+
+### Fixed
+
+- `keyboard_type` inherited latched modifier flags, so with Command held every
+  character became a menu shortcut: nothing was typed and the call reported
+  success.
+- `list_windows` ignored its `app` argument and answered about whatever was
+  frontmost.
+
 ## [0.1.0] — 2026-09-03
 
 First tagged release. An MCP server that gives an AI agent grounded control of a real computer: 105 tools
