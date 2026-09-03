@@ -680,3 +680,128 @@ async fn untrusted_results_are_marked_and_scanned() {
     assert!(d.get("provenance").is_none());
     assert!(d.get("suspicious_instructions").is_none());
 }
+
+/// Resources let a person operating the client see what the agent is working
+/// from, without spending a tool call or a turn to ask.
+#[tokio::test]
+async fn resources_and_prompts_are_advertised_and_readable() {
+    let (server, _calls, _policy) = server_with(vision_only());
+
+    // Advertised in the handshake, or a client will never look.
+    let out = server
+        .handle_line(r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#)
+        .await
+        .unwrap();
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert!(v["result"]["capabilities"]["resources"].is_object());
+    assert!(v["result"]["capabilities"]["prompts"].is_object());
+
+    let out = server
+        .handle_line(r#"{"jsonrpc":"2.0","id":2,"method":"resources/list"}"#)
+        .await
+        .unwrap();
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["result"]["resources"].as_array().unwrap().len(), 3);
+
+    // The audit tail shows what actually happened, and is readable at once.
+    server.dispatch_call("vision_probe", json!({})).await;
+    let out = server
+        .handle_line(
+            r#"{"jsonrpc":"2.0","id":3,"method":"resources/read","params":{"uri":"agentctl://audit/tail"}}"#,
+        )
+        .await
+        .unwrap();
+    let v: Value = serde_json::from_str(&out).unwrap();
+    let text = v["result"]["contents"][0]["text"].as_str().unwrap();
+    assert!(text.contains("vision_probe"));
+
+    let out = server
+        .handle_line(
+            r#"{"jsonrpc":"2.0","id":4,"method":"resources/read","params":{"uri":"agentctl://nope"}}"#,
+        )
+        .await
+        .unwrap();
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert!(v["error"].is_object());
+
+    let out = server
+        .handle_line(r#"{"jsonrpc":"2.0","id":5,"method":"prompts/list"}"#)
+        .await
+        .unwrap();
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["result"]["prompts"].as_array().unwrap().len(), 3);
+
+    // A prompt with its arguments renders; without them it is a clear error.
+    let out = server
+        .handle_line(
+            r#"{"jsonrpc":"2.0","id":6,"method":"prompts/get","params":{"name":"drive-gui-app","arguments":{"app":"TextEdit","goal":"take a note"}}}"#,
+        )
+        .await
+        .unwrap();
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert!(v["result"]["messages"][0]["content"]["text"]
+        .as_str()
+        .unwrap()
+        .contains("TextEdit"));
+
+    let out = server
+        .handle_line(
+            r#"{"jsonrpc":"2.0","id":7,"method":"prompts/get","params":{"name":"drive-gui-app"}}"#,
+        )
+        .await
+        .unwrap();
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["error"]["code"], json!(-32602));
+}
+
+/// The effective-config resource is how an operator checks what is actually in
+/// force. It must never be how somebody learns the HTTP token.
+#[tokio::test]
+async fn the_config_resource_never_exposes_the_token() {
+    let cfg = PolicyConfig {
+        categories: vec![Category::Vision],
+        http_token: "super-secret-bearer-token".into(),
+        ..PolicyConfig::default()
+    };
+    let (server, _calls, _policy) = server_with(cfg);
+    let out = server
+        .handle_line(
+            r#"{"jsonrpc":"2.0","id":1,"method":"resources/read","params":{"uri":"agentctl://config/effective"}}"#,
+        )
+        .await
+        .unwrap();
+    let text = out.clone();
+    assert!(
+        !text.contains("super-secret-bearer-token"),
+        "the token must never appear in the effective config"
+    );
+    let v: Value = serde_json::from_str(&out).unwrap();
+    let body = v["result"]["contents"][0]["text"].as_str().unwrap();
+    assert!(body.contains("redacted"));
+    // And the parts that decide what the agent can reach are all present.
+    let parsed: Value = serde_json::from_str(body).unwrap();
+    for section in ["policy", "input", "fs", "terminal", "network", "browser"] {
+        assert!(parsed[section].is_object(), "missing section {section}");
+    }
+}
+
+/// The kill switch stops reads too: it is meant to stop everything.
+#[tokio::test]
+async fn a_tripped_kill_switch_blocks_resource_reads() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = PolicyConfig {
+        categories: vec![Category::Vision],
+        kill_switch_file: dir.path().join("STOP"),
+        ..PolicyConfig::default()
+    };
+    let (server, _calls, _policy) = server_with(cfg);
+    std::fs::write(dir.path().join("STOP"), b"stopped").unwrap();
+    let out = server
+        .handle_line(
+            r#"{"jsonrpc":"2.0","id":1,"method":"resources/read","params":{"uri":"agentctl://audit/tail"}}"#,
+        )
+        .await
+        .unwrap();
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert!(v["error"].is_object());
+}

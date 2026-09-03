@@ -237,6 +237,73 @@ pub fn default_agentctl_dir() -> PathBuf {
     home.join(".agentctl")
 }
 
+impl PolicyConfig {
+    /// The whole effective policy as JSON, with the HTTP token redacted.
+    ///
+    /// `agentctl config print` only ever showed `[policy]`, which is the half
+    /// an operator is least likely to get wrong. The parts that decide what the
+    /// agent can actually reach — roots, commands, hosts, services — were
+    /// invisible.
+    pub fn to_redacted_json(&self) -> serde_json::Value {
+        use serde_json::json;
+        let paths = |v: &[std::path::PathBuf]| -> Vec<String> {
+            v.iter().map(|p| p.display().to_string()).collect()
+        };
+        json!({
+            "policy": {
+                "categories": self.categories.iter().map(|c| c.slug()).collect::<Vec<_>>(),
+                "enable": self.enable,
+                "mode": self.mode.as_str(),
+                "allowed_apps": self.allowed_apps,
+                "max_denials": self.max_denials,
+                "max_consent_prompts": self.max_consent_prompts,
+                "kill_switch_file": self.kill_switch_file.display().to_string(),
+                "audit_dir": self.audit_dir.display().to_string(),
+            },
+            "input": {
+                "terminal_apps": self.terminal_apps,
+                "human_override": self.human_override,
+                "human_override_px": self.human_override_px,
+                "human_override_grace_ms": self.human_override_grace_ms,
+            },
+            "fs": { "roots": paths(&self.fs_roots) },
+            "terminal": {
+                "allowed_commands": self.allowed_commands,
+                "allow_shell": self.allow_shell,
+                "allowed_shells": self.allowed_shells,
+                "max_pty_sessions": self.max_pty_sessions,
+                "max_pty_buffer": self.max_pty_buffer,
+            },
+            "network": {
+                "allowed_hosts": self.allowed_hosts,
+                "allow_private": self.allow_private_network,
+            },
+            "credentials": { "allowed_services": self.allowed_services },
+            "packages": {
+                "allowed_sources": self.allowed_sources,
+                "allow_arbitrary_source": self.allow_arbitrary_source,
+                "allowlist": self.package_allowlist,
+                "denylist": self.package_denylist,
+            },
+            "browser": { "allowed_origins": self.allowed_origins },
+            "memory": {
+                "store": self.memory_store.display().to_string(),
+                "max_recipes": self.max_recipes,
+            },
+            "http": {
+                "enabled": self.http_enabled,
+                "allowed_origins": self.http_allowed_origins,
+                // Never the value: anyone who can read this can use the transport.
+                "token": if self.http_token.is_empty() {
+                    "(generated per session)".to_string()
+                } else {
+                    format!("‹redacted:len={}›", self.http_token.len())
+                },
+            },
+        })
+    }
+}
+
 #[cfg(test)]
 mod mode_tests {
     use super::Mode;

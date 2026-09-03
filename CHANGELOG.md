@@ -36,6 +36,12 @@ All notable changes to this project are documented here. The format follows
   including whether a human would have been asked.
 - `browser_disconnect`, and a shutdown hook so browsers this session launched
   are stopped on exit rather than leaked.
+- MCP resources (`resources/list`, `resources/read`): the latest screenshot,
+  the tail of the audit log, and the effective configuration with secrets
+  redacted — so a person operating the client can see what the agent is working
+  from without spending a turn to ask.
+- MCP prompts (`prompts/list`, `prompts/get`): a cookbook for driving a GUI
+  app, filling a web form, and acting-and-verifying in one step.
 - `agentctl tools` and a generated tool reference at `docs/tools.md`, checked by
   CI so it cannot drift from the descriptors.
 

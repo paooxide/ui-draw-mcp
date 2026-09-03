@@ -9,9 +9,11 @@
 mod http;
 mod jsonrpc;
 mod registry;
+mod resources;
 mod server;
 
 pub use http::{generate_token, HttpConfig, HttpTransport};
 pub use jsonrpc::{Request, Response, RpcError};
 pub use registry::Registry;
+pub use resources::{URI_AUDIT, URI_CONFIG, URI_SCREENSHOT};
 pub use server::{Server, DEFAULT_MAX_FRAME_BYTES, PROTOCOL_VERSION};

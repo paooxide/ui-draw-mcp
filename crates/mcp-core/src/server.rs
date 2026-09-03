@@ -24,6 +24,9 @@ pub struct Server {
     policy: Arc<Policy>,
     session_id: String,
     max_frame_bytes: usize,
+    /// The last image any tool returned, so a client can show what the agent is
+    /// looking at without spending a turn asking for it again.
+    last_image: std::sync::Mutex<Option<crate::resources::LastImage>>,
 }
 
 impl Server {
@@ -33,6 +36,7 @@ impl Server {
             policy,
             session_id: session_id.into(),
             max_frame_bytes: DEFAULT_MAX_FRAME_BYTES,
+            last_image: std::sync::Mutex::new(None),
         }
     }
 
@@ -207,6 +211,21 @@ impl Server {
             result
         };
 
+        // Remember the image for the `latest-screenshot` resource. Engine-
+        // agnostic on purpose: any tool that returns a picture is showing the
+        // agent something, and that is what a person watching wants to see.
+        if result.ok {
+            if let Some(img) = &result.image {
+                *self.last_image.lock().unwrap_or_else(|e| e.into_inner()) =
+                    Some(crate::resources::LastImage {
+                        tool: name.to_string(),
+                        mime_type: img.mime_type.clone(),
+                        base64: img.base64.clone(),
+                        ts_ms: now_ms(),
+                    });
+            }
+        }
+
         // 7. Post-audit.
         let mut post = AuditRecord::post(&self.session_id, name);
         post.ok = Some(result.ok);
@@ -238,10 +257,70 @@ impl Server {
             .collect()
     }
 
+    /// Read one resource.
+    ///
+    /// Gated by the kill switch and audited like a tool call: these expose the
+    /// agent's screen and the operator's configuration, so "who read what" is
+    /// worth the same record.
+    fn read_resource(&self, uri: &str) -> Result<Value, (i64, String)> {
+        use crate::resources::{URI_AUDIT, URI_CONFIG, URI_SCREENSHOT};
+        if self.policy.kill_switch_tripped() {
+            return Err((-32002, "kill switch engaged".into()));
+        }
+        let mut rec = AuditRecord::pre(&self.session_id, "resources/read");
+        rec.decision = Some("resource".into());
+        rec.args_redacted = Some(json!({ "uri": uri }));
+        self.policy.audit(&rec);
+
+        let contents = match uri {
+            URI_SCREENSHOT => {
+                let g = self.last_image.lock().unwrap_or_else(|e| e.into_inner());
+                let Some(img) = g.as_ref() else {
+                    return Err((
+                        -32002,
+                        "no image has been captured in this session yet".into(),
+                    ));
+                };
+                json!([{ "uri": uri, "mimeType": img.mime_type, "blob": img.base64,
+                         "_meta": { "tool": img.tool, "ts_ms": img.ts_ms } }])
+            }
+            URI_AUDIT => {
+                let sink = self.policy.audit_sink();
+                let text = match sink.path() {
+                    Some(p) => crate::resources::tail_lines(
+                        &std::fs::read_to_string(&p).unwrap_or_default(),
+                        crate::resources::AUDIT_TAIL_LINES,
+                    ),
+                    None => sink
+                        .memory_records()
+                        .iter()
+                        .rev()
+                        .take(crate::resources::AUDIT_TAIL_LINES)
+                        .rev()
+                        .map(|r| r.to_string())
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                };
+                json!([{ "uri": uri, "mimeType": "application/x-ndjson", "text": text }])
+            }
+            URI_CONFIG => {
+                let text = serde_json::to_string_pretty(&self.policy.config().to_redacted_json())
+                    .unwrap_or_else(|_| "{}".into());
+                json!([{ "uri": uri, "mimeType": "application/json", "text": text }])
+            }
+            other => return Err((-32002, format!("unknown resource '{other}'"))),
+        };
+        Ok(json!({ "contents": contents }))
+    }
+
     fn initialize_result(&self) -> Value {
         json!({
             "protocolVersion": PROTOCOL_VERSION,
-            "capabilities": { "tools": { "listChanged": true } },
+            "capabilities": {
+                "tools": { "listChanged": true },
+                "resources": { "subscribe": false, "listChanged": false },
+                "prompts": { "listChanged": false }
+            },
             "serverInfo": { "name": "agentctl", "version": env!("CARGO_PKG_VERSION") },
             "instructions": "Tools are tiered read/standard/dangerous and grouped by \
                 category. Only enabled categories are listed. Dangerous tools require \
@@ -289,6 +368,34 @@ impl Server {
                     .unwrap_or_else(|| json!({}));
                 let env = self.dispatch_call(name, args).await;
                 Response::success(id, self.tool_call_result(env))
+            }
+            "resources/list" => Response::success(id, crate::resources::list()),
+            // No templates: every resource here has a fixed URI.
+            "resources/templates/list" => Response::success(id, json!({ "resourceTemplates": [] })),
+            "resources/read" => {
+                let params = req.params.unwrap_or(Value::Null);
+                let Some(uri) = params.get("uri").and_then(Value::as_str) else {
+                    return Some(Response::error(id, INVALID_PARAMS, "missing 'uri'"));
+                };
+                match self.read_resource(uri) {
+                    Ok(v) => Response::success(id, v),
+                    Err((code, msg)) => Response::error(id, code, msg),
+                }
+            }
+            "prompts/list" => Response::success(id, crate::resources::prompts()),
+            "prompts/get" => {
+                let params = req.params.unwrap_or(Value::Null);
+                let Some(name) = params.get("name").and_then(Value::as_str) else {
+                    return Some(Response::error(id, INVALID_PARAMS, "missing prompt name"));
+                };
+                let args = params
+                    .get("arguments")
+                    .cloned()
+                    .unwrap_or_else(|| json!({}));
+                match crate::resources::get_prompt(name, &args) {
+                    Ok(v) => Response::success(id, v),
+                    Err((code, msg)) => Response::error(id, code, msg),
+                }
             }
             other => Response::error(id, METHOD_NOT_FOUND, format!("method not found: {other}")),
         };
