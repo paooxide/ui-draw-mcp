@@ -39,6 +39,10 @@ mcp-pty = { path = "../crates/mcp-pty" }
 mcp-pkg = { path = "../crates/mcp-pkg" }
 mcp-memory = { path = "../crates/mcp-memory" }
 mcp-window = { path = "../crates/mcp-window" }
+# The desktop trait is portable even though the only backend behind it is
+# macOS-only. `Wiring` names it unconditionally, so gating the dependency on
+# the target broke every non-macOS build.
+mcp-desktop = { path = "../crates/mcp-desktop" }
 # "process" is for the bridge subcommand, which spawns `agentctl serve`
 # as a child and talks MCP to it over pipes.
 tokio = { workspace = true, features = ["signal", "process"] }
@@ -65,5 +69,4 @@ core-graphics = "0.24"
 mcp-macos = { path = "../crates/mcp-macos" }
 mcp-window = { path = "../crates/mcp-window" }
 mcp-vision = { path = "../crates/mcp-vision" }
-# Desktop session/power control is macOS-only for now (no Windows/Linux backend).
-mcp-desktop = { path = "../crates/mcp-desktop" }
+

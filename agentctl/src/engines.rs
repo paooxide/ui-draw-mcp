@@ -117,6 +117,9 @@ pub fn build_stack(cfg: &PolicyConfig) -> (Vec<Arc<dyn ToolModule>>, Wiring) {
     let allowed_apps = cfg.allowed_apps.clone();
     let terminal_apps = cfg.terminal_apps.clone();
     let mut modules: Vec<Arc<dyn ToolModule>> = vec![Arc::new(SystemModule)];
+    // Only a platform with a desktop backend fills this in; elsewhere the
+    // Wiring stays empty and the `mut` is genuinely unused.
+    #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
     let mut wiring = Wiring::default();
     #[cfg(target_os = "macos")]
     let audio_roots = engines.fs_roots.clone();

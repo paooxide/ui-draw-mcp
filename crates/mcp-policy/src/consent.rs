@@ -14,6 +14,10 @@
 //! timeout, dismissal, a broken channel — denies.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
+// Only DialogConsent needs this, and DialogConsent is macOS-only. An
+// unconditional import is an unused-import warning on every other platform,
+// and CI builds with `-D warnings`.
+#[cfg(target_os = "macos")]
 use std::time::Duration;
 
 /// What the human is being asked to approve.
