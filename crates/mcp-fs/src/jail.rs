@@ -53,6 +53,10 @@ pub fn default_denied() -> Vec<String> {
         "/.git-credentials",
         "/shadow",
         "/sudoers",
+        // The server's own state. With a root of `~` the agent could otherwise
+        // rewrite config.toml to widen its policy, edit the audit log that
+        // records what it did, or delete the STOP file that stops it.
+        "/.agentctl/",
     ]
     .iter()
     .map(|s| s.to_string())

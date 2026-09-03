@@ -286,3 +286,39 @@ fn documented_known_gap_hard_links() {
     }
     let _ = std::fs::remove_file(&outside);
 }
+
+/// The server's own state directory is denied even inside a root.
+///
+/// With a root of `~` — the natural thing for an operator to configure — every
+/// control the jail protects would otherwise be editable through the jail
+/// itself: `config.toml` decides which categories are enabled, the audit log is
+/// the record of what the agent did, and `STOP` is the kill switch. Rewriting
+/// the first, truncating the second and deleting the third are the three moves
+/// that turn a contained agent into an uncontained one.
+///
+/// This also denies *reading* the kill-switch file through `fs_read`, which is
+/// intended: the agent has no business inspecting its own leash.
+#[test]
+fn the_agentctl_state_directory_is_denied_inside_a_root() {
+    let root = sandbox("agentctl-state");
+    std::fs::create_dir_all(root.join(".agentctl/audit")).unwrap();
+    std::fs::write(root.join(".agentctl/config.toml"), b"[policy]").unwrap();
+    std::fs::write(root.join(".agentctl/STOP"), b"").unwrap();
+    std::fs::write(root.join(".agentctl/audit/s1.jsonl"), b"{}").unwrap();
+    let j = jail_at(&root);
+    for p in [
+        ".agentctl/config.toml",
+        ".agentctl/STOP",
+        ".agentctl/audit/s1.jsonl",
+        // Case-insensitive, like every other deny-list entry.
+        ".AgentCtl/config.toml",
+    ] {
+        assert!(
+            matches!(j.resolve(&s(&root.join(p))), Err(PathError::Denied(_))),
+            "{p} must be denied inside a root"
+        );
+    }
+    // A sibling that merely starts with the same letters is not the state dir.
+    std::fs::write(root.join("agentctl-notes.md"), b"notes").unwrap();
+    assert!(j.resolve(&s(&root.join("agentctl-notes.md"))).is_ok());
+}
