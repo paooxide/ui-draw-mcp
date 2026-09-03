@@ -25,9 +25,11 @@ members = [
 
 [workspace.package]
 edition = "2021"
-version = "0.0.1"
+version = "0.1.0"
 rust-version = "1.78"
 license = "Apache-2.0"
+repository = "https://github.com/paooxide/ui-draw-mcp"
+description = "MCP server giving an AI agent grounded control of a real computer: GUI, browser and system."
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -50,6 +52,20 @@ toml = "0.8"
 # Skip debuginfo entirely: it is usually the majority of target/ size and we have
 # little disk. Re-enable per-package when you actually need to debug.
 [profile.dev]
+debug = 0
+
+# Release builds are what people download, so they are optimised and stripped.
+#
+# `panic` stays "unwind" deliberately. Teardown in this workspace is Drop-based:
+# PtySession kills its child process group, and CdpBackend stops the browsers it
+# launched and removes their temporary profiles. `panic = "abort"` skips
+# destructors, so a panic would leak a shell or a browser — exactly the class of
+# bug the shutdown work exists to fix.
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
 debug = 0
 
 [profile.dev.package."*"]

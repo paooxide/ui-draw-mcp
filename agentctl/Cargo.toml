@@ -4,6 +4,18 @@ edition.workspace = true
 version.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
+description.workspace = true
+
+# cargo-binstall: fetch the release archive instead of compiling. The template
+# must match the asset names produced by .github/workflows/release.yml.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-v{ version }-{ target }{ archive-suffix }"
+bin-dir = "{ name }-v{ version }-{ target }/{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-fmt = "zip"
 
 [[bin]]
 name = "agentctl"

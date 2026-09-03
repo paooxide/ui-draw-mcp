@@ -4,7 +4,7 @@ version = 3
 
 [[package]]
 name = "agentctl"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "mcp-a11y",
@@ -187,7 +187,7 @@ checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 
 [[package]]
 name = "mcp-a11y"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "mcp-types",
@@ -198,7 +198,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-browser"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "mcp-types",
@@ -210,7 +210,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-core"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "mcp-policy",
@@ -224,7 +224,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-desktop"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "mcp-policy",
@@ -236,7 +236,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-fs"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "mcp-policy",
@@ -249,7 +249,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-input"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "mcp-a11y",
@@ -263,7 +263,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-macos"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "core-foundation",
@@ -281,7 +281,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-memory"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "mcp-policy",
@@ -293,7 +293,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-net"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "mcp-types",
@@ -305,7 +305,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-pkg"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "mcp-policy",
@@ -316,7 +316,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-policy"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "mcp-types",
  "serde",
@@ -327,7 +327,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-proc"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "mcp-policy",
@@ -341,7 +341,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-pty"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "libc",
@@ -353,7 +353,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-sec"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "mcp-types",
@@ -365,7 +365,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-sys"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "libc",
@@ -378,7 +378,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-types"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "serde",
@@ -387,7 +387,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-vision"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "mcp-types",
@@ -399,7 +399,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-window"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "mcp-a11y",
@@ -600,7 +600,7 @@ dependencies = [
 
 [[package]]
 name = "test-support"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "mcp-core",
  "mcp-policy",
