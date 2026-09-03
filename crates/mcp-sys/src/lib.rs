@@ -1,4 +1,4 @@
-//! System / hardware diagnostics (`docs/planning.md` §5.7).
+//! System / hardware diagnostics.
 //!
 //! Entirely read-only: telemetry, OS identity, disk usage, logs. Built on
 //! platform CLIs (`sysctl`, `vm_stat`, `df`, `uptime`, `log`) rather than a

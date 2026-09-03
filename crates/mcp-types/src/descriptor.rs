@@ -33,7 +33,7 @@ pub enum Category {
 }
 
 impl Category {
-    /// Stable config slug (matches `planning.md` §5 and `policy.categories`).
+    /// Stable config slug (matches `policy.categories`).
     pub fn slug(self) -> &'static str {
         match self {
             Category::Vision => "vision",

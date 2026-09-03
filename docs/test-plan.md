@@ -1,7 +1,6 @@
-# TEST PLAN — `agentctl-mcp`
+# TEST PLAN: `agentctl-mcp`
 
-Companion to [`architecture.md`](./architecture.md), [`planning.md`](./planning.md), and
-[`implementation-plan.md`](./implementation-plan.md). This doc is the concrete test catalogue, with emphasis
+Companion to [`architecture.md`](./architecture.md). This doc is the concrete test catalogue, with emphasis
 (per request) on **concurrency / race conditions**, **partial-failure states**, and **boundary conditions**
 (nil/null, empty sets, max payloads), plus the security tests that back the OWASP mapping in `architecture.md`
 §8. Test IDs are stable and referenced in code (`#[test]` names) and CI gates.
@@ -55,7 +54,7 @@ snapshot/session state.
 |---|---|---|
 | CC-ARENA-1 | Thread A takes a new snapshot (write) while thread B resolves a ref from the previous `snapshot_id` | B gets `STALE_REF` deterministically; no panic, no wrong-element resolution |
 | CC-ARENA-2 | Two concurrent `get_ui_tree` calls (two new snapshots) | both succeed; the later `snapshot_id` wins; earlier refs invalidated; arena not corrupted |
-| CC-ARENA-3 | Ref read races with eviction of that exact `snapshot_id` | either valid resolve or `STALE_REF` — never a dangling/native-handle use-after-free |
+| CC-ARENA-3 | Ref read races with eviction of that exact `snapshot_id` | either valid resolve or `STALE_REF`, never a dangling/native-handle use-after-free |
 | CC-ARENA-4 | `loom` model: read lock during a write-swap | no deadlock; no torn read of the map |
 | CC-ARENA-5 | 1000 refs numbered under concurrent snapshots | `@eN` numbering monotonic and unique within each `snapshot_id` |
 
@@ -100,7 +99,7 @@ and no side effect leaks past an error.
 |---|---|---|
 | PF-CORE-1 | `policy.gate` = Allow, engine panics/returns Err | mapped `ErrorCode`; post-audit written; no `ok:true`; no state mutation observable |
 | PF-CORE-2 | Pre-audit write succeeds, engine dies | post-audit marks the call incomplete/failed; never silently dropped |
-| PF-A11Y-1 | Snapshot walk succeeds for most nodes, one subtree read fails | tree returned with the failed node marked; call succeeds partially **and says so**, or fails cleanly per policy — never silently drops nodes as if complete |
+| PF-A11Y-1 | Snapshot walk succeeds for most nodes, one subtree read fails | tree returned with the failed node marked; call succeeds partially **and says so**, or fails cleanly per policy, never silently drops nodes as if complete |
 | PF-A11Y-2 | Element vanishes between snapshot and `get_element` | `STALE_REF`/`NOT_FOUND`, not a stale value |
 | PF-VIS-1 | Capture grabs frame but PNG encode fails | `ACTION_FAILED`; no truncated image content block emitted |
 | PF-INPUT-1 | `keyboard_type` types 3 of 10 chars then focus lost | reports how much was applied + error; never claims full success |
@@ -125,7 +124,7 @@ and no side effect leaks past an error.
 |---|---|---|
 | BND-NIL-1 | Optional arg omitted vs. explicit JSON `null` | both treated as absent identically; documented; no `unwrap` panic |
 | BND-NIL-2 | Required arg missing | `INVALID_ARGS` with the field named; engine never entered |
-| BND-NIL-3 | Empty string where a value is expected (`keyboard_type text:""`) | no-op success or `INVALID_ARGS` per tool spec — defined, not accidental |
+| BND-NIL-3 | Empty string where a value is expected (`keyboard_type text:""`) | no-op success or `INVALID_ARGS` per tool spec: defined, not accidental |
 | BND-NIL-4 | `null` inside a nested object (`region:{x:null}`) | schema/engine rejects with a clear message |
 | BND-NIL-5 | Unicode/RTL/emoji/combining marks/NUL in `keyboard_type` text | typed faithfully or rejected if NUL; never truncated mid-grapheme; no injection via control chars |
 
@@ -143,7 +142,7 @@ and no side effect leaks past an error.
 ### 4.3 Max payloads / large inputs
 | ID | Input | Expected |
 |---|---|---|
-| BND-MAX-1 | a11y tree exceeding `max_tree_chars` | auto skeleton; if still over, hard-truncate with `[HARD TRUNCATED N]` marker — never silent, never unbounded |
+| BND-MAX-1 | a11y tree exceeding `max_tree_chars` | auto skeleton; if still over, hard-truncate with `[HARD TRUNCATED N]` marker, never silent, never unbounded |
 | BND-MAX-2 | Screenshot larger than `max_image_bytes` | downscaled/capped; size asserted ≤ cap |
 | BND-MAX-3 | Extremely deep a11y tree | respects `max_depth`; no stack overflow (iterative walk) |
 | BND-MAX-4 | Huge tool-args JSON (multi-MB) | rejected over a size limit before parse work explodes; `INVALID_ARGS` |
@@ -190,7 +189,7 @@ Each maps to `architecture.md` §8. These are pass/deny assertions, not observat
 | SEC-ACL-1 | A01 / LLM08 | Call into a disabled category → `POLICY_DENIED`, engine never invoked |
 | SEC-ACL-2 | A01 | Dangerous tool without `policy.enable` → denied even in an enabled category |
 | SEC-INJ-1 | A03 | `exec`/pty text with `rm -rf`, `; sudo`, `$(…)`, backticks, `| sh` → destructive gate denies/consent-gates |
-| SEC-INJ-2 | A03 | `exec` cannot run a shell string (argv-only) — attempt to smuggle `sh -c "…"` still argv, metachars inert |
+| SEC-INJ-2 | A03 | `exec` cannot run a shell string (argv-only). Attempt to smuggle `sh -c "…"` still argv, metachars inert |
 | SEC-PATH-1 | A01/A03 | `fs_*` (deferred) path `../../etc/…`, symlink to outside `fs_roots`, NUL byte → denied |
 | SEC-SSRF-1 | A10 | `http_client` (deferred) to `127.0.0.1`, `169.254.169.254`, `::1` → blocked unless opted in |
 | SEC-BROWSER-1 | LLM01/A03 | `browser_eval` off by default; enabled + origin not in `allowed_origins` → denied |
@@ -219,7 +218,7 @@ Each maps to `architecture.md` §8. These are pass/deny assertions, not observat
 
 ---
 
-## 8. Live-OS (macOS MVP) — manual/gated
+## 8. Live-OS (macOS MVP): manual/gated
 
 | ID | Test | Note |
 |---|---|---|
@@ -230,7 +229,7 @@ Each maps to `architecture.md` §8. These are pass/deny assertions, not observat
 | LIVE-5 | Attach to Chrome started with `--remote-debugging-port`; `browser_snapshot` reads a page | post-gate |
 
 CI can't grant TCC/permissions headlessly, so live-OS runs on a self-hosted macOS runner or manually with
-results recorded in `planning.md` §12. Everything else (§1–§7) runs in CI against fakes on any OS.
+results recorded in the commit message. Everything else (§1-§7) runs in CI against fakes on any OS.
 
 ---
 

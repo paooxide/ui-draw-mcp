@@ -1,4 +1,4 @@
-//! Terminal / process engine (`docs/planning.md` §5.4). OS-independent.
+//! Terminal / process engine. OS-independent.
 
 mod exec;
 mod tools;

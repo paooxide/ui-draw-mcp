@@ -1,4 +1,4 @@
-//! Session, power and desktop settings (`docs/planning.md` §5.10).
+//! Session, power and desktop settings.
 //!
 //! This is the engine that lets an agent talk *to the human* rather than to the
 //! machine: `notify_user` is the only outbound channel that is not a consent

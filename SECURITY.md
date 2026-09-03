@@ -14,10 +14,10 @@ layer, which is the only path to an engine.
 
 - **Run as an ordinary user. Never as root.** `privilege_run` is deliberately not implemented: root defeats
   every other control in the system.
-- **Open only what the task needs.** Every engine is closed by default — no filesystem roots, no runnable
+- **Open only what the task needs.** Every engine is closed by default: no filesystem roots, no runnable
   commands, no reachable hosts, no keychain services. Widen deliberately, and narrow again afterwards.
 - **Prefer `interactive` mode when a human is present.** In `autonomous` mode there is nobody to ask, so
-  anything requiring consent is denied rather than allowed — safe, but it means unattended runs cannot do
+  anything requiring consent is denied rather than allowed. Safe, but it means unattended runs cannot do
   high-impact work at all, which is the intended trade.
 - **Run it from a different terminal than it drives.** Synthetic keystrokes go to whatever is frontmost.
 - **Treat the audit log as evidence.** `~/.agentctl/audit/<session>.jsonl` records every call, before and
@@ -48,17 +48,17 @@ There is no bounty programme. Credit is given in the changelog unless you would 
 Anything that lets a driving agent, a web page or a local process reach past a control the server claims to
 provide:
 
-- **Policy bypass** — reaching an engine whose category is disabled, or a dangerous tool not named in
+- **Policy bypass**: reaching an engine whose category is disabled, or a dangerous tool not named in
   `policy.enable`, or executing without the consent that a tool declared it needed.
-- **Containment escape** — reading or writing outside the configured filesystem roots, reaching a denied
+- **Containment escape**: reading or writing outside the configured filesystem roots, reaching a denied
   credential path, or getting an SSRF-guarded request to a private or metadata address.
-- **Secret leakage** — any path that returns a plaintext credential, an unredacted secure text field, or a
+- **Secret leakage**: any path that returns a plaintext credential, an unredacted secure text field, or a
   cookie value to the agent or into the audit log.
-- **Consent bypass** — anything that lets the agent see, pre-fill, suppress or answer its own consent
+- **Consent bypass**: anything that lets the agent see, pre-fill, suppress or answer its own consent
   prompt, or that makes a dialog misrepresent what is being approved.
-- **Kill-switch or audit tampering** — anything that lets the agent disable the STOP file, or write,
+- **Kill-switch or audit tampering**: anything that lets the agent disable the STOP file, or write,
   truncate or forge audit records.
-- **Transport** — authentication bypass on the HTTP transport, request smuggling, or a resource-exhaustion
+- **Transport**: authentication bypass on the HTTP transport, request smuggling, or a resource-exhaustion
   path that runs before the policy gate.
 
 ## What is a known limitation, not a vulnerability
@@ -68,7 +68,7 @@ These are documented, asserted by tests that *prove the gap still exists*, and c
 not treated as new findings:
 
 - **The destructive-command gate is a backstop, not containment.** It matches normalised text and cannot
-  see through shell expansion — `base64 -d | sh`, `$IFS` padding, variable indirection. Seeing through
+  see through shell expansion: `base64 -d | sh`, `$IFS` padding, variable indirection. Seeing through
   those means running the shell, which is the thing being gated. The real control is the argv allowlist
   with `allow_shell = false`.
 - **Hard links are invisible to path resolution.** A hard link has no target to follow, so a link created

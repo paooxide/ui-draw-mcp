@@ -7,7 +7,7 @@ use serde_json::{json, Value};
 
 use crate::backend::{DesktopBackend, DesktopError, MediaAction, PowerAction};
 
-/// The `desktop` engine (`docs/planning.md` §5.10).
+/// The `desktop` engine.
 pub struct DesktopModule {
     backend: Arc<dyn DesktopBackend>,
     /// Roots `play_audio` may read from. Empty = it plays nothing: an agent

@@ -45,7 +45,7 @@ pub struct Flattened {
 
 /// Flatten a tree, applying the budget cascade: try the requested mode; if it
 /// overflows and wasn't skeleton, retry skeleton; if that still overflows,
-/// hard-truncate with an explicit marker (never silent — `planning.md` §5.3).
+/// hard-truncate with an explicit marker (never silent).
 pub fn flatten(
     root: &UiNode,
     app: Option<&str>,

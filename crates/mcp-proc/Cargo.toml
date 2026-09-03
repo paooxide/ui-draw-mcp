@@ -8,7 +8,7 @@ license.workspace = true
 [dependencies]
 mcp-types = { path = "../mcp-types" }
 mcp-policy = { path = "../mcp-policy" }
-# Shares the terminal category (planning.md §5.4); `man_page` renders through the
+# Shares the terminal category; `man_page` renders through the
 # same overstrike/ANSI stripper a PTY needs, and one copy is better than two.
 mcp-pty = { path = "../mcp-pty" }
 serde.workspace = true

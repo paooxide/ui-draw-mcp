@@ -3,7 +3,7 @@
 //! Deliberately a *small, strict* parser for the flat subset the config
 //! actually uses — sections, `key = "string"`, `key = 123`, `key = ["a", "b"]`,
 //! `#` comments — rather than a full TOML dependency. This matches the
-//! project's disk-conscious pattern (see `docs/planning.md` §12) and keeps the
+//! project's disk-conscious pattern and keeps the
 //! security-relevant config path dependency-free.
 //!
 //! **Fail-closed:** a config file that exists but does not parse is an error

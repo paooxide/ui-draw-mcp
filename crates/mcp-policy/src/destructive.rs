@@ -12,7 +12,7 @@
 //! which is the exact thing being gated. `redteam_destructive.rs` pins those
 //! bypasses in an explicit known-gaps test so the limit stays visible.
 
-/// Default seed patterns (lowercased substrings), from `planning.md` §7.2. Kept
+/// Default seed patterns (lowercased substrings). Kept
 /// in config so the list can grow without a code change.
 pub fn default_destructive_patterns() -> Vec<String> {
     [

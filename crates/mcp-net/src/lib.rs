@@ -1,4 +1,4 @@
-//! Network engine (`docs/planning.md` §5.6). OS-independent.
+//! Network engine. OS-independent.
 //!
 //! Outbound HTTP is contained by [`ssrf`]: an agent making requests from this
 //! machine sits inside the network perimeter, so the guard is the point.

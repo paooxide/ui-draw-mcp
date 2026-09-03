@@ -4,7 +4,7 @@
 #
 # EVERY engine is closed by default. With no roots / commands / hosts / services
 # listed here, those engines refuse everything rather than falling open. A file
-# that exists but fails to parse aborts startup — silently reverting to defaults
+# that exists but fails to parse aborts startup: silently reverting to defaults
 # could *widen* a policy stricter than the built-in one.
 
 [policy]
@@ -23,12 +23,12 @@ enable = []
 #               change something reports what it *would* have done, including
 #               whether it would have asked you, and does not do it. The gate
 #               still refuses what it would normally refuse, so this is how you
-#               find out what an agent's prompt will actually try — against the
-#               real config and the real tool list — with nothing at risk.
+#               find out what an agent's prompt will actually try, against the
+#               real config and the real tool list, with nothing at risk.
 mode = "interactive"
 
 # Cap on how often one session may interrupt a human. Past this, further
-# requests are denied without prompting — unlimited dialogs train people to
+# requests are denied without prompting: unlimited dialogs train people to
 # click Allow (consent fatigue).
 max_consent_prompts = 20
 
@@ -59,7 +59,7 @@ human_override_px = 12
 human_override_grace_ms = 1500
 # Apps whose typed input is screened for destructive shell commands.
 # Editors are included by default because their *integrated terminals* run the
-# same shell — the accessibility API cannot tell an editor pane from a terminal
+# same shell: the accessibility API cannot tell an editor pane from a terminal
 # pane, so the whole app is screened. Over-triggering on a source file that
 # merely contains "rm -rf" is the safe direction to be wrong in: it asks, it
 # does not refuse. Setting this replaces the default list.
@@ -80,7 +80,7 @@ allow_shell = "false"
 # Shells `pty_spawn` may start, by absolute path.
 allowed_shells = ["/bin/zsh", "/bin/bash", "/bin/sh"]
 # Concurrent PTY sessions, and how much output each one buffers before the
-# oldest is dropped (the tail is kept — the end answers the question).
+# oldest is dropped (the tail is kept: the end answers the question).
 max_pty_sessions = 4
 max_pty_buffer = 262144
 
@@ -88,7 +88,7 @@ max_pty_buffer = 262144
 # Hosts `http_request` may reach. A leading dot matches subdomains:
 #   ".example.com" matches example.com and api.example.com
 allowed_hosts = []
-# Permit private/loopback/link-local targets. Off by default — this is what
+# Permit private/loopback/link-local targets. Off by default: this is what
 # blocks cloud metadata (169.254.169.254) and internal admin panels.
 allow_private = "false"
 
@@ -102,7 +102,7 @@ allowed_services = []
 # everything. This is the most dangerous category in the product: an install is
 # arbitrary code execution plus persistence.
 allowed_sources = []
-# Permit installing from a URL, local file or third-party tap. Off by default —
+# Permit installing from a URL, local file or third-party tap. Off by default:
 # that path is indistinguishable from malware delivery.
 allow_arbitrary_source = "false"
 # If non-empty, only these package ids may be installed.
@@ -122,13 +122,13 @@ max_recipes = 500
 allowed_origins = []
 
 [vision]
-# Screen-capture cost/legibility trade-offs. These are not security controls —
+# Screen-capture cost/legibility trade-offs. These are not security controls:
 # they decide how much of your image budget a capture spends. Image cost tracks
 # *pixel area*, not file size, so shrinking the longest edge is the only thing
 # that actually reduces spend; compressing harder does not.
 
 # Longest delivered edge for each `detail` tier, in pixels (160-4096).
-detail_low_px = 768         # layout/state checks — "did the dialog appear?"
+detail_low_px = 768         # layout/state checks: "did the dialog appear?"
 detail_balanced_px = 1024   # most interactions
 detail_full_px = 1568       # small text stays legible
 
@@ -141,7 +141,7 @@ pixels_per_token = 750
 
 # Two consecutive frames whose mean absolute difference (0-255) is below this
 # count as visually identical, and the second is reported as `unchanged` instead
-# of being re-sent — a polling loop otherwise re-sends the same megabyte every
+# of being re-sent: a polling loop otherwise re-sends the same megabyte every
 # iteration. Measured idle noise on real hardware is ~0.002, so the default sits
 # far above the noise floor while still catching any change worth acting on.
 # Raise it to dedup more aggressively; set 0 to disable dedup entirely.
@@ -153,7 +153,7 @@ max_image_bytes = 8000000
 
 [http]
 # Optional HTTP transport. OFF by default, and stdio remains the primary
-# transport — over stdio the client *is* the parent process, so the OS does the
+# transport: over stdio the client *is* the parent process, so the OS does the
 # authentication for you. A listening socket has to earn that back, which is
 # what everything below is for.
 enabled = "false"
@@ -168,8 +168,8 @@ bind = "127.0.0.1:8765"
 # There is no anonymous mode and no short-token mode.
 token = ""
 
-# Browser origins allowed to call the endpoint, matched exactly. Empty — the
-# default — means any request carrying an `Origin` header is refused.
+# Browser origins allowed to call the endpoint, matched exactly. Empty (the
+# default) means any request carrying an `Origin` header is refused.
 #
 # This is not CORS pedantry. Any web page can make your browser POST to
 # 127.0.0.1, so a local port is not a private one; a real MCP client sends no

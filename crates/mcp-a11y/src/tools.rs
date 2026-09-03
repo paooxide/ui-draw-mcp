@@ -121,7 +121,7 @@ impl A11yModule {
         // Some apps (SwiftUI, Electron, canvas/custom-drawn UI, games) expose an
         // almost-empty accessibility tree. Say so explicitly rather than letting
         // the agent conclude the window is empty — screen capture plus
-        // coordinate input is the documented fallback (planning.md §5.2, D10).
+        // coordinate input is the documented fallback.
         let mut data = json!({
             "snapshot_id": sid,
             "app": raw.app,

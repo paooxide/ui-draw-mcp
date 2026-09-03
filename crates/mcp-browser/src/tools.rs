@@ -9,7 +9,7 @@ use serde_json::{json, Value};
 use crate::backend::{BrowserBackend, BrowserError};
 use crate::cdp::DialogPolicy;
 
-/// The `browser` CDP engine (`docs/planning.md` §5.11): DOM-level control of a
+/// The `browser` CDP engine: DOM-level control of a
 /// Chromium browser attached over the Chrome DevTools Protocol.
 pub struct BrowserModule {
     backend: Arc<dyn BrowserBackend>,

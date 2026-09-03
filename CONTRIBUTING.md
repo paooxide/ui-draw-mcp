@@ -24,14 +24,14 @@ A change is finished when:
 - `docs/tools.md` is regenerated if any descriptor changed:
   `cargo run -q -p agentctl -- tools --markdown --all > docs/tools.md`. CI diffs it.
 - Anything an operator must know is in `config.example.toml`, and anything a future maintainer must know is
-  in `docs/planning.md` §12.
+  in the commit message and `CHANGELOG.md`.
 
 ## No fake backends
 
 This is the rule that shapes the test suite. The product's whole value is real GUI and browser control, so
 a stubbed backend gives false confidence: it proves the code calls the API, not that the API does what was
-assumed. Every bug found in this repository so far — the missing focused-application fallback, the unset
-mouse click-state, inherited modifier flags, a discarded `app` argument — passed a plausible unit test and
+assumed. Every bug found in this repository so far (the missing focused-application fallback, the unset
+mouse click-state, inherited modifier flags, a discarded `app` argument) passed a plausible unit test and
 failed on a real machine.
 
 So: test pure logic as free functions, and test everything else against the real thing. Where a real check
@@ -40,7 +40,7 @@ needs a permission that may not be granted, assert that the call *returns an ans
 
 Live tests are gated. `AGENTCTL_SKIP_LIVE=1` skips those that drive a real browser, package manager or
 desktop. GUI suites additionally require `AGENTCTL_LIVE_GUI=1`, because they steal window focus and
-synthesise keystrokes — a plain `cargo test` on a machine somebody is using must never do that. Guard on
+synthesise keystrokes. A plain `cargo test` on a machine somebody is using must never do that. Guard on
 the frontmost application before every synthetic keystroke, and act on a scratch document rather than the
 developer's own work.
 
@@ -61,7 +61,7 @@ quietly mistaken for containment.
 
 ## Commit messages
 
-Imperative subject line, then a body that explains **why** rather than what — the diff already says what.
+Imperative subject line, then a body that explains **why** rather than what: the diff already says what.
 When a change was prompted by a real failure, say what the failure was and how it showed up; that is the
 part nobody can reconstruct later.
 
@@ -69,7 +69,7 @@ No trailer block. The message ends on its last content line.
 
 ## Releasing
 
-1. Update `CHANGELOG.md` — move `Unreleased` entries under the new version.
+1. Update `CHANGELOG.md`: move `Unreleased` entries under the new version.
 2. Bump `version` in the workspace `Cargo.toml`, and commit the re-synced `Cargo.lock`.
 3. Tag `vX.Y.Z` and push the tag. The release workflow builds per-platform archives, writes `SHA256SUMS`,
    and opens a draft release.

@@ -1,6 +1,6 @@
 //! Text recognition through Apple's Vision framework, without linking it.
 //!
-//! `docs/planning.md` deferred `ocr_region` because the alternatives were a
+//! `ocr_region` was deferred because the alternatives were a
 //! heavy Rust binding or a build that depends on the Xcode toolchain. There is
 //! a third option, and it is the one this codebase already uses for screen
 //! capture: shell out. A ~90-line Swift program does the recognition; this

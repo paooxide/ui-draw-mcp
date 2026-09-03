@@ -4,7 +4,7 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.1.0] — 2026-09-03
+## [0.1.0] - 2026-09-03
 
 First tagged release. An MCP server that gives an AI agent grounded control of a real computer: 107 tools
 across 12 capability categories, gated by a policy layer that treats the driving agent as untrusted.
@@ -34,7 +34,7 @@ across 12 capability categories, gated by a policy layer that treats the driving
 - **Commodity engines.** Filesystem behind a resolve-then-check path jail; `exec` on argv with no shell by
   default; HTTP with SSRF containment; read-only system telemetry; credentials with no plaintext read; real
   PTY sessions; package lifecycle with a protected set; optional recall of task recipes.
-- **Session and desktop.** `notify_user` — the agent's channel to a human — plus idle status, screen lock,
+- **Session and desktop.** `notify_user`, the agent's channel to a human, plus idle status, screen lock,
   media and power control, speech and audio playback.
 - **CLI.** `serve`, `doctor`, `config print`, and `tools` for a generated tool reference.
 - **Test support.** An in-process MCP client so tests drive the real protocol, and live task suites that
@@ -42,19 +42,19 @@ across 12 capability categories, gated by a policy layer that treats the driving
 - `expect` postconditions on `ui_action`, `set_value`, `keyboard_type`,
   `keyboard_shortcut` and `mouse_action`. The action runs, the condition is
   waited for, and the result carries the delta against the snapshot taken
-  before it — so checking whether an action worked is one call rather than
+  before it, so checking whether an action worked is one call rather than
   four. A failed expectation still returns the delta, because the action
   happened and what it did is what the agent needs to see.
-- `since` on `get_ui_tree` — return what changed rather than the whole tree.
+- `since` on `get_ui_tree`: return what changed rather than the whole tree.
 - `gone` and `focused` conditions on `wait_for`, which now shares its evaluator
   with `expect`.
-- `ocr_region` — read text off the screen through Apple's Vision framework,
+- `ocr_region`: read text off the screen through Apple's Vision framework,
   returning a box per line in screen coordinates. The fallback for surfaces the
   accessibility tree does not describe, and unlike a screenshot it hands back
   coordinates that can be clicked. No longer deferred: a small Swift helper is
   compiled on first use rather than linking a framework or requiring the Xcode
   toolchain at build time.
-- `find_elements` — query the accessibility tree by role, name substring or
+- `find_elements`: query the accessibility tree by role, name substring or
   proximity to a screen point instead of reading all of it. On a busy
   application a targeted query is an order of magnitude smaller than the full
   tree, and the refs it returns are usable by `ui_action` because it takes and
@@ -62,17 +62,17 @@ across 12 capability categories, gated by a policy layer that treats the driving
 - MCP tool annotations (`readOnlyHint`, `destructiveHint`, `idempotentHint`,
   `openWorldHint`) and display titles in `tools/list`, derived from the tier the
   policy gate already enforces.
-- `policy.mode = "dry_run"` — a rehearsal in which read-tier tools run normally
+- `policy.mode = "dry_run"`: a rehearsal in which read-tier tools run normally
   and anything that would change something reports what it would have done,
   including whether a human would have been asked.
-- `agentctl bridge` — a reference MCP client driven by Gemini, which spawns
+- `agentctl bridge`: a reference MCP client driven by Gemini, which spawns
   `agentctl serve` as a child and runs the whole call/response loop over the
   real transport. It doubles as a schema conformance test: every descriptor is
   asserted to be a fixed point of the declaration sanitizer, so a tool that
   grows a keyword the API rejects fails in CI rather than taking every other
   declaration down with it. The API key is read from the environment, `.env` or
   `~/.agentctl/gemini.key`, never from an argument.
-- `agentctl transcript --from-audit` — rebuild the same session record for a
+- `agentctl transcript --from-audit`: rebuild the same session record for a
   client that does not cooperate with us, from the audit log. Recordings in
   `docs/fixtures/` are validated against the live tool list in CI.
 - `browser_disconnect`, and a shutdown hook so browsers this session launched
@@ -82,7 +82,7 @@ across 12 capability categories, gated by a policy layer that treats the driving
   silence is ambiguous between working and hung.
 - MCP resources (`resources/list`, `resources/read`): the latest screenshot,
   the tail of the audit log, and the effective configuration with secrets
-  redacted — so a person operating the client can see what the agent is working
+  redacted, so a person operating the client can see what the agent is working
   from without spending a turn to ask.
 - MCP prompts (`prompts/list`, `prompts/get`): a cookbook for driving a GUI
   app, filling a web form, and acting-and-verifying in one step.
@@ -153,13 +153,13 @@ Field bugs that only a run on real hardware could surface:
   resolved path on macOS, where `/tmp` is a symlink.
 - `expect` was declared beside the arguments rather than among them on all five
   action tools. Valid JSON, and invisible to any client that reads the schema
-  to learn what a tool takes — so the act-and-confirm round trip could only be
+  to learn what a tool takes, so the act-and-confirm round trip could only be
   used by someone who had read the source.
 - `list_apps` returned every process on the machine, including daemons and
   shells that `launch` and `focus_app` would never accept. It now names the
   applications that own windows.
 - `list_windows` with no `app` resolved to the frontmost application, so the
-  obvious opening question — what is open? — returned one app's windows, or
+  obvious opening question (what is open?) returned one app's windows, or
   none, with nothing to say it had been narrowed. It now covers the machine
   unless an app is named or `focus_app` has pinned one, and reads the
   CoreGraphics window list rather than walking accessibility trees, because
@@ -175,7 +175,7 @@ Field bugs that only a run on real hardware could surface:
   traversal is synchronous FFI it never yields, so a `wait_for` with a one
   second deadline overran it twelvefold and nothing could interrupt it. The
   walk now has its own budget, and a tree cut short reports `partial: true`
-  with advice on narrowing the scope — a partial tree and a genuinely small one
+  with advice on narrowing the scope. A partial tree and a genuinely small one
   are otherwise indistinguishable, and an agent that cannot tell concludes the
   control it needs does not exist.
 

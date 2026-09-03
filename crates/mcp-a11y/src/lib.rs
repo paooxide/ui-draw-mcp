@@ -3,7 +3,7 @@
 //! tree into the compact text an agent reads. Backends (macOS AXUIElement,
 //! later UIA/AT-SPI) produce a [`UiNode`] tree; everything downstream is
 //! OS-independent and fully testable with fixtures. See `docs/architecture.md`
-//! §3 (`mcp-a11y`) and `planning.md` §5.1.
+//! §3 (`mcp-a11y`).
 
 mod arena;
 mod backend;

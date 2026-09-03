@@ -1,4 +1,4 @@
-//! Red-team suite for the destructive-command backstop (`planning.md` §7.2).
+//! Red-team suite for the destructive-command backstop.
 //!
 //! This detector is explicitly **not** a security boundary — the tier/category
 //! gate is. But a backstop that any casual reformatting walks through is worse

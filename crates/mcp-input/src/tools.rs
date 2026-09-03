@@ -10,8 +10,7 @@ use crate::backend::{
 };
 
 /// Per-action policy the input engine enforces (the tier/category gate already
-/// ran in `mcp-core`; these are the input-specific checks from `planning.md`
-/// §5.2/§7.2).
+/// ran in `mcp-core`; these are the input-specific checks).
 #[derive(Debug, Clone)]
 pub struct InputPolicy {
     /// Restrict coordinate input to the bounds of the current snapshot.

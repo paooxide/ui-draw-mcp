@@ -1,4 +1,4 @@
-//! Credentials engine (`docs/planning.md` §5.8) — the highest-risk category.
+//! Credentials engine — the highest-risk category.
 //!
 //! One rule governs the whole module: **secret material never reaches the
 //! agent.** Tools here let an agent discover *that* a credential exists and use

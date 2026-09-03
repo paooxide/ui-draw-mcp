@@ -148,7 +148,7 @@ pub struct CdpBackend {
     launched: Mutex<Vec<Launched>>,
     next_id: AtomicU32,
     /// If non-empty, `goto` is restricted to URLs whose origin matches one of
-    /// these prefixes (`docs/planning.md` §9 `browser.allowed_origins`).
+    /// these prefixes (`browser.allowed_origins`).
     allowed_origins: Vec<String>,
     /// Per-target answer for JavaScript dialogs, and the log of ones answered.
     /// Connections are per-call, so the policy has to live with the backend.

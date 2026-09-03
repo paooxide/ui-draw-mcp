@@ -69,7 +69,7 @@ impl Default for BridgeOpts {
     fn default() -> Self {
         BridgeOpts {
             task: String::new(),
-            model: "gemini-2.5-flash".to_string(),
+            model: "gemini-3.8-flash".to_string(),
             max_turns: 12,
             mode: "AUTO".to_string(),
             thinking_level: None,

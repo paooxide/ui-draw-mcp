@@ -1,4 +1,4 @@
-//! The recall store (`docs/planning.md` §5.9).
+//! The recall store.
 //!
 //! A JSON file, not SQLite. The plan named SQLite; a store holding a few
 //! hundred recorded sequences does not need a query engine, and pulling in a

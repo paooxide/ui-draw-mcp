@@ -1,10 +1,8 @@
-# ARCHITECTURE — `agentctl-mcp`
+# ARCHITECTURE: `agentctl-mcp`
 
-Companion to [`planning.md`](./planning.md) (design/ADRs) and [`implementation-plan.md`](./implementation-plan.md)
-(work breakdown). This doc is the **structural** source of truth: how the product is decomposed, how the files
+This doc is the **structural** source of truth: how the product is decomposed, how the files
 are laid out, the rules that keep the decomposition honest, the concurrency model, and the security
-architecture mapped to OWASP guidance. Read the D12 MVP note in `implementation-plan.md` first — file trees
-below mark MVP crates vs. deferred ones.
+architecture mapped to OWASP guidance. File trees below mark shipped crates vs. deferred ones.
 
 ---
 
@@ -37,7 +35,7 @@ below mark MVP crates vs. deferred ones.
 ```
 ┌────────────────┐   MCP / JSON-RPC 2.0    ┌──────────────────────┐   native OS APIs   ┌──────────┐
 │  AI agent      │  (stdio; http later)    │  agentctl (server)   │  AX / capture /    │  macOS   │
-│  (Gemini 3.7,  │ ───────────────────────▶│  policy · engines    │  input · CDP …     │  (later  │
+│  (Gemini 3.8,  │ ───────────────────────▶│  policy · engines    │  input · CDP …     │  (later  │
 │   Claude, …)   │ ◀───────────────────────│  audit               │ ──────────────────▶│  Win/Lx)│
 └────────────────┘   results (redacted)    └──────────┬───────────┘                    └──────────┘
    UNTRUSTED                                           │ append-only
@@ -45,7 +43,7 @@ below mark MVP crates vs. deferred ones.
                                                  audit/<session>.jsonl
 ```
 Trust boundary is the MCP interface: everything left of it is untrusted. A second, inner boundary exists at the
-browser engine — content in a driven web page is untrusted and can attempt indirect prompt injection back
+browser engine: content in a driven web page is untrusted and can attempt indirect prompt injection back
 through the agent.
 
 ### 2.2 Containers (crates)
@@ -195,7 +193,7 @@ pub struct CallCtx {                 // injected; the only way an engine reaches
     pub audit: AuditHandle,          // engines may add structured detail (redacted)
 }
 ```
-`CallCtx` deliberately does **not** carry the policy handle — policy runs in `dispatch` *before* the engine,
+`CallCtx` deliberately does **not** carry the policy handle: policy runs in `dispatch` *before* the engine,
 so an engine cannot re-decide or skip it.
 
 ---
@@ -216,25 +214,25 @@ so an engine cannot re-decide or skip it.
 - **Runtime:** `tokio` multi-threaded. Each `tools/call` is a task. Blocking OS calls (AX, capture, subprocess
   waits) run on `spawn_blocking` so they never stall the reactor.
 - **Shared mutable state is minimized and owned:**
-  - `SnapshotArena` — `Arc<RwLock<Arena>>`; a snapshot write takes the write lock briefly to swap in the new
+  - `SnapshotArena`: `Arc<RwLock<Arena>>`; a snapshot write takes the write lock briefly to swap in the new
     map and evict the old; ref reads take the read lock. Refs carry their `snapshot_id`; a read validates the
     id against the current arena → `STALE_REF` if evicted. **No ref handle outlives its snapshot_id check.**
-  - **Session registries** (browser targets; pty later) — `DashMap`/`Mutex<HashMap>` keyed by id; create/close
+  - **Session registries** (browser targets; pty later): `DashMap`/`Mutex<HashMap>` keyed by id; create/close
     are atomic; every use re-looks-up the id (no cached handle) so a concurrent close yields `NOT_FOUND`, never
     a use-after-free.
-  - **Denial budget** — `AtomicUsize`; incremented on each deny; compared under a single fetch to avoid TOCTOU.
-  - **Audit sink** — single writer task behind an `mpsc` channel; callers send records, the task serializes
+  - **Denial budget**: `AtomicUsize`; incremented on each deny; compared under a single fetch to avoid TOCTOU.
+  - **Audit sink**: single writer task behind an `mpsc` channel; callers send records, the task serializes
     writes → no interleaving/corruption under concurrency, total order preserved.
-  - **Kill switch** — one `CancellationToken`; a poller task trips it; all in-flight tasks observe it via
+  - **Kill switch**: one `CancellationToken`; a poller task trips it; all in-flight tasks observe it via
     `ctx.cancel`. Idempotent.
 - **Lock ordering:** the only place two locks are held together is arena+registry; the rule is
   **arena before registry, always**, to prevent deadlock (enforced by a helper that acquires in order).
-- **Cancellation safety:** engines must be cancellation-safe — a dropped future must not leave a spawned child
+- **Cancellation safety:** engines must be cancellation-safe: a dropped future must not leave a spawned child
   process, an open AX observer, or a half-written file. Each engine documents its cleanup (Drop guards).
 - **Backpressure / DoS bounds:** per-call timeout, output/screenshot/tree size caps, max concurrent
   sessions, denial budget, and (http transport later) request rate limits.
 
-Concurrency is validated with `loom` (lock-based state) and `tokio` cancellation tests — see test-plan §2.
+Concurrency is validated with `loom` (lock-based state) and `tokio` cancellation tests (see test-plan §2).
 
 ---
 
@@ -251,7 +249,7 @@ OWASP Top 10 for LLM Applications apply. Mapping of concern → guidance → con
 | Path traversal | A01/A03 · ASVS V12 | canonicalize + `fs_roots`/`fs_deny` allowlist + symlink-escape denial (deferred fs; pattern defined now) | `mcp-fs/*` (deferred), `policy/allowlist.rs` |
 | SSRF | **A10** · ASVS V12 | `http_client` blocks loopback/link-local/metadata unless opted in (deferred net) | `policy/allowlist.rs`, `mcp-net` |
 | JS/code injection via page | A03 · **LLM01 Prompt Injection (indirect)**, **LLM02 Insecure Output Handling** | `browser_eval` dangerous+opt-in; `browser.allowed_origins`; page content treated as untrusted; results redacted | `mcp-browser/*`, `policy/allowlist.rs` |
-| Secrets / sensitive data | A02 · ASVS V6/V8 · **LLM06 Sensitive Info Disclosure** | central redactor for secure fields, cookies, credential values, API keys — in results **and** audit | `mcp-policy/redact.rs`, `mcp-a11y/secure.rs` |
+| Secrets / sensitive data | A02 · ASVS V6/V8 · **LLM06 Sensitive Info Disclosure** | central redactor for secure fields, cookies, credential values, API keys, in results **and** audit | `mcp-policy/redact.rs`, `mcp-a11y/secure.rs` |
 | Security logging | **A09** · ASVS V7 | append-only pre/post audit of every call incl. decision; single-writer, redacted; `trace` for full bodies | `mcp-policy/audit.rs`, `mcp-core` |
 | Error handling | ASVS V7 · **LLM02** | fail-closed; stable `ErrorCode`; `INTERNAL` never leaks internals to the agent | `core/error.rs`, `mcp-types/envelope.rs` |
 | Secure defaults / misconfig | **A05** · ASVS V14 | minimal default categories (`vision,input,window`); dangerous off; stdout is protocol-only; secrets never in stdout | `agentctl/{config,wire}.rs` |
@@ -277,7 +275,7 @@ core security property.
 - One `ErrorCode` enum (`mcp-types`), stable and documented; each engine maps native errors to exactly one code
   (test: every engine has a mapping test, no `INTERNAL` for expected failures).
 - Fail closed: on any ambiguity the pipeline denies/aborts rather than proceeds.
-- The agent sees `{code, message, suggestion?}` — actionable but never internal (no stack traces, no paths it
+- The agent sees `{code, message, suggestion?}`: actionable but never internal (no stack traces, no paths it
   didn't provide, no secret fragments). `INTERNAL` is logged fully to stderr/audit, returned generically.
 - Partial success is never reported as success (§6, §7); a cancelled multi-step op returns the furthest safe
   state plus the abort reason.
@@ -303,7 +301,7 @@ core security property.
 
 ---
 
-## 12. Extensibility — adding a tool or engine
+## 12. Extensibility: adding a tool or engine
 
 1. Add descriptor(s) to the engine's `tools.rs` (name, category, tier, Gemini-subset schema, description).
 2. Implement the handler; validate args in the handler; map errors to `ErrorCode`.
@@ -312,7 +310,7 @@ core security property.
 5. If dangerous, it's automatically off until named in `policy.enable`; add a threat-model entry + X-D8 review.
 6. Add: allow-path test, deny-path test, boundary tests, and a fake backend in `test-support`.
 
-The trait contract is the whole extension surface — no engine touches transport, policy, or audit directly.
+The trait contract is the whole extension surface: no engine touches transport, policy, or audit directly.
 
 ---
 

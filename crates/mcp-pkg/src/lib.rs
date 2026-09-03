@@ -1,4 +1,4 @@
-//! Application lifecycle — install & uninstall (`docs/planning.md` §5.12, D13).
+//! Application lifecycle — install & uninstall.
 //!
 //! Its own category, not folded into `desktop`, because the risk profile is
 //! categorically different: an install is arbitrary code execution *plus*

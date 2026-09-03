@@ -1,4 +1,4 @@
-//! Interactive terminal sessions (`docs/planning.md` §5.4, the `mcp-pty` half).
+//! Interactive terminal sessions.
 //!
 //! A PTY is a *real shell*, which is exactly the capability `exec`'s argv-only
 //! discipline exists to withhold — so `pty_spawn` is gated on the same

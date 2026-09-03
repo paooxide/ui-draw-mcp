@@ -11,3 +11,9 @@ Cargo.lock.bak
 .env.*
 !.env.example
 *.key
+
+# Internal working notes: kept locally, not published.
+docs/planning.md
+docs/implementation-plan.md
+docs/research-notes.md
+PROGRESS.md

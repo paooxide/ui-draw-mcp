@@ -1,4 +1,4 @@
-//! Optional recall (`docs/planning.md` §5.9) — off unless the `memory`
+//! Optional recall — off unless the `memory`
 //! category is enabled.
 //!
 //! The *agent* records and replays its own verified sequences; the server does

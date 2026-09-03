@@ -1,5 +1,5 @@
 //! Minimal Chrome DevTools Protocol transport, hand-rolled to avoid a heavy
-//! WebSocket/HTTP dependency (disk-conscious, see `docs/planning.md` §12).
+//! WebSocket/HTTP dependency (disk-conscious).
 //!
 //! Two pieces:
 //!   * [`http_json`] — talks to Chrome's `/json/*` HTTP endpoints (target

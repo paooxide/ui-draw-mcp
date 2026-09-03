@@ -8,7 +8,7 @@ macOS permissions, and running the server from the terminal it is driving.
 
 ## Before any client
 
-1. **Install it and find the path.** `which agentctl` — the client config needs an absolute path, because a
+1. **Install it and find the path.** `which agentctl`. The client config needs an absolute path, because a
    GUI application does not inherit your shell's `PATH`.
 2. **Run `agentctl doctor`.** It prints the OS, the protocol version, the kill-switch path, the audit
    directory, which config file was loaded, the enabled categories, the consent channel, and the macOS
@@ -26,7 +26,7 @@ macOS permissions, and running the server from the terminal it is driving.
 
 This is the single most common failure, and the symptom does not point at the cause.
 
-macOS attributes Accessibility and Screen Recording to the **responsible process** — for a child process,
+macOS attributes Accessibility and Screen Recording to the **responsible process**. For a child process,
 that is the application that spawned it. `agentctl` is always a child of the client. So the permission must
 be granted to:
 
@@ -39,14 +39,14 @@ be granted to:
 | Cursor | **Cursor** |
 | `cargo test` in a terminal | that terminal |
 
-Grant it in **System Settings → Privacy & Security → Accessibility**, then **restart the client** — the
+Grant it in **System Settings → Privacy & Security → Accessibility**, then **restart the client**: the
 permission is read at process start.
 
 **Symptoms without it:** every `get_ui_tree`, `ui_action` and window tool returns `PERM_DENIED`.
 `capture_screen` is worse: without Screen Recording it returns the desktop wallpaper instead of your
 windows, with no error, which is why `doctor` preflights it rather than waiting for a failure.
 
-`agentctl` never triggers the permission prompt itself — `AXIsProcessTrusted` is called in its
+`agentctl` never triggers the permission prompt itself. `AXIsProcessTrusted` is called in its
 non-prompting form, so nothing pops a dialog behind your back. Screen Recording prompts once, on the first
 capture.
 
@@ -146,7 +146,7 @@ Edit `~/.gemini/settings.json`:
 ```
 
 `/mcp` lists the connected tools. Tool schemas are already restricted to the JSON-Schema subset Gemini
-accepts — no `pattern`, `format` or `additionalProperties` — so `tools/list` maps mechanically onto
+accepts (no `pattern`, `format` or `additionalProperties`), so `tools/list` maps mechanically onto
 `functionDeclarations`.
 
 Client-side discipline worth knowing: echo model turns back verbatim so `thoughtSignature` survives
@@ -165,7 +165,7 @@ The bearer token is generated and printed to stderr unless `http.token` is set i
 
 It binds loopback only and refuses to bind anything else, rather than warning: plaintext HTTP off loopback
 would put the token on the wire. Requests carrying an `Origin` header are refused by default, because any
-web page can make a browser POST to `127.0.0.1` — a local port is not a private one, and a real MCP client
+web page can make a browser POST to `127.0.0.1`: a local port is not a private one, and a real MCP client
 sends no `Origin`. Only the JSON subset of Streamable HTTP is implemented; `GET` says so rather than
 leaving a client waiting on a stream that will never open.
 

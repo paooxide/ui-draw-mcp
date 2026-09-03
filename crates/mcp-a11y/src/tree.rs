@@ -74,7 +74,7 @@ pub fn normalize_role(role: &str) -> String {
     trimmed.to_ascii_lowercase()
 }
 
-/// Interactive roles receive refs (from `planning.md` §5.1). Matched against the
+/// Interactive roles receive refs. Matched against the
 /// normalized role so both `button` and `AXButton` work.
 pub fn is_interactive_role(role: &str) -> bool {
     const INTERACTIVE: &[&str] = &[

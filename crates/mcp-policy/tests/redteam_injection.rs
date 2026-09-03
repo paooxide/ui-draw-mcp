@@ -86,7 +86,7 @@ fn real_interface_and_file_content_stays_clean() {
     for benign in [
         // Chrome's extensions page, and a sign-in confirmation.
         "Developer mode",
-        "You are now signed in as philip@example.com",
+        "You are now signed in as user@example.com",
         // Documentation and READMEs.
         "Installation instructions",
         "See the instructions in CONTRIBUTING.md",
@@ -94,7 +94,7 @@ fn real_interface_and_file_content_stays_clean() {
         // A flattened accessibility tree.
         "@e1 textarea value=\"hello\"\n@e2 button \"Save\"\n@e3 button \"Cancel\"",
         // A directory listing and a process table.
-        "total 48\ndrwxr-xr-x 12 philip staff 384 Sep 3 04:52 .",
+        "total 48\ndrwxr-xr-x 12 user staff 384 Sep 3 04:52 .",
         "PID   COMMAND\n1     /sbin/launchd",
         // A man page fragment.
         "SYNOPSIS\n     rm [-dfiPRrvW] file ...",

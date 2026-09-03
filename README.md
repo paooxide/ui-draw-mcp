@@ -5,7 +5,7 @@ reliable, structured control of a real computer: GUI applications, a Chromium br
 underneath them.
 
 The difference from a shell-command agent is grounding. Instead of guessing at pixels, `agentctl` reads the
-operating system's **accessibility tree** — roles, names, values, bounds — so an action targets a real UI
+operating system's **accessibility tree** (roles, names, values, bounds), so an action targets a real UI
 element rather than a screenshot coordinate. An agent can open an app, find the Save button by name, click
 it, and confirm from the tree that the state changed.
 
@@ -69,11 +69,11 @@ heuristic.
 
 Only `vision`, `input` and `window` are enabled out of the box, and only their non-dangerous tools.
 
-**The cheapest way to observe is `get_ui_tree`** — plain text, no image, no vision tokens. Ask it for a
+**The cheapest way to observe is `get_ui_tree`**: plain text, no image, no vision tokens. Ask it for a
 delta with `since` and a follow-up observation costs only what changed. `find_elements` is cheaper still
 when the question is narrow, and `expect` on an input tool folds act-wait-verify into one call.
 
-For surfaces with no accessibility tree — canvases, games, some Electron apps — `ocr_region` reads the text
+For surfaces with no accessibility tree (canvases, games, some Electron apps), `ocr_region` reads the text
 and returns a clickable box for each line. Screen capture remains the last resort; captures deduplicate
 against the previous frame, so polling an unchanged screen costs nothing.
 
@@ -109,7 +109,7 @@ cargo binstall --git https://github.com/paooxide/ui-draw-mcp agentctl
 ```
 
 **macOS permissions.** Grant **Accessibility** (and **Screen Recording** if you want captures) to the
-application that *launches* `agentctl` — your terminal, Claude Desktop, Cursor — not to `agentctl` itself.
+application that *launches* `agentctl` (your terminal, Claude Desktop, Cursor), not to `agentctl` itself.
 macOS attributes a child process's permissions to whoever spawned it. `agentctl doctor` reports what is
 granted; [`docs/clients.md`](docs/clients.md) explains the rest.
 
@@ -121,7 +121,7 @@ granted; [`docs/clients.md`](docs/clients.md) explains the rest.
 agentctl doctor          # OS, permissions, enabled categories, kill switch, transport
 ```
 
-Register it with a client — for Claude Code:
+Register it with a client. For Claude Code:
 
 ```sh
 claude mcp add agentctl -- /usr/local/bin/agentctl serve
@@ -185,8 +185,8 @@ JSON subset of Streamable HTTP. stdio is the supported path.
 ## Architecture
 
 A Cargo workspace: a protocol core, a policy kernel, one engine crate per capability category, one backend
-crate per operating system, and a composition-root binary. Dependencies point inward — engines depend on
-shared types and their own backends, never on the core — so the policy gate cannot be bypassed from inside
+crate per operating system, and a composition-root binary. Dependencies point inward: engines depend on
+shared types and their own backends, never on the core, so the policy gate cannot be bypassed from inside
 an engine.
 
 | Crate | Role |
@@ -198,7 +198,7 @@ an engine.
 | `mcp-vision` | Displays and screen/window capture, with change detection and cost accounting. |
 | `mcp-input` | Semantic and coordinate input, and the destructive-keystroke gate. |
 | `mcp-window` | Windows, applications, menus, dialogs, and the `wait_for` settle primitive. |
-| `mcp-browser` | The Chrome DevTools Protocol engine — OS-independent, so the real backend ships here. |
+| `mcp-browser` | The Chrome DevTools Protocol engine. OS-independent, so the real backend ships here. |
 | `mcp-fs` | Filesystem, contained by a resolve-then-check path jail. |
 | `mcp-proc` | `exec` (argv, no shell by default), process listing and signals. |
 | `mcp-net` | HTTP with SSRF containment, DNS, interfaces. |
@@ -206,7 +206,7 @@ an engine.
 | `mcp-sec` | Credentials. No plaintext secret read exists. |
 | `mcp-pty` | Real PTY sessions on `posix_openpt`. |
 | `mcp-pkg` | Package lifecycle, with a protected set that can never be uninstalled. |
-| `mcp-desktop` | Session, power and settings — including `notify_user`, the agent's channel to a human. |
+| `mcp-desktop` | Session, power and settings, including `notify_user`, the agent's channel to a human. |
 | `mcp-memory` | Optional recall of task recipes. Off by default. |
 | `mcp-macos` | The real macOS backend: AXUIElement, CGEvent, CoreGraphics. |
 | `test-support` | An in-process MCP client, so tests drive the real protocol rather than calling engines. |
@@ -217,7 +217,7 @@ an engine.
 ## Status
 
 Every planned capability category has an engine, and both halves are validated against real systems rather
-than test doubles — there are no fake backends in this repository by policy.
+than test doubles. There are no fake backends in this repository by policy.
 
 | Area | State |
 |---|---|
@@ -228,10 +228,7 @@ than test doubles — there are no fake backends in this repository by policy.
 | Hardening: fuzzing, red-team suites, HTTP transport, CI | Shipped; six real defects found and fixed |
 | Linux and Windows desktop backends | Not started |
 | `capture_audio`, `virtual_desktop` | Deferred by design |
-| `privilege_run` | Deliberately never — root defeats every other control |
-
-[`PROGRESS.md`](PROGRESS.md) is the running log, including what each validation run actually proved and the
-bugs it caught.
+| `privilege_run` | Deliberately never: root defeats every other control |
 
 ---
 
@@ -252,14 +249,12 @@ See [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
 ## Docs
 
-- [`docs/tools.md`](docs/tools.md) — every tool, its tier and its arguments (generated).
-- [`docs/clients.md`](docs/clients.md) — connecting Claude Code, Claude Desktop, Cursor and Gemini.
-- [`docs/demo.md`](docs/demo.md) — driving the server with a real model, and the recorded transcripts.
-- [`docs/threat-model.md`](docs/threat-model.md) — actors, abuse cases, controls, and known gaps.
-- [`docs/planning.md`](docs/planning.md) — design source of truth: decisions, tool catalog, implementation log.
-- [`docs/architecture.md`](docs/architecture.md) — crate decomposition, layering rules, security architecture.
-- [`docs/implementation-plan.md`](docs/implementation-plan.md) — phases and workstreams.
-- [`docs/test-plan.md`](docs/test-plan.md) — the test taxonomy.
+- [`docs/tools.md`](docs/tools.md): every tool, its tier and its arguments (generated).
+- [`docs/clients.md`](docs/clients.md): connecting Claude Code, Claude Desktop, Cursor and Gemini.
+- [`docs/demo.md`](docs/demo.md): driving the server with a real model, and the recorded transcripts.
+- [`docs/threat-model.md`](docs/threat-model.md): actors, abuse cases, controls, and known gaps.
+- [`docs/architecture.md`](docs/architecture.md): crate decomposition, layering rules, security architecture.
+- [`docs/test-plan.md`](docs/test-plan.md): the test taxonomy.
 - [`CHANGELOG.md`](CHANGELOG.md) · [`SECURITY.md`](SECURITY.md) · [`CONTRIBUTING.md`](CONTRIBUTING.md)
 
 ## License

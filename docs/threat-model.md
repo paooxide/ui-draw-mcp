@@ -5,7 +5,7 @@ _Living document. Update it whenever a `dangerous`-tier tool or a control change
 ## 1. Scope and assumptions
 
 `agentctl` gives a remote AI agent structured control of a real computer. This document states who might
-attack it, what they would be after, which control stands in the way, and — the part that matters most —
+attack it, what they would be after, which control stands in the way, and, the part that matters most,
 where each control's limits actually are.
 
 Assumptions the design rests on:
@@ -39,7 +39,7 @@ Assumptions the design rests on:
   transport token.
 - **User data**: everything inside the configured filesystem roots, and everything reachable by an
   application the agent can drive.
-- **The desktop session**: keystrokes go to whatever is frontmost, so focus is itself an asset — text
+- **The desktop session**: keystrokes go to whatever is frontmost, so focus is itself an asset: text
   intended for a text editor can land in a shell.
 - **Network position**: the machine may reach internal services, cloud metadata endpoints and admin panels
   that the outside world cannot.
@@ -81,7 +81,7 @@ gate would have refused.
 | Denial budget | `DenialBudget` | An agent spinning against the gate. |
 | Kill switch | `mcp-policy::KillSwitch` | Everything, immediately. Checked before every policy decision. Trips on the STOP file, or from inside when a human takes the mouse; the reason is recorded and persisted. |
 | Human override | `mcp-input::human_override` + `agentctl::override_watch` | An agent doing the wrong thing while a person is watching. Reaching for the mouse is the reflex people already have, so it is the interrupt worth honouring: while agentctl is driving, a sustained divergence between where the pointer is and where the server put it trips the kill switch, cancels any drag, and posts a notification. Keyboard has no equivalent signal and is out of scope. |
-| Destructive-keystroke gate | `mcp-policy::is_destructive` + `input::screens_as_terminal` | `rm -rf /` typed into a shell. Asks the *live input target*, and an undeterminable target screens as a terminal — unknown destination is not evidence of safety. |
+| Destructive-keystroke gate | `mcp-policy::is_destructive` + `input::screens_as_terminal` | `rm -rf /` typed into a shell. Asks the *live input target*, and an undeterminable target screens as a terminal: unknown destination is not evidence of safety. |
 | Path jail | `mcp-fs::Jail` | Reading or writing outside the roots. Resolves *then* checks, defeating `..` and symlinked parents. Credential paths and the server's own state directory are denied even inside a root. |
 | SSRF guard | `mcp-net::ssrf` | Reaching loopback, private ranges, link-local and cloud metadata. Judges the *resolved* address; redirects disabled. |
 | argv execution | `mcp-proc` | Shell metacharacter injection. No shell unless `allow_shell` is on. |
@@ -91,7 +91,7 @@ gate would have refused.
 | Frame cap | `mcp-core::DEFAULT_MAX_FRAME_BYTES` | Memory exhaustion before any policy runs. |
 | HTTP: loopback bind, bearer token, `Origin` refusal | `mcp-core::http` | Network reachability, unauthenticated access, and drive-by requests from the operator's own browser. |
 | Protected package set | `mcp-pkg` | Uninstalling the agent, the package manager, or security tooling. Not configurable. |
-| Audit log | `mcp-policy::AuditSink` | Nothing — but it is how you find out what happened. |
+| Audit log | `mcp-policy::AuditSink` | Nothing, but it is how you find out what happened. |
 
 Full mapping to OWASP categories is in [`architecture.md`](architecture.md) §8.
 
@@ -128,7 +128,7 @@ backstop against an agent that has been tricked, not a boundary against one that
 `crates/mcp-fs/tests/redteam_jail.rs::documented_known_gap_hard_links`. A hard link has no target to
 follow, so a link inside a root pointing at an inode outside it resolves as in-root. The filesystem engine
 exposes no hard-link primitive, so creating one requires an actor with out-of-band write access inside a
-root — at which point they have that access anyway.
+root, at which point they have that access anyway.
 
 **`browser_navigate` is origin-prefix checked, not IP-guarded.**
 The SSRF guard protects `http_request`; the browser is a general-purpose network client and its navigation
@@ -149,7 +149,7 @@ engineering surface.
 Screen capture returns what is on screen, including a secret the human has open. That is the capability,
 not a defect in it.
 
-**Content is not instructions — but the agent may read it as such.**
+**Content is not instructions, but the agent may read it as such.**
 Every perception tool returns text an attacker may have written: page text, file contents, terminal
 output, even an application's accessibility labels. Results from those tools now carry
 `provenance: "untrusted"`, and text that reads as an instruction aimed at a model is additionally flagged
@@ -163,13 +163,13 @@ The scan reads literal text, in English, in one tool result. It therefore misses
 translations, homoglyphs, paraphrase, an instruction stored behind a pointer, a payload split across two
 calls, and anything rendered as an image. All of those are asserted as passing in
 `crates/mcp-policy/tests/redteam_injection.rs::documented_known_bypasses`. Closing them would mean
-understanding the text, which is the model's job rather than a string matcher's — which is exactly why the
+understanding the text, which is the model's job rather than a string matcher's. That is exactly why the
 controls that matter are the ones that do not depend on reading intent. **An injection that succeeds
 completely still cannot call a tool the operator did not enable.**
 
 **Human override is a convenience, not a containment boundary.**
-It notices a person taking the mouse. It cannot notice a person typing — that
-would need an event tap watching every keystroke on the machine — and it is
+It notices a person taking the mouse. It cannot notice a person typing. That
+would need an event tap watching every keystroke on the machine, and it is
 disabled the moment a backend cannot read the pointer, because an unreadable
 sensor must never be treated as evidence of interference. It also cannot help
 when nobody is at the machine, which is exactly when an autonomous agent runs.

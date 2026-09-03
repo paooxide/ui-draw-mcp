@@ -1,5 +1,5 @@
 //! Browser engine: DOM-level control of a Chromium browser over the Chrome
-//! DevTools Protocol (`docs/planning.md` §5.11, D11). Unlike the desktop
+//! DevTools Protocol. Unlike the desktop
 //! engines this crate is OS-independent — it speaks CDP over TCP — so the real
 //! backend ([`CdpBackend`]) ships here, not in a per-OS crate.
 

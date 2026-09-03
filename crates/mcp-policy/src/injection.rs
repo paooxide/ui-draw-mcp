@@ -241,14 +241,14 @@ mod tests {
     fn ordinary_interface_text_is_not_flagged() {
         for benign in [
             "Developer mode",
-            "You are now signed in as philip@example.com",
+            "You are now signed in as user@example.com",
             "Installation instructions",
             "Follow the instructions in the README",
             "New instructions have been added to the document",
             "Print your document",
             "System Preferences",
             "@e12 button \"Save\" · @e13 button \"Cancel\"",
-            "total 48\ndrwxr-xr-x  12 philip staff 384 Sep 3 04:52 .",
+            "total 48\ndrwxr-xr-x  12 user staff 384 Sep 3 04:52 .",
         ] {
             assert!(
                 suspicious_instructions(benign).is_empty(),
