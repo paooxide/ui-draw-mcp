@@ -1,0 +1,134 @@
+{
+  "client": "gemini-bridge",
+  "schema": "agentctl-demo-transcript/1",
+  "started_ms": 1788420075375,
+  "task": "Open a form, type 'pollinator', submit it and read the result off the page",
+  "turns": [
+    {
+      "args": {
+        "launch": {
+          "headless": true
+        }
+      },
+      "decision": "allow",
+      "result": {
+        "excerpt": "",
+        "latency_ms": 1686,
+        "ok": true
+      },
+      "role": "tool",
+      "tool": "browser_connect"
+    },
+    {
+      "args": {
+        "action": "list",
+        "browser_id": 1
+      },
+      "decision": "allow",
+      "result": {
+        "excerpt": "",
+        "latency_ms": 2,
+        "ok": true
+      },
+      "role": "tool",
+      "tool": "browser_tabs"
+    },
+    {
+      "args": {
+        "action": "goto",
+        "target_id": "95D67908AB523BEC65EF93D18A2546EC",
+        "url": "data:text/html,<form onsubmit=\"document.getElementById('out').textContent='you searched for '+document.getElementById('q').value;return false\"><input id=q><button>Go</button></form><p id=out>nothing yet</p>"
+      },
+      "decision": "allow",
+      "result": {
+        "excerpt": "",
+        "latency_ms": 9,
+        "ok": true
+      },
+      "role": "tool",
+      "tool": "browser_navigate"
+    },
+    {
+      "args": {
+        "mode": "dom",
+        "target_id": "95D67908AB523BEC65EF93D18A2546EC"
+      },
+      "decision": "allow",
+      "result": {
+        "excerpt": "",
+        "latency_ms": 6,
+        "ok": true
+      },
+      "role": "tool",
+      "tool": "browser_snapshot"
+    },
+    {
+      "args": {
+        "action": "type",
+        "ref": "//*[@id=\"q\"]",
+        "target_id": "95D67908AB523BEC65EF93D18A2546EC",
+        "value": "pollinator"
+      },
+      "decision": "allow",
+      "result": {
+        "excerpt": "",
+        "latency_ms": 10,
+        "ok": true
+      },
+      "role": "tool",
+      "tool": "browser_act"
+    },
+    {
+      "args": {
+        "action": "click",
+        "ref": "/html/body[1]/form[1]/button[1]",
+        "target_id": "95D67908AB523BEC65EF93D18A2546EC"
+      },
+      "decision": "allow",
+      "result": {
+        "excerpt": "",
+        "latency_ms": 14,
+        "ok": true
+      },
+      "role": "tool",
+      "tool": "browser_act"
+    },
+    {
+      "args": {
+        "mode": "text",
+        "target_id": "95D67908AB523BEC65EF93D18A2546EC"
+      },
+      "decision": "allow",
+      "result": {
+        "excerpt": "",
+        "latency_ms": 5,
+        "ok": true
+      },
+      "role": "tool",
+      "tool": "browser_snapshot"
+    },
+    {
+      "args": {
+        "expression": "document.getElementById('out').textContent",
+        "target_id": "95D67908AB523BEC65EF93D18A2546EC"
+      },
+      "decision": "deny",
+      "role": "tool",
+      "tool": "browser_eval"
+    },
+    {
+      "args": {
+        "browser_id": 1,
+        "kill": true
+      },
+      "decision": "allow",
+      "result": {
+        "excerpt": "",
+        "latency_ms": 87,
+        "ok": true
+      },
+      "role": "tool",
+      "tool": "browser_disconnect"
+    }
+  ]
+}

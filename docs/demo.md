@@ -98,6 +98,13 @@ bounded excerpt of the result. Anything in `docs/fixtures/` is checked in CI
 against the live descriptor list, so a recording that names a tool we have
 since renamed fails the build instead of quietly misleading a reader.
 
+Two fixtures describe the *same* browser session, produced independently:
+`gemini-bridge.json` recorded live by the bridge, and `from-audit.json`
+reconstructed afterwards from `~/.agentctl/audit/<session>.jsonl`. Their tool
+sequences are identical, which is the evidence that Route B needs no
+cooperation from the client — and the reconstruction carries something the live
+recording cannot, the policy decision on each call.
+
 `docs/fixtures/gemini-bridge.json` is a real run: connect a headless browser,
 fill a form, read the result back off the page, and disconnect. It includes a
 `POLICY_DENIED` — the model reached for `browser_eval`, which is Dangerous-tier
