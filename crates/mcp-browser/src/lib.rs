@@ -7,6 +7,6 @@ mod backend;
 mod cdp;
 mod tools;
 
-pub use backend::{BrowserBackend, BrowserError, CdpBackend, Shot};
+pub use backend::{BrowserBackend, BrowserError, CdpBackend, Shot, CHROME_BINS};
 pub use cdp::DialogPolicy;
 pub use tools::BrowserModule;

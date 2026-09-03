@@ -8,18 +8,8 @@
 //!
 //! Skips (rather than fails) when no Chromium binary is installed.
 
-use mcp_browser::{BrowserBackend, CdpBackend, DialogPolicy};
+use mcp_browser::{BrowserBackend, CdpBackend, DialogPolicy, CHROME_BINS};
 use serde_json::{json, Value};
-
-const CHROME_BINS: &[&str] = &[
-    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-    "/Applications/Chromium.app/Contents/MacOS/Chromium",
-    "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
-    "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
-    "/usr/bin/google-chrome",
-    "/usr/bin/chromium",
-    "/usr/bin/chromium-browser",
-];
 
 /// Launching a real browser is the point of this file locally, and an
 /// availability gamble on a hosted CI runner. `AGENTCTL_SKIP_LIVE=1` skips
@@ -203,4 +193,64 @@ async fn intercept_blocks_and_clears_url_patterns() {
         .expect("clearing must work");
     assert_eq!(cleared["count"], 0);
     assert_eq!(cleared["note"], "blocking cleared");
+}
+
+/// Every browser this suite launches must be gone when it ends.
+///
+/// Before `Drop`, each of these tests left a headless Chrome running with a
+/// profile under $TMPDIR for the life of the machine — so the suite that proves
+/// the engine works was also the thing leaking its processes.
+#[tokio::test(flavor = "multi_thread")]
+async fn disconnect_kills_a_launched_browser_and_removes_its_profile() {
+    if !have_chrome() {
+        return;
+    }
+    let b = CdpBackend::new(Vec::new());
+    let port = 9358u64;
+    if b.connect(None, Some(json!({ "headless": true, "port": port })))
+        .await
+        .is_err()
+    {
+        return;
+    }
+    let profile = std::env::temp_dir().join(format!("agentctl-cdp-{}-{port}", std::process::id()));
+    assert!(profile.exists(), "launching should create the profile dir");
+
+    let out = b.disconnect(1, true).await.expect("disconnect");
+    assert_eq!(out.get("killed").and_then(Value::as_bool), Some(true));
+    assert_eq!(
+        out.get("profile_removed").and_then(Value::as_bool),
+        Some(true)
+    );
+    assert!(!profile.exists(), "the profile dir must be gone");
+
+    // The id is forgotten, so a second disconnect is a clean NotFound rather
+    // than a second kill.
+    assert!(b.disconnect(1, true).await.is_err());
+}
+
+/// `kill` is refused for a browser we merely attached to: it belongs to
+/// whoever started it, and killing someone else's browser is not ours to do.
+#[tokio::test(flavor = "multi_thread")]
+async fn kill_is_refused_for_an_attached_browser() {
+    if !have_chrome() {
+        return;
+    }
+    let owner = CdpBackend::new(Vec::new());
+    let port = 9359u64;
+    if owner
+        .connect(None, Some(json!({ "headless": true, "port": port })))
+        .await
+        .is_err()
+    {
+        return;
+    }
+    let attacher = CdpBackend::new(Vec::new());
+    if attacher.connect(Some(port as u16), None).await.is_err() {
+        return;
+    }
+    let err = attacher.disconnect(1, true).await;
+    assert!(err.is_err(), "attached browsers must not be killable");
+    // Still reachable from its owner, i.e. it really was not killed.
+    assert!(owner.tabs(1, "list", None, None).await.is_ok());
 }

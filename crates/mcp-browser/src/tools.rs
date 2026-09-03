@@ -65,6 +65,21 @@ impl BrowserModule {
         )
     }
 
+    async fn disconnect(&self, args: &Value) -> Envelope {
+        let Some(browser_id) = args.get("browser_id").and_then(Value::as_u64) else {
+            return Envelope::fail(
+                "browser_disconnect",
+                ErrorCode::InvalidArgs,
+                "missing 'browser_id'",
+            );
+        };
+        let kill = args.get("kill").and_then(Value::as_bool).unwrap_or(false);
+        result(
+            "browser_disconnect",
+            self.backend.disconnect(browser_id as u32, kill).await,
+        )
+    }
+
     async fn tabs(&self, args: &Value) -> Envelope {
         let Some(browser_id) = args.get("browser_id").and_then(Value::as_u64) else {
             return Envelope::fail(
@@ -288,6 +303,19 @@ impl ToolModule for BrowserModule {
                 ),
             ),
             ToolDescriptor::new(
+                "browser_disconnect",
+                Category::Browser,
+                Tier::Standard,
+                "Disconnect from a browser. With kill=true, also stop a browser this session launched and delete the temporary profile it created (attached browsers are never killed).",
+                obj(
+                    json!({
+                        "browser_id": { "type": "integer" },
+                        "kill": { "type": "boolean", "description": "stop the process; only valid for a browser agentctl launched" }
+                    }),
+                    json!(["browser_id"]),
+                ),
+            ),
+            ToolDescriptor::new(
                 "browser_tabs",
                 Category::Browser,
                 Tier::Standard,
@@ -472,9 +500,16 @@ impl ToolModule for BrowserModule {
         Some("Automatically ACCEPT JavaScript dialogs in this tab? Any confirm() the page raises will be answered 'yes' without further prompting.".to_string())
     }
 
+    /// Stop browsers this session launched. Without this, a `serve` that ends
+    /// leaves a headless Chrome and its profile directory behind for good.
+    fn shutdown(&self) {
+        self.backend.shutdown();
+    }
+
     async fn call(&self, name: &str, args: Value, _ctx: &CallCtx) -> Envelope {
         match name {
             "browser_connect" => self.connect(&args).await,
+            "browser_disconnect" => self.disconnect(&args).await,
             "browser_tabs" => self.tabs(&args).await,
             "browser_navigate" => self.navigate(&args).await,
             "browser_snapshot" => self.snapshot(&args).await,

@@ -26,7 +26,7 @@ mcp-sec = { path = "../crates/mcp-sec" }
 mcp-pty = { path = "../crates/mcp-pty" }
 mcp-pkg = { path = "../crates/mcp-pkg" }
 mcp-memory = { path = "../crates/mcp-memory" }
-tokio.workspace = true
+tokio = { workspace = true, features = ["signal"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 serde_json.workspace = true

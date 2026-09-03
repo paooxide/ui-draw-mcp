@@ -408,3 +408,44 @@ async fn prompt_budget_caps_interruptions() {
         "the human must only be interrupted up to the budget"
     );
 }
+
+/// Engines own things the process does not: child browsers, PTY process
+/// groups, temporary profiles. `Server::shutdown` is the one call that releases
+/// them, so it must actually reach every module.
+#[tokio::test]
+async fn shutdown_reaches_every_module() {
+    struct Counting(Arc<AtomicUsize>);
+    #[async_trait::async_trait]
+    impl ToolModule for Counting {
+        fn descriptors(&self) -> Vec<ToolDescriptor> {
+            vec![ToolDescriptor::new(
+                "counted",
+                Category::System,
+                Tier::Read,
+                "test",
+                serde_json::json!({"type":"object","properties":{},"required":[]}),
+            )]
+        }
+        async fn call(&self, name: &str, _a: Value, _c: &CallCtx) -> Envelope {
+            Envelope::ok(name, serde_json::json!({}))
+        }
+        fn shutdown(&self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    let hits = Arc::new(AtomicUsize::new(0));
+    let registry = Registry::build(vec![Arc::new(Counting(hits.clone()))]).unwrap();
+    let policy = Arc::new(Policy::new(
+        PolicyConfig::default(),
+        AuditSink::memory(),
+        Redactor::empty(),
+    ));
+    let server = Server::new(registry, policy, "s".to_string());
+    server.shutdown();
+    server.shutdown();
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        2,
+        "shutdown must be idempotent and always reach the module"
+    );
+}

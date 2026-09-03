@@ -41,6 +41,14 @@ impl Registry {
     }
 
     /// All descriptors in stable order.
+    /// Let every module release what it owns. Errors are the module's problem;
+    /// one failing must not stop the others from being asked.
+    pub fn shutdown_all(&self) {
+        for m in &self.modules {
+            m.shutdown();
+        }
+    }
+
     pub fn descriptors(&self) -> impl Iterator<Item = &ToolDescriptor> {
         self.order.iter().map(move |name| &self.index[name].1)
     }

@@ -29,4 +29,10 @@ pub trait ToolModule: Send + Sync {
     fn consent_prompt(&self, _name: &str, _args: &Value) -> Option<String> {
         None
     }
+
+    /// Release resources the module owns outside this process: child
+    /// processes, temporary directories, sessions. Called once when the server
+    /// stops serving. Must be synchronous (it runs on shutdown paths where
+    /// there may be no runtime left to await on) and idempotent.
+    fn shutdown(&self) {}
 }

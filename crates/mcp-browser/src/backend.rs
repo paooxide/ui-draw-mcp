@@ -41,6 +41,10 @@ pub trait BrowserBackend: Send + Sync {
         attach_port: Option<u16>,
         launch: Option<Value>,
     ) -> Result<Value, BrowserError>;
+    /// Forget a browser. `kill` additionally stops one *this process started*
+    /// and removes the temporary profile created for it; an attached browser is
+    /// someone else's process and is never killed.
+    async fn disconnect(&self, browser_id: u32, kill: bool) -> Result<Value, BrowserError>;
     /// Tab lifecycle: `list` / `open` / `activate` / `close`.
     async fn tabs(
         &self,
@@ -114,6 +118,8 @@ pub trait BrowserBackend: Send + Sync {
         action: &str,
         cookie: Option<Value>,
     ) -> Result<Value, BrowserError>;
+    /// Release anything this backend started. Default: nothing was started.
+    fn shutdown(&self) {}
 }
 
 #[derive(Clone)]
@@ -123,9 +129,23 @@ struct BrowserEntry {
     port: u16,
 }
 
+/// A browser *this process started*, kept so it can be stopped again.
+///
+/// `std::process::Child` is not `Clone`, and dropping one does not kill the
+/// process, so the handle lives in its own table rather than in the cloneable
+/// `BrowserEntry`. `user_data_dir` is `Some` only when we chose the directory:
+/// an operator-supplied profile is never deleted.
+struct Launched {
+    id: u32,
+    child: std::process::Child,
+    user_data_dir: Option<std::path::PathBuf>,
+}
+
 /// The real Chrome DevTools Protocol backend.
 pub struct CdpBackend {
     browsers: Mutex<Vec<BrowserEntry>>,
+    /// Browsers started by this process, by `browser_id`.
+    launched: Mutex<Vec<Launched>>,
     next_id: AtomicU32,
     /// If non-empty, `goto` is restricted to URLs whose origin matches one of
     /// these prefixes (`docs/planning.md` §9 `browser.allowed_origins`).
@@ -139,9 +159,26 @@ impl CdpBackend {
     pub fn new(allowed_origins: Vec<String>) -> Self {
         CdpBackend {
             browsers: Mutex::new(Vec::new()),
+            launched: Mutex::new(Vec::new()),
             next_id: AtomicU32::new(1),
             allowed_origins,
             dialogs: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Stop every browser this process started and remove the profiles it
+    /// created. Idempotent, so `Drop` and an explicit shutdown can both run.
+    fn reap_all(&self) {
+        let taken: Vec<Launched> = {
+            let mut g = self.launched.lock().expect("launched mutex");
+            std::mem::take(&mut *g)
+        };
+        for l in taken {
+            tracing::info!(
+                browser_id = l.id,
+                "stopping browser launched by this session"
+            );
+            reap_one(l.child, l.user_data_dir.as_deref());
         }
     }
 
@@ -280,22 +317,40 @@ impl BrowserBackend for CdpBackend {
         attach_port: Option<u16>,
         launch: Option<Value>,
     ) -> Result<Value, BrowserError> {
-        let (host, port) = if let Some(p) = attach_port {
-            ("127.0.0.1".to_string(), p)
+        let (host, port, started) = if let Some(p) = attach_port {
+            ("127.0.0.1".to_string(), p, None)
         } else if let Some(spec) = launch {
-            launch_browser(&spec).await?
+            let (h, p, child, dir) = launch_browser(&spec).await?;
+            (h, p, Some((child, dir)))
         } else {
             return Err(BrowserError::Failed(
                 "browser_connect needs 'attach.port' or 'launch'".into(),
             ));
         };
-        // Verify the endpoint is live.
-        let ver = http_json(&host, port, "GET", "/json/version")
-            .await
-            .map_err(|e| {
-                BrowserError::Failed(format!("no CDP endpoint at {host}:{port} ({e:?})"))
-            })?;
+        // Verify the endpoint is live. A browser we started but cannot reach is
+        // reaped here rather than left behind by an early return.
+        let ver = match http_json(&host, port, "GET", "/json/version").await {
+            Ok(v) => v,
+            Err(e) => {
+                if let Some((child, dir)) = started {
+                    reap_one(child, dir.as_deref());
+                }
+                return Err(BrowserError::Failed(format!(
+                    "no CDP endpoint at {host}:{port} ({e:?})"
+                )));
+            }
+        };
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        if let Some((child, user_data_dir)) = started {
+            self.launched
+                .lock()
+                .expect("launched mutex")
+                .push(Launched {
+                    id,
+                    child,
+                    user_data_dir,
+                });
+        }
         self.browsers
             .lock()
             .expect("browsers mutex")
@@ -310,6 +365,55 @@ impl BrowserBackend for CdpBackend {
             "port": port,
             "browser": ver.get("Browser"),
             "protocol": ver.get("Protocol-Version"),
+        }))
+    }
+
+    fn shutdown(&self) {
+        self.reap_all();
+    }
+
+    async fn disconnect(&self, browser_id: u32, kill: bool) -> Result<Value, BrowserError> {
+        let existed = {
+            let mut g = self.browsers.lock().expect("browsers mutex");
+            let before = g.len();
+            g.retain(|b| b.id != browser_id);
+            g.len() != before
+        };
+        if !existed {
+            return Err(BrowserError::NotFound(format!(
+                "no browser with id {browser_id}"
+            )));
+        }
+        let mine = {
+            let mut g = self.launched.lock().expect("launched mutex");
+            g.iter()
+                .position(|l| l.id == browser_id)
+                .map(|i| g.remove(i))
+        };
+        let mut killed = false;
+        let mut profile_removed = false;
+        match (kill, mine) {
+            (true, Some(l)) => {
+                profile_removed = l.user_data_dir.is_some();
+                reap_one(l.child, l.user_data_dir.as_deref());
+                killed = true;
+            }
+            (true, None) => {
+                return Err(BrowserError::Unsupported(
+                    "this browser was attached, not launched by agentctl; \
+                     'kill' only applies to browsers this session started"
+                        .into(),
+                ));
+            }
+            // Keep it running but stop tracking it — while still owning the
+            // child, so shutdown reaps it instead of leaking the process.
+            (false, Some(l)) => self.launched.lock().expect("launched mutex").push(l),
+            (false, None) => {}
+        }
+        Ok(json!({
+            "disconnected": browser_id,
+            "killed": killed,
+            "profile_removed": profile_removed,
         }))
     }
 
@@ -830,7 +934,7 @@ impl BrowserBackend for CdpBackend {
 }
 
 /// Common macOS/Linux Chromium binary locations, tried in order.
-const CHROME_BINS: &[&str] = &[
+pub const CHROME_BINS: &[&str] = &[
     "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
     "/Applications/Chromium.app/Contents/MacOS/Chromium",
     "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
@@ -840,25 +944,61 @@ const CHROME_BINS: &[&str] = &[
     "/usr/bin/chromium-browser",
 ];
 
+/// Last line of defence: a server that exits without calling `shutdown` still
+/// takes its browsers with it. Modelled on `mcp_pty::PtySession`, which kills
+/// its process group the same way.
+impl Drop for CdpBackend {
+    fn drop(&mut self) {
+        self.reap_all();
+    }
+}
+
+/// The temp profile directory this process would create for `port`.
+///
+/// Keyed on the pid as well as the port so two concurrent servers never share
+/// a profile, and so ownership is decidable: only a directory matching this
+/// shape, for *our* pid, was created by us and may be deleted.
+fn own_profile_dir(port: u16) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("agentctl-cdp-{}-{port}", std::process::id()))
+}
+
+/// Stop one launched browser and remove the profile directory we created for
+/// it. Best-effort throughout: this runs on shutdown paths where the only
+/// alternative to ignoring an error is leaking the process.
+fn reap_one(mut child: std::process::Child, user_data_dir: Option<&std::path::Path>) {
+    let _ = child.kill();
+    let _ = child.wait();
+    if let Some(dir) = user_data_dir {
+        if let Err(e) = std::fs::remove_dir_all(dir) {
+            tracing::debug!(dir = %dir.display(), error = %e, "could not remove browser profile");
+        }
+    }
+}
+
 /// Launch a dedicated Chromium instance with a debugging port and poll until
 /// its CDP endpoint answers.
-async fn launch_browser(spec: &Value) -> Result<(String, u16), BrowserError> {
+///
+/// Returns the child handle so the caller can stop it again: a dropped
+/// `Child` does **not** kill the process, so discarding it leaks a browser and
+/// its profile directory for the life of the machine.
+type Launch = (String, u16, std::process::Child, Option<std::path::PathBuf>);
+
+async fn launch_browser(spec: &Value) -> Result<Launch, BrowserError> {
     use tokio::time::{sleep, Duration};
     let port = spec.get("port").and_then(Value::as_u64).unwrap_or(9333) as u16;
     let headless = spec
         .get("headless")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let user_data_dir = spec
-        .get("user_data_dir")
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .unwrap_or_else(|| {
-            std::env::temp_dir()
-                .join(format!("agentctl-cdp-{port}"))
-                .to_string_lossy()
-                .into_owned()
-        });
+    // Only a directory we chose is ours to delete later.
+    let (user_data_dir, owned) = match spec.get("user_data_dir").and_then(Value::as_str) {
+        Some(p) => (std::path::PathBuf::from(p), None),
+        None => {
+            let d = own_profile_dir(port);
+            (d.clone(), Some(d))
+        }
+    };
+    let user_data_dir = user_data_dir.to_string_lossy().into_owned();
     let bin = CHROME_BINS
         .iter()
         .find(|p| std::path::Path::new(p).exists())
@@ -878,7 +1018,8 @@ async fn launch_browser(spec: &Value) -> Result<(String, u16), BrowserError> {
     }
     cmd.stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
-    cmd.spawn()
+    let child = cmd
+        .spawn()
         .map_err(|e| BrowserError::Failed(format!("spawn {bin}: {e}")))?;
 
     // Poll for readiness (~8s).
@@ -887,10 +1028,12 @@ async fn launch_browser(spec: &Value) -> Result<(String, u16), BrowserError> {
             .await
             .is_ok()
         {
-            return Ok(("127.0.0.1".to_string(), port));
+            return Ok(("127.0.0.1".to_string(), port, child, owned));
         }
         sleep(Duration::from_millis(200)).await;
     }
+    // It never came up, so nothing else will ever hold this handle.
+    reap_one(child, owned.as_deref());
     Err(BrowserError::Timeout(format!(
         "launched browser but CDP port {port} never came up"
     )))
@@ -911,6 +1054,38 @@ mod tests {
         let b = CdpBackend::new(vec!["https://ok.example".into()]);
         assert!(b.origin_allowed("https://ok.example/path"));
         assert!(!b.origin_allowed("https://evil.example"));
+    }
+
+    /// Only a directory *we* named is ours to delete. The pid is in the name
+    /// so two servers never share a profile, and so "did we create this?" is
+    /// decidable from the path alone rather than from a guess about the port.
+    #[test]
+    fn own_profile_dir_is_pid_and_port_scoped() {
+        let a = own_profile_dir(9333);
+        let b = own_profile_dir(9334);
+        assert_ne!(a, b, "different ports get different profiles");
+        assert!(a.starts_with(std::env::temp_dir()));
+        let name = a.file_name().unwrap().to_string_lossy().into_owned();
+        assert_eq!(
+            name,
+            format!("agentctl-cdp-{}-9333", std::process::id()),
+            "the pid must be in the name"
+        );
+    }
+
+    /// An operator-supplied profile is never deleted: `launch_browser` records
+    /// `None` for it, and `reap_one` only removes what it is given.
+    #[test]
+    fn a_supplied_profile_dir_is_not_owned() {
+        let spec = json!({ "user_data_dir": "/tmp/somebody-elses-profile", "port": 9999 });
+        let supplied = spec.get("user_data_dir").and_then(Value::as_str);
+        assert!(supplied.is_some());
+        // Mirrors the branch in launch_browser: supplied => not owned.
+        let owned: Option<std::path::PathBuf> = match supplied {
+            Some(_) => None,
+            None => Some(own_profile_dir(9999)),
+        };
+        assert!(owned.is_none(), "a supplied profile must never be deleted");
     }
 
     #[tokio::test]

@@ -118,7 +118,9 @@ async fn serve(force_http: bool) -> std::io::Result<()> {
 
     let Some(http) = http else {
         tracing::info!(session = %session_id, protocol = PROTOCOL_VERSION, "agentctl serving on stdio");
-        return server.serve_stdio().await;
+        let r = run_until_signal(server.serve_stdio()).await;
+        server.shutdown();
+        return r;
     };
 
     // One transport at a time. Serving both would mean an unauthenticated
@@ -152,7 +154,50 @@ async fn serve(force_http: bool) -> std::io::Result<()> {
         %addr,
         "agentctl serving on http (loopback, bearer auth)"
     );
-    transport.serve(Arc::new(server)).await
+    let server = Arc::new(server);
+    let r = run_until_signal(transport.serve(server.clone())).await;
+    server.shutdown();
+    r
+}
+
+/// Serve until the transport ends or the process is asked to stop.
+///
+/// Without this, Ctrl-C and SIGTERM kill the process outright: no destructor
+/// runs, so a browser this session launched keeps running with its temporary
+/// profile, and a PTY keeps its child process group alive. Both signals are
+/// treated as a clean end of service so the shutdown hooks get to run.
+async fn run_until_signal<F>(serving: F) -> std::io::Result<()>
+where
+    F: std::future::Future<Output = std::io::Result<()>>,
+{
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut term = signal(SignalKind::terminate())?;
+        tokio::pin!(serving);
+        tokio::select! {
+            r = &mut serving => r,
+            _ = tokio::signal::ctrl_c() => {
+                tracing::info!("interrupted; shutting engines down");
+                Ok(())
+            }
+            _ = term.recv() => {
+                tracing::info!("terminated; shutting engines down");
+                Ok(())
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::pin!(serving);
+        tokio::select! {
+            r = &mut serving => r,
+            _ = tokio::signal::ctrl_c() => {
+                tracing::info!("interrupted; shutting engines down");
+                Ok(())
+            }
+        }
+    }
 }
 
 /// Translate the operator's `[http]` settings into the transport's own config.

@@ -54,6 +54,13 @@ impl Server {
         &self.session_id
     }
 
+    /// Stop serving: let every engine release child processes, temporary
+    /// directories and sessions. Idempotent, and safe to call from any exit
+    /// path (EOF, transport error, signal).
+    pub fn shutdown(&self) {
+        self.registry.shutdown_all();
+    }
+
     // ---- dispatch (the single security-relevant path; arch §2.3, §6) --------
 
     /// Validate → gate → audit → execute → redact → audit. The only path that
