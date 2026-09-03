@@ -351,3 +351,90 @@ async fn find_elements_is_cheaper_than_the_tree_and_its_refs_work() {
 
     let _ = c.call("close_app", json!({ "app": "Calculator" })).await;
 }
+
+/// After an action, almost nothing on screen is different — so send the
+/// difference, not the tree.
+///
+/// This is the token-cost argument made concrete: an agent that observes,
+/// acts, and observes again pays for the whole UI twice. With `since` the
+/// second observation is the change alone, and it still carries usable refs.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_delta_is_far_smaller_than_the_tree_and_names_what_changed() {
+    if !ready() {
+        return;
+    }
+    let c = client("live-delta");
+    c.initialize().await;
+    c.ok("launch", json!({ "app": "TextEdit" })).await;
+    if !settle_on(&c, "TextEdit").await {
+        return;
+    }
+    if !guarded_key(&c, "TextEdit", "cmd+n").await {
+        return;
+    }
+    tokio::time::sleep(Duration::from_millis(700)).await;
+
+    let first = c.ok("get_ui_tree", json!({ "app": "TextEdit" })).await;
+    let base = first["snapshot_id"].as_str().unwrap().to_string();
+    let tree_chars = first["text"].as_str().unwrap_or_default().len();
+
+    let nonce = format!("delta-{}", mcp_policy::now_ms());
+    if !guarded_type(&c, "TextEdit", &nonce).await {
+        return;
+    }
+    let settled = c
+        .call(
+            "wait_for",
+            json!({ "app": "TextEdit", "text": &nonce, "timeout_ms": 5000 }),
+        )
+        .await;
+    if !settled.ok {
+        eprintln!("skipping: the typed text never landed");
+        return;
+    }
+
+    let delta = c
+        .ok("get_ui_tree", json!({ "app": "TextEdit", "since": &base }))
+        .await;
+    let delta_bytes = serde_json::to_string(&delta).unwrap().len();
+    assert!(
+        delta_bytes * 3 < tree_chars,
+        "a delta should be much smaller than the tree ({delta_bytes} vs {tree_chars})"
+    );
+    assert!(
+        delta.get("text").is_none(),
+        "the tree text is the thing being avoided; it must be opt-in"
+    );
+
+    // The changed element is named, with what it changed from.
+    let changed = delta["delta"]["changed"].as_array().unwrap();
+    let typed = changed
+        .iter()
+        .find(|e| e["value"].as_str().is_some_and(|v| v.contains(&nonce)))
+        .unwrap_or_else(|| panic!("the edited field should be in the delta: {changed:?}"));
+    assert!(typed["fields"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("value")));
+    assert!(
+        typed["before"]["value"].is_string() || typed["before"]["value"].is_null(),
+        "a change reports the previous value"
+    );
+    assert!(
+        delta["delta"]["counts"]["unchanged"].as_u64().unwrap() > 10,
+        "most of the UI did not change, which is the whole point"
+    );
+
+    // A snapshot that has aged out is a clear error naming what is left, not a
+    // silent full tree.
+    let stale = c
+        .call(
+            "get_ui_tree",
+            json!({ "app": "TextEdit", "since": "s-nope" }),
+        )
+        .await;
+    assert!(!stale.ok);
+    assert_eq!(stale.error.unwrap().code, mcp_types::ErrorCode::NotFound);
+
+    let _ = c.call("close_app", json!({ "app": "TextEdit" })).await;
+}

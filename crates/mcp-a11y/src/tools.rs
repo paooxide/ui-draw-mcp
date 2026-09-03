@@ -1,4 +1,3 @@
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -7,6 +6,7 @@ use serde_json::{json, Value};
 
 use crate::arena::{RefError, SnapshotArena};
 use crate::backend::{A11yBackend, BackendError, SnapshotRequest};
+use crate::diff::diff_snapshots;
 use crate::flatten::{flatten, FlattenConfig};
 use crate::query::{parse_query, query_schema, query_snapshot};
 
@@ -19,7 +19,6 @@ const SPARSE_TREE_REFS: usize = 5;
 pub struct A11yModule {
     backend: Arc<dyn A11yBackend>,
     arena: Arc<Mutex<SnapshotArena>>,
-    counter: AtomicU64,
     max_chars: usize,
 }
 
@@ -28,7 +27,6 @@ impl A11yModule {
         A11yModule {
             backend,
             arena: Arc::new(Mutex::new(SnapshotArena::new())),
-            counter: AtomicU64::new(1),
             max_chars,
         }
     }
@@ -39,8 +37,13 @@ impl A11yModule {
         self.arena.clone()
     }
 
+    /// Ids come from the arena so every observation, from whichever tool,
+    /// draws from one sequence.
     fn next_snapshot_id(&self) -> String {
-        format!("s{:x}", self.counter.fetch_add(1, Ordering::SeqCst))
+        self.arena
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .next_id()
     }
 
     async fn get_ui_tree(&self, args: &Value) -> Envelope {
@@ -85,8 +88,33 @@ impl A11yModule {
             truncated,
             used_skeleton,
         } = f;
+
+        // `since`: report what changed rather than everything. After an action
+        // almost nothing on screen differs, and re-reading the whole tree to
+        // find that out is the cost this avoids.
+        let since = str_arg(args, "since");
+        let mut delta = None;
         {
             let mut arena = self.arena.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(id) = &since {
+                match arena.get(id) {
+                    Some(before) => delta = Some(diff_snapshots(before, &snapshot).to_json()),
+                    None => {
+                        let known = arena.known_ids().join(", ");
+                        return Envelope::fail_with(
+                            "get_ui_tree",
+                            ErrorCode::NotFound,
+                            format!("snapshot '{id}' is no longer retained"),
+                            if known.is_empty() {
+                                "call get_ui_tree without 'since' to observe from scratch"
+                                    .to_string()
+                            } else {
+                                format!("retained snapshots: {known}")
+                            },
+                        );
+                    }
+                }
+            }
             arena.install(snapshot);
         }
 
@@ -98,12 +126,26 @@ impl A11yModule {
             "snapshot_id": sid,
             "app": raw.app,
             "window": raw.window,
-            "text": text,
             "ref_count": ref_count,
             "truncated": truncated,
             "skeleton": used_skeleton,
         });
-        if ref_count < SPARSE_TREE_REFS && !used_skeleton {
+        // In delta mode the full text is the thing being avoided, so it is sent
+        // only when asked for. Refs in the delta resolve against the snapshot
+        // just installed, so they remain actionable either way.
+        let want_text = since.is_none()
+            || args
+                .get("include_text")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+        if want_text {
+            data["text"] = json!(text);
+        }
+        if let Some(d) = delta {
+            data["since"] = json!(since);
+            data["delta"] = d;
+        }
+        if since.is_none() && ref_count < SPARSE_TREE_REFS && !used_skeleton {
             data["sparse"] = json!(true);
             data["hint"] = json!(
                 "this app exposes few accessibility elements — its UI may be custom-drawn                  (SwiftUI/Electron/canvas). Fall back to capture_screen plus coordinate                  input (mouse_action/scroll), or browser_* if it is web content."
@@ -249,6 +291,14 @@ impl ToolModule for A11yModule {
                             "type": "string",
                             "enum": ["window", "focused", "menu", "menubar", "sheet", "popover", "alert"],
                             "description": "which UI surface to observe"
+                        },
+                        "since": {
+                            "type": "string",
+                            "description": "a previous snapshot_id: return only what changed since then, instead of the whole tree"
+                        },
+                        "include_text": {
+                            "type": "boolean",
+                            "description": "with 'since', also return the full tree text (default false)"
                         }
                     },
                     "required": []

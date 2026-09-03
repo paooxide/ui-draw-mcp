@@ -1,8 +1,28 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use serde::Serialize;
 
 use crate::tree::Bounds;
+
+/// How many superseded snapshots are retained for diffing.
+///
+/// Enough that an agent can compare against something it observed a few turns
+/// ago; small enough that a long session does not accumulate UI trees. These
+/// are kept for *comparison only* — see [`SnapshotArena::get`].
+const HISTORY: usize = 8;
+
+/// The parts of an element's state a diff should notice.
+///
+/// Separated from the identifying fields so a change in any of them reads as
+/// "this element changed", not "one element vanished and another appeared".
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct ElementState {
+    pub focused: bool,
+    pub disabled: bool,
+    pub selected: bool,
+    pub checked: Option<bool>,
+    pub expanded: Option<bool>,
+}
 
 /// What we retain per element ref: enough for `get_element`, and for memory to
 /// convert a ref into a `{role, name}` selector. Never stores a live native
@@ -17,6 +37,9 @@ pub struct ElementInfo {
     /// Backend token to act on this element (input tools). `None` if the backend
     /// did not provide one.
     pub node_id: Option<u64>,
+    /// Toggles and flags, compared when diffing snapshots.
+    #[serde(default)]
+    pub state: ElementState,
 }
 
 /// One captured snapshot: an id, the app/window it came from, and the `@eN` ->
@@ -27,6 +50,10 @@ pub struct Snapshot {
     pub app: Option<String>,
     pub window: Option<String>,
     pub elements: HashMap<String, ElementInfo>,
+    /// Whether this snapshot was taken in depth-limited overview mode. A
+    /// skeleton and a full tree are not comparable, so a diff across the two
+    /// says so instead of reporting the missing detail as deletions.
+    pub skeleton: bool,
 }
 
 /// Why a ref failed to resolve.
@@ -44,6 +71,9 @@ pub enum RefError {
 #[derive(Default)]
 pub struct SnapshotArena {
     current: Option<Snapshot>,
+    /// Superseded snapshots, newest first, for diffing only.
+    history: VecDeque<Snapshot>,
+    counter: u64,
 }
 
 impl SnapshotArena {
@@ -51,9 +81,48 @@ impl SnapshotArena {
         SnapshotArena::default()
     }
 
+    /// The next snapshot id. Lives here so every observation, from whichever
+    /// tool, draws from one sequence.
+    pub fn next_id(&mut self) -> String {
+        self.counter += 1;
+        format!("s{:x}", self.counter)
+    }
+
     /// Install a new snapshot, superseding any previous one.
+    ///
+    /// The superseded snapshot moves to the history, where it can be *compared*
+    /// against but never resolved: its refs and backend handles belong to a UI
+    /// that has moved on.
     pub fn install(&mut self, snapshot: Snapshot) {
+        if let Some(old) = self.current.take() {
+            self.history.push_front(old);
+            while self.history.len() >= HISTORY {
+                self.history.pop_back();
+            }
+        }
         self.current = Some(snapshot);
+    }
+
+    /// Look up a snapshot by id, current or retained, **for diffing only**.
+    ///
+    /// Deliberately not a resolution path. A retained snapshot's `@eN` refs
+    /// point into a tree that no longer exists, and its backend node ids were
+    /// invalidated the moment the next observation replaced them — acting on
+    /// one would target nothing, or something else.
+    pub fn get(&self, id: &str) -> Option<&Snapshot> {
+        self.current
+            .as_ref()
+            .filter(|s| s.id == id)
+            .or_else(|| self.history.iter().find(|s| s.id == id))
+    }
+
+    /// Ids currently available to `get`, newest first.
+    pub fn known_ids(&self) -> Vec<String> {
+        self.current
+            .iter()
+            .chain(self.history.iter())
+            .map(|s| s.id.clone())
+            .collect()
     }
 
     pub fn current_id(&self) -> Option<&str> {
@@ -95,6 +164,7 @@ mod tests {
             secure: false,
             bounds: None,
             node_id: None,
+            state: ElementState::default(),
         }
     }
 
@@ -106,6 +176,7 @@ mod tests {
             app: None,
             window: None,
             elements,
+            skeleton: false,
         }
     }
 

@@ -207,6 +207,7 @@ pub fn query_schema() -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::arena::ElementState;
     use std::collections::HashMap;
 
     fn el(
@@ -227,6 +228,7 @@ mod tests {
                 h: 10.0,
             }),
             node_id,
+            state: ElementState::default(),
         }
     }
 
@@ -235,6 +237,7 @@ mod tests {
             id: "s1".into(),
             app: Some("Test".into()),
             window: None,
+            skeleton: false,
             elements: items
                 .iter()
                 .map(|(r, i)| ((*r).to_string(), i.clone()))
@@ -361,6 +364,7 @@ mod tests {
             id: "s1".into(),
             app: None,
             window: None,
+            skeleton: false,
             elements: items.into_iter().collect(),
         };
         let (hits, total) = query_snapshot(&s, &q(json!({"role":"button","limit": 5})));

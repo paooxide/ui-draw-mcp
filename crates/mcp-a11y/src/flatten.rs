@@ -106,6 +106,7 @@ fn build(
             app: app.map(str::to_string),
             window: window.map(str::to_string),
             elements: b.elements,
+            skeleton,
         },
         ref_count,
         truncated: false,
@@ -223,6 +224,13 @@ fn element_info(node: &UiNode, cfg: &FlattenConfig) -> ElementInfo {
         secure,
         bounds: node.bounds,
         node_id: node.node_id,
+        state: crate::arena::ElementState {
+            focused: node.focused,
+            disabled: node.disabled,
+            selected: node.selected,
+            checked: node.checked,
+            expanded: node.expanded,
+        },
     }
 }
 

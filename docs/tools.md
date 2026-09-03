@@ -190,8 +190,10 @@ Observe the UI. Returns interactive elements with refs (@e1, @e2…) as flattene
 | Argument | Type | Required | Description |
 |---|---|---|---|
 | `app` | string |  | target application name |
+| `include_text` | boolean |  | with 'since', also return the full tree text (default false) |
 | `max_depth` | integer |  | limit tree depth |
 | `root` | string |  | drill into this container ref (@eN) |
+| `since` | string |  | a previous snapshot_id: return only what changed since then, instead of the whole tree |
 | `skeleton` | boolean |  | depth-limited overview |
 | `surface` | one of: window, focused, menu, menubar, sheet, popover, alert |  | which UI surface to observe |
 
