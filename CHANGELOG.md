@@ -36,6 +36,9 @@ All notable changes to this project are documented here. The format follows
   including whether a human would have been asked.
 - `browser_disconnect`, and a shutdown hook so browsers this session launched
   are stopped on exit rather than leaked.
+- `notifications/progress` on stdio, driven by `_meta.progressToken`. A wait is
+  the one place this server is deliberately slow, so it is the one place
+  silence is ambiguous between working and hung.
 - MCP resources (`resources/list`, `resources/read`): the latest screenshot,
   the tail of the audit log, and the effective configuration with secrets
   redacted — so a person operating the client can see what the agent is working
@@ -69,6 +72,15 @@ All notable changes to this project are documented here. The format follows
   success.
 - `list_windows` ignored its `app` argument and answered about whatever was
   frontmost.
+- An accessibility traversal had no time bound. Every attribute read is an IPC
+  round trip to the target application, so a busy or large app made each one
+  slow: measured at 12 seconds for 58 elements from Finder. Because the
+  traversal is synchronous FFI it never yields, so a `wait_for` with a one
+  second deadline overran it twelvefold and nothing could interrupt it. The
+  walk now has its own budget, and a tree cut short reports `partial: true`
+  with advice on narrowing the scope — a partial tree and a genuinely small one
+  are otherwise indistinguishable, and an agent that cannot tell concludes the
+  control it needs does not exist.
 
 ## [0.1.0] — 2026-09-03
 

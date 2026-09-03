@@ -145,7 +145,18 @@ impl A11yModule {
             data["since"] = json!(since);
             data["delta"] = d;
         }
-        if since.is_none() && ref_count < SPARSE_TREE_REFS && !used_skeleton {
+        // A partial tree and a genuinely small one look identical, and an agent
+        // that cannot tell them apart concludes the control it needs is absent.
+        if raw.partial {
+            data["partial"] = json!(true);
+            data["hint"] = json!(
+                "observing this app took too long, so the tree stops early and is incomplete. \
+                 Narrow it: pass 'app' to scope to one application, 'surface' to one window or \
+                 sheet, 'root' to drill into a container, or use find_elements to search for \
+                 what you need instead of reading everything."
+            );
+        }
+        if !raw.partial && since.is_none() && ref_count < SPARSE_TREE_REFS && !used_skeleton {
             data["sparse"] = json!(true);
             data["hint"] = json!(
                 "this app exposes few accessibility elements — its UI may be custom-drawn                  (SwiftUI/Electron/canvas). Fall back to capture_screen plus coordinate                  input (mouse_action/scroll), or browser_* if it is web content."
@@ -207,6 +218,9 @@ impl A11yModule {
                 "count": hits.len(),
                 "total_matched": total,
                 "truncated": total > hits.len(),
+                // The search covered only part of the UI, so "not found" here
+                // does not mean "not present".
+                "partial": raw.partial,
                 "elements": hits,
             }),
         )

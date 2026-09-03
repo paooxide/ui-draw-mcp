@@ -1,6 +1,24 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// A server-initiated message with no id and therefore no reply.
+#[derive(Debug, Serialize)]
+pub struct Notification {
+    pub jsonrpc: &'static str,
+    pub method: String,
+    pub params: Value,
+}
+
+impl Notification {
+    pub fn new(method: impl Into<String>, params: Value) -> Self {
+        Notification {
+            jsonrpc: "2.0",
+            method: method.into(),
+            params,
+        }
+    }
+}
+
 /// A JSON-RPC 2.0 request (or notification, when `id` is absent).
 #[derive(Debug, Clone, Deserialize)]
 pub struct Request {

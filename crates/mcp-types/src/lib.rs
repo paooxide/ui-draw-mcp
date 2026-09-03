@@ -10,7 +10,7 @@ mod descriptor;
 mod envelope;
 mod module;
 
-pub use context::{CallCtx, CancelToken};
+pub use context::{CallCtx, CancelToken, Notifier, Progress};
 pub use descriptor::{Category, Tier, ToolDescriptor};
 pub use envelope::{Envelope, ErrorCode, ImageContent, ToolError};
 pub use module::ToolModule;

@@ -224,3 +224,115 @@ async fn a_notification_method_sent_with_an_id_still_gets_a_reply() {
     assert!(responses[0]["result"].is_object());
     assert_eq!(responses[1]["id"], 2);
 }
+
+/// A slow call must not be silence.
+///
+/// Progress frames have to arrive *while* the call is running, not batched
+/// after it — batching them would defeat the point — and they must always
+/// precede the response they belong to, so a client can attribute them.
+#[tokio::test]
+async fn progress_frames_arrive_before_the_response() {
+    struct Slow;
+    #[async_trait::async_trait]
+    impl ToolModule for Slow {
+        fn descriptors(&self) -> Vec<ToolDescriptor> {
+            vec![ToolDescriptor::new(
+                "slow",
+                Category::System,
+                Tier::Read,
+                "reports progress",
+                json!({"type":"object","properties":{},"required":[]}),
+            )]
+        }
+        async fn call(&self, name: &str, _a: Value, ctx: &CallCtx) -> Envelope {
+            for i in 1..=3 {
+                ctx.progress(f64::from(i), Some(3.0), Some("step"));
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            Envelope::ok(name, json!({"done": true}))
+        }
+    }
+    let registry = Registry::build(vec![Arc::new(Slow)]).unwrap();
+    let policy = Arc::new(Policy::new(
+        PolicyConfig {
+            categories: vec![Category::System],
+            ..PolicyConfig::default()
+        },
+        AuditSink::memory(),
+        Redactor::empty(),
+    ));
+    let server = Server::new(registry, policy, "progress-test");
+
+    let input = concat!(
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"slow","arguments":{},"_meta":{"progressToken":"p1"}}}"#,
+        "\n"
+    );
+    let out = exchange(&server, input).await;
+    // Three notifications, then the response.
+    assert_eq!(
+        out.len(),
+        4,
+        "expected 3 progress frames + 1 response: {out:?}"
+    );
+    for (i, frame) in out.iter().take(3).enumerate() {
+        assert_eq!(frame["method"], json!("notifications/progress"));
+        assert_eq!(frame["params"]["progressToken"], json!("p1"));
+        assert_eq!(frame["params"]["progress"], json!(i as f64 + 1.0));
+        assert_eq!(frame["params"]["total"], json!(3.0));
+        assert!(frame.get("id").is_none(), "a notification has no id");
+    }
+    assert_eq!(out[3]["id"], json!(1));
+    assert!(out[3]["result"].is_object());
+}
+
+/// Without a token there is nothing to correlate a report to, so none are sent.
+#[tokio::test]
+async fn no_progress_token_means_no_notifications() {
+    struct Chatty;
+    #[async_trait::async_trait]
+    impl ToolModule for Chatty {
+        fn descriptors(&self) -> Vec<ToolDescriptor> {
+            vec![ToolDescriptor::new(
+                "chatty",
+                Category::System,
+                Tier::Read,
+                "reports progress",
+                json!({"type":"object","properties":{},"required":[]}),
+            )]
+        }
+        async fn call(&self, name: &str, _a: Value, ctx: &CallCtx) -> Envelope {
+            ctx.progress(1.0, None, Some("hello"));
+            Envelope::ok(name, json!({}))
+        }
+    }
+    let registry = Registry::build(vec![Arc::new(Chatty)]).unwrap();
+    let policy = Arc::new(Policy::new(
+        PolicyConfig {
+            categories: vec![Category::System],
+            ..PolicyConfig::default()
+        },
+        AuditSink::memory(),
+        Redactor::empty(),
+    ));
+    let server = Server::new(registry, policy, "quiet-test");
+    let out = exchange(
+        &server,
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"chatty\",\"arguments\":{}}}\n",
+    )
+    .await;
+    assert_eq!(out.len(), 1, "only the response: {out:?}");
+    assert_eq!(out[0]["id"], json!(1));
+}
+
+/// A float token cannot survive the round trip intact, so a client could never
+/// match the report to its call — the same reason request ids refuse them.
+#[tokio::test]
+async fn a_non_integer_progress_token_is_ignored() {
+    let server = server();
+    let out = exchange(
+        &server,
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"echo\",\"arguments\":{},\"_meta\":{\"progressToken\":1.5}}}\n",
+    )
+    .await;
+    assert!(out.iter().all(|f| f.get("method").is_none()));
+}

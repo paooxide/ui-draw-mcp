@@ -390,3 +390,23 @@ async fn malformed_json_gets_a_jsonrpc_parse_error() {
     let v = body(&raw(f.addr, &post(Some(&f.token), "{not json", "")).await);
     assert_eq!(v["error"]["code"], -32700);
 }
+
+/// The HTTP transport has nowhere to put a server-initiated frame, so a
+/// progress token is accepted and ignored rather than refused: a client written
+/// for stdio must still work here, it just hears nothing until the call ends.
+#[tokio::test]
+async fn a_progress_token_is_accepted_and_quietly_dropped() {
+    let f = start(Vec::new(), 64 * 1024).await;
+    let req = post(
+        Some(&f.token),
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"vision_ok","arguments":{},"_meta":{"progressToken":"p1"}}}"#,
+        "",
+    );
+    let resp = raw(f.addr, &req).await;
+    assert_eq!(status(&resp), 200, "{resp}");
+    assert!(
+        !resp.contains("notifications/progress"),
+        "there is no channel for them here"
+    );
+    assert_eq!(body(&resp)["id"], serde_json::json!(1));
+}

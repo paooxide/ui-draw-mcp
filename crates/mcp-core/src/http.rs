@@ -21,6 +21,12 @@
 //! a notification). Server-Sent Events are **not** implemented, so there is no
 //! server-initiated streaming — `GET` on the endpoint is refused rather than
 //! silently hanging.
+//!
+//! **No server-initiated frames.** One request, one response: there is nowhere
+//! to put a `notifications/progress` message. `_meta.progressToken` is accepted
+//! and ignored rather than refused, so a client written for stdio works here
+//! too — it simply hears nothing until the call returns. Carrying them would
+//! mean implementing SSE, which this transport deliberately does not.
 
 use std::io;
 use std::net::SocketAddr;

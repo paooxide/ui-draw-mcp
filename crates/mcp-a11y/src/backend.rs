@@ -21,6 +21,13 @@ pub struct RawSnapshot {
     pub window: Option<String>,
     /// True for terminal apps (keep value tails, not heads).
     pub terminal_app: bool,
+    /// True when the backend stopped traversing early — it ran out of time or
+    /// hit a node cap — so the tree is a prefix of the real one.
+    ///
+    /// This has to be distinguishable from "the app really has this little in
+    /// it", because an agent that cannot tell will conclude the button it needs
+    /// does not exist.
+    pub partial: bool,
 }
 
 /// Why a backend snapshot failed. Mapped to `ErrorCode` by the tool layer.

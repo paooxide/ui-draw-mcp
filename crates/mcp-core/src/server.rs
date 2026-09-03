@@ -27,6 +27,27 @@ pub struct Server {
     /// The last image any tool returned, so a client can show what the agent is
     /// looking at without spending a turn asking for it again.
     last_image: std::sync::Mutex<Option<crate::resources::LastImage>>,
+    /// Where mid-call notifications go, when a transport can carry them.
+    /// Installed by `serve_stream`; `None` under a transport that cannot.
+    notifier: std::sync::Mutex<Option<Arc<dyn mcp_types::Notifier>>>,
+}
+
+/// Sends notification frames to the transport loop.
+///
+/// A channel rather than the writer itself: `notify` must be synchronous and
+/// non-blocking (it is called from inside engine loops), and the writer is
+/// owned by `serve_stream` and borrowed for the whole call.
+struct ChannelNotifier(tokio::sync::mpsc::UnboundedSender<String>);
+
+impl mcp_types::Notifier for ChannelNotifier {
+    fn notify(&self, method: &str, params: Value) {
+        if let Ok(line) = serde_json::to_string(&crate::jsonrpc::Notification::new(method, params))
+        {
+            // A closed channel means the call outlived its transport; dropping
+            // is right, and a progress report is never worth an error path.
+            let _ = self.0.send(line);
+        }
+    }
 }
 
 impl Server {
@@ -37,6 +58,7 @@ impl Server {
             session_id: session_id.into(),
             max_frame_bytes: DEFAULT_MAX_FRAME_BYTES,
             last_image: std::sync::Mutex::new(None),
+            notifier: std::sync::Mutex::new(None),
         }
     }
 
@@ -70,6 +92,16 @@ impl Server {
     /// Validate → gate → audit → execute → redact → audit. The only path that
     /// reaches an engine.
     pub async fn dispatch_call(&self, name: &str, args: Value) -> Envelope {
+        self.dispatch_call_with(name, args, None).await
+    }
+
+    /// As [`Self::dispatch_call`], with a client-supplied progress token.
+    pub async fn dispatch_call_with(
+        &self,
+        name: &str,
+        args: Value,
+        progress_token: Option<Value>,
+    ) -> Envelope {
         // 1. Kill switch first.
         if self.policy.kill_switch_tripped() {
             let mut pre = AuditRecord::pre(&self.session_id, name);
@@ -197,7 +229,17 @@ impl Server {
 
         // 5. Execute (descriptor borrow has ended; `module` is an owned Arc).
         let start = now_ms();
-        let ctx = CallCtx::new(self.session_id.clone(), CancelToken::new());
+        let mut ctx = CallCtx::new(self.session_id.clone(), CancelToken::new());
+        if let Some(token) = progress_token {
+            let n = self
+                .notifier
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            if let Some(n) = n {
+                ctx = ctx.with_progress(token, n);
+            }
+        }
         let result = module.call(name, args, &ctx).await;
 
         // 6. Redact the result, then mark its provenance.
@@ -366,7 +408,15 @@ impl Server {
                     .get("arguments")
                     .cloned()
                     .unwrap_or_else(|| json!({}));
-                let env = self.dispatch_call(name, args).await;
+                // Strings and integers only, for the same reason request ids
+                // are: a float does not survive the round trip intact, so the
+                // client could not match the report to its call.
+                let progress_token = params
+                    .get("_meta")
+                    .and_then(|m| m.get("progressToken"))
+                    .filter(|t| t.is_string() || t.is_i64() || t.is_u64())
+                    .cloned();
+                let env = self.dispatch_call_with(name, args, progress_token).await;
                 Response::success(id, self.tool_call_result(env))
             }
             "resources/list" => Response::success(id, crate::resources::list()),
@@ -461,11 +511,50 @@ impl Server {
     {
         use tokio::io::AsyncWriteExt;
 
+        // Mid-call notifications arrive on this channel while the call is still
+        // running, so they need writing *between* the request and its response.
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        *self.notifier.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some(Arc::new(ChannelNotifier(tx)));
+        let result = self.stream_loop(&mut reader, &mut writer, &mut rx).await;
+        *self.notifier.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        let _ = writer.flush().await;
+        result
+    }
+
+    async fn stream_loop<R, W>(
+        &self,
+        reader: &mut R,
+        writer: &mut W,
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<String>,
+    ) -> std::io::Result<()>
+    where
+        R: tokio::io::AsyncBufRead + Unpin,
+        W: tokio::io::AsyncWrite + Unpin,
+    {
+        use tokio::io::AsyncWriteExt;
+
         loop {
-            let frame = read_frame(&mut reader, self.max_frame_bytes).await?;
+            let frame = read_frame(reader, self.max_frame_bytes).await?;
             let response = match frame {
                 Frame::Eof => return Ok(()),
-                Frame::Line(line) => self.handle_line(&line).await,
+                Frame::Line(line) => {
+                    // Race the call against its own notifications, so progress
+                    // is written as it happens rather than batched at the end —
+                    // which would defeat the point of reporting it at all.
+                    let fut = self.handle_line(&line);
+                    tokio::pin!(fut);
+                    loop {
+                        tokio::select! {
+                            r = &mut fut => break r,
+                            Some(note) = rx.recv() => {
+                                writer.write_all(note.as_bytes()).await?;
+                                writer.write_all(b"\n").await?;
+                                writer.flush().await?;
+                            }
+                        }
+                    }
+                }
                 // Answer rather than disconnect: the oversized frame has been
                 // drained, so the stream is back in sync at the next newline
                 // and a well-behaved client can carry on.
@@ -478,11 +567,17 @@ impl Server {
                     ),
                 ))),
             };
+            // Drain anything queued in the last instant before the response, so
+            // a report about a call never arrives after that call's result.
+            while let Ok(note) = rx.try_recv() {
+                writer.write_all(note.as_bytes()).await?;
+                writer.write_all(b"\n").await?;
+            }
             if let Some(resp) = response {
                 writer.write_all(resp.as_bytes()).await?;
                 writer.write_all(b"\n").await?;
-                writer.flush().await?;
             }
+            writer.flush().await?;
         }
     }
 }

@@ -214,14 +214,47 @@ struct NodeRef {
     name: Option<String>,
 }
 
+/// How long a single snapshot may spend traversing.
+///
+/// Every attribute read is an IPC round trip to the target application, so an
+/// app that is busy — or that simply has a lot of elements, like Finder with a
+/// populated desktop — makes each one slow. Measured on a real machine: 12
+/// seconds for 58 refs from Finder.
+///
+/// This matters beyond the wait itself. The traversal is synchronous FFI, so it
+/// never yields, which means `tokio::time::timeout` cannot interrupt it and a
+/// `wait_for` with a 1s deadline was overrunning by 12x. The bound has to be
+/// *inside* the walk.
+const WALK_BUDGET: std::time::Duration = std::time::Duration::from_secs(3);
+
 struct Walker {
     counter: u64,
     paths: HashMap<u64, NodeRef>,
     count: usize,
     max_nodes: usize,
+    /// When the traversal started, and whether it ran out of time.
+    started: std::time::Instant,
+    budget: std::time::Duration,
+    timed_out: bool,
 }
 
 impl Walker {
+    /// Whether the traversal has spent its budget. Sticky, so the answer does
+    /// not flap while unwinding the recursion.
+    fn out_of_time(&mut self) -> bool {
+        if self.timed_out {
+            return true;
+        }
+        if self.started.elapsed() >= self.budget {
+            self.timed_out = true;
+            tracing::warn!(
+                nodes = self.count,
+                "accessibility traversal ran out of time; the tree is partial"
+            );
+        }
+        self.timed_out
+    }
+
     unsafe fn walk(
         &mut self,
         elem: &CFType,
@@ -272,9 +305,9 @@ impl Walker {
             ..Default::default()
         };
 
-        if depth < max_depth && self.count < self.max_nodes {
+        if depth < max_depth && self.count < self.max_nodes && !self.out_of_time() {
             for (i, child) in copy_children(eref).iter().enumerate() {
-                if self.count >= self.max_nodes {
+                if self.count >= self.max_nodes || self.out_of_time() {
                     break;
                 }
                 path.push(i);
@@ -560,6 +593,9 @@ impl A11yBackend for MacosBackend {
                 paths: HashMap::new(),
                 count: 0,
                 max_nodes: 4000,
+                started: std::time::Instant::now(),
+                budget: WALK_BUDGET,
+                timed_out: false,
             };
             let mut path = Vec::new();
             let root = walker.walk(&app, 0, max_depth, &mut path);
@@ -567,6 +603,7 @@ impl A11yBackend for MacosBackend {
                 .filter(|s| !s.is_empty())
                 .or(Some(target_name).filter(|s| !s.is_empty()));
 
+            let partial = walker.timed_out || walker.count >= walker.max_nodes;
             {
                 let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
                 st.pid = Some(pid);
@@ -579,6 +616,7 @@ impl A11yBackend for MacosBackend {
                 app: app_name,
                 window: None,
                 terminal_app: terminal,
+                partial,
             })
         }
     }

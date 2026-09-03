@@ -154,21 +154,33 @@ where
     Fut: std::future::Future<Output = bool>,
 {
     let start = Instant::now();
+    let deadline = start + Duration::from_millis(timeout_ms);
     loop {
         // Check before sleeping: a condition that is already true must not cost
         // a poll interval, which is most of them after a fast action.
         if cancel.is_cancelled() {
             return (false, start.elapsed().as_millis() as u64);
         }
-        if probe().await {
-            return (true, start.elapsed().as_millis() as u64);
+        // The probe itself is raced against the deadline. Observing a busy
+        // application can take seconds, and checking the clock only *after* the
+        // probe returns lets a single slow observation overrun the timeout by
+        // an order of magnitude — measured at 12.7s against a stated 1s while
+        // snapshotting Finder. A cap that a slow probe can ignore is not a cap.
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return (false, start.elapsed().as_millis() as u64);
+        }
+        match tokio::time::timeout(remaining, probe()).await {
+            Ok(true) => return (true, start.elapsed().as_millis() as u64),
+            Ok(false) => {}
+            Err(_) => return (false, start.elapsed().as_millis() as u64),
         }
         let elapsed = start.elapsed().as_millis() as u64;
         if elapsed >= timeout_ms {
             return (false, elapsed);
         }
-        let remaining = timeout_ms - elapsed;
-        tokio::time::sleep(Duration::from_millis(interval_ms.min(remaining))).await;
+        let left = timeout_ms - elapsed;
+        tokio::time::sleep(Duration::from_millis(interval_ms.min(left))).await;
     }
 }
 
@@ -196,7 +208,17 @@ impl WaitEvaluator {
             .any(|c| matches!(c, WaitCondition::Window(_)));
 
         let last: std::sync::Mutex<Option<RawSnapshot>> = std::sync::Mutex::new(None);
+        let started = Instant::now();
+        let describe = describe(spec);
         let (met, waited_ms) = poll_until(spec.timeout_ms, POLL_MS, &ctx.cancel, || async {
+            // A wait is the one place this server is deliberately slow, so it
+            // is the one place silence is ambiguous between "working" and
+            // "hung". Costs nothing unless the client asked for reports.
+            ctx.progress(
+                started.elapsed().as_millis() as f64,
+                Some(spec.timeout_ms as f64),
+                Some(&describe),
+            );
             // One observation per poll, shared by every text condition: three
             // conditions must not mean three traversals of the same tree.
             let tree = if needs_tree {
@@ -249,6 +271,21 @@ impl WaitEvaluator {
             last: last.into_inner().unwrap_or(None),
         }
     }
+}
+
+/// A short human-readable form of what is being waited for.
+fn describe(spec: &WaitSpec) -> String {
+    let parts: Vec<String> = spec
+        .conditions
+        .iter()
+        .map(|c| match c {
+            WaitCondition::Text(t) => format!("text {t:?}"),
+            WaitCondition::Window(t) => format!("window {t:?}"),
+            WaitCondition::Gone(t) => format!("{t:?} gone"),
+            WaitCondition::Focused(t) => format!("{t:?} focused"),
+        })
+        .collect();
+    format!("waiting for {}", parts.join(" and "))
 }
 
 /// The default timeout for a standalone `wait_for`.
@@ -384,6 +421,24 @@ mod tests {
     }
 
     /// The kill switch cancels in-flight work, so a wait must not outlive it.
+    /// A probe that takes longer than the whole timeout must not be allowed to
+    /// run to completion: the deadline is a deadline.
+    #[tokio::test]
+    async fn a_slow_probe_cannot_overrun_the_deadline() {
+        let cancel = CancelToken::new();
+        let started = Instant::now();
+        let (met, waited) = poll_until(150, 20, &cancel, || async {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            true
+        })
+        .await;
+        assert!(!met);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "a 150ms wait must not take {waited}ms"
+        );
+    }
+
     #[tokio::test]
     async fn cancellation_ends_the_wait() {
         let cancel = CancelToken::new();
