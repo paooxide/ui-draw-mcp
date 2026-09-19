@@ -10,9 +10,11 @@ publish = false
 [dependencies]
 mcp-types = { path = "../mcp-types" }
 mcp-policy = { path = "../mcp-policy" }
+mcp-judge = { path = "../mcp-judge" }
 async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros"] }

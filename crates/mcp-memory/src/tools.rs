@@ -1,12 +1,15 @@
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use mcp_types::{CallCtx, Category, Envelope, ErrorCode, Tier, ToolDescriptor, ToolModule};
 use serde_json::{json, Value};
 
-use crate::store::{Step, Store, StoreError};
+use crate::store::{Recipe, Step, Store, StoreError};
 
 pub struct MemoryModule {
     store: Store,
     max_results: usize,
+    judge: Option<Arc<mcp_judge::Judge>>,
 }
 
 impl MemoryModule {
@@ -14,8 +17,119 @@ impl MemoryModule {
         MemoryModule {
             store,
             max_results: 10,
+            judge: None,
         }
     }
+
+    /// Attach the judge that reranks `memory_find` hits against the goal when
+    /// the caller asks for it (`rerank: true`).
+    pub fn with_judge(mut self, judge: Arc<mcp_judge::Judge>) -> Self {
+        self.judge = Some(judge);
+        self
+    }
+
+    /// Reorder the substring matches by how well each recipe's *goal* fits the
+    /// request, rather than by success count alone. Read-only: it changes the
+    /// order of the returned list, never what is stored. Degrades to the
+    /// deterministic order (and says so) when the judge cannot answer, because
+    /// success-count order is itself useful.
+    async fn find_reranked(&self, goal: &str, hits: Vec<Recipe>) -> Envelope {
+        let tool = "memory_find";
+        if goal.trim().is_empty() {
+            return Envelope::fail_with(
+                tool,
+                ErrorCode::InvalidArgs,
+                "rerank needs a 'goal' to rank the recipes against",
+                "pass the goal you want recipes for, or drop rerank to list by success count",
+            );
+        }
+        let Some(judge) = self.judge.as_ref().filter(|j| j.enabled()) else {
+            return Envelope::fail_with(
+                tool,
+                ErrorCode::UnsupportedOs,
+                "rerank needs the judge, which is not enabled",
+                "set [judge] enabled = \"true\" and provide TYPESAFE_API_KEY, or drop rerank",
+            );
+        };
+        if hits.len() < 2 {
+            // Nothing to reorder; the single (or empty) result stands.
+            return Envelope::ok(
+                tool,
+                json!({
+                    "recipes": hits, "count": hits.len(),
+                    "reranked": false, "reason": "fewer than two matches to reorder"
+                }),
+            );
+        }
+        let candidates = recipe_candidates(&hits);
+        let state = json!({ "request": goal, "candidates": candidates });
+        match judge
+            .rank(
+                state,
+                "Which candidate recipe in `candidates` best achieves `request`? Judge by how closely each recipe's goal matches the request, not by how many steps it has.",
+                &candidates,
+            )
+            .await
+        {
+            Ok(r) => {
+                let hits = reorder_by_probability(hits, &r.probabilities);
+                Envelope::ok(
+                    tool,
+                    json!({
+                        "recipes": hits, "count": hits.len(), "reranked": true,
+                        "ranking": {
+                            "best": r.choice,
+                            "confidence": r.confidence,
+                            "any_fits": r.any_fits,
+                            "confident": r.any_fits >= judge.match_threshold(),
+                        }
+                    }),
+                )
+            }
+            Err(e) => {
+                tracing::debug!(error = %e.message(), "memory rerank skipped; success-count order stands");
+                Envelope::ok(
+                    tool,
+                    json!({
+                        "recipes": hits, "count": hits.len(),
+                        "reranked": false, "reason": e.message()
+                    }),
+                )
+            }
+        }
+    }
+}
+
+/// Describe each recipe for the judge, keyed by its (unique) normalized goal.
+fn recipe_candidates(hits: &[Recipe]) -> std::collections::BTreeMap<String, String> {
+    hits.iter()
+        .map(|r| {
+            (
+                r.goal_norm.clone(),
+                format!(
+                    "Goal \"{}\" ({} step(s), succeeded {} time(s))",
+                    r.goal,
+                    r.steps.len(),
+                    r.success_count
+                ),
+            )
+        })
+        .collect()
+}
+
+/// Stable-sort the hits by the probability the judge gave each recipe's
+/// normalized goal, most likely first. A recipe the judge did not score sinks
+/// to the bottom rather than jumping the queue.
+fn reorder_by_probability(
+    mut hits: Vec<Recipe>,
+    probabilities: &std::collections::BTreeMap<String, f64>,
+) -> Vec<Recipe> {
+    hits.sort_by(|a, b| {
+        let pa = probabilities.get(&a.goal_norm).copied().unwrap_or(-1.0);
+        let pb = probabilities.get(&b.goal_norm).copied().unwrap_or(-1.0);
+        pb.partial_cmp(&pa).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    hits
 }
 
 fn err(tool: &str, e: StoreError) -> Envelope {
@@ -72,10 +186,15 @@ impl ToolModule for MemoryModule {
                 Category::Memory,
                 Tier::Read,
                 "Look up recorded sequences for a goal. Exact (normalized) match wins; otherwise \
-                 substring matches ranked by success count. Omit 'goal' to list everything.",
+                 substring matches ranked by success count. Omit 'goal' to list everything. \
+                 Set 'rerank' to reorder the matches by how well each recipe's goal fits yours, \
+                 judged semantically (needs the judge enabled); the order and a 'ranking' block \
+                 are reported, and it falls back to success-count order if the judge is \
+                 unavailable.",
                 json!({"type":"object","properties":{
                     "goal":{"type":"string"},
-                    "limit":{"type":"integer"}},"required":[]}),
+                    "limit":{"type":"integer"},
+                    "rerank":{"type":"boolean","description":"reorder matches by semantic fit to 'goal' using the judge"}},"required":[]}),
             ),
             ToolDescriptor::new(
                 "memory_forget",
@@ -133,13 +252,18 @@ impl ToolModule for MemoryModule {
                     .map(|n| n as usize)
                     .unwrap_or(self.max_results)
                     .clamp(1, self.max_results);
-                match self.store.find(goal, limit) {
-                    Ok(hits) => Envelope::ok(
+                let rerank = args.get("rerank").and_then(Value::as_bool).unwrap_or(false);
+                let hits = match self.store.find(goal, limit) {
+                    Ok(hits) => hits,
+                    Err(e) => return err("memory_find", e),
+                };
+                if !rerank {
+                    return Envelope::ok(
                         "memory_find",
                         json!({ "recipes": hits, "count": hits.len() }),
-                    ),
-                    Err(e) => err("memory_find", e),
+                    );
                 }
+                self.find_reranked(goal, hits).await
             }
             "memory_forget" => {
                 let Some(goal) = args.get("goal").and_then(Value::as_str) else {
@@ -256,5 +380,143 @@ mod tests {
         for t in ["memory_save", "memory_find", "memory_forget"] {
             assert!(m.consent_prompt(t, &json!({})).is_none());
         }
+    }
+
+    // ---- rerank ---------------------------------------------------------
+
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    /// A transport that replays one scripted reply.
+    struct OneReply(Mutex<Option<Result<(u16, String), String>>>);
+    #[async_trait]
+    impl mcp_judge::Transport for OneReply {
+        async fn post(
+            &self,
+            _u: &str,
+            _k: &str,
+            _b: &Value,
+            _t: Duration,
+        ) -> Result<(u16, String), String> {
+            self.0
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap_or_else(|| Err("exhausted".into()))
+        }
+    }
+
+    fn judge(reply: Result<(u16, String), String>) -> Arc<mcp_judge::Judge> {
+        let cfg = mcp_judge::JudgeConfig {
+            enabled: true,
+            match_threshold: Some(0.6),
+            ..mcp_judge::JudgeConfig::default()
+        };
+        Arc::new(mcp_judge::Judge::with_transport(
+            cfg,
+            Some("k".into()),
+            Box::new(OneReply(Mutex::new(Some(reply)))),
+        ))
+    }
+
+    /// Save two recipes that share the substring "restart the" (so a lookup by
+    /// it returns both) but whose success counts and semantic fit disagree:
+    /// "restart the machine" has more successes, while "restart the app" is the
+    /// better semantic match for the app-focused requests below.
+    async fn two_recipes(tag: &str, judge: Option<Arc<mcp_judge::Judge>>) -> MemoryModule {
+        let mut m = module(tag);
+        if let Some(j) = judge {
+            m = m.with_judge(j);
+        }
+        for _ in 0..3 {
+            m.call(
+                "memory_save",
+                json!({ "goal": "restart the machine", "steps": [{ "tool": "exec",
+                    "selector": { "role": "button", "name": "X", "app": "A" } }] }),
+                &ctx(),
+            )
+            .await;
+        }
+        m.call(
+            "memory_save",
+            json!({ "goal": "restart the app", "steps": [{ "tool": "exec",
+                "selector": { "role": "button", "name": "X", "app": "A" } }] }),
+            &ctx(),
+        )
+        .await;
+        m
+    }
+
+    #[tokio::test]
+    async fn without_rerank_the_order_is_success_count_and_no_judge_is_asked() {
+        // A judge that would error if consulted proves rerank=false never asks.
+        let m = two_recipes("norerank", Some(judge(Err("must not be called".into())))).await;
+        let out = m
+            .call("memory_find", json!({ "goal": "restart the" }), &ctx())
+            .await;
+        assert!(out.ok, "{out:?}");
+        let data = out.data.unwrap();
+        assert_eq!(data["count"], 2, "both recipes match the shared substring");
+        assert_eq!(data["recipes"][0]["goal"], "restart the machine");
+        assert!(data.get("reranked").is_none());
+    }
+
+    #[tokio::test]
+    async fn rerank_reorders_by_semantic_fit_over_success_count() {
+        // The judge favours "restart the app" though "machine" has more wins.
+        let body = r#"{"answers":{
+            "pick":{"type":"choice","choice":"restart the app","probabilities":{"restart the app":0.85,"restart the machine":0.15},"confidence":0.85},
+            "any":{"type":"noul","noul":0.9}
+        }}"#;
+        let m = two_recipes("rerank", Some(judge(Ok((200, body.into()))))).await;
+        let out = m
+            .call(
+                "memory_find",
+                json!({ "goal": "restart the", "rerank": true }),
+                &ctx(),
+            )
+            .await;
+        assert!(out.ok, "{out:?}");
+        let data = out.data.unwrap();
+        assert_eq!(data["reranked"], true);
+        assert_eq!(
+            data["recipes"][0]["goal"], "restart the app",
+            "semantic fit beats success count once reranked"
+        );
+        assert_eq!(data["ranking"]["confident"], true);
+    }
+
+    #[tokio::test]
+    async fn rerank_degrades_to_success_count_order_when_the_judge_fails() {
+        let m = two_recipes("degrade", Some(judge(Ok((500, "boom".into()))))).await;
+        let out = m
+            .call(
+                "memory_find",
+                json!({ "goal": "restart the", "rerank": true }),
+                &ctx(),
+            )
+            .await;
+        assert!(out.ok, "a judge failure must not fail the lookup: {out:?}");
+        let data = out.data.unwrap();
+        assert_eq!(data["reranked"], false);
+        assert_eq!(
+            data["recipes"][0]["goal"], "restart the machine",
+            "deterministic success-count order still stands"
+        );
+    }
+
+    #[tokio::test]
+    async fn rerank_without_the_judge_enabled_is_a_clear_error() {
+        let m = two_recipes("noneenabled", None).await;
+        let out = m
+            .call(
+                "memory_find",
+                json!({ "goal": "restart the", "rerank": true }),
+                &ctx(),
+            )
+            .await;
+        assert!(!out.ok);
+        let msg = out.error.unwrap().message;
+        assert!(msg.contains("judge"), "{msg}");
     }
 }

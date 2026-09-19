@@ -216,11 +216,14 @@ pub fn build_stack(cfg: &PolicyConfig) -> (Vec<Arc<dyn ToolModule>>, Wiring) {
             ..PkgPolicy::default()
         })));
 
-        modules.push(Arc::new(MemoryModule::new(MemoryStore::new(
-            engines.memory_store,
-            engines.max_recipes,
-            200,
-        ))));
+        modules.push(Arc::new(
+            MemoryModule::new(MemoryStore::new(
+                engines.memory_store,
+                engines.max_recipes,
+                200,
+            ))
+            .with_judge(judge.clone()),
+        ));
     }
 
     #[cfg(target_os = "macos")]

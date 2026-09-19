@@ -1032,11 +1032,13 @@ name = "mcp-memory"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "mcp-judge",
  "mcp-policy",
  "mcp-types",
  "serde",
  "serde_json",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
