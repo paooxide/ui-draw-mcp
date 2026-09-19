@@ -58,6 +58,8 @@ async-trait.workspace = true
 test-support = { path = "../crates/test-support" }
 mcp-browser = { path = "../crates/mcp-browser" }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
 
 [target.'cfg(target_os = "macos")'.dev-dependencies]
 mcp-macos = { path = "../crates/mcp-macos" }

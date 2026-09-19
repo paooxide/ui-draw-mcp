@@ -316,7 +316,9 @@ impl Portal {
             })
             .collect();
         tracing::info!(
+            devices = ?devices.devices(),
             streams = streams.len(),
+            persist = ?persist,
             "remote-desktop portal session started"
         );
         Ok(Live {

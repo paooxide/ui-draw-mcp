@@ -21,6 +21,15 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use test_support::{live_gui_enabled, skip_live, test_policy, InProcClient};
 
+/// Route agentctl's tracing to the test output so a failing run is legible.
+/// Best-effort and idempotent: several tests may call it.
+fn trace() {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_test_writer()
+        .try_init();
+}
+
 /// Apps the GUI half may drive. Nothing else is launched or typed into.
 const EDITOR: &str = "org.gnome.TextEditor";
 
@@ -326,6 +335,7 @@ async fn editor_receives_typed_text_and_the_tree_shows_it() {
         eprintln!("skipping: GNOME Text Editor is not installed");
         return;
     }
+    trace();
     let c = client("linux-gui");
     let nonce = format!("agentctl-{}", mcp_policy::now_ms());
     c.ok("launch", json!({ "app": EDITOR })).await;
@@ -347,6 +357,14 @@ async fn editor_receives_typed_text_and_the_tree_shows_it() {
             .call("ui_action", json!({ "ref": h["ref"], "action": "focus" }))
             .await;
     }
+    // Where will the keystrokes actually go? On Wayland this is the window
+    // the compositor has focused, which is what we are trying to confirm is
+    // the editor and not the terminal running the test.
+    let tgt = c.call("get_ui_tree", json!({})).await;
+    eprintln!(
+        "before typing, the default-target tree is app={:?}",
+        tgt.data.as_ref().and_then(|d| d["app"].as_str())
+    );
     let typed = c.call("keyboard_type", json!({ "text": &nonce })).await;
     if !typed.ok {
         let e = typed.error.unwrap();

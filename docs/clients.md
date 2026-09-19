@@ -141,6 +141,14 @@ visit. `agentctl doctor` prints each one:
   is installed, and otherwise report that they cannot reach the clipboard. On KDE and wlroots the native
   Wayland path works with nothing extra. `agentctl doctor` says which applies.
 
+Working on a window that is not in front: you usually do not need to raise it. `ui_action` presses a
+control and `set_value` fills a field through the accessibility API, and both work on a background window
+with no focus and no portal. Only `keyboard_type`, `keyboard_shortcut` and coordinate `mouse_action` need
+the window focused, because Wayland delivers synthetic keys to whatever the compositor has focused.
+`control_window` with `action: "focus"` asks GNOME to bring a window forward, which works when nothing else
+is holding focus; GNOME's focus-stealing prevention can refuse it while another application is active, and
+the tool then says so and points you at the focus-independent paths.
+
 Two things Wayland hides from every client, and therefore from `agentctl`: where a window is on the
 screen, and where the pointer is. Tree coordinates from Wayland-native applications are window-relative,
 so prefer `ui_action` on a ref over `mouse_action` at a coordinate read from the tree; coordinates read from

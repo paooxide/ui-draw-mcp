@@ -109,6 +109,7 @@ impl LinuxBackend {
     /// when the target could not be raised.
     async fn ensure_target_active(&self) -> Result<(), InputError> {
         let Some(target) = self.pinned_target().await else {
+            tracing::debug!("no pinned target; keys go to whatever the compositor has focused");
             return Ok(());
         };
         let conn = self.conn().await.map_err(InputError::Failed)?;
@@ -121,10 +122,11 @@ impl LinuxBackend {
             }
         }
         crate::window::activate_app(&conn, &app).await?;
-        for _ in 0..20 {
+        for _ in 0..24 {
             sleep(Duration::from_millis(50)).await;
             if let Ok(ws) = a11y::windows_of(&conn, &app).await {
                 if is_active(&ws) {
+                    tracing::debug!(app = %target.name, "target raised and active");
                     // Active in the tree is not yet keyboard focus at the
                     // compositor; let the raise settle before keys are sent.
                     sleep(Duration::from_millis(120)).await;
@@ -132,9 +134,12 @@ impl LinuxBackend {
                 }
             }
         }
+        // Fail safe: keystrokes go to whatever the compositor has focused, so
+        // typing without confirming the target is active would leak input into
+        // another application. Refuse, and name the focus-independent paths.
         Err(InputError::Failed(format!(
-            "refusing to type: target app '{}' could not be brought to the front, so keystrokes would land in another application",
-            target.name
+            "refusing to type: {}",
+            crate::window::cannot_foreground_msg(&target.name)
         )))
     }
 }
@@ -314,6 +319,11 @@ impl InputBackend for LinuxBackend {
         // by the time the first key is sent.
         self.portal.ensure_ready().await?;
         self.ensure_target_active().await?;
+        tracing::debug!(
+            target = ?self.current_target(),
+            chars = text.chars().count(),
+            "typing into the target"
+        );
         for sym in keys::keysyms_for_text(text) {
             if self.cancel.load(Ordering::SeqCst) {
                 return Err(InputError::Failed("typing aborted".into()));

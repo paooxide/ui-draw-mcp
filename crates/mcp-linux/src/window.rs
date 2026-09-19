@@ -38,6 +38,15 @@ fn fail(e: impl std::fmt::Display) -> WindowError {
     WindowError::Failed(e.to_string())
 }
 
+/// The honest, actionable message when GNOME will not foreground a window.
+/// Shared by the window backend and the typing path so both say the same
+/// thing.
+pub fn cannot_foreground_msg(app: &str) -> String {
+    format!(
+        "GNOME declined to bring '{app}' to the front (focus-stealing prevention keeps a          background application from taking focus while another is active). You do not need          focus to act on it: ui_action presses its controls and set_value fills its fields          through the accessibility API, both working on a background window. To send          keystrokes, switch to '{app}' yourself or minimise the focused window first."
+    )
+}
+
 fn input_to_window(e: InputError) -> WindowError {
     match e {
         InputError::PermissionDenied(m) => WindowError::PermissionDenied(m),
@@ -184,24 +193,32 @@ impl LinuxBackend {
         false
     }
 
-    /// Every keyboard-driven verb needs the window active first.
-    async fn make_active(
+    /// Bring an application's window to the front and confirm it took.
+    ///
+    /// `Application.Activate` (via [`activate_app`]) is the only lever a client
+    /// has on GNOME, and it also unminimizes. It works in the common case
+    /// where nothing else is holding focus, which is what an agent driving the
+    /// desktop usually faces. When another application is actively focused,
+    /// GNOME's focus-stealing prevention accepts the request but leaves the
+    /// window in the background, so this confirms the window actually became
+    /// active and reports honestly, pointing at the focus-independent paths,
+    /// when it did not.
+    async fn bring_to_front(
         &self,
         conn: &AccessibilityConnection,
         target: &AppInfo,
-        win: &a11y::WindowRef,
     ) -> Result<(), WindowError> {
-        if win.states.contains(State::Active) {
-            return Ok(());
+        // Already active: nothing to do, and no need to poll.
+        if let Ok(ws) = a11y::windows_of(conn, target).await {
+            if ws.iter().any(|w| w.states.contains(State::Active)) {
+                return Ok(());
+            }
         }
         activate_app(conn, target).await.map_err(input_to_window)?;
         if self.wait_active(target, true, 20).await {
             Ok(())
         } else {
-            Err(WindowError::Failed(format!(
-                "'{}' could not be brought to the front",
-                target.name
-            )))
+            Err(WindowError::Failed(cannot_foreground_msg(&target.name)))
         }
     }
 
@@ -466,9 +483,9 @@ impl WindowBackend for LinuxBackend {
         let win = self.pick_window(&target, title).await?;
         let conn = self.conn().await.map_err(WindowError::PermissionDenied)?;
         match action {
-            WindowAction::Focus => self.make_active(&conn, &target, &win).await,
+            WindowAction::Focus => self.bring_to_front(&conn, &target).await,
             WindowAction::Close => {
-                self.make_active(&conn, &target, &win).await?;
+                self.bring_to_front(&conn, &target).await?;
                 self.key_combo("alt+f4").await.map_err(input_to_window)?;
                 for _ in 0..20 {
                     sleep(Duration::from_millis(100)).await;
@@ -485,7 +502,7 @@ impl WindowBackend for LinuxBackend {
                 ))
             }
             WindowAction::Minimize => {
-                self.make_active(&conn, &target, &win).await?;
+                self.bring_to_front(&conn, &target).await?;
                 self.key_combo("super+h").await.map_err(input_to_window)?;
                 if self.wait_active(&target, false, 20).await {
                     Ok(())
@@ -497,20 +514,17 @@ impl WindowBackend for LinuxBackend {
                 }
             }
             WindowAction::Maximize => {
-                self.make_active(&conn, &target, &win).await?;
+                self.bring_to_front(&conn, &target).await?;
                 self.key_combo("super+up").await.map_err(input_to_window)
             }
             WindowAction::Restore => {
+                // Unminimize (and raise) is what Activate does, and GNOME
+                // honours it for a minimized window; then unmaximize if it was
+                // also maximized.
                 if win.states.contains(State::Iconified) {
-                    activate_app(&conn, &target)
-                        .await
-                        .map_err(input_to_window)?;
-                    if self.wait_active(&target, true, 20).await {
-                        return Ok(());
-                    }
-                    return Err(WindowError::Failed("the window did not come back".into()));
+                    return self.bring_to_front(&conn, &target).await;
                 }
-                self.make_active(&conn, &target, &win).await?;
+                self.bring_to_front(&conn, &target).await?;
                 self.key_combo("super+down").await.map_err(input_to_window)
             }
             WindowAction::Move | WindowAction::Resize => {
@@ -746,6 +760,14 @@ impl WindowBackend for LinuxBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_foreground_refusal_names_the_app_and_the_focus_free_paths() {
+        let m = cannot_foreground_msg("org.gnome.TextEditor");
+        assert!(m.contains("org.gnome.TextEditor"));
+        assert!(m.contains("ui_action") && m.contains("set_value"));
+        assert!(m.to_lowercase().contains("focus-stealing"));
+    }
 
     #[test]
     fn at_spi_key_bindings_become_shortcut_syntax() {
