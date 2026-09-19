@@ -895,6 +895,7 @@ name = "mcp-a11y"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "mcp-judge",
  "mcp-types",
  "serde",
  "serde_json",
@@ -962,6 +963,17 @@ dependencies = [
  "mcp-policy",
  "mcp-types",
  "mcp-window",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "mcp-judge"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
  "serde",
  "serde_json",
  "tokio",
@@ -1055,10 +1067,13 @@ dependencies = [
 name = "mcp-policy"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "mcp-judge",
  "mcp-types",
  "serde",
  "serde_json",
  "tempfile",
+ "tokio",
  "tracing",
 ]
 
@@ -1144,6 +1159,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "mcp-a11y",
+ "mcp-judge",
  "mcp-types",
  "serde",
  "serde_json",

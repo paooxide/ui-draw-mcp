@@ -160,6 +160,28 @@ unchanged_mad = 1.0
 # agent knows to capture a region instead.
 max_image_bytes = 8000000
 
+[judge]
+# A System One model (TypeSafe's jev) consulted for the semantic residue of a
+# decision: which of forty buttons is the one that saves, whether page text is
+# addressed to the model, whether a typed line would destroy data when the
+# pattern list did not match. Off by default. When on, a judgment can only
+# tighten a decision (a denial, a consent prompt, a warning) or rank
+# candidates for the agent; nothing it says can loosen one, and when it is
+# unreachable the server proceeds on the deterministic answer alone.
+#
+# What it sends leaves the machine: element names, window titles, page text
+# after redaction, typed commands. Never a secure field's value.
+enabled = "false"
+# The key is read from TYPESAFE_API_KEY, then ./.env, then
+# ~/.agentctl/typesafe.key (chmod 600). Never from this file, never from argv.
+base_url = "https://api.typesafe.ai"
+model = "jev-latest"
+timeout_ms = 4000
+# A yes-probability at or above this counts as yes wherever yes tightens.
+threshold = 0.7
+# Largest state sent with one question, in bytes; text beyond it is cut.
+max_state_bytes = 48000
+
 [http]
 # Optional HTTP transport. OFF by default, and stdio remains the primary
 # transport: over stdio the client *is* the parent process, so the OS does the

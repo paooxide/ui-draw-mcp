@@ -64,6 +64,9 @@ pub struct PolicyConfig {
     /// driving a local development server. Off by default: the browser is a
     /// network client inside the perimeter, same as `http_request`.
     pub browser_allow_private: bool,
+    /// The System One judge (`[judge]`). Off by default; when on, a judgment
+    /// may tighten a decision or rank candidates, never loosen anything.
+    pub judge: mcp_judge::JudgeConfig,
     /// Session aborts after this many denied calls (anti-spin).
     pub max_denials: usize,
     /// How many times one session may interrupt a human for approval. Past this
@@ -152,6 +155,7 @@ impl Default for PolicyConfig {
                 .collect(),
             allowed_origins: Vec::new(),
             browser_allow_private: false,
+            judge: mcp_judge::JudgeConfig::default(),
             max_denials: 5,
             max_consent_prompts: 20,
             kill_switch_file: base.join("STOP"),
@@ -295,6 +299,14 @@ impl PolicyConfig {
             "browser": {
                 "allowed_origins": self.allowed_origins,
                 "allow_private": self.browser_allow_private,
+            },
+            "judge": {
+                "enabled": self.judge.enabled,
+                "base_url": self.judge.base_url,
+                "model": self.judge.model,
+                "timeout_ms": self.judge.timeout_ms,
+                "threshold": self.judge.threshold,
+                "max_state_bytes": self.judge.max_state_bytes,
             },
             "memory": {
                 "store": self.memory_store.display().to_string(),

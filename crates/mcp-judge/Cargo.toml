@@ -1,20 +1,19 @@
 [package]
-name = "mcp-policy"
+name = "mcp-judge"
 edition.workspace = true
 version.workspace = true
 rust-version.workspace = true
 license.workspace = true
 # Installed from git, never from crates.io.
 publish = false
+description = "Typed judgments from a System One model, used only to tighten a decision or rank candidates."
 
 [dependencies]
-mcp-types = { path = "../mcp-types" }
-mcp-judge = { path = "../mcp-judge" }
 serde.workspace = true
 serde_json.workspace = true
+async-trait.workspace = true
 tracing.workspace = true
+tokio = { workspace = true, features = ["process", "time", "io-util", "rt"] }
 
 [dev-dependencies]
-tempfile = "3"
 tokio = { workspace = true, features = ["rt", "macros"] }
-async-trait.workspace = true

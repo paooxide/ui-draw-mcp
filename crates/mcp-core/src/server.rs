@@ -248,7 +248,10 @@ impl Server {
         //    a secret, and the markers it adds are never themselves scanned.
         let result = self.policy.redact_envelope(result);
         let result = if untrusted_output {
-            self.policy.mark_untrusted(result)
+            // The pattern scan first, then the judge's second opinion, which
+            // can add the flag but never remove it.
+            let marked = self.policy.mark_untrusted(result);
+            self.policy.second_opinion(marked).await
         } else {
             result
         };

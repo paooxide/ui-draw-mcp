@@ -20,6 +20,7 @@ pub struct A11yModule {
     backend: Arc<dyn A11yBackend>,
     arena: Arc<Mutex<SnapshotArena>>,
     max_chars: usize,
+    judge: Option<Arc<mcp_judge::Judge>>,
 }
 
 impl A11yModule {
@@ -28,7 +29,14 @@ impl A11yModule {
             backend,
             arena: Arc::new(Mutex::new(SnapshotArena::new())),
             max_chars,
+            judge: None,
         }
+    }
+
+    /// Attach the judge that ranks `describe` queries.
+    pub fn with_judge(mut self, judge: Arc<mcp_judge::Judge>) -> Self {
+        self.judge = Some(judge);
+        self
     }
 
     /// Shared arena handle (input tools will consume this once wired into
@@ -204,26 +212,86 @@ impl A11yModule {
             &cfg,
         );
         let snapshot = f.snapshot;
-        let (hits, total) = query_snapshot(&snapshot, &q);
+        let (mut hits, total) = query_snapshot(&snapshot, &q);
         {
             let mut arena = self.arena.lock().unwrap_or_else(|e| e.into_inner());
             arena.install(snapshot);
         }
-        Envelope::ok(
-            "find_elements",
-            json!({
-                "snapshot_id": sid,
-                "app": raw.app,
-                "window": raw.window,
-                "count": hits.len(),
-                "total_matched": total,
-                "truncated": total > hits.len(),
-                // The search covered only part of the UI, so "not found" here
-                // does not mean "not present".
-                "partial": raw.partial,
-                "elements": hits,
-            }),
-        )
+        let mut ranking = json!(null);
+        if let Some(describe) = &q.describe {
+            let Some(judge) = self.judge.as_ref().filter(|j| j.enabled()) else {
+                return Envelope::fail_with(
+                    "find_elements",
+                    ErrorCode::UnsupportedOs,
+                    "'describe' needs the judge, which is not enabled",
+                    "set [judge] enabled = \"true\" and provide TYPESAFE_API_KEY, or query by role, name or near",
+                );
+            };
+            if hits.is_empty() {
+                // Nothing to rank; the deterministic answer stands.
+            } else {
+                let considered = hits.len().min(crate::query::MAX_DESCRIBE_CANDIDATES);
+                let candidates: std::collections::BTreeMap<String, String> = hits
+                    .iter()
+                    .take(considered)
+                    .map(|h| {
+                        (
+                            h.reff.clone(),
+                            crate::query::candidate_line(h, raw.window.as_deref()),
+                        )
+                    })
+                    .collect();
+                let state = json!({
+                    "request": describe,
+                    "application": raw.app,
+                    "window": raw.window,
+                    "candidates": candidates,
+                });
+                match judge
+                    .rank(
+                        state,
+                        "Which candidate in `candidates` (keyed by element ref) is the user-interface element that `request` describes? Judge by role, name, value and placement in `window`.",
+                        &candidates,
+                    )
+                    .await
+                {
+                    Ok(r) => {
+                        hits = crate::query::apply_ranking(hits, &r.probabilities, q.limit);
+                        ranking = json!({
+                            "best": r.choice,
+                            "confidence": r.confidence,
+                            "any_fits": r.any_fits,
+                            "considered": considered,
+                            "considered_all": considered == total,
+                        });
+                    }
+                    Err(e) => {
+                        return Envelope::fail_with(
+                            "find_elements",
+                            ErrorCode::ActionFailed,
+                            format!("'describe' could not be ranked: {}", e.message()),
+                            "query by role, name or near instead",
+                        );
+                    }
+                }
+            }
+        }
+        let mut data = json!({
+            "snapshot_id": sid,
+            "app": raw.app,
+            "window": raw.window,
+            "count": hits.len(),
+            "total_matched": total,
+            "truncated": total > hits.len(),
+            // The search covered only part of the UI, so "not found" here
+            // does not mean "not present".
+            "partial": raw.partial,
+            "elements": hits,
+        });
+        if !ranking.is_null() {
+            data["ranking"] = ranking;
+        }
+        Envelope::ok("find_elements", data)
     }
 
     fn get_element(&self, args: &Value) -> Envelope {
@@ -324,9 +392,12 @@ impl ToolModule for A11yModule {
                 Tier::Read,
                 "Find elements without reading the whole UI. Filter by role and/or a \
                  case-insensitive substring of the name, or rank by distance from a \
-                 screen point. Much cheaper than get_ui_tree on a busy app. Takes a \
-                 fresh snapshot, so the refs it returns are usable by ui_action until \
-                 the next observation.",
+                 screen point. With 'describe', say what you want in plain language \
+                 ('the button that saves the document') and the candidates come back \
+                 ranked, each with a probability, plus 'ranking.any_fits' for whether \
+                 anything matched at all (needs the judge enabled). Much cheaper than \
+                 get_ui_tree on a busy app. Takes a fresh snapshot, so the refs it \
+                 returns are usable by ui_action until the next observation.",
                 query_schema(),
             ).untrusted_output(),
             ToolDescriptor::new(

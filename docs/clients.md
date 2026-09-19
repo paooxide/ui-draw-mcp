@@ -104,6 +104,18 @@ not by Claude, and the model cannot see or answer them.
 
 ---
 
+## Enabling the judge
+
+`[judge]` is off in the example config. To turn it on, set `enabled = "true"` and give the server a key
+one of three ways, in this order of precedence: the `TYPESAFE_API_KEY` environment variable, a
+`TYPESAFE_API_KEY=` line in `./.env` (or the file `AGENTCTL_ENV` names), or `~/.agentctl/typesafe.key`.
+The file forms must be mode 600 or they are refused. `agentctl doctor` says whether a key was found and
+how long it is, never what it is. With the judge on, `find_elements` accepts `describe`, `wait_for` and
+`expect` accept `judge`, and untrusted results and shell-bound text get a second opinion; with it off or
+unreachable, every one of those falls back to the deterministic behaviour and says so.
+
+---
+
 ## Linux: nothing to grant up front, one portal dialog later
 
 The pieces a Linux desktop already has are the ones `agentctl` uses, so there is no permission panel to

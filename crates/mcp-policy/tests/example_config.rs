@@ -44,6 +44,7 @@ fn every_documented_section_is_a_real_one() {
         "memory",
         "browser",
         "vision",
+        "judge",
         "http",
     ];
     for line in example().lines() {
@@ -75,6 +76,10 @@ fn the_example_is_closed_by_default() {
     assert!(
         !cfg.browser_allow_private,
         "browser.allow_private must stay off: the browser is a network client inside the perimeter"
+    );
+    assert!(
+        !cfg.judge.enabled,
+        "judge.enabled must stay off: it sends UI text to a remote model"
     );
     assert!(
         !cfg.allow_arbitrary_source,

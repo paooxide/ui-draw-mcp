@@ -205,19 +205,36 @@ impl WindowModule {
             Ok(s) => s,
             Err(msg) => return Envelope::fail("wait_for", ErrorCode::InvalidArgs, msg),
         };
-        let outcome = self.evaluator.wait(&spec, ctx).await;
-        if outcome.met {
-            Envelope::ok(
+        let wants_judge = spec
+            .conditions
+            .iter()
+            .any(|c| matches!(c, crate::wait::WaitCondition::Judged(_)));
+        if wants_judge && !self.evaluator.judge_available() {
+            return Envelope::fail_with(
                 "wait_for",
-                json!({ "ok": true, "waited_ms": outcome.waited_ms }),
-            )
+                ErrorCode::UnsupportedOs,
+                "'judge' needs the judge, which is not enabled",
+                "set [judge] enabled = \"true\" and provide TYPESAFE_API_KEY, or wait on text, window, gone or focused",
+            );
+        }
+        let outcome = self.evaluator.wait(&spec, ctx).await;
+        let mut data = json!({ "ok": outcome.met, "waited_ms": outcome.waited_ms });
+        if let Some(p) = outcome.judge_probability {
+            data["judge_probability"] = json!((p * 1000.0).round() / 1000.0);
+        }
+        if outcome.met {
+            Envelope::ok("wait_for", data)
         } else {
-            Envelope::fail_with(
+            let mut env = Envelope::fail_with(
                 "wait_for",
                 ErrorCode::Timeout,
                 format!("condition not met after {}ms", outcome.waited_ms),
                 "observe with get_ui_tree to see the current state",
-            )
+            );
+            if outcome.judge_probability.is_some() {
+                env.data = Some(data);
+            }
+            env
         }
     }
 }

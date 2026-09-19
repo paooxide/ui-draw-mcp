@@ -146,6 +146,12 @@ pub fn suspicious_instructions(text: &str) -> Vec<&'static str> {
 /// whole thing.
 const SCAN_BUDGET: usize = 512 * 1024;
 
+/// Every string in a result, for a second opinion that reads the same text
+/// the pattern scan read.
+pub fn collect_text(v: &Value, out: &mut String) {
+    collect_strings(v, out)
+}
+
 fn collect_strings(v: &Value, out: &mut String) {
     if out.len() >= SCAN_BUDGET {
         return;

@@ -172,6 +172,22 @@ impl PolicyConfig {
                 ("policy.allowed_apps", Val::List(v)) => cfg.allowed_apps = v.clone(),
                 ("browser.allowed_origins", Val::List(v)) => cfg.allowed_origins = v.clone(),
                 ("browser.allow_private", Val::Str(s)) => cfg.browser_allow_private = s == "true",
+                ("judge.enabled", Val::Str(s)) => cfg.judge.enabled = s == "true",
+                ("judge.base_url", Val::Str(s)) => cfg.judge.base_url = s.clone(),
+                ("judge.model", Val::Str(s)) => cfg.judge.model = s.clone(),
+                ("judge.timeout_ms", Val::Int(i)) if *i > 0 => cfg.judge.timeout_ms = *i as u64,
+                ("judge.threshold", Val::Float(f)) => cfg.judge.threshold = *f,
+                ("judge.threshold", Val::Int(i)) => cfg.judge.threshold = *i as f64,
+                ("judge.max_state_bytes", Val::Int(i)) if *i > 0 => {
+                    cfg.judge.max_state_bytes = *i as usize
+                }
+                ("judge.enabled" | "judge.base_url" | "judge.model", _) => {
+                    return Err(format!("{key} must be a string"))
+                }
+                ("judge.timeout_ms" | "judge.max_state_bytes", _) => {
+                    return Err(format!("{key} must be a positive integer"))
+                }
+                ("judge.threshold", _) => return Err(format!("{key} must be a number")),
                 ("fs.roots", Val::List(v)) => cfg.fs_roots = v.iter().map(PathBuf::from).collect(),
                 ("terminal.allowed_commands", Val::List(v)) => cfg.allowed_commands = v.clone(),
                 ("network.allowed_hosts", Val::List(v)) => cfg.allowed_hosts = v.clone(),
@@ -291,6 +307,10 @@ impl PolicyConfig {
                 _ => tracing::warn!(key = %key, "ignoring unknown config key"),
             }
         }
+        // A judge that can never work fails here, at load, rather than on
+        // the first call: falling back to defaults could silently drop a
+        // judgment the operator meant to have.
+        cfg.judge.validate()?;
         Ok(cfg)
     }
 

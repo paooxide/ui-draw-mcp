@@ -21,6 +21,8 @@ pub struct InputPolicy {
     pub autonomous: bool,
     /// Destructive-command substrings.
     pub destructive_patterns: Vec<String>,
+    /// The judge, consulted after the patterns and only able to add a flag.
+    pub judge: Option<std::sync::Arc<mcp_policy::mcp_judge::Judge>>,
 }
 
 /// Apps whose keystrokes may be shell input.
@@ -124,6 +126,7 @@ impl Default for InputPolicy {
             terminal_apps: default_terminal_apps(),
             autonomous: false,
             destructive_patterns: mcp_policy::default_destructive_patterns(),
+            judge: None,
         }
     }
 }
@@ -273,21 +276,35 @@ impl InputModule {
     /// When the target cannot be determined at all, destructive text is treated
     /// as if it *were* headed for a terminal. Unknown destination is not
     /// evidence of safety.
-    fn destructive_check(&self, tool: &str, text: &str) -> Option<Envelope> {
+    async fn destructive_check(&self, tool: &str, text: &str) -> Option<Envelope> {
         let target = self.backend.input_target().or_else(|| self.current_app());
         let is_term = screens_as_terminal(target.as_deref(), &self.policy.terminal_apps);
-        if is_term && mcp_policy::is_destructive(text, &self.policy.destructive_patterns) {
+        if !is_term {
+            return None;
+        }
+        let verdict = mcp_policy::judged_destructive(
+            text,
+            &self.policy.destructive_patterns,
+            self.policy.judge.as_ref(),
+            &format!(
+                "a terminal ({})",
+                target.as_deref().unwrap_or("unknown application")
+            ),
+        )
+        .await;
+        if verdict.is_destructive() {
+            let reason = verdict.reason();
             return Some(if self.policy.autonomous {
                 Envelope::fail(
                     tool,
                     ErrorCode::PolicyDenied,
-                    "destructive command blocked (autonomous mode)",
+                    format!("destructive command blocked (autonomous mode): {reason}"),
                 )
             } else {
                 Envelope::fail_with(
                     tool,
                     ErrorCode::ConsentRequired,
-                    "destructive command requires human consent",
+                    format!("destructive command requires human consent: {reason}"),
                     "confirm interactively or run a non-destructive command",
                 )
             });
@@ -351,7 +368,7 @@ impl InputModule {
         let Some(text) = args.get("text").and_then(Value::as_str) else {
             return Envelope::fail(tool, ErrorCode::InvalidArgs, "missing 'text'");
         };
-        if let Some(deny) = self.destructive_check(tool, text) {
+        if let Some(deny) = self.destructive_check(tool, text).await {
             return deny;
         }
         let (node_id, _) = match self.resolve_ref(tool, reff) {
@@ -369,7 +386,7 @@ impl InputModule {
         let Some(text) = args.get("text").and_then(Value::as_str) else {
             return Envelope::fail(tool, ErrorCode::InvalidArgs, "missing 'text'");
         };
-        if let Some(deny) = self.destructive_check(tool, text) {
+        if let Some(deny) = self.destructive_check(tool, text).await {
             return deny;
         }
         if let Some(reff) = args.get("ref").and_then(Value::as_str) {
@@ -544,7 +561,7 @@ impl InputModule {
         let Some(data) = args.get("data").and_then(Value::as_str) else {
             return Envelope::fail(tool, ErrorCode::InvalidArgs, "missing 'data'");
         };
-        if let Some(deny) = self.destructive_check(tool, data) {
+        if let Some(deny) = self.destructive_check(tool, data).await {
             return deny;
         }
         match self.backend.clipboard_write(format, data).await {

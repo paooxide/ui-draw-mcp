@@ -112,6 +112,17 @@ pub struct Wiring {
     pub input: Option<Arc<dyn mcp_input::InputBackend>>,
     pub activity: Option<Arc<mcp_input::Activity>>,
     pub desktop: Option<Arc<dyn mcp_desktop::DesktopBackend>>,
+    /// The judge, built once here so the policy kernel and the engines that
+    /// consult it share one set of counters.
+    pub judge: Option<Arc<mcp_policy::mcp_judge::Judge>>,
+}
+
+/// Where agentctl keeps state beside the config: the kill switch's directory.
+fn state_dir(cfg: &PolicyConfig) -> std::path::PathBuf {
+    cfg.kill_switch_file
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(std::env::temp_dir)
 }
 
 /// Wire every engine, and hand back the extra handles.
@@ -129,6 +140,10 @@ pub fn build_stack(cfg: &PolicyConfig) -> (Vec<Arc<dyn ToolModule>>, Wiring) {
     // Wiring stays empty and the `mut` is genuinely unused.
     #[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(unused_mut))]
     let mut wiring = Wiring::default();
+    // Built even when disabled: a disabled judge answers every question with
+    // `Disabled`, which every caller treats as "no opinion".
+    let judge = mcp_policy::mcp_judge::Judge::from_config(cfg.judge.clone(), &state_dir(cfg));
+    wiring.judge = Some(judge.clone());
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     let audio_roots = engines.fs_roots.clone();
 
@@ -185,6 +200,7 @@ pub fn build_stack(cfg: &PolicyConfig) -> (Vec<Arc<dyn ToolModule>>, Wiring) {
             max_sessions: engines.max_pty_sessions,
             max_buffer: engines.max_pty_buffer,
             autonomous: engines.autonomous,
+            judge: Some(judge.clone()),
             ..PtyPolicy::default()
         })));
 
@@ -221,17 +237,19 @@ pub fn build_stack(cfg: &PolicyConfig) -> (Vec<Arc<dyn ToolModule>>, Wiring) {
             .map(|p| p.join("bin"))
             .unwrap_or_else(std::env::temp_dir);
         let backend = Arc::new(MacosBackend::new().with_helper_dir(helper_dir));
-        let a11y = A11yModule::new(backend.clone(), 12_000);
+        let a11y = A11yModule::new(backend.clone(), 12_000).with_judge(judge.clone());
         let arena = a11y.arena();
         let input_policy = InputPolicy {
             autonomous,
             terminal_apps,
+            judge: Some(judge.clone()),
             ..InputPolicy::default()
         };
         // The postcondition verifier shares the wait evaluator with wait_for,
         // so `expect` and an explicit wait cannot disagree about when the UI
         // has settled.
-        let evaluator = mcp_window::WaitEvaluator::new(backend.clone(), backend.clone());
+        let evaluator = mcp_window::WaitEvaluator::new(backend.clone(), backend.clone())
+            .with_judge(judge.clone());
         let verifier = Arc::new(mcp_input::Verifier::new(
             evaluator,
             backend.clone(),
@@ -276,14 +294,16 @@ pub fn build_stack(cfg: &PolicyConfig) -> (Vec<Arc<dyn ToolModule>>, Wiring) {
             .map(|p| p.join("bin"))
             .unwrap_or_else(std::env::temp_dir);
         let backend = Arc::new(LinuxBackend::new().with_helper_dir(helper_dir));
-        let a11y = A11yModule::new(backend.clone(), 12_000);
+        let a11y = A11yModule::new(backend.clone(), 12_000).with_judge(judge.clone());
         let arena = a11y.arena();
         let input_policy = InputPolicy {
             autonomous,
             terminal_apps,
+            judge: Some(judge.clone()),
             ..InputPolicy::default()
         };
-        let evaluator = mcp_window::WaitEvaluator::new(backend.clone(), backend.clone());
+        let evaluator = mcp_window::WaitEvaluator::new(backend.clone(), backend.clone())
+            .with_judge(judge.clone());
         let verifier = Arc::new(mcp_input::Verifier::new(
             evaluator,
             backend.clone(),

@@ -368,6 +368,7 @@ fn doctor() {
         cfg.human_override_grace_ms
     );
     println!("  enabled cats:    {}", slugs(&cfg));
+    print_judge(&cfg);
     println!(
         "  transport:       {}",
         if cfg.http_enabled {
@@ -457,6 +458,32 @@ fn print_ocr_helper(cfg: &PolicyConfig) {
         "not compiled yet (the first ocr_region call builds it)".to_string()
     };
     println!("  ocr helper:      {state}");
+}
+
+/// The judge: whether it is on, whether a key was found, and where it sends.
+/// Never the key.
+fn print_judge(cfg: &PolicyConfig) {
+    if !cfg.judge.enabled {
+        println!("  judge:           off ([judge] enabled = \"false\")");
+        return;
+    }
+    let dir = cfg
+        .kill_switch_file
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(std::env::temp_dir);
+    match mcp_policy::mcp_judge::api_key(&dir) {
+        Ok(k) => println!(
+            "  judge:           on, {} at {} (key present, {} chars)",
+            cfg.judge.model,
+            cfg.judge.base_url,
+            k.len()
+        ),
+        Err(e) => {
+            println!("  judge:           on, but NO KEY: every judgment is skipped");
+            println!("    -> {e}");
+        }
+    }
 }
 
 fn print_permissions() {

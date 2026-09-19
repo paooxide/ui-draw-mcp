@@ -40,6 +40,11 @@ pub enum WaitCondition {
     Gone(String),
     /// An element whose line contains this text is focused.
     Focused(String),
+    /// A plain-language claim about the UI ("the document has been saved")
+    /// that the judge finds true of the observed tree at or above its
+    /// threshold. Needs `[judge]` enabled; without it the wait fails at
+    /// parse time rather than pretending.
+    Judged(String),
 }
 
 /// A parsed wait, with its scope and deadline.
@@ -54,6 +59,9 @@ pub struct WaitSpec {
 pub struct WaitOutcome {
     pub met: bool,
     pub waited_ms: u64,
+    /// The judge's last probability for a `judge` condition, when one was
+    /// asked, whether or not it cleared the threshold.
+    pub judge_probability: Option<f64>,
     /// The last observation taken while polling. Handing it back means a caller
     /// that also wants to diff does not have to re-snapshot, which would both
     /// cost another traversal and race the next change.
@@ -83,8 +91,11 @@ pub fn parse_wait_spec(v: &Value, default_timeout_ms: u64) -> Result<WaitSpec, S
     if let Some(t) = s("focused") {
         conditions.push(WaitCondition::Focused(t));
     }
+    if let Some(t) = s("judge") {
+        conditions.push(WaitCondition::Judged(t));
+    }
     if conditions.is_empty() {
-        return Err("need at least one of text|element|window|gone|focused".into());
+        return Err("need at least one of text|element|window|gone|focused|judge".into());
     }
     Ok(WaitSpec {
         conditions,
@@ -109,6 +120,7 @@ pub fn wait_schema(description: &str) -> Value {
             "window": { "type": "string", "description": "wait until a window with this title exists" },
             "gone": { "type": "string", "description": "wait until this text is no longer present" },
             "focused": { "type": "string", "description": "wait until an element matching this text has focus" },
+            "judge": { "type": "string", "description": "wait until this plain-language claim about the UI is judged true (needs the judge enabled); the probability is reported" },
             "app": { "type": "string", "description": "which application to observe" },
             "timeout_ms": { "type": "integer", "description": "give up after this long (max 30000)" }
         },
@@ -128,7 +140,7 @@ pub fn text_condition_holds(cond: &WaitCondition, tree: &str) -> bool {
         WaitCondition::Focused(t) => tree
             .lines()
             .any(|l| l.contains(t.as_str()) && l.split_whitespace().any(|w| w == "focused")),
-        WaitCondition::Window(_) => false,
+        WaitCondition::Window(_) | WaitCondition::Judged(_) => false,
     }
 }
 
@@ -189,11 +201,42 @@ where
 pub struct WaitEvaluator {
     window: Arc<dyn WindowBackend>,
     a11y: Arc<dyn A11yBackend>,
+    judge: Option<Arc<mcp_judge::Judge>>,
+}
+
+/// Ask the judge whether `claim` holds of `tree`. `None` when it could not
+/// answer, which never counts as met.
+pub async fn judged_claim_holds(judge: &mcp_judge::Judge, claim: &str, tree: &str) -> Option<f64> {
+    let state = json!({ "claim": claim, "ui": judge.fit(tree) });
+    judge
+        .noul(
+            state,
+            "`ui` is the accessibility tree of an application's window as text, one element per line. Is `claim` true of the state that tree shows right now?",
+            "Yes: the tree shows the state the claim describes",
+            "No: the tree does not show it, or shows the opposite, or shows too little to tell",
+        )
+        .await
+        .ok()
 }
 
 impl WaitEvaluator {
     pub fn new(window: Arc<dyn WindowBackend>, a11y: Arc<dyn A11yBackend>) -> Self {
-        WaitEvaluator { window, a11y }
+        WaitEvaluator {
+            window,
+            a11y,
+            judge: None,
+        }
+    }
+
+    /// Attach the judge that evaluates `judge` conditions.
+    pub fn with_judge(mut self, judge: Arc<mcp_judge::Judge>) -> Self {
+        self.judge = Some(judge);
+        self
+    }
+
+    /// Whether this evaluator can honour a `judge` condition.
+    pub fn judge_available(&self) -> bool {
+        self.judge.as_ref().is_some_and(|j| j.enabled())
     }
 
     /// Wait for every condition in `spec` to hold at once.
@@ -208,6 +251,7 @@ impl WaitEvaluator {
             .any(|c| matches!(c, WaitCondition::Window(_)));
 
         let last: std::sync::Mutex<Option<RawSnapshot>> = std::sync::Mutex::new(None);
+        let last_probability: std::sync::Mutex<Option<f64>> = std::sync::Mutex::new(None);
         let started = Instant::now();
         let describe = describe(spec);
         let (met, waited_ms) = poll_until(spec.timeout_ms, POLL_MS, &ctx.cancel, || async {
@@ -254,20 +298,48 @@ impl WaitEvaluator {
             } else {
                 None
             };
-            spec.conditions.iter().all(|c| match c {
+            // The structural conditions first; the judge is asked only when
+            // they all hold, so a wait never pays for a judgment it will
+            // not use, and a judgment can never stand in for a structural
+            // condition that failed.
+            let structural = spec.conditions.iter().all(|c| match c {
                 WaitCondition::Window(t) => windows
                     .as_deref()
                     .is_some_and(|ws| window_condition_holds(t, ws)),
+                WaitCondition::Judged(_) => true,
                 other => tree
                     .as_deref()
                     .is_some_and(|t| text_condition_holds(other, t)),
-            })
+            });
+            if !structural {
+                return false;
+            }
+            let mut judged_ok = true;
+            for c in &spec.conditions {
+                let WaitCondition::Judged(claim) = c else {
+                    continue;
+                };
+                let (Some(j), Some(t)) = (self.judge.as_ref(), tree.as_deref()) else {
+                    return false;
+                };
+                match judged_claim_holds(j, claim, t).await {
+                    Some(p) => {
+                        *last_probability.lock().unwrap_or_else(|e| e.into_inner()) = Some(p);
+                        if p < j.threshold() {
+                            judged_ok = false;
+                        }
+                    }
+                    None => judged_ok = false,
+                }
+            }
+            judged_ok
         })
         .await;
 
         WaitOutcome {
             met,
             waited_ms,
+            judge_probability: last_probability.into_inner().unwrap_or(None),
             last: last.into_inner().unwrap_or(None),
         }
     }
@@ -283,6 +355,7 @@ fn describe(spec: &WaitSpec) -> String {
             WaitCondition::Window(t) => format!("window {t:?}"),
             WaitCondition::Gone(t) => format!("{t:?} gone"),
             WaitCondition::Focused(t) => format!("{t:?} focused"),
+            WaitCondition::Judged(t) => format!("judged {t:?}"),
         })
         .collect();
     format!("waiting for {}", parts.join(" and "))
@@ -296,6 +369,80 @@ pub fn default_wait_timeout() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct Scripted(std::sync::Mutex<Vec<Result<(u16, String), String>>>);
+
+    #[async_trait::async_trait]
+    impl mcp_judge::Transport for Scripted {
+        async fn post(
+            &self,
+            _u: &str,
+            _k: &str,
+            _b: &Value,
+            _t: Duration,
+        ) -> Result<(u16, String), String> {
+            let mut r = self.0.lock().unwrap();
+            if r.is_empty() {
+                Err("exhausted".into())
+            } else {
+                r.remove(0)
+            }
+        }
+    }
+
+    fn judge_saying(p: f64) -> mcp_judge::Judge {
+        let reply = format!(r#"{{"answers":{{"q":{{"type":"noul","noul":{p}}}}}}}"#);
+        mcp_judge::Judge::with_transport(
+            mcp_judge::JudgeConfig {
+                enabled: true,
+                ..mcp_judge::JudgeConfig::default()
+            },
+            Some("k".into()),
+            Box::new(Scripted(std::sync::Mutex::new(vec![Ok((200, reply))]))),
+        )
+    }
+
+    #[test]
+    fn a_judge_condition_parses_and_is_never_a_text_condition() {
+        let s = parse_wait_spec(&json!({ "judge": "the file is saved" }), 1000).unwrap();
+        assert_eq!(
+            s.conditions,
+            vec![WaitCondition::Judged("the file is saved".into())]
+        );
+        assert!(!text_condition_holds(
+            &WaitCondition::Judged("x".into()),
+            "x"
+        ));
+        assert!(describe(&s).contains("judged"));
+        assert!(parse_wait_spec(&json!({ "judge": "" }), 1000).is_err());
+    }
+
+    #[tokio::test]
+    async fn a_judged_claim_reports_its_probability_or_nothing() {
+        let j = judge_saying(0.83);
+        assert_eq!(
+            judged_claim_holds(&j, "saved", "window \"x\"\n button \"Save\"").await,
+            Some(0.83)
+        );
+        let down = mcp_judge::Judge::with_transport(
+            mcp_judge::JudgeConfig {
+                enabled: true,
+                ..mcp_judge::JudgeConfig::default()
+            },
+            Some("k".into()),
+            Box::new(Scripted(std::sync::Mutex::new(vec![
+                Err("down".into()),
+                Err("down".into()),
+            ]))),
+        );
+        assert_eq!(judged_claim_holds(&down, "saved", "tree").await, None);
+        let off = mcp_judge::Judge::with_transport(
+            mcp_judge::JudgeConfig::default(),
+            None,
+            Box::new(Scripted(std::sync::Mutex::new(vec![]))),
+        );
+        assert_eq!(judged_claim_holds(&off, "saved", "tree").await, None);
+    }
 
     #[test]
     fn a_spec_must_contain_a_condition() {

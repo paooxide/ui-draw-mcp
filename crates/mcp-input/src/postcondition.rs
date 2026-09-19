@@ -33,6 +33,8 @@ pub struct Verifier {
 /// What verification found.
 pub struct Verified {
     pub met: bool,
+    /// The judge's probability for a `judge` clause, when one was asked.
+    pub judge_probability: Option<f64>,
     pub waited_ms: u64,
     pub delta: Value,
     pub snapshot_id: Option<String>,
@@ -113,6 +115,7 @@ impl Verifier {
         let Some(raw) = raw else {
             return Verified {
                 met: outcome.met,
+                judge_probability: outcome.judge_probability,
                 waited_ms: outcome.waited_ms,
                 delta: json!({ "unavailable": "could not observe the UI after the action" }),
                 snapshot_id: None,
@@ -151,6 +154,7 @@ impl Verifier {
         }
         Verified {
             met: outcome.met,
+            judge_probability: outcome.judge_probability,
             waited_ms: outcome.waited_ms,
             delta,
             snapshot_id: Some(sid),
@@ -167,10 +171,11 @@ pub fn attach(env: Envelope, tool: &str, v: Verified) -> Envelope {
     }
     let mut data = env.data.unwrap_or_else(|| json!({}));
     if let Some(obj) = data.as_object_mut() {
-        obj.insert(
-            "expect".into(),
-            json!({ "met": v.met, "waited_ms": v.waited_ms }),
-        );
+        let mut expect = json!({ "met": v.met, "waited_ms": v.waited_ms });
+        if let Some(p) = v.judge_probability {
+            expect["judge_probability"] = json!((p * 1000.0).round() / 1000.0);
+        }
+        obj.insert("expect".into(), expect);
         obj.insert("delta".into(), v.delta.clone());
         if let Some(sid) = &v.snapshot_id {
             obj.insert("snapshot_id".into(), json!(sid));
@@ -199,6 +204,7 @@ mod tests {
     fn verified(met: bool) -> Verified {
         Verified {
             met,
+            judge_probability: None,
             waited_ms: 42,
             delta: json!({"counts": {"changed": 1}}),
             snapshot_id: Some("s7".into()),

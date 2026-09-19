@@ -162,6 +162,32 @@ printf '%s\n' \
 
 ---
 
+## The judge (optional)
+
+The deterministic checks decide everything they can. What they cannot decide is semantic: which of forty
+buttons is the one that saves, whether the text a page returned is talking to the model, whether a typed
+line would wipe a disk when the pattern list did not match. With `[judge]` enabled, those questions go to a
+System One model (TypeSafe's `jev`), which answers a typed question with a probability in about a hundred
+milliseconds. Four places use it:
+
+- `find_elements` takes `describe` ("the button that saves the document") and returns the candidates
+  ranked, each with a probability, plus whether anything fits at all.
+- `wait_for` and every `expect` clause take `judge`, a plain-language claim about the UI, and report the
+  probability alongside the structural result.
+- Results marked untrusted get a second opinion on whether their text is addressed to a model. The flag
+  can be added, never removed.
+- Text headed for a shell gets a second opinion after the destructive patterns. A yes escalates to consent
+  or a denial; a no changes nothing.
+
+**A judgment can only tighten.** Nothing it says is consulted on an allow path, so a wrong, absent or
+manipulated answer makes the server more careful, never less. When the service is unreachable, the
+deterministic answer stands and the failure is counted. The key comes from `TYPESAFE_API_KEY`, `.env` or
+`~/.agentctl/typesafe.key`, never from the config file or an argument. What is sent leaves the machine:
+element names, window titles, page text after redaction, typed commands, never a secure field's value.
+See [`docs/threat-model.md`](docs/threat-model.md) §7.
+
+---
+
 ## Configuration
 
 Settings live in `~/.agentctl/config.toml`, or wherever `$AGENTCTL_CONFIG` points.
@@ -208,6 +234,7 @@ an engine.
 | `mcp-fs` | Filesystem, contained by a resolve-then-check path jail. |
 | `mcp-proc` | `exec` (argv, no shell by default), process listing and signals. |
 | `mcp-ssrf` | The resolved-address guard, a dependency-free leaf shared by the network and browser engines. |
+| `mcp-judge` | Typed judgments from a System One model (TypeSafe's `jev`), consulted only where a judgment can tighten a decision or rank candidates. Off by default. |
 | `mcp-net` | HTTP with SSRF containment, DNS, interfaces. |
 | `mcp-sys` | Read-only OS, hardware, disk and log telemetry. |
 | `mcp-sec` | Credentials. No plaintext secret read exists. |

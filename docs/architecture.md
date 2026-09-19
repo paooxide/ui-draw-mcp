@@ -87,6 +87,7 @@ crates/
   mcp-desktop/                 # session/power/settings       [deferred]
   mcp-pty/ mcp-proc/           # terminal/process             [deferred]
   mcp-ssrf/                    # resolved-address guard (leaf, shared by net + browser)
+  mcp-judge/                   # System One client (leaf); policy, a11y and window consult it to tighten or rank
   mcp-macos/ mcp-linux/        # the real desktop backends, one per OS
   mcp-fs/ mcp-net/ mcp-sys/    # fs/network/kernel            [deferred]
   mcp-sec/                     # credentials                  [deferred]
@@ -160,8 +161,8 @@ mcp-types  ◀── mcp-policy ◀── mcp-core ◀── agentctl ──▶ 
 ```
 
 **Enforced rules** (checked in review; some by `cargo-deny`/lints):
-- Engines depend on `mcp-types`, dependency-free leaf guards such as `mcp-ssrf`, and their OS crates
-  **only**. An engine importing `mcp-core`, `mcp-policy` or another engine is a bug (it would allow
+- Engines depend on `mcp-types`, dependency-free leaf crates such as `mcp-ssrf` and `mcp-judge`, and their
+  OS crates **only**. An engine importing `mcp-core`, `mcp-policy` or another engine is a bug (it would allow
   bypassing the gate, or a circular dependency). A guard two engines share is lifted into a leaf crate
   rather than one engine importing the other.
 - `mcp-policy` depends on `mcp-types` only. It never depends on an engine (it gates by descriptor metadata,

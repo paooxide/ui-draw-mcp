@@ -198,6 +198,19 @@ toolkit reports over AT-SPI start at (0, 0). A `mouse_action` aimed with those n
 place. Coordinates read from `capture_screen` or `ocr_region` are screen-global and correct, and
 `ui_action` on a ref needs no coordinate at all. XWayland and X11 applications report global bounds.
 
+**The judge is a second opinion, not a boundary.**
+`[judge]` sends text to a remote model and gets a probability back. Its own documentation says adversarial
+content can move its answers, so it is wired where that cannot matter: `judged_destructive` runs the
+pattern check first and asks the judge only when the patterns found nothing, a yes adds a flag and a no
+changes nothing; `second_opinion_on_content` can set `suspicious_instructions` and never clear it; the
+`describe` ranking and the `judge` wait condition inform the agent and gate no permission. There is no code
+path on which a judgment allows anything. `crates/mcp-policy/tests/redteam_judge.rs` scripts the service
+to say the most convenient thing an attacker could wish for and asserts the deterministic answer stands.
+What does leave the machine is data: element names and values, window titles, page text after redaction,
+typed commands, cut to `judge.max_state_bytes`. Secure fields never carry their value into a snapshot, so
+they never reach it. The key is read from the environment or a mode-600 file and is never printed, never
+in argv, and never in `agentctl config print`.
+
 **OCR models are fetched, not shipped.**
 `ocr_region` on Linux downloads two model files from the `ocrs` project's bucket on first use, over
 HTTPS, without a pinned checksum. A tampered model can misread text; it cannot execute anything, because

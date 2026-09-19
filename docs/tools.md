@@ -157,11 +157,12 @@ Capture a single window as a PNG image: prefer this over capture_screen when you
 
 `find_elements` · read tier
 
-Find elements without reading the whole UI. Filter by role and/or a case-insensitive substring of the name, or rank by distance from a screen point. Much cheaper than get_ui_tree on a busy app. Takes a fresh snapshot, so the refs it returns are usable by ui_action until the next observation.
+Find elements without reading the whole UI. Filter by role and/or a case-insensitive substring of the name, or rank by distance from a screen point. With 'describe', say what you want in plain language ('the button that saves the document') and the candidates come back ranked, each with a probability, plus 'ranking.any_fits' for whether anything matched at all (needs the judge enabled). Much cheaper than get_ui_tree on a busy app. Takes a fresh snapshot, so the refs it returns are usable by ui_action until the next observation.
 
 | Argument | Type | Required | Description |
 |---|---|---|---|
 | `app` | string |  | target application name |
+| `describe` | string |  | plain-language description of the wanted element, e.g. 'the button that saves the document'; candidates are ranked by the judge and each carries a probability (needs the judge enabled) |
 | `interactive_only` | boolean |  | only elements ui_action can target (default true) |
 | `limit` | integer |  | max matches (default 20, cap 200) |
 | `name` | string |  | case-insensitive substring of the element name |
@@ -287,6 +288,7 @@ Press a key or chord, e.g. return, escape, cmd+s, cmd+shift+n.
 | `expect.element` | string |  | synonym for text |
 | `expect.focused` | string |  | wait until an element matching this text has focus |
 | `expect.gone` | string |  | wait until this text is no longer present |
+| `expect.judge` | string |  | wait until this plain-language claim about the UI is judged true (needs the judge enabled); the probability is reported |
 | `expect.text` | string |  | wait until this text appears in the UI |
 | `expect.timeout_ms` | integer |  | give up after this long (max 30000) |
 | `expect.window` | string |  | wait until a window with this title exists |
@@ -304,6 +306,7 @@ Type Unicode text. If 'ref' is given, focus it first. Does not press return.
 | `expect.element` | string |  | synonym for text |
 | `expect.focused` | string |  | wait until an element matching this text has focus |
 | `expect.gone` | string |  | wait until this text is no longer present |
+| `expect.judge` | string |  | wait until this plain-language claim about the UI is judged true (needs the judge enabled); the probability is reported |
 | `expect.text` | string |  | wait until this text appears in the UI |
 | `expect.timeout_ms` | integer |  | give up after this long (max 30000) |
 | `expect.window` | string |  | wait until a window with this title exists |
@@ -324,6 +327,7 @@ Coordinate pointer action (screen control). 'modifiers' holds keys down for the 
 | `expect.element` | string |  | synonym for text |
 | `expect.focused` | string |  | wait until an element matching this text has focus |
 | `expect.gone` | string |  | wait until this text is no longer present |
+| `expect.judge` | string |  | wait until this plain-language claim about the UI is judged true (needs the judge enabled); the probability is reported |
 | `expect.text` | string |  | wait until this text appears in the UI |
 | `expect.timeout_ms` | integer |  | give up after this long (max 30000) |
 | `expect.window` | string |  | wait until a window with this title exists |
@@ -359,6 +363,7 @@ Set the value of a text element by ref (accessibility SetValue).
 | `expect.element` | string |  | synonym for text |
 | `expect.focused` | string |  | wait until an element matching this text has focus |
 | `expect.gone` | string |  | wait until this text is no longer present |
+| `expect.judge` | string |  | wait until this plain-language claim about the UI is judged true (needs the judge enabled); the probability is reported |
 | `expect.text` | string |  | wait until this text appears in the UI |
 | `expect.timeout_ms` | integer |  | give up after this long (max 30000) |
 | `expect.window` | string |  | wait until a window with this title exists |
@@ -379,6 +384,7 @@ Perform a semantic action on an element by ref (accessibility action, no cursor)
 | `expect.element` | string |  | synonym for text |
 | `expect.focused` | string |  | wait until an element matching this text has focus |
 | `expect.gone` | string |  | wait until this text is no longer present |
+| `expect.judge` | string |  | wait until this plain-language claim about the UI is judged true (needs the judge enabled); the probability is reported |
 | `expect.text` | string |  | wait until this text appears in the UI |
 | `expect.timeout_ms` | integer |  | give up after this long (max 30000) |
 | `expect.window` | string |  | wait until a window with this title exists |
@@ -509,6 +515,7 @@ Block until the UI settles: text appears, a window appears, text is gone, or an 
 | `element` | string |  | synonym for text |
 | `focused` | string |  | wait until an element matching this text has focus |
 | `gone` | string |  | wait until this text is no longer present |
+| `judge` | string |  | wait until this plain-language claim about the UI is judged true (needs the judge enabled); the probability is reported |
 | `text` | string |  | wait until this text appears in the UI |
 | `timeout_ms` | integer |  | give up after this long (max 30000) |
 | `window` | string |  | wait until a window with this title exists |

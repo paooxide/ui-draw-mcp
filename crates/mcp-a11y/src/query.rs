@@ -32,6 +32,10 @@ pub struct ElementQuery {
     /// "where is Save" wants something it can click.
     pub interactive_only: bool,
     pub limit: usize,
+    /// A plain-language description of the wanted element ("the button that
+    /// saves the document"), ranked by the judge over the candidates the
+    /// other filters leave. Needs `[judge]` enabled.
+    pub describe: Option<String>,
 }
 
 /// One match, with everything needed to decide and then act.
@@ -54,6 +58,9 @@ pub struct ElementHit {
     /// target it. Reported rather than hidden: an agent that asked for a label
     /// should be told it found a label.
     pub actionable: bool,
+    /// The judge's probability that this is the element `describe` meant.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub probability: Option<f64>,
 }
 
 /// Parse the tool arguments. Returns a message suitable for `INVALID_ARGS`.
@@ -93,9 +100,14 @@ pub fn parse_query(args: &Value) -> Result<ElementQuery, String> {
             .and_then(Value::as_bool)
             .unwrap_or(true),
         limit,
+        describe: args
+            .get("describe")
+            .and_then(Value::as_str)
+            .map(|d| d.trim().to_string())
+            .filter(|d| !d.is_empty()),
     };
-    if q.role.is_none() && q.name.is_none() && q.near.is_none() {
-        return Err("need at least one of 'role', 'name' or 'near'".into());
+    if q.role.is_none() && q.name.is_none() && q.near.is_none() && q.describe.is_none() {
+        return Err("need at least one of 'role', 'name', 'near' or 'describe'".into());
     }
     Ok(q)
 }
@@ -155,6 +167,7 @@ pub fn query_snapshot(snap: &Snapshot, q: &ElementQuery) -> (Vec<ElementHit>, us
                 .near
                 .and_then(|(x, y)| info.bounds.as_ref().map(|b| distance(b, x, y))),
             actionable: info.node_id.is_some(),
+            probability: None,
         })
         .collect();
 
@@ -172,8 +185,66 @@ pub fn query_snapshot(snap: &Snapshot, q: &ElementQuery) -> (Vec<ElementHit>, us
     } else {
         hits.sort_by_key(|h| ref_order(&h.reff));
     }
-    hits.truncate(q.limit);
+    // A described query keeps every candidate for the judge to rank; the
+    // limit applies after ranking.
+    if q.describe.is_none() {
+        hits.truncate(q.limit);
+    }
     (hits, total)
+}
+
+/// How many candidates a described query hands to the judge. Above this the
+/// tree-order prefix is what gets ranked, and the response says so.
+pub const MAX_DESCRIBE_CANDIDATES: usize = mcp_judge::MAX_CHOICE_OPTIONS;
+
+/// One line per candidate, the way the judge sees it. Secure fields never
+/// carry their value.
+pub fn candidate_line(h: &ElementHit, window: Option<&str>) -> String {
+    let mut s = h.role.to_string();
+    if let Some(n) = &h.name {
+        s.push_str(&format!(" named {n:?}"));
+    }
+    if h.secure {
+        s.push_str(" (password field)");
+    } else if let Some(v) = &h.value {
+        let v: String = v.chars().take(80).collect();
+        s.push_str(&format!(" with value {v:?}"));
+    }
+    if let Some(b) = &h.bounds {
+        s.push_str(&format!(
+            " at ({:.0}, {:.0}) size {:.0}x{:.0}",
+            b.x, b.y, b.w, b.h
+        ));
+    }
+    if !h.actionable {
+        s.push_str(" (not actionable)");
+    }
+    if let Some(w) = window {
+        s.push_str(&format!(" in window {w:?}"));
+    }
+    s
+}
+
+/// Attach probabilities to hits and order them best first, then cut to the
+/// limit. Hits the ranking did not mention keep no probability and sort
+/// last, in tree order.
+pub fn apply_ranking(
+    mut hits: Vec<ElementHit>,
+    probabilities: &std::collections::BTreeMap<String, f64>,
+    limit: usize,
+) -> Vec<ElementHit> {
+    for h in hits.iter_mut() {
+        h.probability = probabilities.get(&h.reff).copied();
+    }
+    hits.sort_by(|a, b| {
+        let pa = a.probability.unwrap_or(-1.0);
+        let pb = b.probability.unwrap_or(-1.0);
+        pb.partial_cmp(&pa)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| ref_order(&a.reff).cmp(&ref_order(&b.reff)))
+    });
+    hits.truncate(limit);
+    hits
 }
 
 /// The tool's JSON schema, in the Gemini-safe subset.
@@ -198,7 +269,8 @@ pub fn query_schema() -> Value {
                 "type": "boolean",
                 "description": "only elements ui_action can target (default true)"
             },
-            "limit": { "type": "integer", "description": "max matches (default 20, cap 200)" }
+            "limit": { "type": "integer", "description": "max matches (default 20, cap 200)" },
+            "describe": { "type": "string", "description": "plain-language description of the wanted element, e.g. 'the button that saves the document'; candidates are ranked by the judge and each carries a probability (needs the judge enabled)" }
         },
         "required": []
     })
@@ -207,6 +279,81 @@ pub fn query_schema() -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn hit(reff: &str, role: &str, name: Option<&str>, secure: bool) -> ElementHit {
+        ElementHit {
+            reff: reff.into(),
+            role: role.into(),
+            name: name.map(String::from),
+            value: Some("hidden-value".into()),
+            secure,
+            bounds: Some(Bounds {
+                x: 10.0,
+                y: 20.0,
+                w: 30.0,
+                h: 40.0,
+            }),
+            distance: None,
+            actionable: true,
+            probability: None,
+        }
+    }
+
+    #[test]
+    fn describe_alone_is_a_valid_query_and_keeps_every_candidate() {
+        let q = parse_query(&json!({ "describe": "  the save button " })).unwrap();
+        assert_eq!(q.describe.as_deref(), Some("the save button"));
+        assert!(q.role.is_none() && q.name.is_none());
+        assert!(parse_query(&json!({ "describe": "   " })).is_err());
+        assert!(parse_query(&json!({ "describe": "" })).is_err());
+    }
+
+    #[test]
+    fn ranking_orders_by_probability_then_tree_order_and_cuts_to_the_limit() {
+        let hits = vec![
+            hit("@e1", "button", Some("Cancel"), false),
+            hit("@e2", "button", Some("Save"), false),
+            hit("@e3", "link", None, false),
+        ];
+        let mut p = std::collections::BTreeMap::new();
+        p.insert("@e2".to_string(), 0.8);
+        p.insert("@e1".to_string(), 0.2);
+        let ranked = apply_ranking(hits.clone(), &p, 10);
+        let order: Vec<&str> = ranked.iter().map(|h| h.reff.as_str()).collect();
+        assert_eq!(order, vec!["@e2", "@e1", "@e3"]);
+        assert_eq!(ranked[0].probability, Some(0.8));
+        assert_eq!(
+            ranked[2].probability, None,
+            "unranked hits carry no probability"
+        );
+        assert_eq!(apply_ranking(hits.clone(), &p, 1).len(), 1);
+        assert!(apply_ranking(Vec::new(), &p, 5).is_empty());
+        // No probabilities at all: tree order, unchanged.
+        let none = apply_ranking(hits, &std::collections::BTreeMap::new(), 10);
+        assert_eq!(
+            none.iter().map(|h| h.reff.as_str()).collect::<Vec<_>>(),
+            vec!["@e1", "@e2", "@e3"]
+        );
+    }
+
+    #[test]
+    fn candidate_lines_never_carry_a_secure_value() {
+        let line = candidate_line(
+            &hit("@e9", "textfield", Some("Password"), true),
+            Some("Login"),
+        );
+        assert!(line.contains("password field"));
+        assert!(!line.contains("hidden-value"), "{line}");
+        assert!(line.contains("in window \"Login\""));
+        let line = candidate_line(&hit("@e9", "textfield", Some("User"), false), None);
+        assert!(line.contains("hidden-value"));
+        assert!(line.contains("at (10, 20) size 30x40"));
+        let mut h = hit("@e1", "statictext", None, false);
+        h.actionable = false;
+        h.value = None;
+        h.bounds = None;
+        assert_eq!(candidate_line(&h, None), "statictext (not actionable)");
+    }
     use crate::arena::ElementState;
     use std::collections::HashMap;
 

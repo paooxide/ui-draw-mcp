@@ -63,7 +63,11 @@ pub fn build_server_with(
 ) -> Result<(Server, Arc<Policy>, engines::Wiring), String> {
     let (modules, wiring) = build_stack(&cfg);
     let registry = Registry::build(modules)?;
-    let policy = Arc::new(Policy::new(cfg, audit, Redactor::empty()).with_consent(consent));
+    let mut policy = Policy::new(cfg, audit, Redactor::empty()).with_consent(consent);
+    if let Some(judge) = wiring.judge.clone() {
+        policy = policy.with_judge(judge);
+    }
+    let policy = Arc::new(policy);
     let session_id = session_id.into();
     Ok((
         Server::new(registry, policy.clone(), session_id),

@@ -14,6 +14,7 @@ mod decision;
 mod destructive;
 mod gate;
 mod injection;
+mod judged;
 mod killswitch;
 mod load;
 mod redact;
@@ -25,7 +26,9 @@ pub use decision::Decision;
 pub use destructive::{default_destructive_patterns, is_destructive};
 pub use gate::Policy;
 pub use injection::{flag_untrusted, suspicious_instructions};
+pub use judged::{judged_destructive, second_opinion_on_content, Destructive};
 pub use killswitch::KillSwitch;
+pub use mcp_judge;
 pub use redact::Redactor;
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]

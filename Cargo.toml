@@ -12,6 +12,7 @@ members = [
     "crates/mcp-fs",
     "crates/mcp-proc",
     "crates/mcp-ssrf",
+    "crates/mcp-judge",
     "crates/mcp-net",
     "crates/mcp-sys",
     "crates/mcp-sec",

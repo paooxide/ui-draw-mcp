@@ -76,6 +76,7 @@ jobs:
           cargo test -p mcp-policy --test example_config
           cargo test -p mcp-net --test redteam_ssrf
           cargo test -p mcp-browser --test redteam_navigate
+          cargo test -p mcp-policy --test redteam_judge
           cargo test -p mcp-fs --test redteam_jail
 
       # The example config is what operators copy. Prove the shipped binary

@@ -15,6 +15,7 @@ pub struct Policy {
     redactor: Redactor,
     consent: std::sync::Arc<dyn crate::ConsentProvider>,
     prompts: crate::PromptBudget,
+    judge: Option<std::sync::Arc<mcp_judge::Judge>>,
 }
 
 impl Policy {
@@ -31,7 +32,28 @@ impl Policy {
             redactor,
             consent: std::sync::Arc::new(crate::NoConsent),
             prompts,
+            judge: None,
         }
+    }
+
+    /// Attach the judge. It is consulted only where a judgment can tighten:
+    /// see `judged.rs`.
+    pub fn with_judge(mut self, judge: std::sync::Arc<mcp_judge::Judge>) -> Self {
+        self.judge = Some(judge);
+        self
+    }
+
+    pub fn judge(&self) -> Option<&std::sync::Arc<mcp_judge::Judge>> {
+        self.judge.as_ref()
+    }
+
+    /// The judge's second opinion on an untrusted result: may add the
+    /// injection flag, never remove it. Runs after [`Self::mark_untrusted`].
+    pub async fn second_opinion(&self, mut env: Envelope) -> Envelope {
+        if let Some(data) = env.data.as_mut() {
+            crate::judged::second_opinion_on_content(data, self.judge.as_ref()).await;
+        }
+        env
     }
 
     /// Attach the out-of-band human-approval channel.

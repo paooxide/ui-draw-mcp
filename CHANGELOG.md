@@ -8,6 +8,16 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- **The judge** (`mcp-judge`, `[judge]` in the config, off by default): typed judgments from a System One
+  model (TypeSafe's `jev`), consulted only where a judgment can tighten a decision or rank candidates.
+  `find_elements` takes `describe` and returns candidates ranked with probabilities; `wait_for` and
+  `expect` take `judge`, a claim about the UI, and report its probability; results marked untrusted get a
+  second opinion on whether their text is addressed to a model (the flag can be added, never removed);
+  text headed for a terminal or a PTY gets a second opinion after the destructive patterns (a yes
+  escalates, a no changes nothing). Unreachable, keyless or disabled, it is skipped and counted. The key
+  is read from `TYPESAFE_API_KEY`, `.env` or `~/.agentctl/typesafe.key`, never from config or argv. A
+  red-team suite pins that no scripted answer can loosen anything.
+
 - **Linux desktop backend** (`mcp-linux`). Perception over AT-SPI2: `get_ui_tree`, `find_elements`,
   `get_element` and delta snapshots read the same tree a screen reader does, with refs that keep the
   object reference and fall back to a path replay and an identity search when a widget is replaced.
