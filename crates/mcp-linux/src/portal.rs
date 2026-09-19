@@ -82,6 +82,13 @@ fn dist2(s: &StreamGeom, x: f64, y: f64) -> f64 {
     dx * dx + dy * dy
 }
 
+/// Does a portal error say the compositor will not persist the session? The
+/// message is the only signal ashpd surfaces for it.
+pub fn refused_persistence(msg: &str) -> bool {
+    let m = msg.to_ascii_lowercase();
+    m.contains("cannot persist") || (m.contains("persist") && m.contains("invalidargument"))
+}
+
 /// evdev button codes the portal expects.
 pub fn button_code(name: Option<&str>) -> Result<i32, InputError> {
     Ok(match name.unwrap_or("left") {
@@ -198,7 +205,24 @@ impl Portal {
         }
     }
 
+    /// Open a session. GNOME refuses persistence on a remote-desktop session
+    /// ("Remote desktop sessions cannot persist"), while KDE and newer GNOME
+    /// allow it, so this tries to persist first and falls back to a
+    /// per-session grant when the compositor rejects the mode. A persisted
+    /// grant is remembered; a per-session one asks the human each run.
     async fn open(&self) -> Result<Live, InputError> {
+        match self.open_with(PersistMode::ExplicitlyRevoked).await {
+            Err(InputError::Failed(m)) if refused_persistence(&m) => {
+                tracing::info!(
+                    "this compositor does not persist remote-desktop grants;                      asking for a per-session one instead"
+                );
+                self.open_with(PersistMode::DoNot).await
+            }
+            other => other,
+        }
+    }
+
+    async fn open_with(&self, persist: PersistMode) -> Result<Live, InputError> {
         let failed = |what: &str, e: ashpd::Error| {
             InputError::Failed(format!("remote-desktop portal {what}: {e}"))
         };
@@ -211,13 +235,19 @@ impl Portal {
             .create_session()
             .await
             .map_err(|e| failed("create session", e))?;
-        let token = self.read_token();
+        // A restore token only helps when we are asking to persist; with a
+        // per-session grant there is nothing to restore.
+        let token = if persist == PersistMode::DoNot {
+            None
+        } else {
+            self.read_token()
+        };
         proxy
             .select_devices(
                 &session,
                 DeviceType::Keyboard | DeviceType::Pointer,
                 token.as_deref(),
-                PersistMode::ExplicitlyRevoked,
+                persist,
             )
             .await
             .map_err(|e| failed("select devices", e))?
@@ -233,7 +263,7 @@ impl Portal {
             BitFlags::from(SourceType::Monitor),
             true,
             token.as_deref(),
-            PersistMode::ExplicitlyRevoked,
+            persist,
         )
         .await
         .map_err(|e| failed("select sources", e))?
@@ -264,8 +294,10 @@ impl Portal {
                 devices.devices()
             )));
         }
-        if let Some(t) = devices.restore_token() {
-            self.write_token(t);
+        if persist != PersistMode::DoNot {
+            if let Some(t) = devices.restore_token() {
+                self.write_token(t);
+            }
         }
         let streams: Vec<StreamGeom> = devices
             .streams()
@@ -447,6 +479,20 @@ mod tests {
         assert!(layout_matches(&geoms(), &Vec::new()));
         // No streams yet and monitors exist: mismatch, so a session is opened.
         assert!(!layout_matches(&[], &two));
+    }
+
+    #[test]
+    fn a_persistence_refusal_is_recognised_from_the_portal_message() {
+        assert!(refused_persistence(
+            "remote-desktop portal select sources: Portal request failed: org.freedesktop.portal.Error.InvalidArgument: Remote desktop sessions cannot persist"
+        ));
+        assert!(refused_persistence(
+            "something InvalidArgument about persist mode"
+        ));
+        assert!(!refused_persistence(
+            "select devices: the dialog was dismissed"
+        ));
+        assert!(!refused_persistence("connection reset"));
     }
 
     #[test]

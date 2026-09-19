@@ -30,6 +30,12 @@ impl WindowModule {
         }
     }
 
+    /// Give `wait_for`'s evaluator the judge that answers a `judge` condition.
+    pub fn with_judge(mut self, judge: Arc<mcp_judge::Judge>) -> Self {
+        self.evaluator = self.evaluator.with_judge(judge);
+        self
+    }
+
     fn app_allowed(&self, app: &str) -> bool {
         let lower = app.to_ascii_lowercase();
         self.allowed_apps

@@ -260,7 +260,8 @@ pub fn build_stack(cfg: &PolicyConfig) -> (Vec<Arc<dyn ToolModule>>, Wiring) {
             .with_verifier(verifier)
             .with_activity(activity.clone());
         let vision = VisionModule::new(backend.clone(), engines.vision);
-        let window = WindowModule::new(backend.clone(), backend.clone(), allowed_apps);
+        let window = WindowModule::new(backend.clone(), backend.clone(), allowed_apps)
+            .with_judge(judge.clone());
         modules.push(Arc::new(a11y));
         modules.push(Arc::new(input));
         modules.push(Arc::new(vision));
@@ -314,7 +315,8 @@ pub fn build_stack(cfg: &PolicyConfig) -> (Vec<Arc<dyn ToolModule>>, Wiring) {
             .with_verifier(verifier)
             .with_activity(activity.clone());
         let vision = VisionModule::new(backend.clone(), engines.vision);
-        let window = WindowModule::new(backend.clone(), backend.clone(), allowed_apps);
+        let window = WindowModule::new(backend.clone(), backend.clone(), allowed_apps)
+            .with_judge(judge.clone());
         modules.push(Arc::new(a11y));
         modules.push(Arc::new(input));
         modules.push(Arc::new(vision));
