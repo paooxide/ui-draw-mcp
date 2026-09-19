@@ -17,7 +17,7 @@ categories = ["vision", "input", "window", "browser", "system"]
 # operator's pre-approval; in interactive mode a human is *also* asked per call.
 enable = []
 
-# interactive = ask a human (macOS dialog) before risky actions.
+# interactive = ask a human (a native dialog on macOS, zenity on Linux) before risky actions.
 # autonomous  = nobody to ask, so anything needing consent is denied.
 # dry_run     = rehearsal. Read-tier tools run for real; anything that would
 #               change something reports what it *would* have done, including

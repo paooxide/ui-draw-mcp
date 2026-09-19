@@ -9,7 +9,7 @@ use mcp_ssrf::{NetPolicy, UrlError};
 /// HTTP goes through `curl` rather than a Rust TLS stack: it is present on
 /// every target platform and avoids pulling a large TLS dependency into a
 /// disk-constrained build. Arguments are passed as argv (never a shell string),
-/// and redirects are **not** followed — a redirect is the standard way to turn
+/// and redirects are **not** followed: a redirect is the standard way to turn
 /// an allowlisted URL into an internal one.
 pub struct NetModule {
     policy: NetPolicy,
@@ -132,7 +132,7 @@ impl NetModule {
     /// Listening and established sockets with their owning process.
     ///
     /// `lsof` rather than `netstat`, because the owning PID is the part that
-    /// makes this useful — "something is on 8080" is a much weaker answer than
+    /// makes this useful: "something is on 8080" is a much weaker answer than
     /// "node, pid 4711, is on 8080".
     async fn socket_inspection(&self, args: &Value) -> Envelope {
         let tool = "socket_inspection";
@@ -275,7 +275,7 @@ impl NetModule {
     }
 
     /// The application firewall. Listing is a read; changing it is not, and on
-    /// macOS the change also needs root — which this engine will not obtain for
+    /// macOS the change also needs root, which this engine will not obtain for
     /// itself, so a denial from the OS is reported as exactly that.
     async fn firewall_rules(&self, args: &Value) -> Envelope {
         let tool = "firewall_rules";
@@ -342,7 +342,8 @@ impl NetModule {
     }
 
     /// Wi-Fi and VPN state. The Wi-Fi password never enters a log line or a
-    /// response — it goes to `networksetup` as argv and nowhere else.
+    /// response: it goes to `networksetup` as argv and nowhere else.
+    #[cfg(not(target_os = "linux"))]
     async fn network_manage(&self, args: &Value) -> Envelope {
         let tool = "network_manage";
         let action = args
@@ -446,7 +447,7 @@ impl NetModule {
 
     /// Bluetooth pairing.
     ///
-    /// macOS ships no supported command-line pairing interface — `system_profiler`
+    /// macOS ships no supported command-line pairing interface: `system_profiler`
     /// lists devices and nothing more. Where `blueutil` is installed it is used;
     /// otherwise the tool says exactly what is missing instead of failing vaguely.
     async fn bluetooth_pair(&self, args: &Value) -> Envelope {
@@ -607,7 +608,7 @@ fn clip_net(text: &str, max: usize) -> String {
 
 /// Run a fixed diagnostic binary. The program is always a literal in this file;
 /// only arguments vary, and the caller validates those.
-async fn run_net_tool(program: &str, args: &[&str]) -> Result<String, String> {
+pub(crate) async fn run_net_tool(program: &str, args: &[&str]) -> Result<String, String> {
     run_net_timed(program, args, 30)
         .await
         .and_then(|(ok, out)| {
@@ -619,7 +620,7 @@ async fn run_net_tool(program: &str, args: &[&str]) -> Result<String, String> {
         })
 }
 
-/// Same, but reports success separately — a failing `ping` is a *result*
+/// Same, but reports success separately: a failing `ping` is a *result*
 /// ("unreachable"), not an error.
 async fn run_net_timed(
     program: &str,
@@ -645,6 +646,7 @@ async fn run_net_timed(
 }
 
 /// The Wi-Fi interface name (`en0` on most Macs, but not all).
+#[cfg(not(target_os = "linux"))]
 async fn wifi_device() -> Option<String> {
     let text = run_net_tool("/usr/sbin/networksetup", &["-listallhardwareports"])
         .await
@@ -694,7 +696,7 @@ impl ToolModule for NetModule {
                 "socket_inspection",
                 Category::Network,
                 Tier::Read,
-                "Open sockets with the process that owns each one — what is listening on a port, \
+                "Open sockets with the process that owns each one: what is listening on a port, \
                  and which program it is.",
                 json!({"type":"object","properties":{
                     "proto":{"type":"string","enum":["all","tcp","udp"]},
@@ -706,7 +708,7 @@ impl ToolModule for NetModule {
                 Category::Network,
                 Tier::Standard,
                 "Reachability probes: ping, traceroute, dns, tcp_connect. Subject to the same \
-                 host allowlist and private-range rules as http_request — a probe is still a \
+                 host allowlist and private-range rules as http_request: a probe is still a \
                  reach-out.",
                 json!({"type":"object","properties":{
                     "op":{"type":"string","enum":["ping","traceroute","dns","tcp_connect"]},
@@ -729,7 +731,7 @@ impl ToolModule for NetModule {
                 "network_manage",
                 Category::Network,
                 Tier::Dangerous,
-                "Wi-Fi and VPN state. Connecting changes which network this machine is on — and \
+                "Wi-Fi and VPN state. Connecting changes which network this machine is on, and \
                  therefore what it can reach and who can reach it. A supplied secret goes to the \
                  OS and is never echoed back or logged.",
                 json!({"type":"object","properties":{
@@ -767,14 +769,17 @@ impl ToolModule for NetModule {
             "socket_inspection" => self.socket_inspection(&args).await,
             "packet_diagnostics" => self.packet_diagnostics(&args).await,
             "firewall_rules" => self.firewall_rules(&args).await,
+            #[cfg(not(target_os = "linux"))]
             "network_manage" => self.network_manage(&args).await,
+            #[cfg(target_os = "linux")]
+            "network_manage" => self.linux_network_manage(&args).await,
             "bluetooth_pair" => self.bluetooth_pair(&args).await,
             other => Envelope::fail(other, ErrorCode::InvalidArgs, "unknown tool"),
         }
     }
 
     /// Requests that can change remote state, or carry a body, get a human in
-    /// the loop — that is the exfiltration path.
+    /// the loop: that is the exfiltration path.
     fn consent_prompt(&self, name: &str, args: &Value) -> Option<String> {
         let action = args.get("action").and_then(Value::as_str).unwrap_or("");
         match name {
@@ -805,7 +810,7 @@ impl ToolModule for NetModule {
                 return matches!(action, "pair" | "unpair" | "connect").then(|| {
                     format!(
                         "{action} the Bluetooth device '{}'? A paired device keeps standing access \
-                         to this machine — including, for a keyboard, the ability to type on it.",
+                         to this machine, including, for a keyboard, the ability to type on it.",
                         args.get("device").and_then(Value::as_str).unwrap_or("?")
                     )
                 })
@@ -1089,7 +1094,7 @@ mod extended_tests {
         }
     }
 
-    /// The secret must not come back in the response — that is how it ends up
+    /// The secret must not come back in the response: that is how it ends up
     /// in a transcript, an audit line, and a model's context.
     #[tokio::test]
     async fn a_wifi_secret_is_never_echoed_back() {

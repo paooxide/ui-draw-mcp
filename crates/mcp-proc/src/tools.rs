@@ -150,7 +150,7 @@ impl ProcModule {
                 "pass a bare name like 'git'; paths and shell syntax are not accepted",
             );
         }
-        // Resolution is a read, so it is not gated on the exec allowlist — an
+        // Resolution is a read, so it is not gated on the exec allowlist: an
         // agent should be able to learn that a tool exists before asking to run
         // it. Actually *running* --help is, since that executes the binary.
         let path = which(name).await;
@@ -271,6 +271,7 @@ impl ProcModule {
 
     /// launchd service control. Reads are free; anything that starts, stops or
     /// restarts a service is dangerous-tier and consent-gated.
+    #[cfg(not(target_os = "linux"))]
     async fn service_control(&self, args: &Value) -> Envelope {
         let tool = "service_control";
         let action = args
@@ -357,7 +358,7 @@ impl ProcModule {
         }
     }
 
-    /// cron and launchd agents — a persistence vector, so every mutation is
+    /// cron and launchd agents, a persistence vector, so every mutation is
     /// dangerous-tier, consent-gated, and recorded with the exact spec.
     async fn scheduled_tasks(&self, args: &Value) -> Envelope {
         let tool = "scheduled_tasks";
@@ -536,7 +537,7 @@ impl ProcModule {
     }
 }
 
-/// A bare command name — no path, no shell syntax. `command_info` and
+/// A bare command name: no path, no shell syntax. `command_info` and
 /// `man_page` pass this straight to another program as argv.
 fn valid_command_name(name: &str) -> bool {
     !name.is_empty()
@@ -547,17 +548,23 @@ fn valid_command_name(name: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '+'))
 }
 
-/// A launchd label: reverse-DNS-ish, and never an option.
-fn valid_service_label(name: &str) -> bool {
+/// A launchd label: reverse-DNS-ish, and never an option. systemd unit names
+/// additionally carry `@` (instances) and `:` (D-Bus activated units), so
+/// those are admitted on Linux only.
+pub(crate) fn valid_service_label(name: &str) -> bool {
+    #[cfg(target_os = "linux")]
+    const EXTRA: &[char] = &['@', ':'];
+    #[cfg(not(target_os = "linux"))]
+    const EXTRA: &[char] = &[];
     !name.is_empty()
         && name.len() <= 128
         && !name.starts_with('-')
-        && name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+        && name.chars().all(|c| {
+            c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') || EXTRA.contains(&c)
+        })
 }
 
-fn clip(text: &str, max: usize) -> String {
+pub(crate) fn clip(text: &str, max: usize) -> String {
     if text.len() <= max {
         return text.to_string();
     }
@@ -568,8 +575,8 @@ fn clip(text: &str, max: usize) -> String {
     format!("{}\n[truncated]", &text[..end])
 }
 
-/// Run a fixed diagnostic binary with a scrubbed environment. Not agent-supplied
-/// — the program is always a literal in this file; only arguments vary, and
+/// Run a fixed diagnostic binary with a scrubbed environment. Not agent-supplied:
+/// the program is always a literal in this file; only arguments vary, and
 /// those are validated by the caller.
 async fn run_tool(program: &str, args: &[&str]) -> Result<String, String> {
     let out = tokio::process::Command::new(program)
@@ -592,6 +599,7 @@ async fn run_tool(program: &str, args: &[&str]) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
 }
 
+#[cfg(not(target_os = "linux"))]
 async fn current_uid() -> String {
     run_tool("/usr/bin/id", &["-u"])
         .await
@@ -636,6 +644,7 @@ async fn write_crontab(contents: &str) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(not(target_os = "linux"))]
 fn finish(tool: &str, name: &str, r: Result<String, String>) -> Envelope {
     match r {
         Ok(_) => Envelope::ok(tool, json!({ "ok": true, "service": name })),
@@ -651,7 +660,7 @@ impl ToolModule for ProcModule {
                 "exec",
                 Category::Terminal,
                 Tier::Dangerous,
-                "Run an allowlisted command. Pass argv in 'args' — shell metacharacters in \
+                "Run an allowlisted command. Pass argv in 'args': shell metacharacters in \
                  arguments are NOT interpreted unless shell=true (which is separately gated).",
                 json!({
                     "type": "object",
@@ -676,7 +685,7 @@ impl ToolModule for ProcModule {
                 "man_page",
                 Category::Terminal,
                 Tier::Read,
-                "A manual page as clean plain text — pager and overstrike formatting removed. \
+                "A manual page as clean plain text, pager and overstrike formatting removed. \
                  search=true runs apropos instead.",
                 json!({"type":"object","properties":{
                     "name":{"type":"string"},"section":{"type":"integer"},
@@ -735,7 +744,10 @@ impl ToolModule for ProcModule {
             "exec" => self.exec(&args).await,
             "command_info" => self.command_info(&args).await,
             "man_page" => self.man_page(&args).await,
+            #[cfg(not(target_os = "linux"))]
             "service_control" => self.service_control(&args).await,
+            #[cfg(target_os = "linux")]
+            "service_control" => self.linux_service_control(&args).await,
             "scheduled_tasks" => self.scheduled_tasks(&args).await,
             "process_list" => self.process_list(&args).await,
             "process_signal" => self.process_signal(&args).await,
@@ -774,7 +786,7 @@ impl ToolModule for ProcModule {
                 matches!(action, "start" | "stop" | "restart")
                     .then(|| format!("{action} the launchd service '{svc}'?"))
             }
-            // A scheduled job outlives the session that created it — that is
+            // A scheduled job outlives the session that created it: that is
             // what makes it persistence rather than just another command.
             "scheduled_tasks" => match args.get("action").and_then(Value::as_str) {
                 Some("create") => Some(format!(
@@ -968,8 +980,8 @@ mod extended_tests {
         }
     }
 
-    /// Resolution is a read — an agent may learn a tool exists before asking to
-    /// run it — but `--help` executes the binary, so that part stays gated.
+    /// Resolution is a read (an agent may learn a tool exists before asking to
+    /// run it), but `--help` executes the binary, so that part stays gated.
     #[tokio::test]
     async fn command_info_resolves_without_running_a_disallowed_binary() {
         let env = m()
@@ -1064,6 +1076,35 @@ mod extended_tests {
         assert!(first["label"].as_str().is_some());
     }
 
+    /// A unit neither manager knows is NOT_FOUND, not a vague failure; and a
+    /// systemd instance name (`@`) passes validation on Linux while an option
+    /// still does not.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn linux_status_of_an_unknown_unit_is_not_found() {
+        let env = m()
+            .call(
+                "service_control",
+                json!({ "action": "status", "name": "agentctl-definitely-absent-xyz" }),
+                &ctx(),
+            )
+            .await;
+        assert!(!env.ok, "{env:?}");
+        let e = env.error.unwrap();
+        assert_eq!(e.code, ErrorCode::NotFound, "{e:?}");
+        assert!(
+            e.message.contains("agentctl-definitely-absent-xyz.service"),
+            "{}",
+            e.message
+        );
+        assert!(valid_service_label("getty@tty1.service"));
+        assert!(valid_service_label(
+            "dbus-:1.2-org.freedesktop.secrets@0.service"
+        ));
+        assert!(!valid_service_label("--user"));
+        assert!(!valid_service_label("a b"));
+    }
+
     #[tokio::test]
     async fn service_labels_are_validated() {
         let env = m()
@@ -1119,7 +1160,7 @@ mod extended_tests {
         assert!(e.suggestion.unwrap().contains("approval"));
     }
 
-    /// Deleting must be limited to entries this server created — an agent
+    /// Deleting must be limited to entries this server created: an agent
     /// should not be able to remove the operator's own cron jobs.
     #[tokio::test]
     async fn deleting_an_untagged_task_is_refused() {

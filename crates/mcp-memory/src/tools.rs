@@ -34,7 +34,7 @@ impl ToolModule for MemoryModule {
                 Category::Memory,
                 Tier::Standard,
                 "Record a sequence that achieved a goal, so a later run can replay it. Steps hold \
-                 selectors ({role,name,app,window?,index?}), never element refs — refs belong to \
+                 selectors ({role,name,app,window?,index?}), never element refs: refs belong to \
                  one snapshot. Saving an existing goal replaces its steps and counts the success.",
                 json!({
                     "type": "object",

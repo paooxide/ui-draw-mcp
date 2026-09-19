@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 // Only DialogConsent needs this, and DialogConsent is macOS-only. An
 // unconditional import is an unused-import warning on every other platform,
 // and CI builds with `-D warnings`.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::time::Duration;
 
 /// What the human is being asked to approve.
@@ -196,6 +196,137 @@ impl ConsentProvider for DialogConsent {
     }
 }
 
+/// A native dialog on Linux: `zenity --question` with **Deny** as the
+/// default (cancel) button and a timeout that denies. When zenity is not
+/// installed, a desktop notification with Allow and Deny actions through
+/// `notify-send`, which also denies on timeout or dismissal. Neither can be
+/// answered by the agent: both are drawn by the desktop, out of band.
+#[cfg(target_os = "linux")]
+pub struct DialogConsent {
+    timeout: Duration,
+}
+
+#[cfg(target_os = "linux")]
+impl DialogConsent {
+    pub fn new(timeout: Duration) -> Self {
+        DialogConsent { timeout }
+    }
+
+    /// The text of the dialog, shared by both channels.
+    fn body(req: &ConsentRequest) -> String {
+        let mut body = format!("Tool: {}\n\n{}", req.tool, req.summary);
+        if let Some(d) = &req.details {
+            let d: String = d.chars().take(400).collect();
+            body.push_str(&format!("\n\n{d}"));
+        }
+        body.push_str(&format!("\n\nSession: {}", req.session_id));
+        // Pango markup would let a crafted argument restyle the dialog;
+        // zenity accepts --no-markup, and the text is passed as one argv
+        // element so nothing in it is interpreted by a shell.
+        body
+    }
+
+    fn zenity(&self, body: &str) -> Option<ConsentOutcome> {
+        let secs = self.timeout.as_secs().max(5);
+        let out = std::process::Command::new("/usr/bin/zenity")
+            .args([
+                "--question",
+                "--title=agentctl needs approval",
+                "--no-markup",
+                "--icon=dialog-warning",
+                "--ok-label=Allow",
+                "--cancel-label=Deny",
+                "--default-cancel",
+                &format!("--timeout={secs}"),
+                "--width=420",
+                "--text",
+            ])
+            .arg(body)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .ok()?;
+        Some(zenity_outcome(out.status.code()))
+    }
+
+    fn notification(&self, body: &str) -> Option<ConsentOutcome> {
+        let ms = self.timeout.as_millis().max(5000).to_string();
+        let out = std::process::Command::new("/usr/bin/notify-send")
+            .args([
+                "--app-name=agentctl",
+                "--urgency=critical",
+                "--wait",
+                "--action=deny=Deny",
+                "--action=allow=Allow",
+                "--expire-time",
+                &ms,
+                "agentctl needs approval",
+            ])
+            .arg(body)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .ok()?;
+        Some(notify_send_outcome(
+            out.status.success(),
+            &String::from_utf8_lossy(&out.stdout),
+        ))
+    }
+}
+
+/// zenity exits 0 for the OK button, 1 for cancel or Escape, 5 on timeout,
+/// and anything else for a failure to show at all.
+#[cfg(target_os = "linux")]
+pub fn zenity_outcome(code: Option<i32>) -> ConsentOutcome {
+    match code {
+        Some(0) => ConsentOutcome::Approved,
+        Some(1) => ConsentOutcome::Denied,
+        Some(5) => ConsentOutcome::TimedOut,
+        _ => ConsentOutcome::Unavailable,
+    }
+}
+
+/// `notify-send --wait --action` prints the chosen action's key on stdout,
+/// or nothing when the notification expired or was dismissed.
+#[cfg(target_os = "linux")]
+pub fn notify_send_outcome(ran: bool, stdout: &str) -> ConsentOutcome {
+    if !ran {
+        return ConsentOutcome::Unavailable;
+    }
+    match stdout.trim() {
+        "allow" => ConsentOutcome::Approved,
+        "deny" => ConsentOutcome::Denied,
+        "" => ConsentOutcome::TimedOut,
+        _ => ConsentOutcome::Denied,
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Default for DialogConsent {
+    fn default() -> Self {
+        Self::new(Duration::from_secs(60))
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl ConsentProvider for DialogConsent {
+    fn request(&self, req: &ConsentRequest) -> ConsentOutcome {
+        let body = Self::body(req);
+        if std::path::Path::new("/usr/bin/zenity").exists() {
+            if let Some(o) = self.zenity(&body) {
+                return o;
+            }
+        }
+        if std::path::Path::new("/usr/bin/notify-send").exists() {
+            if let Some(o) = self.notification(&body) {
+                return o;
+            }
+        }
+        ConsentOutcome::Unavailable
+    }
+    fn kind(&self) -> &'static str {
+        "linux-dialog"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -238,6 +369,49 @@ mod tests {
     fn zero_budget_refuses_immediately() {
         let b = PromptBudget::new(0);
         assert!(!b.take());
+    }
+
+    /// The mapping from what the desktop tools say to a decision. Only the
+    /// one explicit answer approves; every other exit is a denial.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn zenity_and_notify_send_answers_fail_closed() {
+        assert_eq!(zenity_outcome(Some(0)), ConsentOutcome::Approved);
+        assert_eq!(zenity_outcome(Some(1)), ConsentOutcome::Denied);
+        assert_eq!(zenity_outcome(Some(5)), ConsentOutcome::TimedOut);
+        assert_eq!(zenity_outcome(Some(255)), ConsentOutcome::Unavailable);
+        assert_eq!(zenity_outcome(None), ConsentOutcome::Unavailable);
+        assert_eq!(
+            notify_send_outcome(true, "allow\n"),
+            ConsentOutcome::Approved
+        );
+        assert_eq!(notify_send_outcome(true, "deny"), ConsentOutcome::Denied);
+        assert_eq!(notify_send_outcome(true, ""), ConsentOutcome::TimedOut);
+        assert_eq!(notify_send_outcome(true, "garbage"), ConsentOutcome::Denied);
+        assert_eq!(
+            notify_send_outcome(false, "allow"),
+            ConsentOutcome::Unavailable
+        );
+    }
+
+    /// A crafted argument must not be able to add its own options: the body
+    /// is one argv element after `--text`, so a leading dash is text.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn dialog_body_is_data_not_options() {
+        let r = ConsentRequest {
+            tool: "exec".into(),
+            summary: "--ok-label=Deny --cancel-label=Allow".into(),
+            details: Some("x".repeat(1000)),
+            session_id: "s".into(),
+        };
+        let body = DialogConsent::body(&r);
+        assert!(body.starts_with("Tool: exec"));
+        assert!(
+            body.contains("--ok-label=Deny"),
+            "the text is kept verbatim as data"
+        );
+        assert!(body.len() < 600, "details are truncated for the dialog");
     }
 
     #[cfg(target_os = "macos")]

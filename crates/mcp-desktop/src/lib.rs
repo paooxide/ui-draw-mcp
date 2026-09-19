@@ -12,7 +12,7 @@
 mod backend;
 mod tools;
 
-pub use backend::{DesktopBackend, DesktopError, IdleStatus};
+pub use backend::{DesktopBackend, DesktopError, IdleStatus, MediaAction, PowerAction};
 pub use tools::DesktopModule;
 
 #[cfg(target_os = "macos")]

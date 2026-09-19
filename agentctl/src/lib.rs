@@ -20,15 +20,16 @@ pub use engines::{build_modules, build_stack, EngineConfig, Wiring};
 
 /// The out-of-band human-approval channel.
 ///
-/// On macOS this is a real native dialog (default button **Deny**, and the
-/// timeout denies). Elsewhere there is no channel yet, so consent requests are
+/// On macOS this is a real native dialog and on Linux a zenity dialog (or a
+/// notification with buttons), both with **Deny** as the default and a timeout
+/// that denies. Elsewhere there is no channel yet, so consent requests are
 /// refused rather than silently allowed.
 pub fn consent_provider() -> Arc<dyn mcp_policy::ConsentProvider> {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
         Arc::new(mcp_policy::DialogConsent::default())
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         Arc::new(mcp_policy::NoConsent)
     }

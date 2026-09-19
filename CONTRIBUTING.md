@@ -40,7 +40,8 @@ needs a permission that may not be granted, assert that the call *returns an ans
 
 Live tests are gated. `AGENTCTL_SKIP_LIVE=1` skips those that drive a real browser, package manager or
 desktop. GUI suites additionally require `AGENTCTL_LIVE_GUI=1`, because they steal window focus and
-synthesise keystrokes. A plain `cargo test` on a machine somebody is using must never do that. Guard on
+synthesise keystrokes (on Linux the first one also raises the remote-desktop portal dialog, which a person
+must approve). A plain `cargo test` on a machine somebody is using must never do that. Guard on
 the frontmost application before every synthetic keystroke, and act on a scratch document rather than the
 developer's own work.
 

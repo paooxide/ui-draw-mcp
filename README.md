@@ -11,8 +11,8 @@ it, and confirm from the tree that the state changed.
 
 It is pure capability. There is no embedded model and no internal planning loop: any MCP-capable client
 (Claude Code, Claude Desktop, Cursor, Gemini) decides what to do, and the server validates, gates, executes
-and reports. Desktop control is macOS-only today; the browser and the commodity engines are
-platform-independent.
+and reports. Desktop control runs on macOS and on Linux (GNOME on Wayland is where it is validated); the
+browser and the commodity engines are platform-independent.
 
 ---
 
@@ -81,8 +81,8 @@ against the previous frame, so polling an unchanged screen costs nothing.
 
 ## Install
 
-Desktop control requires macOS. The browser, filesystem, process, network, system, credential, PTY, package
-and recall engines build and run on Linux too.
+Desktop control runs on macOS (AXUIElement) and Linux (AT-SPI and the desktop portals). The browser,
+filesystem, process, network, system, credential, PTY, package and recall engines run on both.
 
 **From a release.** Download the archive for your platform, verify it, and unpack:
 
@@ -112,6 +112,12 @@ cargo binstall --git https://github.com/paooxide/ui-draw-mcp agentctl
 application that *launches* `agentctl` (your terminal, Claude Desktop, Cursor), not to `agentctl` itself.
 macOS attributes a child process's permissions to whoever spawned it. `agentctl doctor` reports what is
 granted; [`docs/clients.md`](docs/clients.md) explains the rest.
+
+**Linux.** Nothing to grant up front. Perception reads the AT-SPI accessibility bus, which every graphical
+session has. The first synthetic keystroke or click opens a remote-desktop portal session, and the desktop
+asks you once, in its own dialog, to allow it; the grant is remembered. Consent for risky actions is a
+zenity dialog (or a notification with Allow and Deny buttons) with Deny as the default. `agentctl doctor`
+reports the bus, the portals and what is missing.
 
 ---
 
@@ -210,6 +216,7 @@ an engine.
 | `mcp-desktop` | Session, power and settings, including `notify_user`, the agent's channel to a human. |
 | `mcp-memory` | Optional recall of task recipes. Off by default. |
 | `mcp-macos` | The real macOS backend: AXUIElement, CGEvent, CoreGraphics. |
+| `mcp-linux` | The real Linux backend: AT-SPI2 perception and actions, RemoteDesktop and Screenshot portals, D-Bus session control. |
 | `test-support` | An in-process MCP client, so tests drive the real protocol rather than calling engines. |
 | `agentctl` | The composition root: CLI, config, and wiring only the enabled engines. |
 
@@ -223,11 +230,11 @@ than test doubles. There are no fake backends in this repository by policy.
 | Area | State |
 |---|---|
 | Protocol, policy, consent, audit, kill switch | Shipped, verified end to end |
-| Perception, input, windows, menus, capture | Shipped, validated on real macOS |
+| Perception, input, windows, menus, capture | Shipped, validated on real macOS and on GNOME 50 (Wayland) |
 | Browser (CDP) | Shipped, validated against live Chrome |
 | Terminal, filesystem, network, system, credentials, PTY, packages, recall | Shipped |
 | Hardening: fuzzing, red-team suites, HTTP transport, CI | Shipped; six real defects found and fixed |
-| Linux and Windows desktop backends | Not started |
+| Windows desktop backend | Not started |
 | `capture_audio`, `virtual_desktop` | Deferred by design |
 | `privilege_run` | Deliberately never: root defeats every other control |
 

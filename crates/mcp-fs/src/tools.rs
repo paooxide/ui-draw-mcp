@@ -212,7 +212,7 @@ impl FsModule {
         }
     }
 
-    /// Both endpoints of a move/copy are resolved and contained — otherwise a
+    /// Both endpoints of a move/copy are resolved and contained, otherwise a
     /// copy could be used to write outside the jail.
     fn transfer(&self, tool: &str, args: &Value, is_move: bool) -> Envelope {
         let (Some(from), Some(to)) = (Self::arg_path(args, "from"), Self::arg_path(args, "to"))
@@ -271,11 +271,15 @@ impl FsModule {
         // rather than the file.
         let trash = args.get("trash").and_then(Value::as_bool).unwrap_or(true);
         if trash {
-            return match move_to_trash(&path) {
-                Ok(()) => Envelope::ok(
-                    tool,
-                    json!({ "trashed": path.display().to_string(), "recoverable": true }),
-                ),
+            return match trash_path(&path) {
+                Ok(location) => {
+                    let mut data =
+                        json!({ "trashed": path.display().to_string(), "recoverable": true });
+                    if let Some(l) = location {
+                        data["trash_location"] = json!(l.display().to_string());
+                    }
+                    Envelope::ok(tool, data)
+                }
                 Err(e) => Envelope::fail_with(
                     tool,
                     ErrorCode::ActionFailed,
@@ -362,7 +366,7 @@ impl FsModule {
     }
 
     /// Create a symlink. Both the link *and its target* must be inside the
-    /// roots — a link pointing out would otherwise become a permanent hole in
+    /// roots: a link pointing out would otherwise become a permanent hole in
     /// the jail that every later read walks straight through.
     fn symlink(&self, args: &Value) -> Envelope {
         let tool = "fs_symlink";
@@ -527,6 +531,7 @@ impl FsModule {
     }
 
     /// Physical devices and volumes. Read-only.
+    #[cfg(not(target_os = "linux"))]
     async fn storage_inspect(&self) -> Envelope {
         let tool = "storage_inspect";
         let list = match run_fs_capture("/usr/sbin/diskutil", &["list"]).await {
@@ -585,6 +590,7 @@ impl FsModule {
 
     /// Mount and unmount volumes. Unmounting a volume takes it away from every
     /// other program on the machine, not just this session.
+    #[cfg(not(target_os = "linux"))]
     async fn mount_control(&self, args: &Value) -> Envelope {
         let tool = "mount_control";
         match args.get("action").and_then(Value::as_str).unwrap_or("list") {
@@ -712,7 +718,7 @@ impl FsModule {
 }
 
 /// Depth-bounded walk. `f` returns false to stop early. Symlinked directories
-/// are not followed — that is both a loop hazard and a jail escape.
+/// are not followed: that is both a loop hazard and a jail escape.
 fn walk(
     dir: &std::path::Path,
     depth: usize,
@@ -742,8 +748,9 @@ fn walk(
 /// Move a path to the Trash.
 ///
 /// Through Finder rather than a rename into `~/.Trash`, because Finder records
-/// the Put Back location — the difference between "recoverable" and "somewhere
+/// the Put Back location: the difference between "recoverable" and "somewhere
 /// in a folder of orphans".
+#[cfg(target_os = "macos")]
 fn move_to_trash(path: &std::path::Path) -> Result<(), String> {
     let script = format!(
         "tell application \"Finder\" to delete POSIX file \"{}\"",
@@ -760,6 +767,23 @@ fn move_to_trash(path: &std::path::Path) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// Trash `path`, returning where it landed when the platform can say. Finder
+/// does not report the destination; the freedesktop trash does.
+#[cfg(target_os = "macos")]
+fn trash_path(path: &std::path::Path) -> Result<Option<PathBuf>, String> {
+    move_to_trash(path).map(|()| None)
+}
+
+#[cfg(target_os = "linux")]
+fn trash_path(path: &std::path::Path) -> Result<Option<PathBuf>, String> {
+    crate::linux::move_to_trash(path)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn trash_path(_path: &std::path::Path) -> Result<Option<PathBuf>, String> {
+    Err("moving to the trash is implemented for macOS and Linux only".into())
 }
 
 /// Apply literal find/replace edits. Every `find` must match, and an ambiguous
@@ -780,7 +804,7 @@ fn apply_edits(original: &str, edits: &[Value]) -> Result<(String, usize), Strin
         let hits = text.matches(find).count();
         if hits == 0 {
             return Err(format!(
-                "edit {i}: no match for {find:?} — the file does not contain the text this patch \
+                "edit {i}: no match for {find:?}. The file does not contain the text this patch \
                  expects, so nothing was changed"
             ));
         }
@@ -861,7 +885,7 @@ fn apply_unified_diff(original: &str, diff: &str) -> Result<(String, usize), Str
                     })?;
                     if actual.trim_end_matches(['\n', '\r']) != content {
                         return Err(format!(
-                            "context mismatch at line {}: patch expects {:?}, file has {:?} — the \
+                            "context mismatch at line {}: patch expects {:?}, file has {:?}. The \
                              file changed since this diff was made",
                             cursor + 1,
                             content,
@@ -879,7 +903,7 @@ fn apply_unified_diff(original: &str, diff: &str) -> Result<(String, usize), Str
         }
     }
     if hunks == 0 {
-        return Err("no hunks found — is this a unified diff?".into());
+        return Err("no hunks found (is this a unified diff?)".into());
     }
     for l in &src[cursor..] {
         out.push((*l).to_string());
@@ -910,7 +934,7 @@ fn guess_format(dst: &std::path::Path) -> String {
     }
 }
 
-fn valid_device(d: &str) -> bool {
+pub(crate) fn valid_device(d: &str) -> bool {
     !d.is_empty()
         && d.len() < 128
         && !d.starts_with('-')
@@ -944,7 +968,7 @@ async fn run_fs_tool(
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
 }
 
-async fn run_fs_capture(program: &str, args: &[&str]) -> Result<String, String> {
+pub(crate) async fn run_fs_capture(program: &str, args: &[&str]) -> Result<String, String> {
     run_fs_tool(program, args, None).await
 }
 
@@ -1211,14 +1235,20 @@ impl ToolModule for FsModule {
             "fs_symlink" => self.symlink(&args),
             "fs_archive" => self.archive(&args).await,
             "fs_watch" => self.watch(&args).await,
+            #[cfg(not(target_os = "linux"))]
             "storage_inspect" => self.storage_inspect().await,
+            #[cfg(not(target_os = "linux"))]
             "mount_control" => self.mount_control(&args).await,
+            #[cfg(target_os = "linux")]
+            "storage_inspect" => self.linux_storage_inspect().await,
+            #[cfg(target_os = "linux")]
+            "mount_control" => self.linux_mount_control(&args).await,
             other => Envelope::fail(other, ErrorCode::InvalidArgs, "unknown tool"),
         }
     }
 
     /// Deletion is irreversible, so a human approves the specific target.
-    /// Recursive deletes say so explicitly — that is the one people regret.
+    /// Recursive deletes say so explicitly: that is the one people regret.
     fn consent_prompt(&self, name: &str, args: &Value) -> Option<String> {
         let path = args.get("path").and_then(Value::as_str).unwrap_or("?");
         match name {
@@ -1376,7 +1406,7 @@ mod tests {
     }
 
     /// Deletes must ask a human, name the target, and distinguish recoverable
-    /// from permanent — calling a trash move "cannot be undone" trains people to
+    /// from permanent: calling a trash move "cannot be undone" trains people to
     /// click through the prompt that actually matters.
     #[test]
     fn delete_consent_names_the_target_and_the_stakes() {
@@ -1424,6 +1454,37 @@ mod tests {
         assert_eq!(d["recoverable"], true, "default delete must be recoverable");
         assert!(d.get("trashed").is_some(), "{d}");
         assert!(!f.exists(), "file must be gone from its original location");
+        // The freedesktop trash says where the entry went; it must really be
+        // there, with its content, and the test takes it out again so a run
+        // does not fill the developer's wastebasket.
+        #[cfg(target_os = "linux")]
+        {
+            let location = PathBuf::from(
+                d["trash_location"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("no trash_location in {d}")),
+            );
+            assert_eq!(
+                std::fs::read_to_string(&location).unwrap(),
+                "bye",
+                "the trashed file must be readable at {}",
+                location.display()
+            );
+            let files = location.parent().unwrap();
+            assert_eq!(
+                files.file_name().unwrap(),
+                "files",
+                "{}",
+                location.display()
+            );
+            let info = files.parent().unwrap().join("info").join(format!(
+                "{}.trashinfo",
+                location.file_name().unwrap().to_string_lossy()
+            ));
+            assert!(info.exists(), "no trashinfo at {}", info.display());
+            std::fs::remove_file(&location).unwrap();
+            std::fs::remove_file(&info).unwrap();
+        }
 
         let g = root.join("gone.txt");
         std::fs::write(&g, b"bye").unwrap();

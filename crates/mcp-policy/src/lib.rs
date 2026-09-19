@@ -28,7 +28,7 @@ pub use injection::{flag_untrusted, suspicious_instructions};
 pub use killswitch::KillSwitch;
 pub use redact::Redactor;
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub use consent::DialogConsent;
 pub use consent::{
     applescript_escape, ConsentOutcome, ConsentProvider, ConsentRequest, NoConsent, PromptBudget,

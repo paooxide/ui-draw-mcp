@@ -13,8 +13,8 @@ use mcp_types::ToolModule;
 use crate::tools_system::SystemModule;
 
 /// Assemble the enabled engines. On macOS the real AXUIElement backend
-/// (perception plus semantic input) is wired in; elsewhere only the diagnostic
-/// tools are present. The a11y and input engines share one snapshot arena so
+/// (perception plus semantic input) is wired in, on Linux the AT-SPI and
+/// portal backend; elsewhere only the diagnostic tools are present. The a11y and input engines share one snapshot arena so
 /// input can act on refs from `get_ui_tree`.
 /// The slice of config the OS-independent engines need.
 pub struct EngineConfig {
@@ -37,7 +37,7 @@ pub struct EngineConfig {
     pub max_recipes: usize,
     pub autonomous: bool,
     // The vision engine only exists where there is a capture backend.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     pub vision: mcp_vision::VisionConfig,
 }
 
@@ -62,7 +62,7 @@ impl From<&PolicyConfig> for EngineConfig {
             memory_store: c.memory_store.clone(),
             max_recipes: c.max_recipes,
             autonomous: matches!(c.mode, Mode::Autonomous),
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
             vision: vision_config(c),
         }
     }
@@ -74,7 +74,7 @@ impl From<&PolicyConfig> for EngineConfig {
 /// `mcp-policy` carries these as plain numbers so it need not depend on an
 /// engine; the translation (including turning `default_detail` from a string
 /// into a `Detail`) happens here, at the composition root.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub fn vision_config(c: &PolicyConfig) -> mcp_vision::VisionConfig {
     mcp_vision::VisionConfig {
         detail_low_px: c.vision_detail_low_px,
@@ -95,7 +95,10 @@ pub fn vision_config(c: &PolicyConfig) -> mcp_vision::VisionConfig {
 /// Takes the whole `PolicyConfig` rather than a handful of extracted fields so
 /// there is exactly one place a new setting has to be threaded through, and so
 /// callers cannot build a *nearly* correct server by forgetting an argument.
-#[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux")),
+    allow(unused_variables)
+)]
 pub fn build_modules(cfg: &PolicyConfig) -> Vec<Arc<dyn ToolModule>> {
     build_stack(cfg).0
 }
@@ -112,7 +115,10 @@ pub struct Wiring {
 }
 
 /// Wire every engine, and hand back the extra handles.
-#[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux")),
+    allow(unused_variables)
+)]
 pub fn build_stack(cfg: &PolicyConfig) -> (Vec<Arc<dyn ToolModule>>, Wiring) {
     let engines = EngineConfig::from(cfg);
     let autonomous = matches!(cfg.mode, Mode::Autonomous);
@@ -121,9 +127,9 @@ pub fn build_stack(cfg: &PolicyConfig) -> (Vec<Arc<dyn ToolModule>>, Wiring) {
     let mut modules: Vec<Arc<dyn ToolModule>> = vec![Arc::new(SystemModule)];
     // Only a platform with a desktop backend fills this in; elsewhere the
     // Wiring stays empty and the `mut` is genuinely unused.
-    #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
+    #[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(unused_mut))]
     let mut wiring = Wiring::default();
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     let audio_roots = engines.fs_roots.clone();
 
     // OS-independent engines, wired on every platform. Each one is closed by
@@ -245,6 +251,55 @@ pub fn build_stack(cfg: &PolicyConfig) -> (Vec<Arc<dyn ToolModule>>, Wiring) {
         // an agent able to name any path could use the speakers to read out a
         // file it was never allowed to open.
         let desktop_backend = Arc::new(MacosDesktop::new());
+        modules.push(Arc::new(DesktopModule::new(
+            desktop_backend.clone(),
+            audio_roots,
+        )));
+        wiring.input = Some(backend.clone());
+        wiring.activity = Some(activity);
+        wiring.desktop = Some(desktop_backend);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use mcp_a11y::A11yModule;
+        use mcp_desktop::DesktopModule;
+        use mcp_input::{InputModule, InputPolicy};
+        use mcp_linux::{LinuxBackend, LinuxDesktop};
+        use mcp_vision::VisionModule;
+        use mcp_window::WindowModule;
+
+        // OCR models and the portal grant are cached beside the rest of the
+        // agentctl state, next to the config and the audit log.
+        let helper_dir = cfg
+            .kill_switch_file
+            .parent()
+            .map(|p| p.join("bin"))
+            .unwrap_or_else(std::env::temp_dir);
+        let backend = Arc::new(LinuxBackend::new().with_helper_dir(helper_dir));
+        let a11y = A11yModule::new(backend.clone(), 12_000);
+        let arena = a11y.arena();
+        let input_policy = InputPolicy {
+            autonomous,
+            terminal_apps,
+            ..InputPolicy::default()
+        };
+        let evaluator = mcp_window::WaitEvaluator::new(backend.clone(), backend.clone());
+        let verifier = Arc::new(mcp_input::Verifier::new(
+            evaluator,
+            backend.clone(),
+            arena.clone(),
+        ));
+        let activity = mcp_input::Activity::new();
+        let input = InputModule::new(backend.clone(), arena, input_policy)
+            .with_verifier(verifier)
+            .with_activity(activity.clone());
+        let vision = VisionModule::new(backend.clone(), engines.vision);
+        let window = WindowModule::new(backend.clone(), backend.clone(), allowed_apps);
+        modules.push(Arc::new(a11y));
+        modules.push(Arc::new(input));
+        modules.push(Arc::new(vision));
+        modules.push(Arc::new(window));
+        let desktop_backend = Arc::new(LinuxDesktop::new());
         modules.push(Arc::new(DesktopModule::new(
             desktop_backend.clone(),
             audio_roots,

@@ -120,7 +120,7 @@ impl A11yModule {
 
         // Some apps (SwiftUI, Electron, canvas/custom-drawn UI, games) expose an
         // almost-empty accessibility tree. Say so explicitly rather than letting
-        // the agent conclude the window is empty — screen capture plus
+        // the agent conclude the window is empty: screen capture plus
         // coordinate input is the documented fallback.
         let mut data = json!({
             "snapshot_id": sid,
@@ -159,7 +159,7 @@ impl A11yModule {
         if !raw.partial && since.is_none() && ref_count < SPARSE_TREE_REFS && !used_skeleton {
             data["sparse"] = json!(true);
             data["hint"] = json!(
-                "this app exposes few accessibility elements — its UI may be custom-drawn                  (SwiftUI/Electron/canvas). Fall back to capture_screen plus coordinate                  input (mouse_action/scroll), or browser_* if it is web content."
+                "this app exposes few accessibility elements: its UI may be custom-drawn                  (SwiftUI/Electron/canvas). Fall back to capture_screen plus coordinate                  input (mouse_action/scroll), or browser_* if it is web content."
             );
         }
         Envelope::ok("get_ui_tree", data)
@@ -170,7 +170,7 @@ impl A11yModule {
     /// Takes a fresh snapshot and installs it, so every ref returned is valid
     /// for `ui_action` until the next observation. Querying a *retained* older
     /// snapshot would be cheaper and would hand back refs that resolve to
-    /// nothing — or, worse, to a different control.
+    /// nothing: or, worse, to a different control.
     async fn find_elements(&self, args: &Value) -> Envelope {
         let q = match parse_query(args) {
             Ok(q) => q,

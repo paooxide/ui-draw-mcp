@@ -12,6 +12,9 @@ use async_trait::async_trait;
 use mcp_types::{CallCtx, Category, Envelope, ErrorCode, Tier, ToolDescriptor, ToolModule};
 use serde_json::{json, Value};
 
+#[cfg(target_os = "linux")]
+mod linux;
+
 pub struct SysModule {
     max_log_lines: usize,
 }
@@ -33,6 +36,7 @@ fn run(program: &str, args: &[&str]) -> Option<String> {
 }
 
 /// Read one `sysctl` key as a trimmed string.
+#[cfg(not(target_os = "linux"))]
 fn sysctl(key: &str) -> Option<String> {
     run("/usr/sbin/sysctl", &["-n", key]).map(|s| s.trim().to_string())
 }
@@ -44,9 +48,13 @@ fn sysctl(key: &str) -> Option<String> {
 ///  -InternalBattery-0 (id=...)    45%; discharging; 4:28 remaining present: true
 /// ```
 ///
-/// The percentage alone does not answer the question an agent actually has —
-/// "can this machine finish the job?" — so the source, the charging state and
+/// The percentage alone does not answer the question an agent actually has
+/// ("can this machine finish the job?"), so the source, the charging state and
 /// the time estimate are all kept.
+///
+/// A pure parser, so it stays compiled and tested on every platform even
+/// though only the macOS telemetry path calls it.
+#[cfg_attr(target_os = "linux", allow(dead_code))]
 fn parse_power(text: &str) -> Option<Value> {
     let mut out = json!({});
     if let Some(src) = text
@@ -101,12 +109,17 @@ impl SysModule {
         if let Some(v) = run("/usr/bin/uname", &["-r"]) {
             data["kernel"] = json!(v.trim());
         }
-        if let Some(v) = run("/usr/bin/sw_vers", &["-productVersion"]) {
-            data["os_version"] = json!(v.trim());
+        #[cfg(not(target_os = "linux"))]
+        {
+            if let Some(v) = run("/usr/bin/sw_vers", &["-productVersion"]) {
+                data["os_version"] = json!(v.trim());
+            }
+            if let Some(v) = sysctl("hw.model") {
+                data["model"] = json!(v);
+            }
         }
-        if let Some(v) = sysctl("hw.model") {
-            data["model"] = json!(v);
-        }
+        #[cfg(target_os = "linux")]
+        self.linux_os_info(&mut data);
         if let Some(v) = run("/bin/hostname", &[]) {
             data["hostname"] = json!(v.trim());
         }
@@ -116,6 +129,7 @@ impl SysModule {
         Envelope::ok("os_info", data)
     }
 
+    #[cfg(not(target_os = "linux"))]
     fn telemetry(&self) -> Envelope {
         let mut data = json!({});
         if let Some(n) = sysctl("hw.ncpu").and_then(|v| v.parse::<u64>().ok()) {
@@ -193,6 +207,7 @@ impl SysModule {
     }
 
     /// Connected devices, by bus.
+    #[cfg(not(target_os = "linux"))]
     fn bus_devices(&self, args: &Value) -> Envelope {
         let tool = "bus_devices";
         let bus = args.get("bus").and_then(Value::as_str).unwrap_or("all");
@@ -242,9 +257,10 @@ impl SysModule {
     /// Read another process's memory map, or its bytes.
     ///
     /// Write-never by design (D9). Raw reads need the OS to grant attach rights,
-    /// which on macOS means a signed debugger entitlement or root — neither of
-    /// which this server has or acquires — so on an ordinary machine the map is
+    /// which on macOS means a signed debugger entitlement or root (neither of
+    /// which this server has or acquires), so on an ordinary machine the map is
     /// what you get and a byte read reports `PERM_DENIED` honestly.
+    #[cfg(not(target_os = "linux"))]
     fn proc_memory_read(&self, args: &Value) -> Envelope {
         let tool = "proc_memory_read";
         let Some(pid) = args.get("pid").and_then(Value::as_i64) else {
@@ -340,6 +356,7 @@ impl SysModule {
     /// Two stores: `defaults` (per-user preferences) and `sysctl` (kernel
     /// parameters). Writing either changes machine behaviour outside this
     /// session, so writes are gated and the key is validated as argv.
+    #[cfg(not(target_os = "linux"))]
     fn system_config(&self, args: &Value) -> Envelope {
         let tool = "system_config";
         let store = args
@@ -469,39 +486,46 @@ impl SysModule {
             .unwrap_or(self.max_log_lines)
             .min(self.max_log_lines);
 
-        // `log show` takes a predicate; pass the term as data via argv, never a
-        // shell string, and quote it inside the predicate expression.
-        let escaped = query.replace('\\', "\\\\").replace('"', "\\\"");
-        let predicate = format!("eventMessage CONTAINS \"{escaped}\"");
-        let out = run(
-            "/usr/bin/log",
-            &[
-                "show",
-                "--style",
-                "compact",
-                "--last",
-                &format!("{minutes}m"),
-                "--predicate",
-                &predicate,
-            ],
-        );
-        match out {
-            Some(text) => {
-                let collected: Vec<&str> = text.lines().take(lines).collect();
-                let truncated = text.lines().count() > collected.len();
-                Envelope::ok(
+        #[cfg(target_os = "linux")]
+        {
+            self.linux_logs(query, minutes, lines)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            // `log show` takes a predicate; pass the term as data via argv, never a
+            // shell string, and quote it inside the predicate expression.
+            let escaped = query.replace('\\', "\\\\").replace('"', "\\\"");
+            let predicate = format!("eventMessage CONTAINS \"{escaped}\"");
+            let out = run(
+                "/usr/bin/log",
+                &[
+                    "show",
+                    "--style",
+                    "compact",
+                    "--last",
+                    &format!("{minutes}m"),
+                    "--predicate",
+                    &predicate,
+                ],
+            );
+            match out {
+                Some(text) => {
+                    let collected: Vec<&str> = text.lines().take(lines).collect();
+                    let truncated = text.lines().count() > collected.len();
+                    Envelope::ok(
+                        tool,
+                        json!({
+                            "query": query, "last_minutes": minutes,
+                            "lines": collected, "truncated": truncated,
+                        }),
+                    )
+                }
+                None => Envelope::fail(
                     tool,
-                    json!({
-                        "query": query, "last_minutes": minutes,
-                        "lines": collected, "truncated": truncated,
-                    }),
-                )
+                    ErrorCode::UnsupportedOs,
+                    "system log query is unavailable on this platform",
+                ),
             }
-            None => Envelope::fail(
-                tool,
-                ErrorCode::UnsupportedOs,
-                "system log query is unavailable on this platform",
-            ),
         }
     }
 }
@@ -597,9 +621,9 @@ fn read_process_memory(pid: i32, address: u64, length: usize) -> Result<Vec<u8>,
     Ok(buf)
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn read_process_memory(_pid: i32, _address: u64, _length: usize) -> Result<Vec<u8>, String> {
-    Err("raw process-memory reads are implemented for macOS only".into())
+    Err("raw process-memory reads are implemented for macOS and Linux only".into())
 }
 
 #[async_trait]
@@ -667,7 +691,7 @@ impl ToolModule for SysModule {
                 "sys_logs",
                 Category::System,
                 Tier::Read,
-                "Search recent system logs. A query is required — unfiltered dumps are refused.",
+                "Search recent system logs. A query is required: unfiltered dumps are refused.",
                 json!({
                     "type": "object",
                     "properties": {
@@ -715,12 +739,24 @@ impl ToolModule for SysModule {
     async fn call(&self, name: &str, args: Value, _ctx: &CallCtx) -> Envelope {
         match name {
             "os_info" => self.os_info(),
-            "hardware_telemetry" => self.telemetry(),
             "disk_usage" => self.disk_usage(),
             "sys_logs" => self.logs(&args),
+            #[cfg(not(target_os = "linux"))]
+            "hardware_telemetry" => self.telemetry(),
+            #[cfg(not(target_os = "linux"))]
             "bus_devices" => self.bus_devices(&args),
+            #[cfg(not(target_os = "linux"))]
             "proc_memory_read" => self.proc_memory_read(&args),
+            #[cfg(not(target_os = "linux"))]
             "system_config" => self.system_config(&args),
+            #[cfg(target_os = "linux")]
+            "hardware_telemetry" => self.linux_telemetry(),
+            #[cfg(target_os = "linux")]
+            "bus_devices" => self.linux_bus_devices(&args),
+            #[cfg(target_os = "linux")]
+            "proc_memory_read" => self.linux_proc_memory_read(&args),
+            #[cfg(target_os = "linux")]
+            "system_config" => self.linux_system_config(&args),
             other => Envelope::fail(other, ErrorCode::InvalidArgs, "unknown tool"),
         }
     }
@@ -783,7 +819,7 @@ mod tests {
         assert_eq!(out["state"], "charged");
     }
 
-    /// Desktops have no battery line at all — report the source, invent nothing.
+    /// Desktops have no battery line at all: report the source, invent nothing.
     #[test]
     fn power_without_a_battery_yields_no_percentage() {
         let out = parse_power("Now drawing from 'AC Power'\n");
@@ -930,7 +966,7 @@ mod tests {
         assert_eq!(env.data.unwrap()["maps_only"], true);
     }
 
-    /// A byte read either succeeds or reports a permission problem — never a
+    /// A byte read either succeeds or reports a permission problem, never a
     /// vague failure the agent might retry forever.
     #[tokio::test]
     async fn a_byte_read_without_rights_is_perm_denied() {

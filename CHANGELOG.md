@@ -6,6 +6,39 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **Linux desktop backend** (`mcp-linux`). Perception over AT-SPI2: `get_ui_tree`, `find_elements`,
+  `get_element` and delta snapshots read the same tree a screen reader does, with refs that keep the
+  object reference and fall back to a path replay and an identity search when a widget is replaced.
+  Semantic input (`ui_action`, `set_value`) through the widgets' own AT-SPI actions and text interfaces,
+  so no pointer is involved. Keyboard and pointer input through the `RemoteDesktop` portal, which asks the
+  person once and is remembered; `cmd` in a combo is translated to Control. Capture through the
+  `Screenshot` portal, display geometry from Mutter, text recognition with the `ocrs` engine (models
+  fetched on first use, or placed by hand). Windows, applications, menus and dialogs from AT-SPI;
+  `launch` and `focus_app` through desktop entries and `org.freedesktop.Application`; `control_window`
+  through GNOME's shortcuts. Session control over D-Bus: lock, idle, notifications, volume, colour scheme,
+  brightness, do-not-disturb, MPRIS media, logind power, `espeak-ng` speech. Validated on GNOME 50 on
+  Wayland.
+- A consent dialog on Linux: `zenity --question` with Deny as the default, a critical notification with
+  Allow and Deny buttons when zenity is absent, and a timeout that denies either way.
+- `agentctl doctor` on Linux reports the accessibility bus, the session accessibility flag, the portal
+  versions, whether the input grant has been given, the consent channel, the OCR models and the helper
+  binaries, each with what to do when it is missing.
+- The commodity engines now have real Linux paths where they shelled out to macOS tools: trash via `gio`
+  (with an XDG fallback), storage and mounts via `lsblk`, `findmnt` and `udisksctl`, Wi-Fi and VPN via
+  `nmcli`, services via `systemctl`, the keyring via the Secret Service (existence checks never see the
+  value), bus devices, sysctl, process maps and telemetry from `/sys` and `/proc`.
+- A Linux live suite (`agentctl/tests/live_linux.rs`): the read-only half runs on any graphical session,
+  the acting half behind `AGENTCTL_LIVE_GUI=1`.
+
+### Fixed
+
+- `pty_spawn` with no `shell` picked the first allowed shell whether or not it existed, so on a machine
+  without `/bin/zsh` every default spawn failed. It now prefers `$SHELL` when allowed and present, then
+  the first allowed shell that exists, and names every candidate when none does.
+- The `docs/tools.md` check now runs on both CI legs, since both build every engine.
+
 ### Security
 
 - `browser_navigate` now runs the same resolved-address guard as `http_request`. With

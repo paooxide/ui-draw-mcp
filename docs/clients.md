@@ -2,7 +2,7 @@
 
 `agentctl` speaks MCP over stdio. A client launches it as a child process, lists its tools, and calls them.
 This page covers the four clients it has been set up against, plus the two things that go wrong first:
-macOS permissions, and running the server from the terminal it is driving.
+OS permissions, and running the server from the terminal it is driving.
 
 ---
 
@@ -11,8 +11,8 @@ macOS permissions, and running the server from the terminal it is driving.
 1. **Install it and find the path.** `which agentctl`. The client config needs an absolute path, because a
    GUI application does not inherit your shell's `PATH`.
 2. **Run `agentctl doctor`.** It prints the OS, the protocol version, the kill-switch path, the audit
-   directory, which config file was loaded, the enabled categories, the consent channel, and the macOS
-   permission state. Everything below assumes it looks right.
+   directory, which config file was loaded, the enabled categories, the consent channel, and the
+   platform's permission state (macOS grants, or the Linux bus and portals). Everything below assumes it looks right.
 3. **Decide what to enable.** The defaults are `vision`, `input` and `window`, with no dangerous tools, no
    filesystem roots, no runnable commands and no reachable hosts. Copy `config.example.toml` to
    `~/.agentctl/config.toml` and open only what the task needs.
@@ -101,6 +101,38 @@ Quit and reopen Claude Desktop. Grant Accessibility to **Claude**.
 
 Consent dialogs appear as native macOS alerts in front of the Claude window. They are raised by `agentctl`,
 not by Claude, and the model cannot see or answer them.
+
+---
+
+## Linux: nothing to grant up front, one portal dialog later
+
+The pieces a Linux desktop already has are the ones `agentctl` uses, so there is no permission panel to
+visit. `agentctl doctor` prints each one:
+
+- **Accessibility bus.** `get_ui_tree`, `find_elements`, `ui_action` and `set_value` read and drive
+  widgets over AT-SPI2, the same interface a screen reader uses. It is present on every GNOME, KDE and
+  most other sessions. `agentctl` switches the session's accessibility flag on when it starts, which is
+  what makes GTK3 and Electron applications export their trees; GTK4 applications always do.
+- **Remote-desktop portal.** Synthetic keyboard and pointer input can only enter a Wayland session through
+  `xdg-desktop-portal`. The first `keyboard_type`, `keyboard_shortcut`, `mouse_action`, `scroll` or
+  `drag_drop` opens a session, and the desktop raises its own dialog asking whether to allow remote
+  interaction and which screens to share. Approve it once; the grant is stored as a restore token under
+  `~/.agentctl/bin/` and reused. Until it is approved, every input call is refused with `PERM_DENIED`.
+  Semantic actions on tree refs do not need it.
+- **Screenshot portal.** `capture_screen` and `ocr_region` use it. The first call on a session takes a
+  few seconds while the portal records the grant; later calls take about half a second.
+- **Consent dialog.** Risky actions in interactive mode raise a `zenity` question with Deny as the
+  default, or a critical notification with Allow and Deny buttons when zenity is not installed. Both time
+  out to Deny. With neither installed, everything that needs consent is denied.
+
+Two things Wayland hides from every client, and therefore from `agentctl`: where a window is on the
+screen, and where the pointer is. Tree coordinates from Wayland-native applications are window-relative,
+so prefer `ui_action` on a ref over `mouse_action` at a coordinate read from the tree; coordinates read from
+a screenshot are screen-global and fine. And the human-override brake, which on macOS notices a hand on
+the mouse, has no sensor here: the STOP file and the consent dialog are the controls.
+
+`control_window` uses GNOME's default shortcuts (Super+H to minimize, Super+Up to maximize, Alt+F4 to
+close); move and resize are not possible from a client and say so.
 
 ---
 

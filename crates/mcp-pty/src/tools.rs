@@ -89,7 +89,7 @@ impl PtyModule {
                 .cloned()
                 .ok_or_else(|| "no terminal roots configured".to_string())?,
         };
-        // Resolve fully, then check — `..` and symlinks must not walk out.
+        // Resolve fully, then check: `..` and symlinks must not walk out.
         let real = std::fs::canonicalize(&path).map_err(|e| format!("{}: {e}", path.display()))?;
         if !self.policy.roots.iter().any(|r| real.starts_with(r)) {
             return Err(format!(
@@ -110,6 +110,36 @@ fn pty_err(tool: &str, e: PtyError) -> Envelope {
     }
 }
 
+/// The shell to start when the caller names none.
+///
+/// The allowlist is an operator's statement of what may run, not of what is
+/// installed: the default list names `/bin/zsh` first, which most Linux boxes
+/// lack. So the choice is the user's own `$SHELL` when the list permits it
+/// and it exists, else the first allowed shell that exists on disk. When
+/// nothing on the list exists the error names every candidate, so the fix is
+/// obvious from the message alone.
+pub(crate) fn pick_default_shell(
+    allowed: &[String],
+    env_shell: Option<&str>,
+    exists: impl Fn(&str) -> bool,
+) -> Result<String, String> {
+    if allowed.is_empty() {
+        return Err("terminal.allowed_shells is empty, so there is no shell to start".into());
+    }
+    if let Some(s) = env_shell.filter(|s| !s.is_empty()) {
+        if allowed.iter().any(|a| a == s) && exists(s) {
+            return Ok(s.to_string());
+        }
+    }
+    if let Some(s) = allowed.iter().find(|a| exists(a)) {
+        return Ok(s.clone());
+    }
+    Err(format!(
+        "none of terminal.allowed_shells exists on this machine: {}",
+        allowed.join(", ")
+    ))
+}
+
 fn no_session(tool: &str, id: u64) -> Envelope {
     Envelope::fail_with(
         tool,
@@ -128,21 +158,28 @@ impl PtyModule {
                 tool,
                 ErrorCode::PolicyDenied,
                 "interactive shells are disabled",
-                "a PTY is a real shell — set terminal.allow_shell = \"true\" to permit it, or use \
+                "a PTY is a real shell: set terminal.allow_shell = \"true\" to permit it, or use \
                  exec for one-shot commands",
             );
         }
-        let shell = args
-            .get("shell")
-            .and_then(Value::as_str)
-            .unwrap_or_else(|| {
-                self.policy
-                    .allowed_shells
-                    .first()
-                    .map(String::as_str)
-                    .unwrap_or("/bin/sh")
-            })
-            .to_string();
+        let shell = match args.get("shell").and_then(Value::as_str) {
+            Some(s) => s.to_string(),
+            None => match pick_default_shell(
+                &self.policy.allowed_shells,
+                std::env::var("SHELL").ok().as_deref(),
+                |p| std::path::Path::new(p).is_file(),
+            ) {
+                Ok(s) => s,
+                Err(e) => {
+                    return Envelope::fail_with(
+                        tool,
+                        ErrorCode::NotFound,
+                        e,
+                        "name an installed shell with 'shell', or fix terminal.allowed_shells",
+                    )
+                }
+            },
+        };
         if !self.policy.allowed_shells.contains(&shell) {
             return Envelope::fail_with(
                 tool,
@@ -215,7 +252,7 @@ impl PtyModule {
         let Some(data) = args.get("data").and_then(Value::as_str) else {
             return Envelope::fail(tool, ErrorCode::InvalidArgs, "missing 'data'");
         };
-        // A PTY write *is* shell input — the one place the destructive gate is
+        // A PTY write *is* shell input, the one place the destructive gate is
         // unambiguously in scope.
         if mcp_policy::is_destructive(data, &self.policy.destructive_patterns) {
             return if self.policy.autonomous {
@@ -516,7 +553,7 @@ mod tests {
         assert_eq!(env.error.unwrap().code, ErrorCode::PolicyDenied);
     }
 
-    /// The session is stateful — that is the whole reason it exists. `cd` in one
+    /// The session is stateful: that is the whole reason it exists. `cd` in one
     /// write must be visible to the next.
     #[tokio::test]
     async fn state_persists_across_writes() {
@@ -602,6 +639,86 @@ mod tests {
         let env = m.call("pty_spawn", json!({ "cwd": "/etc" }), &ctx()).await;
         assert!(!env.ok);
         assert_eq!(env.error.unwrap().code, ErrorCode::PolicyDenied);
+    }
+
+    /// The family: an allowlist whose first entry is not installed. The
+    /// default must be the first entry that is, and `$SHELL` wins when the
+    /// list permits it.
+    #[test]
+    fn default_shell_is_the_first_allowed_one_that_exists() {
+        let allowed: Vec<String> = ["/bin/zsh", "/bin/bash", "/bin/sh"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let on_disk = |p: &str| matches!(p, "/bin/bash" | "/bin/sh" | "/usr/bin/fish");
+        assert_eq!(
+            pick_default_shell(&allowed, None, on_disk).unwrap(),
+            "/bin/bash",
+            "first entry missing, second present"
+        );
+        assert_eq!(
+            pick_default_shell(&allowed, Some("/bin/sh"), on_disk).unwrap(),
+            "/bin/sh",
+            "$SHELL is allowed and present, so it wins"
+        );
+        assert_eq!(
+            pick_default_shell(&allowed, Some("/usr/bin/fish"), on_disk).unwrap(),
+            "/bin/bash",
+            "$SHELL outside the allowlist is ignored"
+        );
+        assert_eq!(
+            pick_default_shell(&allowed, Some("/bin/zsh"), on_disk).unwrap(),
+            "/bin/bash",
+            "$SHELL allowed but missing is ignored"
+        );
+        assert_eq!(
+            pick_default_shell(&allowed, Some(""), on_disk).unwrap(),
+            "/bin/bash",
+            "an empty $SHELL is no $SHELL"
+        );
+        let all_present = |_: &str| true;
+        assert_eq!(
+            pick_default_shell(&allowed, None, all_present).unwrap(),
+            "/bin/zsh",
+            "when everything exists the first entry is the default, as before"
+        );
+    }
+
+    #[test]
+    fn no_installed_shell_names_every_candidate() {
+        let allowed: Vec<String> = vec!["/bin/zsh".into(), "/opt/fish".into()];
+        let err = pick_default_shell(&allowed, Some("/bin/zsh"), |_| false).unwrap_err();
+        assert!(err.contains("/bin/zsh"), "{err}");
+        assert!(err.contains("/opt/fish"), "{err}");
+        assert!(err.contains("allowed_shells"), "{err}");
+        let err = pick_default_shell(&[], None, |_| true).unwrap_err();
+        assert!(err.contains("empty"), "{err}");
+    }
+
+    /// Against the real disk: `/bin/sh` exists everywhere, a made-up path
+    /// does not, and the spawned session reports which one it got.
+    #[tokio::test]
+    async fn spawn_without_a_shell_uses_one_that_exists() {
+        let m = PtyModule::new(PtyPolicy {
+            allowed_shells: vec!["/nonexistent/zsh".into(), "/bin/sh".into()],
+            ..open_policy()
+        });
+        let env = m.call("pty_spawn", json!({}), &ctx()).await;
+        assert!(env.ok, "{env:?}");
+        assert_eq!(env.data.unwrap()["shell"], "/bin/sh");
+        assert_eq!(m.session_count().await, 1);
+
+        let m = PtyModule::new(PtyPolicy {
+            allowed_shells: vec!["/nonexistent/zsh".into(), "/nonexistent/fish".into()],
+            ..open_policy()
+        });
+        let env = m.call("pty_spawn", json!({}), &ctx()).await;
+        assert!(!env.ok);
+        let e = env.error.unwrap();
+        assert_eq!(e.code, ErrorCode::NotFound);
+        assert!(e.message.contains("/nonexistent/zsh"), "{}", e.message);
+        assert!(e.message.contains("/nonexistent/fish"), "{}", e.message);
+        assert_eq!(m.session_count().await, 0, "a failed spawn holds no slot");
     }
 
     #[tokio::test]

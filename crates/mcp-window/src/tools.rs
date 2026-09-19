@@ -196,8 +196,8 @@ impl WindowModule {
 
     /// Wait for the UI to settle.
     ///
-    /// Synthetic input is asynchronous — the app processes it on its own run
-    /// loop — so this is the primitive that makes observe-after-act reliable.
+    /// Synthetic input is asynchronous: the app processes it on its own run
+    /// loop: so this is the primitive that makes observe-after-act reliable.
     /// The same evaluator backs every `expect` clause on an input tool, so the
     /// two cannot drift apart.
     async fn wait_for(&self, args: &Value, ctx: &CallCtx) -> Envelope {
@@ -252,7 +252,7 @@ impl ToolModule for WindowModule {
                 Category::Window,
                 Tier::Read,
                 "List open windows: title, position, size, minimised state. With no \
-                 'app', lists every application's windows — start here to see what is \
+                 'app', lists every application's windows: start here to see what is \
                  open. With 'app', lists just that one. After focus_app has pinned an \
                  application, omitting 'app' means the pinned one. Desktop furniture \
                  (the Dock, menu bar, overlays) is left out.",
@@ -351,7 +351,7 @@ impl ToolModule for WindowModule {
                 Tier::Read,
                 "Block until the UI settles: text appears, a window appears, text is gone, \
                  or an element takes focus. Synthetic input is asynchronous, so observing \
-                 straight after acting reads the previous state — wait first. Several \
+                 straight after acting reads the previous state: wait first. Several \
                  conditions must all hold at once.",
                 wait_schema("what to wait for; all given conditions must hold together"),
             ),

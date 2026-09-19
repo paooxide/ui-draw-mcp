@@ -3,8 +3,8 @@
 //! A JSON file, not SQLite. The plan named SQLite; a store holding a few
 //! hundred recorded sequences does not need a query engine, and pulling in a
 //! bundled SQLite would cost several megabytes of build output against a
-//! standing disk constraint. The semantics the plan actually specified —
-//! `goal_norm` uniqueness, replace-on-resave, `success_count` — are kept.
+//! standing disk constraint. The semantics the plan actually specified:
+//! `goal_norm` uniqueness, replace-on-resave, `success_count`: are kept.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -70,7 +70,7 @@ pub struct Step {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Recipe {
     pub goal: String,
-    /// Normalized goal — the uniqueness key.
+    /// Normalized goal: the uniqueness key.
     pub goal_norm: String,
     pub steps: Vec<Step>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -142,7 +142,7 @@ impl Store {
     }
 
     /// Insert or replace. Re-saving an existing goal **replaces** its steps and
-    /// bumps `success_count` — a later successful run supersedes an earlier one
+    /// bumps `success_count`: a later successful run supersedes an earlier one
     /// rather than accumulating stale variants.
     pub fn save(
         &self,
@@ -173,7 +173,7 @@ impl Store {
             if let Some(sel) = &s.selector {
                 if !sel.is_addressable() {
                     return Err(StoreError::Invalid(format!(
-                        "step {i}: selector cannot identify one element — an unnamed control needs \
+                        "step {i}: selector cannot identify one element: an unnamed control needs \
                          a 'window' or 'index' tiebreaker, or replay would act on the wrong one"
                     )));
                 }

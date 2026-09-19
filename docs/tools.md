@@ -13,7 +13,7 @@ enabled category, while a `dangerous` tool additionally has to be named in
 | Tool | Category | Tier | Summary |
 |---|---|---|---|
 | [`capture_screen`](#capture-screen) | vision | read | Capture a display (or a region) as a PNG image. |
-| [`capture_window`](#capture-window) | vision | read | Capture a single window as a PNG image — prefer this over capture_screen when you only care about one app; fewer pixels means proportional… |
+| [`capture_window`](#capture-window) | vision | read | Capture a single window as a PNG image: prefer this over capture_screen when you only care about one app; fewer pixels means proportionally… |
 | [`find_elements`](#find-elements) | vision | read | Find elements without reading the whole UI. |
 | [`get_element`](#get-element) | vision | read | Read one property of an element by ref from the latest snapshot. |
 | [`get_ui_tree`](#get-ui-tree) | vision | read | Observe the UI. |
@@ -63,7 +63,7 @@ enabled category, while a `dangerous` tool additionally has to be named in
 | [`browser_wait`](#browser-wait) | browser | read | Wait for a settle signal: a selector to appear, navigation to complete, or the network to idle. |
 | [`command_info`](#command-info) | terminal | read | Resolve a command and capture its own --help and --version. |
 | [`exec`](#exec) | terminal | dangerous | Run an allowlisted command. |
-| [`man_page`](#man-page) | terminal | read | A manual page as clean plain text — pager and overstrike formatting removed. |
+| [`man_page`](#man-page) | terminal | read | A manual page as clean plain text, pager and overstrike formatting removed. |
 | [`process_list`](#process-list) | terminal | read | List running processes (pid, ppid, cpu%, mem%, command). |
 | [`process_signal`](#process-signal) | terminal | dangerous | Send a signal (TERM/KILL/INT/HUP/QUIT) to a process. |
 | [`pty_close`](#pty-close) | terminal | standard | End a session and kill its whole process group. |
@@ -97,7 +97,7 @@ enabled category, while a `dangerous` tool additionally has to be named in
 | [`network_interfaces`](#network-interfaces) | network | read | List local network interfaces and their addresses. |
 | [`network_manage`](#network-manage) | network | dangerous | Wi-Fi and VPN state. |
 | [`packet_diagnostics`](#packet-diagnostics) | network | standard | Reachability probes: ping, traceroute, dns, tcp_connect. |
-| [`socket_inspection`](#socket-inspection) | network | read | Open sockets with the process that owns each one — what is listening on a port, and which program it is. |
+| [`socket_inspection`](#socket-inspection) | network | read | Open sockets with the process that owns each one: what is listening on a port, and which program it is. |
 | [`bus_devices`](#bus-devices) | system | read | Connected USB, PCI and Bluetooth devices. |
 | [`disk_usage`](#disk-usage) | system | read | Mounted volumes with total/used/available bytes. |
 | [`echo`](#echo) | system | read | Echo back the provided message. |
@@ -109,7 +109,7 @@ enabled category, while a `dangerous` tool additionally has to be named in
 | [`system_config`](#system-config) | system | dangerous | Read or write a preference (defaults) or kernel parameter (sysctl). |
 | [`app_info`](#app-info) | packages | read | Version, description, licence, homepage and declared dependencies. |
 | [`app_install`](#app-install) | packages | dangerous | Install a package. |
-| [`app_install_plan`](#app-install-plan) | packages | read | Dry run: what an install would actually bring in — resolved version, the full transitive dependency list, and whether elevation is needed. |
+| [`app_install_plan`](#app-install-plan) | packages | read | Dry run: what an install would actually bring in, that is the resolved version, the full transitive dependency list, and whether elevation is needed. |
 | [`app_list_installed`](#app-list-installed) | packages | read | List installed packages with their versions. |
 | [`app_search`](#app-search) | packages | read | Search the package index. |
 | [`app_uninstall`](#app-uninstall) | packages | dangerous | Remove a package. |
@@ -134,7 +134,7 @@ Capture a display (or a region) as a PNG image. Large captures are downscaled fo
 | `display` | integer |  | display index from list_displays |
 | `force` | boolean |  | re-send even if pixel-identical to the last capture of this source |
 | `max_edge` | integer |  | explicit longest-edge override in px |
-| `region` | object |  | capture just this screen rect — far cheaper than a full screen |
+| `region` | object |  | capture just this screen rect: far cheaper than a full screen |
 | `region.h` | number |  |  |
 | `region.w` | number |  |  |
 | `region.x` | number |  |  |
@@ -144,7 +144,7 @@ Capture a display (or a region) as a PNG image. Large captures are downscaled fo
 
 `capture_window` · read tier
 
-Capture a single window as a PNG image — prefer this over capture_screen when you only care about one app; fewer pixels means proportionally fewer tokens.
+Capture a single window as a PNG image: prefer this over capture_screen when you only care about one app; fewer pixels means proportionally fewer tokens.
 
 | Argument | Type | Required | Description |
 |---|---|---|---|
@@ -210,7 +210,7 @@ No arguments.
 
 `ocr_region` · read tier
 
-Read text off the screen, with a box for each line in screen coordinates. The fallback when get_ui_tree comes back sparse — a canvas, a game, a custom-drawn or Electron UI — where the text is visible but not in the accessibility tree. Cheaper than a screenshot for reading, and unlike a screenshot it hands back coordinates you can click.
+Read text off the screen, with a box for each line in screen coordinates. The fallback when get_ui_tree comes back sparse: a canvas, a game, a custom-drawn or Electron UI: where the text is visible but not in the accessibility tree. Cheaper than a screenshot for reading, and unlike a screenshot it hands back coordinates you can click.
 
 | Argument | Type | Required | Description |
 |---|---|---|---|
@@ -457,7 +457,7 @@ No arguments.
 
 `list_windows` · read tier
 
-List open windows: title, position, size, minimised state. With no 'app', lists every application's windows — start here to see what is open. With 'app', lists just that one. After focus_app has pinned an application, omitting 'app' means the pinned one. Desktop furniture (the Dock, menu bar, overlays) is left out.
+List open windows: title, position, size, minimised state. With no 'app', lists every application's windows: start here to see what is open. With 'app', lists just that one. After focus_app has pinned an application, omitting 'app' means the pinned one. Desktop furniture (the Dock, menu bar, overlays) is left out.
 
 | Argument | Type | Required | Description |
 |---|---|---|---|
@@ -501,7 +501,7 @@ Open a menu-bar menu by title path, e.g. ["File"].
 
 `wait_for` · read tier
 
-Block until the UI settles: text appears, a window appears, text is gone, or an element takes focus. Synthetic input is asynchronous, so observing straight after acting reads the previous state — wait first. Several conditions must all hold at once.
+Block until the UI settles: text appears, a window appears, text is gone, or an element takes focus. Synthetic input is asynchronous, so observing straight after acting reads the previous state: wait first. Several conditions must all hold at once.
 
 | Argument | Type | Required | Description |
 |---|---|---|---|
@@ -645,7 +645,7 @@ Cookie access: get (values redacted), set, or clear.
 
 `browser_dialog` · standard tier
 
-Inspect and control how the page's JavaScript dialogs (alert/confirm/prompt/beforeunload) are answered. They are answered automatically — an unanswered dialog blocks the tab — and dismissed by default; call with policy='accept' only when confirming is what you actually intend. Omit 'policy' to read the current setting and the dialogs seen so far.
+Inspect and control how the page's JavaScript dialogs (alert/confirm/prompt/beforeunload) are answered. They are answered automatically: an unanswered dialog blocks the tab: and dismissed by default; call with policy='accept' only when confirming is what you actually intend. Omit 'policy' to read the current setting and the dialogs seen so far.
 
 | Argument | Type | Required | Description |
 |---|---|---|---|
@@ -691,7 +691,7 @@ Navigate a tab: goto a url, or go back/forward/reload.
 
 `browser_network` · dangerous tier
 
-Network control. log: record requests and responses for a bounded window (URLs, methods, statuses — header values and cookies are deliberately omitted). intercept: block URL patterns via headers.block. set_headers: extra HTTP headers.
+Network control. log: record requests and responses for a bounded window (URLs, methods, statuses: header values and cookies are deliberately omitted). intercept: block URL patterns via headers.block. set_headers: extra HTTP headers.
 
 | Argument | Type | Required | Description |
 |---|---|---|---|
@@ -780,7 +780,7 @@ Resolve a command and capture its own --help and --version. Use this before gues
 
 `exec` · dangerous tier
 
-Run an allowlisted command. Pass argv in 'args' — shell metacharacters in arguments are NOT interpreted unless shell=true (which is separately gated).
+Run an allowlisted command. Pass argv in 'args': shell metacharacters in arguments are NOT interpreted unless shell=true (which is separately gated).
 
 | Argument | Type | Required | Description |
 |---|---|---|---|
@@ -793,7 +793,7 @@ Run an allowlisted command. Pass argv in 'args' — shell metacharacters in argu
 
 `man_page` · read tier
 
-A manual page as clean plain text — pager and overstrike formatting removed. search=true runs apropos instead.
+A manual page as clean plain text, pager and overstrike formatting removed. search=true runs apropos instead.
 
 | Argument | Type | Required | Description |
 |---|---|---|---|
@@ -1148,7 +1148,7 @@ No arguments.
 
 `network_manage` · dangerous tier
 
-Wi-Fi and VPN state. Connecting changes which network this machine is on — and therefore what it can reach and who can reach it. A supplied secret goes to the OS and is never echoed back or logged.
+Wi-Fi and VPN state. Connecting changes which network this machine is on, and therefore what it can reach and who can reach it. A supplied secret goes to the OS and is never echoed back or logged.
 
 | Argument | Type | Required | Description |
 |---|---|---|---|
@@ -1160,7 +1160,7 @@ Wi-Fi and VPN state. Connecting changes which network this machine is on — and
 
 `packet_diagnostics` · standard tier
 
-Reachability probes: ping, traceroute, dns, tcp_connect. Subject to the same host allowlist and private-range rules as http_request — a probe is still a reach-out.
+Reachability probes: ping, traceroute, dns, tcp_connect. Subject to the same host allowlist and private-range rules as http_request: a probe is still a reach-out.
 
 | Argument | Type | Required | Description |
 |---|---|---|---|
@@ -1173,7 +1173,7 @@ Reachability probes: ping, traceroute, dns, tcp_connect. Subject to the same hos
 
 `socket_inspection` · read tier
 
-Open sockets with the process that owns each one — what is listening on a port, and which program it is.
+Open sockets with the process that owns each one: what is listening on a port, and which program it is.
 
 | Argument | Type | Required | Description |
 |---|---|---|---|
@@ -1251,7 +1251,7 @@ Read another process's memory map, or its bytes. Read-only, this user's own proc
 
 `sys_logs` · read tier
 
-Search recent system logs. A query is required — unfiltered dumps are refused.
+Search recent system logs. A query is required: unfiltered dumps are refused.
 
 | Argument | Type | Required | Description |
 |---|---|---|---|
@@ -1302,7 +1302,7 @@ Install a package. Arbitrary sources (URLs, local files, third-party taps) are o
 
 `app_install_plan` · read tier
 
-Dry run: what an install would actually bring in — resolved version, the full transitive dependency list, and whether elevation is needed. Call this first, so approval covers what will land rather than just the package you named.
+Dry run: what an install would actually bring in, that is the resolved version, the full transitive dependency list, and whether elevation is needed. Call this first, so approval covers what will land rather than just the package you named.
 
 | Argument | Type | Required | Description |
 |---|---|---|---|
@@ -1335,7 +1335,7 @@ Search the package index.
 
 `app_uninstall` · dangerous tier
 
-Remove a package. 'purge' also removes its configuration and data. A protected set — this agent, the package manager, security tooling — can never be removed.
+Remove a package. 'purge' also removes its configuration and data. A protected set (this agent, the package manager, security tooling) can never be removed.
 
 | Argument | Type | Required | Description |
 |---|---|---|---|
@@ -1360,7 +1360,7 @@ Update one package, or all of them when 'id' is omitted.
 
 `secure_vault` · dangerous tier
 
-Check whether a keychain credential exists, or store one. Secret values are NEVER returned — there is no plaintext read.
+Check whether a keychain credential exists, or store one. Secret values are NEVER returned: there is no plaintext read.
 
 | Argument | Type | Required | Description |
 |---|---|---|---|
@@ -1404,7 +1404,7 @@ Delete the recorded sequence for a goal.
 
 `memory_save` · standard tier
 
-Record a sequence that achieved a goal, so a later run can replay it. Steps hold selectors ({role,name,app,window?,index?}), never element refs — refs belong to one snapshot. Saving an existing goal replaces its steps and counts the success.
+Record a sequence that achieved a goal, so a later run can replay it. Steps hold selectors ({role,name,app,window?,index?}), never element refs: refs belong to one snapshot. Saving an existing goal replaces its steps and counts the success.
 
 | Argument | Type | Required | Description |
 |---|---|---|---|

@@ -435,8 +435,8 @@ impl ToolModule for BrowserModule {
                 Category::Browser,
                 Tier::Standard,
                 "Inspect and control how the page's JavaScript dialogs (alert/confirm/prompt/\
-                 beforeunload) are answered. They are answered automatically — an unanswered \
-                 dialog blocks the tab — and dismissed by default; call with policy='accept' \
+                 beforeunload) are answered. They are answered automatically: an unanswered \
+                 dialog blocks the tab: and dismissed by default; call with policy='accept' \
                  only when confirming is what you actually intend. Omit 'policy' to read the \
                  current setting and the dialogs seen so far.",
                 json!({
@@ -454,7 +454,7 @@ impl ToolModule for BrowserModule {
                 Category::Browser,
                 Tier::Dangerous,
                 "Network control. log: record requests and responses for a bounded window \
-                 (URLs, methods, statuses — header values and cookies are deliberately omitted). \
+                 (URLs, methods, statuses: header values and cookies are deliberately omitted). \
                  intercept: block URL patterns via headers.block. set_headers: extra HTTP headers.",
                 obj(
                     json!({

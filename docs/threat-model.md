@@ -179,6 +179,31 @@ sensor must never be treated as evidence of interference. It also cannot help
 when nobody is at the machine, which is exactly when an autonomous agent runs.
 The STOP file remains the control that always works.
 
+**On Linux the override has no sensor at all.**
+Wayland gives a client no way to read the pointer's position, so `pointer_position` answers `None`, which
+the watcher treats as no evidence rather than as interference. Reaching for the mouse does not stop the
+agent on Linux. The STOP file, the consent dialog and the portal grant (revocable from the desktop's
+settings) are the controls.
+
+**The portal grant is a file.**
+The remote-desktop approval is remembered as a restore token under `~/.agentctl/bin/`, mode 0600. Any
+program running as the same user could present that token to reopen input without a dialog. The same
+program could also simply ask the person itself, so the token widens nothing a same-user process could
+not already do; it is listed because it is state worth knowing about, and deleting it makes the desktop
+ask again.
+
+**Tree coordinates on Wayland are window-relative.**
+A Wayland compositor never tells an application where its window is, so the bounds a Wayland-native
+toolkit reports over AT-SPI start at (0, 0). A `mouse_action` aimed with those numbers lands in the wrong
+place. Coordinates read from `capture_screen` or `ocr_region` are screen-global and correct, and
+`ui_action` on a ref needs no coordinate at all. XWayland and X11 applications report global bounds.
+
+**OCR models are fetched, not shipped.**
+`ocr_region` on Linux downloads two model files from the `ocrs` project's bucket on first use, over
+HTTPS, without a pinned checksum. A tampered model can misread text; it cannot execute anything, because
+`rten` interprets it. An operator who does not want the download places the files by hand, or points
+`AGENTCTL_OCR_MODELS` at a directory that has them; `agentctl doctor` reports which is in effect.
+
 ## 8. Out of scope, by choice
 
 - **`privilege_run` / running as root.** Root defeats every control above.

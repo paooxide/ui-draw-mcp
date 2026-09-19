@@ -72,3 +72,9 @@ mcp-macos = { path = "../crates/mcp-macos" }
 mcp-window = { path = "../crates/mcp-window" }
 mcp-vision = { path = "../crates/mcp-vision" }
 
+# Real Linux backend (AT-SPI, portals), only on Linux.
+[target.'cfg(target_os = "linux")'.dependencies]
+mcp-linux = { path = "../crates/mcp-linux" }
+mcp-window = { path = "../crates/mcp-window" }
+mcp-vision = { path = "../crates/mcp-vision" }
+

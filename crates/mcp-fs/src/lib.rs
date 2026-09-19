@@ -4,6 +4,8 @@
 //! The security model is containment, not trust: see [`jail`].
 
 mod jail;
+#[cfg(target_os = "linux")]
+mod linux;
 mod tools;
 
 pub use jail::{default_denied, has_traversal, Jail, PathError};

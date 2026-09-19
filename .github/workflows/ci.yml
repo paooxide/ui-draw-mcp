@@ -30,11 +30,9 @@ env:
 jobs:
   # Build/lint/test the OS-independent crates on both Linux and macOS.
   #
-  # The desktop engines (perception, input, window, vision, session/power) are
-  # `#[cfg(target_os = "macos")]`, so on Linux this compiles the portable half:
-  # core, policy, browser, fs, proc, net, sys, sec, pty, pkg, memory. That is
-  # exactly what the cross-platform work needs to keep honest: the portable
-  # crates must not quietly grow a macOS assumption.
+  # Both legs build every engine: the macOS desktop backend on one, the Linux
+  # (AT-SPI and portal) backend on the other, and the portable crates on both,
+  # which keeps a platform assumption from creeping into shared code.
   #
   # Capability jobs that drive real AX/capture/input against a live desktop are
   # deliberately not here: they need a logged-in session with Accessibility and
@@ -84,10 +82,9 @@ jobs:
       # accepts it, not just that the parser does.
       # The reference is generated from the descriptors the server actually
       # serves, so a schema change that skips the regeneration is a doc that
-      # lies to whoever writes an agent against it. macOS only: the desktop
-      # engines do not exist on the Linux leg, so it would render 70 tools.
+      # lies to whoever writes an agent against it. Both legs build every
+      # engine now, so both must render the same 107 tools.
       - name: Tool reference is up to date
-        if: runner.os == 'macOS'
         run: cargo run -q -p agentctl -- tools --markdown --all | diff -u docs/tools.md -
 
       - name: Example config is accepted by the built binary

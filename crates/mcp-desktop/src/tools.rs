@@ -19,7 +19,7 @@ pub struct DesktopModule {
 
 impl DesktopModule {
     pub fn new(backend: Arc<dyn DesktopBackend>, audio_roots: Vec<PathBuf>) -> Self {
-        // Canonicalise, as the filesystem jail does — the comparison here is
+        // Canonicalise, as the filesystem jail does: the comparison here is
         // against a resolved path, so the roots must be resolved too.
         let audio_roots = audio_roots
             .into_iter()
@@ -63,7 +63,7 @@ impl DesktopModule {
                 tool,
                 ErrorCode::InvalidArgs,
                 format!("title+body exceeds {} characters", self.max_notify_len),
-                "notifications are a signal, not a transcript — send a summary",
+                "notifications are a signal, not a transcript: send a summary",
             );
         }
         let urgency = str_arg(args, "urgency").unwrap_or("normal");
@@ -185,7 +185,7 @@ impl DesktopModule {
             Ok(p) => p,
             Err(e) => return Envelope::fail(tool, ErrorCode::NotFound, format!("{raw}: {e}")),
         };
-        // Resolve first, then check — the same order the filesystem jail uses,
+        // Resolve first, then check: the same order the filesystem jail uses,
         // so `..` and symlinks cannot walk out of an allowed root.
         if !self.audio_roots.iter().any(|r| path.starts_with(r)) {
             return Envelope::fail_with(
@@ -286,7 +286,7 @@ impl ToolModule for DesktopModule {
         ]
     }
 
-    /// Power transitions that end the session need a human. Sleep does not —
+    /// Power transitions that end the session need a human. Sleep does not:
     /// it is reversible and destroys nothing.
     fn consent_prompt(&self, name: &str, args: &Value) -> Option<String> {
         if name != "power_control" {

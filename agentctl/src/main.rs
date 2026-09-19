@@ -386,6 +386,40 @@ fn doctor() {
     print_permissions();
     #[cfg(target_os = "macos")]
     print_ocr_helper(&cfg);
+    #[cfg(target_os = "linux")]
+    print_linux_session(&cfg);
+}
+
+/// Report what the Linux desktop engines depend on: the accessibility bus,
+/// the portals, the consent dialog, the OCR models. Preflight only: nothing
+/// here opens a portal session, so no approval dialog is raised.
+#[cfg(target_os = "linux")]
+fn print_linux_session(cfg: &PolicyConfig) {
+    let dir = cfg
+        .kill_switch_file
+        .parent()
+        .map(|p| p.join("bin"))
+        .unwrap_or_else(std::env::temp_dir);
+    // `doctor` runs outside the server's runtime; a scoped thread with its own
+    // runtime works whether or not one is already active.
+    let report = std::thread::scope(|s| {
+        s.spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map(|rt| rt.block_on(mcp_linux::doctor(&dir)))
+        })
+        .join()
+    });
+    match report {
+        Ok(Ok(d)) => {
+            for line in d.lines() {
+                println!("{line}");
+            }
+        }
+        Ok(Err(e)) => println!("  linux session:   could not probe ({e})"),
+        Err(_) => println!("  linux session:   probe panicked"),
+    }
 }
 
 /// Report the TCC grants the desktop engines depend on.
@@ -443,7 +477,9 @@ fn print_permissions() {
             println!("       Without it capture_screen returns the wallpaper, not the windows.");
         }
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    println!("  permissions:     none needed; the portals ask per grant (see below)");
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     println!("  permissions:     n/a on this platform");
 }
 

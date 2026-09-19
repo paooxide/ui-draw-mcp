@@ -1,9 +1,9 @@
-//! Credentials engine — the highest-risk category.
+//! Credentials engine: the highest-risk category.
 //!
 //! One rule governs the whole module: **secret material never reaches the
 //! agent.** Tools here let an agent discover *that* a credential exists and use
 //! it indirectly; they never return the value. A model that can read secrets
-//! can leak them into a prompt, a log, a tool call, or an HTTP body — and once
+//! can leak them into a prompt, a log, a tool call, or an HTTP body, and once
 //! read, a secret must be treated as compromised.
 //!
 //! `secure_vault` therefore has no `get` that returns plaintext. Reads confirm
@@ -15,6 +15,9 @@
 use async_trait::async_trait;
 use mcp_types::{CallCtx, Category, Envelope, ErrorCode, Tier, ToolDescriptor, ToolModule};
 use serde_json::{json, Value};
+
+#[cfg(target_os = "linux")]
+mod linux;
 
 /// Marker returned instead of any secret value.
 pub const REDACTED: &str = "***REDACTED***";
@@ -35,6 +38,7 @@ impl SecModule {
 
     /// Does this keychain item exist? Uses `find-generic-password` **without**
     /// `-w`, so the password is never printed and never enters our memory.
+    #[cfg(not(target_os = "linux"))]
     fn vault_exists(&self, args: &Value) -> Envelope {
         let tool = "secure_vault";
         let Some(service) = args.get("service").and_then(Value::as_str) else {
@@ -79,6 +83,7 @@ impl SecModule {
 
     /// Store a secret. Writing is safe in a way reading is not: the agent
     /// already holds the value it is storing.
+    #[cfg(not(target_os = "linux"))]
     fn vault_set(&self, args: &Value) -> Envelope {
         let tool = "secure_vault";
         let (Some(service), Some(account), Some(secret)) = (
@@ -131,7 +136,7 @@ impl SecModule {
             if let Ok(rd) = std::fs::read_dir(&dir) {
                 for e in rd.flatten() {
                     let p = e.path();
-                    // Only ever look at *.pub — never a private key.
+                    // Only ever look at *.pub, never a private key.
                     if p.extension().and_then(|s| s.to_str()) != Some("pub") {
                         continue;
                     }
@@ -168,7 +173,7 @@ impl ToolModule for SecModule {
                 Category::Credentials,
                 Tier::Dangerous,
                 "Check whether a keychain credential exists, or store one. Secret values are \
-                 NEVER returned — there is no plaintext read.",
+                 NEVER returned: there is no plaintext read.",
                 json!({
                     "type": "object",
                     "properties": {
@@ -193,8 +198,14 @@ impl ToolModule for SecModule {
     async fn call(&self, name: &str, args: Value, _ctx: &CallCtx) -> Envelope {
         match name {
             "secure_vault" => match args.get("action").and_then(Value::as_str) {
+                #[cfg(not(target_os = "linux"))]
                 Some("exists") => self.vault_exists(&args),
+                #[cfg(not(target_os = "linux"))]
                 Some("set") => self.vault_set(&args),
+                #[cfg(target_os = "linux")]
+                Some("exists") => self.linux_vault_exists(&args),
+                #[cfg(target_os = "linux")]
+                Some("set") => self.linux_vault_set(&args),
                 Some("get") => Envelope::fail_with(
                     "secure_vault",
                     ErrorCode::PolicyDenied,
@@ -267,6 +278,20 @@ mod tests {
                 &ctx(),
             )
             .await;
+        // On Linux the backend is a daemon on the session bus, which a
+        // headless runner may not have. An absent backend is a clear answer
+        // naming what is missing, never a faked success.
+        #[cfg(target_os = "linux")]
+        if !env.ok {
+            let e = env.error.unwrap();
+            assert_eq!(e.code, ErrorCode::ActionFailed, "{e:?}");
+            assert!(
+                e.message.contains("gdbus") || e.message.contains("Secret Service"),
+                "the error must name the missing backend: {}",
+                e.message
+            );
+            return;
+        }
         assert!(env.ok, "{env:?}");
         let d = env.data.unwrap();
         // Absent here, but if present the value must be the marker.
@@ -274,6 +299,71 @@ mod tests {
             assert_eq!(d["value"], json!(REDACTED));
         }
         assert!(d.to_string().find("password").is_none());
+    }
+
+    /// Against the real Secret Service: store, confirm, and take it out
+    /// again. The stored value must never appear in either response.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn linux_store_then_exists_round_trips_without_the_value() {
+        if std::env::var_os("AGENTCTL_SKIP_LIVE").is_some_and(|v| v != "0") {
+            return;
+        }
+        let service = format!("agentctl-test-{}", std::process::id());
+        let m = SecModule::new(vec![service.clone()]);
+        let stored = m
+            .call(
+                "secure_vault",
+                json!({ "action": "set", "service": service, "account": "alice",
+                        "secret": "dummy-test-value-not-a-real-secret" }),
+                &ctx(),
+            )
+            .await;
+        if !stored.ok {
+            let e = stored.error.unwrap();
+            assert_eq!(e.code, ErrorCode::ActionFailed, "{e:?}");
+            assert!(
+                e.message.contains("secret-tool") || e.message.contains("Secret Service"),
+                "{}",
+                e.message
+            );
+            return;
+        }
+        let exists = m
+            .call(
+                "secure_vault",
+                json!({ "action": "exists", "service": service, "account": "alice" }),
+                &ctx(),
+            )
+            .await;
+        // Clean up before asserting, so a failure does not leave the entry.
+        let _ = std::process::Command::new("/usr/bin/secret-tool")
+            .args(["clear", "service", &service, "account", "alice"])
+            .output();
+        assert!(exists.ok, "{exists:?}");
+        let d = exists.data.unwrap();
+        assert_eq!(d["exists"], json!(true), "{d}");
+        assert_eq!(d["account"], json!("alice"), "{d}");
+        assert_eq!(d["value"], json!(REDACTED), "{d}");
+        let text = serde_json::to_string(&d).unwrap() + &serde_json::to_string(&stored).unwrap();
+        assert!(
+            !text.contains("dummy-test-value"),
+            "the secret leaked: {text}"
+        );
+
+        let gone = m
+            .call(
+                "secure_vault",
+                json!({ "action": "exists", "service": service, "account": "alice" }),
+                &ctx(),
+            )
+            .await;
+        assert!(gone.ok, "{gone:?}");
+        assert_eq!(
+            gone.data.unwrap()["exists"],
+            json!(false),
+            "cleared entry still found"
+        );
     }
 
     #[tokio::test]
@@ -359,7 +449,7 @@ mod tests {
         out
     }
 
-    /// `privilege_run` is deliberately absent — root defeats every other control.
+    /// `privilege_run` is deliberately absent: root defeats every other control.
     #[tokio::test]
     async fn privilege_escalation_is_not_offered() {
         let m = SecModule::new(vec![]);

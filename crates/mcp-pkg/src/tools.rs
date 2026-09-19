@@ -323,7 +323,7 @@ impl ToolModule for PkgModule {
                 "app_install_plan",
                 Category::Packages,
                 Tier::Read,
-                "Dry run: what an install would actually bring in — resolved version, the full \
+                "Dry run: what an install would actually bring in, that is the resolved version, the full \
                  transitive dependency list, and whether elevation is needed. Call this first, so \
                  approval covers what will land rather than just the package you named.",
                 json!({"type":"object","properties":{
@@ -346,7 +346,7 @@ impl ToolModule for PkgModule {
                 Category::Packages,
                 Tier::Dangerous,
                 "Remove a package. 'purge' also removes its configuration and data. A protected \
-                 set — this agent, the package manager, security tooling — can never be removed.",
+                 set (this agent, the package manager, security tooling) can never be removed.",
                 json!({"type":"object","properties":{
                     "id":{"type":"string"},"source":src,"purge":{"type":"boolean"}},
                     "required":["id"]}),

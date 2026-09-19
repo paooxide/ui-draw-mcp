@@ -3,6 +3,8 @@
 //! Outbound HTTP is contained by [`mcp_ssrf`]: an agent making requests from this
 //! machine sits inside the network perimeter, so the guard is the point.
 
+#[cfg(target_os = "linux")]
+mod linux;
 mod tools;
 
 /// The guard itself lives in `mcp-ssrf` so the browser engine can share it;

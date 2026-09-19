@@ -98,6 +98,10 @@ pub fn is_interactive_role(role: &str) -> bool {
         "colorwell",
         "dockitem",
         "disclosuretriangle",
+        // AT-SPI toolkits: rows in a GTK list are pressed as rows, and a menu
+        // must be pressed to open before its items exist.
+        "listitem",
+        "menu",
     ];
     let norm = normalize_role(role);
     INTERACTIVE.contains(&norm.as_str())

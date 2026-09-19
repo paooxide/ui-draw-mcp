@@ -36,7 +36,7 @@ architecture mapped to OWASP guidance. File trees below mark shipped crates vs. 
 ### 2.1 System context
 ```
 ┌────────────────┐   MCP / JSON-RPC 2.0    ┌──────────────────────┐   native OS APIs   ┌──────────┐
-│  AI agent      │  (stdio; http later)    │  agentctl (server)   │  AX / capture /    │  macOS   │
+│  AI agent      │  (stdio; http later)    │  agentctl (server)   │  AX / AT-SPI /     │  macOS / │
 │  (Gemini 3.8,  │ ───────────────────────▶│  policy · engines    │  input · CDP …     │  (later  │
 │   Claude, …)   │ ◀───────────────────────│  audit               │ ──────────────────▶│  Win/Lx)│
 └────────────────┘   results (redacted)    └──────────┬───────────┘                    └──────────┘
@@ -87,6 +87,7 @@ crates/
   mcp-desktop/                 # session/power/settings       [deferred]
   mcp-pty/ mcp-proc/           # terminal/process             [deferred]
   mcp-ssrf/                    # resolved-address guard (leaf, shared by net + browser)
+  mcp-macos/ mcp-linux/        # the real desktop backends, one per OS
   mcp-fs/ mcp-net/ mcp-sys/    # fs/network/kernel            [deferred]
   mcp-sec/                     # credentials                  [deferred]
   mcp-memory/                  # optional recall              [deferred]
@@ -130,7 +131,7 @@ mcp-a11y/src/
   tree.rs          # OS-independent node model
   flatten.rs       # Flattened{text,index}; budget → skeleton → hard-truncate marker
   secure.rs        # secure-field detection (redact before flatten)
-  backend/{mod.rs, macos.rs}   # AXUIElement [cfg]; windows.rs/linux.rs deferred
+  backend.rs       # the A11yBackend trait; real backends live in mcp-macos and mcp-linux
   tools.rs         # get_ui_tree, get_element (descriptors + handlers)
 
 mcp-vision/src/    # capture.rs, encode.rs (PNG + size cap/downscale), displays.rs, backend/macos.rs, tools.rs
@@ -143,7 +144,7 @@ agentctl/src/
   cli.rs           # serve | doctor | config print
   config.rs        # load config.toml + AGENTCTL_* overrides + validation
   wire.rs          # build registry from ENABLED categories only (secure default)
-  doctor.rs        # OS permission checks (Accessibility/Screen Recording on macOS)
+  doctor.rs        # OS checks (Accessibility/Screen Recording on macOS; a11y bus and portals on Linux)
 
 test-support/src/  # lib.rs (in-proc MCP client that drives the real protocol)
 ```
@@ -322,8 +323,9 @@ The trait contract is the whole extension surface: no engine touches transport, 
 ## 13. Deployment & trust boundaries
 
 - Run `agentctl` as a **normal user**, from a **different app than it controls** (else it types into its own
-  console). It needs OS permissions (macOS: Accessibility; Screen Recording for capture) granted to the
-  launching app; `agentctl doctor` reports state.
+  console). On macOS it needs Accessibility (and Screen Recording for capture) granted to the launching
+  app; on Linux the desktop portals ask the person once for input and capture. `agentctl doctor` reports
+  state.
 - Never run as root/admin for the MVP; `privilege_run` (deferred) is the only elevation path and routes through
   the OS's own auth prompt.
 - stdio deployment has no network attack surface. The optional http transport (P10) is the only remote surface

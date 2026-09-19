@@ -64,7 +64,7 @@ impl VisionModule {
             });
         }
         // With no argument the configured default tier is sent explicitly,
-        // rather than leaving the backend to pick — so `config.toml` is the one
+        // rather than leaving the backend to pick: so `config.toml` is the one
         // place that decides, on every platform.
         let detail = match args.get("detail").and_then(Value::as_str) {
             None => self.cfg.default_detail,
@@ -113,7 +113,7 @@ impl VisionModule {
                         data["width"] = json!(cap.width);
                         data["height"] = json!(cap.height);
                         data["note"] = json!(
-                            "pixel-identical to the previous capture of this source; image omitted                              to save tokens — reuse the earlier one. Pass force=true to re-send."
+                            "pixel-identical to the previous capture of this source; image omitted                              to save tokens: reuse the earlier one. Pass force=true to re-send."
                         );
                         data["session_image_tokens"] = json!(spent);
                         data["session_image_tokens_saved"] = json!(saved);
@@ -328,8 +328,8 @@ impl VisionModule {
                 "text": text,
                 "lines": lines,
                 "line_count": lines.len(),
-                // Said explicitly, because the obvious assumption — that these
-                // are image pixels — would put every click in the wrong place.
+                // Said explicitly, because the obvious assumption: that these
+                // are image pixels: would put every click in the wrong place.
                 "coordinate_space": "screen",
                 "region": { "x": res.origin.0, "y": res.origin.1,
                             "w": res.screen_size.0, "h": res.screen_size.1 },
@@ -406,7 +406,7 @@ impl ToolModule for VisionModule {
                         "display": { "type": "integer", "description": "display index from list_displays" },
                         "region": {
                             "type": "object",
-                            "description": "capture just this screen rect — far cheaper than a full screen",
+                            "description": "capture just this screen rect: far cheaper than a full screen",
                             "properties": {
                                 "x": {"type":"number"}, "y": {"type":"number"},
                                 "w": {"type":"number"}, "h": {"type":"number"}
@@ -428,8 +428,8 @@ impl ToolModule for VisionModule {
                 Category::Vision,
                 Tier::Read,
                 "Read text off the screen, with a box for each line in screen coordinates. \
-                 The fallback when get_ui_tree comes back sparse — a canvas, a game, a \
-                 custom-drawn or Electron UI — where the text is visible but not in the \
+                 The fallback when get_ui_tree comes back sparse: a canvas, a game, a \
+                 custom-drawn or Electron UI: where the text is visible but not in the \
                  accessibility tree. Cheaper than a screenshot for reading, and unlike a \
                  screenshot it hands back coordinates you can click.",
                 json!({
@@ -467,7 +467,7 @@ impl ToolModule for VisionModule {
                 "capture_window",
                 Category::Vision,
                 Tier::Read,
-                "Capture a single window as a PNG image — prefer this over capture_screen when \
+                "Capture a single window as a PNG image: prefer this over capture_screen when \
                  you only care about one app; fewer pixels means proportionally fewer tokens.",
                 json!({
                     "type": "object",
@@ -649,7 +649,7 @@ mod tests {
         );
     }
 
-    /// Without a signature we must not guess — dedup is skipped.
+    /// Without a signature we must not guess: dedup is skipped.
     #[test]
     fn missing_or_mismatched_signature_is_incomparable() {
         assert_eq!(signature_distance(&[], &[]), None);
@@ -752,7 +752,7 @@ mod tests {
         assert!(forced.data.unwrap().get("unchanged").is_none());
     }
 
-    /// Different sources are tracked independently — a region capture must not
+    /// Different sources are tracked independently: a region capture must not
     /// be deduped against a full-screen one.
     #[tokio::test]
     async fn dedup_is_per_source() {
