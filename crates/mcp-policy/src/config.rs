@@ -45,6 +45,70 @@ impl Mode {
     }
 }
 
+/// A one-word permission profile that spares the operator the chore of
+/// enabling each category and naming each dangerous tool. Setting it turns on
+/// every capability and picks how risk is handled; the granular fields
+/// (`categories`, `enable`) are then unnecessary and ignored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Access {
+    /// Read and act freely; a dangerous tool or a high-impact action asks the
+    /// human through the consent dialog. The safe default profile.
+    Ask,
+    /// Run unattended: nothing prompts, but a clearly destructive action is
+    /// refused rather than done blind (there is no human to approve it).
+    Auto,
+    /// Everything runs, nothing prompts, the destructive gate is off. Only the
+    /// kill switch and human-override remain. The operator's explicit "I take
+    /// responsibility"; never a default.
+    Bypass,
+}
+
+impl Access {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Access::Ask => "ask",
+            Access::Auto => "auto",
+            Access::Bypass => "bypass",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Access> {
+        match s {
+            "ask" => Some(Access::Ask),
+            "auto" => Some(Access::Auto),
+            "bypass" => Some(Access::Bypass),
+            _ => None,
+        }
+    }
+
+    /// The interaction mode this profile implies.
+    pub fn mode(self) -> Mode {
+        match self {
+            Access::Ask => Mode::Interactive,
+            Access::Auto | Access::Bypass => Mode::Autonomous,
+        }
+    }
+}
+
+/// Every capability category, for the `access` profiles that enable them all.
+pub fn all_categories() -> Vec<Category> {
+    use Category::*;
+    vec![
+        Vision,
+        Input,
+        Window,
+        Terminal,
+        Filesystem,
+        Network,
+        System,
+        Credentials,
+        Memory,
+        Desktop,
+        Browser,
+        Packages,
+    ]
+}
+
 /// The policy configuration. Secure defaults: only the three GUI categories are
 /// enabled, no dangerous tools are opted in, interactive consent.
 #[derive(Debug, Clone)]
@@ -54,6 +118,9 @@ pub struct PolicyConfig {
     /// Dangerous tools opted in by exact name.
     pub enable: Vec<String>,
     pub mode: Mode,
+    /// The one-word permission profile. When `Some`, it enables all categories
+    /// and all dangerous tools and sets `mode`; the granular fields are ignored.
+    pub access: Option<Access>,
     /// Apps that `launch` (and app-targeted actions) are allowed to touch.
     pub allowed_apps: Vec<String>,
     /// Origins the browser engine may navigate to (`scheme://host[:port][/path]`).
@@ -149,6 +216,7 @@ impl Default for PolicyConfig {
             categories: vec![Category::Vision, Category::Input, Category::Window],
             enable: Vec::new(),
             mode: Mode::Interactive,
+            access: None,
             allowed_apps: ["Terminal", "Finder", "TextEdit"]
                 .iter()
                 .map(|s| s.to_string())
@@ -265,6 +333,7 @@ impl PolicyConfig {
                 "categories": self.categories.iter().map(|c| c.slug()).collect::<Vec<_>>(),
                 "enable": self.enable,
                 "mode": self.mode.as_str(),
+                "access": self.access.map(|a| a.as_str()),
                 "allowed_apps": self.allowed_apps,
                 "max_denials": self.max_denials,
                 "max_consent_prompts": self.max_consent_prompts,

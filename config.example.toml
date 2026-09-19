@@ -8,7 +8,20 @@
 # could *widen* a policy stricter than the built-in one.
 
 [policy]
-# Only these categories are advertised and callable.
+# The quick way: one permission profile instead of listing categories and
+# dangerous tools by hand. Uncomment ONE, and the two settings below it
+# (categories, enable) are ignored.
+#   access = "ask"     every capability on; read and act freely, but a
+#                      dangerous tool or a destructive action asks you (dialog).
+#   access = "auto"    every capability on; nothing prompts, but a clearly
+#                      destructive action is refused rather than done blind.
+#   access = "bypass"  every capability on; nothing prompts; the destructive
+#                      gate is off. Only the kill switch and reaching for the
+#                      mouse can stop it. Your explicit "I take responsibility".
+# access = "ask"
+
+# The granular way (used only when `access` is not set). Only these categories
+# are advertised and callable.
 #   vision input window browser system terminal filesystem network credentials
 #   memory desktop packages
 categories = ["vision", "input", "window", "browser", "system"]

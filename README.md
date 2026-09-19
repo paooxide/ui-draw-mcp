@@ -188,6 +188,24 @@ See [`docs/threat-model.md`](docs/threat-model.md) §7.
 
 ---
 
+## Permissions in one word
+
+Granting each category and naming each dangerous tool is a chore. `policy.access` collapses it to one
+setting that turns on every capability and picks how risk is handled:
+
+| `access` | Capability | Prompts | Destructive action |
+|---|---|---|---|
+| `ask` | all on | dangerous tools and destructive actions ask you | confirmed via the dialog |
+| `auto` | all on | none | refused rather than done blind |
+| `bypass` | all on | none | gate off; only the kill switch and human-override remain |
+
+`ask` is the safe profile: read and act freely, confirm the dangerous. `bypass` is the explicit "I take
+responsibility". When `access` is set, the granular `categories` and `enable` lists are ignored; leave it
+unset to keep the fine-grained control. The kill switch (`~/.agentctl/STOP`) and the mouse-override stop
+the agent under every profile, including bypass.
+
+---
+
 ## Entering a password
 
 The owner can have the agent enter a password, in a terminal prompt or a GUI field, by passing it as an

@@ -19,6 +19,8 @@ pub struct InputPolicy {
     pub terminal_apps: Vec<String>,
     /// No consent channel: destructive matches become denials.
     pub autonomous: bool,
+    /// Bypass profile: the destructive gate is off entirely.
+    pub bypass: bool,
     /// Destructive-command substrings.
     pub destructive_patterns: Vec<String>,
     /// The judge, consulted after the patterns and only able to add a flag.
@@ -125,6 +127,7 @@ impl Default for InputPolicy {
             clamp_input: true,
             terminal_apps: default_terminal_apps(),
             autonomous: false,
+            bypass: false,
             destructive_patterns: mcp_policy::default_destructive_patterns(),
             judge: None,
         }
@@ -277,6 +280,9 @@ impl InputModule {
     /// as if it *were* headed for a terminal. Unknown destination is not
     /// evidence of safety.
     async fn destructive_check(&self, tool: &str, text: &str, secret: bool) -> Option<Envelope> {
+        if self.policy.bypass {
+            return None;
+        }
         let target = self.backend.input_target().or_else(|| self.current_app());
         let is_term = screens_as_terminal(target.as_deref(), &self.policy.terminal_apps);
         if !is_term {

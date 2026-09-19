@@ -36,6 +36,7 @@ pub struct EngineConfig {
     pub memory_store: std::path::PathBuf,
     pub max_recipes: usize,
     pub autonomous: bool,
+    pub bypass: bool,
     // The vision engine only exists where there is a capture backend.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     pub vision: mcp_vision::VisionConfig,
@@ -62,6 +63,7 @@ impl From<&PolicyConfig> for EngineConfig {
             memory_store: c.memory_store.clone(),
             max_recipes: c.max_recipes,
             autonomous: matches!(c.mode, Mode::Autonomous),
+            bypass: c.access == Some(mcp_policy::Access::Bypass),
             #[cfg(any(target_os = "macos", target_os = "linux"))]
             vision: vision_config(c),
         }
@@ -133,6 +135,7 @@ fn state_dir(cfg: &PolicyConfig) -> std::path::PathBuf {
 pub fn build_stack(cfg: &PolicyConfig) -> (Vec<Arc<dyn ToolModule>>, Wiring) {
     let engines = EngineConfig::from(cfg);
     let autonomous = matches!(cfg.mode, Mode::Autonomous);
+    let bypass = cfg.access == Some(mcp_policy::Access::Bypass);
     let allowed_apps = cfg.allowed_apps.clone();
     let terminal_apps = cfg.terminal_apps.clone();
     let mut modules: Vec<Arc<dyn ToolModule>> = vec![Arc::new(SystemModule)];
@@ -200,6 +203,7 @@ pub fn build_stack(cfg: &PolicyConfig) -> (Vec<Arc<dyn ToolModule>>, Wiring) {
             max_sessions: engines.max_pty_sessions,
             max_buffer: engines.max_pty_buffer,
             autonomous: engines.autonomous,
+            bypass: engines.bypass,
             judge: Some(judge.clone()),
             ..PtyPolicy::default()
         })));
@@ -241,6 +245,7 @@ pub fn build_stack(cfg: &PolicyConfig) -> (Vec<Arc<dyn ToolModule>>, Wiring) {
         let arena = a11y.arena();
         let input_policy = InputPolicy {
             autonomous,
+            bypass,
             terminal_apps,
             judge: Some(judge.clone()),
             ..InputPolicy::default()
@@ -299,6 +304,7 @@ pub fn build_stack(cfg: &PolicyConfig) -> (Vec<Arc<dyn ToolModule>>, Wiring) {
         let arena = a11y.arena();
         let input_policy = InputPolicy {
             autonomous,
+            bypass,
             terminal_apps,
             judge: Some(judge.clone()),
             ..InputPolicy::default()

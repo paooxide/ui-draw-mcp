@@ -198,6 +198,14 @@ toolkit reports over AT-SPI start at (0, 0). A `mouse_action` aimed with those n
 place. Coordinates read from `capture_screen` or `ocr_region` are screen-global and correct, and
 `ui_action` on a ref needs no coordinate at all. XWayland and X11 applications report global bounds.
 
+**`access = "bypass"` is the operator disarming the gate, on purpose.**
+The three permission profiles are a shortcut for enabling every category and dangerous tool. `ask` still
+confirms each dangerous action and `auto` refuses destructive ones, but `bypass` turns off consent and the
+destructive-command gate entirely: any tool the agent calls runs. It is never a default, is set only in the
+operator-owned config (which the filesystem jail keeps the agent from editing), and the kill switch and
+human-override still abort in-flight work. It exists because the owner of a machine may legitimately choose
+to run wide-open on it; it is not a control the agent can reach or raise.
+
 **A provided password is kept out of the log and away from the judge.**
 The owner may hand the agent a password to type. A call flagged `secret: true` (`keyboard_type`,
 `set_value`, `pty_write`, `clipboard_write`) has its payload replaced with a length marker in the audit log

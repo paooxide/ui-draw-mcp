@@ -169,6 +169,11 @@ impl PolicyConfig {
                     cfg.categories = cats;
                 }
                 ("policy.enable", Val::List(v)) => cfg.enable = v.clone(),
+                ("policy.access", Val::Str(a)) => {
+                    cfg.access = Some(crate::Access::parse(a).ok_or_else(|| {
+                        format!("unknown policy.access '{a}' (expected ask, auto, or bypass)")
+                    })?);
+                }
                 ("policy.allowed_apps", Val::List(v)) => cfg.allowed_apps = v.clone(),
                 ("browser.allowed_origins", Val::List(v)) => cfg.allowed_origins = v.clone(),
                 ("browser.allow_private", Val::Str(s)) => cfg.browser_allow_private = s == "true",
@@ -304,8 +309,19 @@ impl PolicyConfig {
                 ("policy.max_denials" | "policy.max_consent_prompts", _) => {
                     return Err(format!("{key} must be a non-negative integer"))
                 }
+                ("policy.access", _) => {
+                    return Err(format!("{key} must be a string (ask, auto, or bypass)"))
+                }
                 _ => tracing::warn!(key = %key, "ignoring unknown config key"),
             }
+        }
+        // A permission profile is a shortcut: it turns on every category and
+        // every dangerous tool and sets the interaction mode, so the operator
+        // need not list them. The granular `categories`/`enable` are then
+        // ignored, and `mode` follows the profile.
+        if let Some(access) = cfg.access {
+            cfg.categories = crate::all_categories();
+            cfg.mode = access.mode();
         }
         // A judge that can never work fails here, at load, rather than on
         // the first call: falling back to defaults could silently drop a
@@ -354,6 +370,26 @@ mod tests {
         assert_eq!(cfg.mode, Mode::Autonomous);
         assert_eq!(cfg.max_denials, 9);
         assert_eq!(cfg.allowed_origins, vec!["https://ok.example"]);
+    }
+
+    #[test]
+    fn an_access_profile_enables_everything_and_sets_the_mode() {
+        let cfg = PolicyConfig::from_toml_str("[policy]\naccess = \"bypass\"\n").unwrap();
+        assert_eq!(cfg.access, Some(crate::Access::Bypass));
+        assert_eq!(cfg.categories.len(), crate::all_categories().len());
+        assert_eq!(cfg.mode, Mode::Autonomous);
+        let cfg = PolicyConfig::from_toml_str("[policy]\naccess = \"ask\"\n").unwrap();
+        assert_eq!(cfg.access, Some(crate::Access::Ask));
+        assert_eq!(cfg.mode, Mode::Interactive);
+        assert!(cfg.categories.contains(&mcp_types::Category::Terminal));
+        // A profile overrides a hand-written category list.
+        let cfg =
+            PolicyConfig::from_toml_str("[policy]\ncategories = [\"vision\"]\naccess = \"auto\"\n")
+                .unwrap();
+        assert_eq!(cfg.categories.len(), crate::all_categories().len());
+        // An unknown profile is a hard error, not a silent default.
+        assert!(PolicyConfig::from_toml_str("[policy]\naccess = \"yolo\"\n").is_err());
+        assert!(PolicyConfig::from_toml_str("[policy]\naccess = 3\n").is_err());
     }
 
     #[test]

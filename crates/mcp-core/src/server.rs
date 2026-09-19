@@ -192,8 +192,13 @@ impl Server {
 
         let mut decision = gated;
         if decision.is_allow() {
-            if let Some(prompt) = module.consent_prompt(name, &args) {
-                decision = Decision::NeedConsent { prompt };
+            // Under bypass the operator has waived per-action approval, so an
+            // engine's risk prompt is not raised; every other profile still
+            // asks (interactive) or refuses (autonomous).
+            if !self.policy.is_bypass() {
+                if let Some(prompt) = module.consent_prompt(name, &args) {
+                    decision = Decision::NeedConsent { prompt };
+                }
             }
         }
         let decision = self.policy.resolve_consent(decision);

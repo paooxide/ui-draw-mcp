@@ -8,6 +8,11 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- **One-word permission profiles.** `policy.access = "ask" | "auto" | "bypass"` replaces enabling each
+  category and naming each dangerous tool. All three turn on every capability; `ask` confirms a dangerous
+  tool or destructive action through the dialog, `auto` runs unattended but refuses a clearly destructive
+  action, and `bypass` turns off consent and the destructive gate (kill switch and human-override remain).
+  The granular `categories`/`enable` config still works when `access` is unset.
 - **Secret-safe input.** `keyboard_type`, `set_value`, `pty_write` and `clipboard_write` take
   `secret: true` for entering a password the owner provides. The payload is redacted from the append-only
   audit log (length marker only) and is never sent to the judge, while the real value still reaches the OS.

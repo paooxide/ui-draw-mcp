@@ -28,6 +28,8 @@ pub struct PtyPolicy {
     pub destructive_patterns: Vec<String>,
     /// No consent channel: destructive input becomes a denial.
     pub autonomous: bool,
+    /// Bypass profile: the destructive gate is off entirely.
+    pub bypass: bool,
     /// The judge, consulted after the patterns and only able to add a flag.
     pub judge: Option<std::sync::Arc<mcp_policy::mcp_judge::Judge>>,
 }
@@ -45,6 +47,7 @@ impl Default for PtyPolicy {
             max_buffer: 256 * 1024,
             destructive_patterns: mcp_policy::default_destructive_patterns(),
             autonomous: false,
+            bypass: false,
             judge: None,
         }
     }
@@ -258,36 +261,40 @@ impl PtyModule {
         // A PTY write *is* shell input, the one place the destructive gate is
         // unambiguously in scope. The patterns decide first; the judge can
         // only add to what they found. A secret (a password piped to a prompt)
-        // skips the remote judge; the offline pattern check still runs.
-        let secret = args.get("secret").and_then(Value::as_bool).unwrap_or(false);
-        let judge = if secret {
-            None
-        } else {
-            self.policy.judge.as_ref()
-        };
-        let verdict = mcp_policy::judged_destructive(
-            data,
-            &self.policy.destructive_patterns,
-            judge,
-            "an interactive shell (pty)",
-        )
-        .await;
-        if verdict.is_destructive() {
-            let reason = verdict.reason();
-            return if self.policy.autonomous {
-                Envelope::fail(
-                    tool,
-                    ErrorCode::PolicyDenied,
-                    format!("destructive command blocked (autonomous mode): {reason}"),
-                )
+        // skips the remote judge; the offline pattern check still runs. Under
+        // bypass the gate is off entirely.
+        // Under bypass the destructive gate is off entirely.
+        if !self.policy.bypass {
+            let secret = args.get("secret").and_then(Value::as_bool).unwrap_or(false);
+            let judge = if secret {
+                None
             } else {
-                Envelope::fail_with(
-                    tool,
-                    ErrorCode::ConsentRequired,
-                    format!("destructive command requires human consent: {reason}"),
-                    "confirm interactively or send a non-destructive command",
-                )
+                self.policy.judge.as_ref()
             };
+            let verdict = mcp_policy::judged_destructive(
+                data,
+                &self.policy.destructive_patterns,
+                judge,
+                "an interactive shell (pty)",
+            )
+            .await;
+            if verdict.is_destructive() {
+                let reason = verdict.reason();
+                return if self.policy.autonomous {
+                    Envelope::fail(
+                        tool,
+                        ErrorCode::PolicyDenied,
+                        format!("destructive command blocked (autonomous mode): {reason}"),
+                    )
+                } else {
+                    Envelope::fail_with(
+                        tool,
+                        ErrorCode::ConsentRequired,
+                        format!("destructive command requires human consent: {reason}"),
+                        "confirm interactively or send a non-destructive command",
+                    )
+                };
+            }
         }
         let timeout = args
             .get("read_timeout_ms")

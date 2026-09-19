@@ -367,6 +367,18 @@ fn doctor() {
         cfg.human_override_px,
         cfg.human_override_grace_ms
     );
+    match cfg.access {
+        Some(a) => println!(
+            "  access profile:  {} (all categories on; {})",
+            a.as_str(),
+            match a {
+                mcp_policy::Access::Ask => "dangerous actions ask you",
+                mcp_policy::Access::Auto => "no prompts; destructive actions refused",
+                mcp_policy::Access::Bypass => "no prompts; destructive gate OFF",
+            }
+        ),
+        None => println!("  access profile:  none (granular categories/enable)"),
+    }
     println!("  enabled cats:    {}", slugs(&cfg));
     print_judge(&cfg);
     println!(

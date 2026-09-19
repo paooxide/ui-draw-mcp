@@ -133,19 +133,28 @@ impl Policy {
         }
         match desc.tier {
             Tier::Read | Tier::Standard => Decision::Allow,
-            Tier::Dangerous => {
-                if self.config.enable.iter().any(|n| n == &desc.name) {
-                    Decision::Allow
-                } else {
-                    Decision::Deny {
-                        code: ErrorCode::PolicyDenied,
-                        reason: format!(
-                            "dangerous tool '{}' is not enabled (add it to policy.enable)",
-                            desc.name
-                        ),
+            Tier::Dangerous => match self.config.access {
+                // A profile enables every dangerous tool. "ask" still confirms
+                // each one with the human; "auto" and "bypass" let it run.
+                Some(crate::Access::Ask) => Decision::NeedConsent {
+                    prompt: format!("run the dangerous tool '{}'", desc.name),
+                },
+                Some(crate::Access::Auto) | Some(crate::Access::Bypass) => Decision::Allow,
+                // No profile: the granular opt-in list decides.
+                None => {
+                    if self.config.enable.iter().any(|n| n == &desc.name) {
+                        Decision::Allow
+                    } else {
+                        Decision::Deny {
+                            code: ErrorCode::PolicyDenied,
+                            reason: format!(
+                                "dangerous tool '{}' is not enabled (add it to policy.enable,                                  or set policy.access = \"ask\")",
+                                desc.name
+                            ),
+                        }
                     }
                 }
-            }
+            },
         }
     }
 
@@ -174,6 +183,17 @@ impl Policy {
     }
 
     /// Whether mutations should be reported rather than performed.
+    /// The permission profile in force, if any.
+    pub fn access(&self) -> Option<crate::Access> {
+        self.config.access
+    }
+
+    /// Bypass turns off consent and the destructive gate; only the kill switch
+    /// and human-override remain. Checked in the dispatch and the engines.
+    pub fn is_bypass(&self) -> bool {
+        self.config.access == Some(crate::Access::Bypass)
+    }
+
     pub fn is_dry_run(&self) -> bool {
         matches!(self.config.mode, Mode::DryRun)
     }
@@ -268,6 +288,48 @@ mod tests {
         cfg2.enable.push("power_control".into());
         let p2 = policy_with(cfg2);
         assert_eq!(p2.gate(&dang), Decision::Allow);
+    }
+
+    /// The three access profiles, over a dangerous tool the granular config
+    /// would have refused: ask confirms it, auto and bypass run it, and the
+    /// category is on for all three (a profile enables everything).
+    #[test]
+    fn access_profiles_gate_a_dangerous_tool_three_ways() {
+        let dang = desc("power_control", Category::Desktop, Tier::Dangerous);
+        let with = |access| {
+            let mut cfg = PolicyConfig {
+                access: Some(access),
+                ..PolicyConfig::default()
+            };
+            // A profile enables every category; the loader does this, so mirror
+            // it here where we construct the config by hand.
+            cfg.categories = crate::all_categories();
+            policy_with(cfg)
+        };
+        match with(crate::Access::Ask).gate(&dang) {
+            Decision::NeedConsent { prompt } => assert!(prompt.contains("power_control")),
+            other => panic!("ask should confirm, got {other:?}"),
+        }
+        assert_eq!(with(crate::Access::Auto).gate(&dang), Decision::Allow);
+        assert_eq!(with(crate::Access::Bypass).gate(&dang), Decision::Allow);
+        // And a standard tool in a category the defaults never enabled is now
+        // allowed under a profile, because everything is on.
+        let std_tool = desc("exec", Category::Terminal, Tier::Standard);
+        assert_eq!(with(crate::Access::Ask).gate(&std_tool), Decision::Allow);
+    }
+
+    #[test]
+    fn only_bypass_reports_bypass() {
+        let mk = |a: Option<crate::Access>| {
+            policy_with(PolicyConfig {
+                access: a,
+                ..PolicyConfig::default()
+            })
+        };
+        assert!(mk(Some(crate::Access::Bypass)).is_bypass());
+        assert!(!mk(Some(crate::Access::Ask)).is_bypass());
+        assert!(!mk(Some(crate::Access::Auto)).is_bypass());
+        assert!(!mk(None).is_bypass());
     }
 
     #[test]

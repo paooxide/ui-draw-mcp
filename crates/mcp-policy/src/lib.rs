@@ -21,7 +21,7 @@ mod redact;
 
 pub use audit::{now_ms, AuditRecord, AuditSink};
 pub use budget::DenialBudget;
-pub use config::{default_agentctl_dir, Mode, PolicyConfig};
+pub use config::{all_categories, default_agentctl_dir, Access, Mode, PolicyConfig};
 pub use decision::Decision;
 pub use destructive::{default_destructive_patterns, is_destructive};
 pub use gate::Policy;
