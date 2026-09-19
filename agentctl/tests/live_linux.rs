@@ -24,9 +24,26 @@ use test_support::{live_gui_enabled, skip_live, test_policy, InProcClient};
 /// Route agentctl's tracing to the test output so a failing run is legible.
 /// Best-effort and idempotent: several tests may call it.
 fn trace() {
-    let _ = tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::DEBUG)
-        .with_test_writer()
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+    use tracing_subscriber::Layer;
+
+    // DEBUG for our own crates, but hold zbus to ERROR: ashpd's proxy cache
+    // logs a WARN on every portal with no cacheable properties, which buries
+    // the test output.
+    let filter = tracing_subscriber::filter::filter_fn(|meta| {
+        let level = *meta.level();
+        if level > tracing::Level::DEBUG {
+            return false;
+        }
+        if meta.target().starts_with("zbus") && level > tracing::Level::ERROR {
+            return false;
+        }
+        true
+    });
+    let fmt_layer = tracing_subscriber::fmt::layer().with_test_writer();
+    let _ = tracing_subscriber::registry()
+        .with(fmt_layer.with_filter(filter))
         .try_init();
 }
 

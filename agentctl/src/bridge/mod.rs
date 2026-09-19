@@ -14,6 +14,7 @@
 pub mod curl;
 pub mod gemini;
 pub mod mcp_child;
+pub mod prune;
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -63,6 +64,9 @@ pub struct BridgeOpts {
     /// operator's own `~/.agentctl/config.toml`.
     pub config: Option<PathBuf>,
     pub system: Option<String>,
+    /// Ask TypeSafe to trim the declared tool list to what the task needs.
+    /// Off by default; needs the judge's key. Degrades to the full list.
+    pub prune: bool,
 }
 
 impl Default for BridgeOpts {
@@ -76,6 +80,7 @@ impl Default for BridgeOpts {
             record: None,
             config: None,
             system: None,
+            prune: false,
         }
     }
 }
@@ -205,8 +210,21 @@ pub async fn run(opts: BridgeOpts, state_dir: &Path) -> Result<Transcript, Strin
     let key = api_key(state_dir)?;
     let exe = std::env::current_exe().map_err(|e| format!("could not find my own path: {e}"))?;
 
+    // The judge is only built when pruning is asked for. `from_config` looks
+    // up the TypeSafe key and logs (non-fatally) if it is missing, so a prune
+    // request with no key simply declares the full list.
+    let judge = if opts.prune {
+        let cfg = mcp_policy::mcp_judge::JudgeConfig {
+            enabled: true,
+            ..mcp_policy::mcp_judge::JudgeConfig::default()
+        };
+        Some(mcp_policy::mcp_judge::Judge::from_config(cfg, state_dir))
+    } else {
+        None
+    };
+
     let mut child = mcp_child::McpChild::spawn(&exe, opts.config.as_deref()).await?;
-    let result = drive(&mut child, &opts, &key).await;
+    let result = drive(&mut child, &opts, &key, judge.as_deref()).await;
     child.shutdown().await;
     let transcript = result?;
 
@@ -224,15 +242,39 @@ async fn drive(
     child: &mut mcp_child::McpChild,
     opts: &BridgeOpts,
     key: &str,
+    judge: Option<&mcp_policy::mcp_judge::Judge>,
 ) -> Result<Transcript, String> {
     let init = child.initialize().await?;
     let server = init
         .pointer("/serverInfo/name")
         .and_then(Value::as_str)
         .unwrap_or("agentctl");
-    let tools = child.tools_list().await?;
+    let mut tools = child.tools_list().await?;
+    let offered = tools.len();
+    // Optionally let TypeSafe trim the list to what this task plausibly needs.
+    if let Some(judge) = judge {
+        let pruned = prune::prune(judge, &opts.task, &tools).await;
+        if pruned.judged {
+            eprintln!(
+                "bridge: judge trimmed the tool list from {offered} to {} for this task \
+                 (dropped: {})",
+                pruned.kept.len(),
+                if pruned.dropped.is_empty() {
+                    "none".to_string()
+                } else {
+                    pruned.dropped.join(", ")
+                }
+            );
+        } else {
+            eprintln!(
+                "bridge: tool pruning was requested but the judge was unavailable; \
+                 declaring all {offered} tools"
+            );
+        }
+        tools = pruned.tools;
+    }
     eprintln!(
-        "bridge: {server} offered {} tools; driving {} (max {} turns)",
+        "bridge: {server} offered {offered} tools; declaring {}; driving {} (max {} turns)",
         tools.len(),
         opts.model,
         opts.max_turns

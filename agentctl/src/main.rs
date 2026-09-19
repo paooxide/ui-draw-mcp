@@ -47,9 +47,30 @@ async fn main() -> std::io::Result<()> {
 }
 
 fn init_tracing() {
-    tracing_subscriber::fmt()
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+    use tracing_subscriber::Layer;
+
+    // INFO and above, as the fmt default has always been, with one carve-out:
+    // ashpd's zbus proxy logs a WARN every time it fails to pre-populate a
+    // D-Bus property cache, which it does routinely on portals that expose no
+    // such properties. It is noise, not a fault, so zbus is held to ERROR.
+    // Everything else is untouched, and a real zbus error still prints.
+    let filter = tracing_subscriber::filter::filter_fn(|meta| {
+        let level = *meta.level();
+        if level > tracing::Level::INFO {
+            return false;
+        }
+        if meta.target().starts_with("zbus") && level > tracing::Level::ERROR {
+            return false;
+        }
+        true
+    });
+    let fmt_layer = tracing_subscriber::fmt::layer()
         .with_writer(std::io::stderr)
-        .with_target(false)
+        .with_target(false);
+    tracing_subscriber::registry()
+        .with(fmt_layer.with_filter(filter))
         .try_init()
         .ok();
 }
@@ -293,6 +314,7 @@ async fn bridge(args: &[String]) -> std::io::Result<()> {
         record: flag(args, "--record").map(std::path::PathBuf::from),
         config: flag(args, "--config").map(std::path::PathBuf::from),
         system: flag(args, "--system").map(str::to_string),
+        prune: has(args, "--prune"),
     };
     let transcript = agentctl::bridge::run(opts, &dir).await.map_err(fail)?;
     let (ok, total) = transcript.tally();
@@ -556,7 +578,7 @@ fn print_help() {
          \x20   doctor           Print environment & permission status\n\
          \x20   config print     Print the effective configuration\n\
          \x20   tools            Print the tool reference (--all, --json)\n\
-         \x20   bridge           Drive this server with Gemini (--task, --list-models)\n\
+         \x20   bridge           Drive this server with Gemini (--task, --list-models, --prune)\n\
          \x20   transcript       Rebuild a session record from an audit log\n\
          \x20   help             Show this help\n",
         env!("CARGO_PKG_VERSION")
