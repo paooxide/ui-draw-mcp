@@ -201,6 +201,7 @@ an engine.
 | `mcp-browser` | The Chrome DevTools Protocol engine. OS-independent, so the real backend ships here. |
 | `mcp-fs` | Filesystem, contained by a resolve-then-check path jail. |
 | `mcp-proc` | `exec` (argv, no shell by default), process listing and signals. |
+| `mcp-ssrf` | The resolved-address guard, a dependency-free leaf shared by the network and browser engines. |
 | `mcp-net` | HTTP with SSRF containment, DNS, interfaces. |
 | `mcp-sys` | Read-only OS, hardware, disk and log telemetry. |
 | `mcp-sec` | Credentials. No plaintext secret read exists. |

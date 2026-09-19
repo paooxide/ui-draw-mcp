@@ -34,7 +34,11 @@ confidence-threshold = 0.9
 # Duplicate versions of the same crate bloat the tree and the audit surface;
 # warn so they stay visible without blocking builds during early development.
 multiple-versions = "warn"
-wildcard = "deny"
+wildcards = "deny"
+# Workspace crates reference each other by path with no version, which
+# cargo-deny counts as a wildcard. They are ours and unpublished
+# (`publish = false`), which is what makes this exemption apply.
+allow-wildcard-paths = true
 # Prefer the highest semver-compatible version when several are in the graph.
 highlight = "all"
 

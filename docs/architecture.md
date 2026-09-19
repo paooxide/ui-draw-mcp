@@ -21,11 +21,13 @@ architecture mapped to OWASP guidance. File trees below mark shipped crates vs. 
 5. **Defense in depth.** Schema validation → engine-level semantic validation → policy → OS permission → audit.
    A bypass of one layer is caught by the next.
 6. **Separation of concerns + dependency inversion.** `mcp-core` depends on an abstract `ToolModule` trait, not
-   on concrete engines. Engines depend only on `mcp-types` and their OS crates. Dependencies point inward.
+   on concrete engines. Engines depend only on `mcp-types`, the shared leaf guards (`mcp-ssrf`) and their OS
+   crates. Dependencies point inward.
 7. **Deterministic & auditable.** Every call is validated, gated, and written to an append-only audit log
    before and after execution. Secrets are redacted centrally.
 8. **Testable by construction.** No hidden global state; all capability handles flow through an injected
-   `CallCtx`; every engine has a fake backend so the full pipeline runs on any OS in CI.
+   `CallCtx`. There are no fake backends (see `CONTRIBUTING.md`): pure logic is tested as free functions,
+   and everything else against the real OS, browser or service, gated by `AGENTCTL_SKIP_LIVE`.
 
 ---
 
@@ -84,10 +86,11 @@ crates/
   mcp-browser/                 # CDP                          [MVP+ (post-gate)]
   mcp-desktop/                 # session/power/settings       [deferred]
   mcp-pty/ mcp-proc/           # terminal/process             [deferred]
+  mcp-ssrf/                    # resolved-address guard (leaf, shared by net + browser)
   mcp-fs/ mcp-net/ mcp-sys/    # fs/network/kernel            [deferred]
   mcp-sec/                     # credentials                  [deferred]
   mcp-memory/                  # optional recall              [deferred]
-  test-support/                # in-proc client, fakes        [MVP]
+  test-support/                # in-proc MCP client          [MVP]
 ```
 
 ### 3.2 File-level layout (MVP crates)
@@ -142,7 +145,7 @@ agentctl/src/
   wire.rs          # build registry from ENABLED categories only (secure default)
   doctor.rs        # OS permission checks (Accessibility/Screen Recording on macOS)
 
-test-support/src/  # client.rs (in-proc MCP client), fakes/ (per-engine fake backends), fixtures.rs, assert.rs
+test-support/src/  # lib.rs (in-proc MCP client that drives the real protocol)
 ```
 
 ---
@@ -156,8 +159,10 @@ mcp-types  ◀── mcp-policy ◀── mcp-core ◀── agentctl ──▶ 
 ```
 
 **Enforced rules** (checked in review; some by `cargo-deny`/lints):
-- Engines depend on `mcp-types` and their OS crates **only**. An engine importing `mcp-core` or `mcp-policy`
-  is a bug (would allow bypassing the gate or circular deps).
+- Engines depend on `mcp-types`, dependency-free leaf guards such as `mcp-ssrf`, and their OS crates
+  **only**. An engine importing `mcp-core`, `mcp-policy` or another engine is a bug (it would allow
+  bypassing the gate, or a circular dependency). A guard two engines share is lifted into a leaf crate
+  rather than one engine importing the other.
 - `mcp-policy` depends on `mcp-types` only. It never depends on an engine (it gates by descriptor metadata,
   not by concrete type).
 - `mcp-core` orchestrates: depends on `mcp-types` + `mcp-policy` + the `ToolModule` trait; it does **not**
@@ -247,7 +252,7 @@ OWASP Top 10 for LLM Applications apply. Mapping of concern → guidance → con
 | Input validation | A03 · ASVS V5 | JSON-schema validate → engine semantic validate (ref shape, enums, one-of, path canon, combo regex) | `core/dispatch.rs`, each `tools.rs` |
 | Command injection | A03 · ASVS V5.3 | `exec`/subprocess use **argv arrays, never shell strings**; destructive-input denylist on shell-bound text | `mcp-policy/destructive.rs`, engines |
 | Path traversal | A01/A03 · ASVS V12 | canonicalize + `fs_roots`/`fs_deny` allowlist + symlink-escape denial (deferred fs; pattern defined now) | `mcp-fs/*` (deferred), `policy/allowlist.rs` |
-| SSRF | **A10** · ASVS V12 | `http_client` blocks loopback/link-local/metadata unless opted in (deferred net) | `policy/allowlist.rs`, `mcp-net` |
+| SSRF | **A10** · ASVS V12 | `http_request` and `browser_navigate` resolve first and block loopback/link-local/metadata unless opted in | `mcp-ssrf`, `mcp-net`, `mcp-browser/src/nav.rs` |
 | JS/code injection via page | A03 · **LLM01 Prompt Injection (indirect)**, **LLM02 Insecure Output Handling** | `browser_eval` dangerous+opt-in; `browser.allowed_origins`; page content treated as untrusted; results redacted | `mcp-browser/*`, `policy/allowlist.rs` |
 | Secrets / sensitive data | A02 · ASVS V6/V8 · **LLM06 Sensitive Info Disclosure** | central redactor for secure fields, cookies, credential values, API keys, in results **and** audit | `mcp-policy/redact.rs`, `mcp-a11y/secure.rs` |
 | Security logging | **A09** · ASVS V7 | append-only pre/post audit of every call incl. decision; single-writer, redacted; `trace` for full bodies | `mcp-policy/audit.rs`, `mcp-core` |
@@ -308,7 +313,7 @@ core security property.
 3. Register the module in `agentctl/wire.rs` under its category.
 4. If it returns secrets, register the field with `redact.rs`.
 5. If dangerous, it's automatically off until named in `policy.enable`; add a threat-model entry + X-D8 review.
-6. Add: allow-path test, deny-path test, boundary tests, and a fake backend in `test-support`.
+6. Add: allow-path test, deny-path test, boundary tests, and a live test gated by `AGENTCTL_SKIP_LIVE`.
 
 The trait contract is the whole extension surface: no engine touches transport, policy, or audit directly.
 

@@ -1,8 +1,8 @@
 //! Configuration loading (`config.toml` + environment).
 //!
 //! Deliberately a *small, strict* parser for the flat subset the config
-//! actually uses — sections, `key = "string"`, `key = 123`, `key = ["a", "b"]`,
-//! `#` comments — rather than a full TOML dependency. This matches the
+//! actually uses (sections, `key = "string"`, `key = 123`, `key = ["a", "b"]`,
+//! `#` comments) rather than a full TOML dependency. This matches the
 //! project's disk-conscious pattern and keeps the
 //! security-relevant config path dependency-free.
 //!
@@ -171,6 +171,7 @@ impl PolicyConfig {
                 ("policy.enable", Val::List(v)) => cfg.enable = v.clone(),
                 ("policy.allowed_apps", Val::List(v)) => cfg.allowed_apps = v.clone(),
                 ("browser.allowed_origins", Val::List(v)) => cfg.allowed_origins = v.clone(),
+                ("browser.allow_private", Val::Str(s)) => cfg.browser_allow_private = s == "true",
                 ("fs.roots", Val::List(v)) => cfg.fs_roots = v.iter().map(PathBuf::from).collect(),
                 ("terminal.allowed_commands", Val::List(v)) => cfg.allowed_commands = v.clone(),
                 ("network.allowed_hosts", Val::List(v)) => cfg.allowed_hosts = v.clone(),

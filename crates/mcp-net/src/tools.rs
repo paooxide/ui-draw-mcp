@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use mcp_types::{CallCtx, Category, Envelope, ErrorCode, Tier, ToolDescriptor, ToolModule};
 use serde_json::{json, Value};
 
-use crate::ssrf::{NetPolicy, UrlError};
+use mcp_ssrf::{NetPolicy, UrlError};
 
 /// Network tools: `http_request`, `dns_lookup`, `network_interfaces`.
 ///

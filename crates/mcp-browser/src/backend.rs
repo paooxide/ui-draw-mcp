@@ -11,6 +11,7 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use crate::cdp::{http_json, CdpConn, DialogPolicy};
+use crate::nav::NavPolicy;
 
 /// Why a browser operation failed.
 #[derive(Debug, Clone)]
@@ -147,21 +148,21 @@ pub struct CdpBackend {
     /// Browsers started by this process, by `browser_id`.
     launched: Mutex<Vec<Launched>>,
     next_id: AtomicU32,
-    /// If non-empty, `goto` is restricted to URLs whose origin matches one of
-    /// these prefixes (`browser.allowed_origins`).
-    allowed_origins: Vec<String>,
+    /// Where `goto` may take the browser: `browser.allowed_origins` plus the
+    /// resolved-address check (see [`crate::nav`]).
+    nav: NavPolicy,
     /// Per-target answer for JavaScript dialogs, and the log of ones answered.
     /// Connections are per-call, so the policy has to live with the backend.
     dialogs: Mutex<HashMap<String, (DialogPolicy, Vec<Value>)>>,
 }
 
 impl CdpBackend {
-    pub fn new(allowed_origins: Vec<String>) -> Self {
+    pub fn new(nav: NavPolicy) -> Self {
         CdpBackend {
             browsers: Mutex::new(Vec::new()),
             launched: Mutex::new(Vec::new()),
             next_id: AtomicU32::new(1),
-            allowed_origins,
+            nav,
             dialogs: Mutex::new(HashMap::new()),
         }
     }
@@ -180,15 +181,6 @@ impl CdpBackend {
             );
             reap_one(l.child, l.user_data_dir.as_deref());
         }
-    }
-
-    fn origin_allowed(&self, url: &str) -> bool {
-        if self.allowed_origins.is_empty() {
-            return true;
-        }
-        self.allowed_origins
-            .iter()
-            .any(|o| url.starts_with(o.as_str()))
     }
 
     /// Snapshot of connected browsers (guard released before any await).
@@ -405,7 +397,7 @@ impl BrowserBackend for CdpBackend {
                         .into(),
                 ));
             }
-            // Keep it running but stop tracking it — while still owning the
+            // Keep it running but stop tracking it, while still owning the
             // child, so shutdown reaps it instead of leaking the process.
             (false, Some(l)) => self.launched.lock().expect("launched mutex").push(l),
             (false, None) => {}
@@ -490,10 +482,8 @@ impl BrowserBackend for CdpBackend {
         let mut out = match action {
             "goto" => {
                 let u = url.ok_or_else(|| BrowserError::Failed("goto needs 'url'".into()))?;
-                if !self.origin_allowed(u) {
-                    return Err(BrowserError::PermissionDenied(format!(
-                        "navigation to '{u}' blocked by browser.allowed_origins policy"
-                    )));
+                if let Err(denied) = self.nav.check(u).await {
+                    return Err(BrowserError::PermissionDenied(denied.message()));
                 }
                 let r = c.call("Page.navigate", json!({ "url": u })).await?;
                 if let Some(err) = r.get("errorText").and_then(Value::as_str) {
@@ -861,7 +851,7 @@ impl BrowserBackend for CdpBackend {
             }
             "intercept" => {
                 // Blocking by URL pattern is what "intercept" can mean without
-                // holding requests open across tool calls — a paused request
+                // holding requests open across tool calls: a paused request
                 // with nobody to resume it stalls the page indefinitely.
                 let patterns: Vec<String> = headers
                     .as_ref()
@@ -901,7 +891,7 @@ impl BrowserBackend for CdpBackend {
                 let r = c.call("Network.getCookies", json!({})).await?;
                 let empty = vec![];
                 let cookies = r.get("cookies").and_then(Value::as_array).unwrap_or(&empty);
-                // Redact values — session tokens must never reach the agent/audit (D6).
+                // Redact values: session tokens must never reach the agent/audit (D6).
                 let redacted: Vec<Value> = cookies
                     .iter()
                     .map(|ck| {
@@ -1043,19 +1033,6 @@ async fn launch_browser(spec: &Value) -> Result<Launch, BrowserError> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn origin_policy_empty_allows_all() {
-        let b = CdpBackend::new(vec![]);
-        assert!(b.origin_allowed("https://anything.example"));
-    }
-
-    #[test]
-    fn origin_policy_restricts() {
-        let b = CdpBackend::new(vec!["https://ok.example".into()]);
-        assert!(b.origin_allowed("https://ok.example/path"));
-        assert!(!b.origin_allowed("https://evil.example"));
-    }
-
     /// Only a directory *we* named is ours to delete. The pid is in the name
     /// so two servers never share a profile, and so "did we create this?" is
     /// decidable from the path alone rather than from a guess about the port.
@@ -1090,21 +1067,21 @@ mod tests {
 
     #[tokio::test]
     async fn connect_requires_attach_or_launch() {
-        let b = CdpBackend::new(vec![]);
+        let b = CdpBackend::new(NavPolicy::default());
         let e = b.connect(None, None).await;
         assert!(matches!(e, Err(BrowserError::Failed(_))));
     }
 
     #[tokio::test]
     async fn tabs_unknown_browser_id_is_not_found() {
-        let b = CdpBackend::new(vec![]);
+        let b = CdpBackend::new(NavPolicy::default());
         let e = b.tabs(999, "list", None, None).await;
         assert!(matches!(e, Err(BrowserError::NotFound(_))));
     }
 
     #[tokio::test]
     async fn resolve_ws_with_no_browsers_is_not_found() {
-        let b = CdpBackend::new(vec![]);
+        let b = CdpBackend::new(NavPolicy::default());
         assert!(matches!(
             b.resolve_ws("ABC").await,
             Err(BrowserError::NotFound(_))

@@ -4,6 +4,8 @@ edition.workspace = true
 version.workspace = true
 rust-version.workspace = true
 license.workspace = true
+# Installed from git, never from crates.io.
+publish = false
 repository.workspace = true
 description.workspace = true
 
@@ -27,9 +29,9 @@ mcp-policy = { path = "../crates/mcp-policy" }
 mcp-core = { path = "../crates/mcp-core" }
 mcp-a11y = { path = "../crates/mcp-a11y" }
 mcp-input = { path = "../crates/mcp-input" }
-# Browser/CDP engine is OS-independent (talks CDP over TCP) — always wired in.
+# Browser/CDP engine is OS-independent (talks CDP over TCP), always wired in.
 mcp-browser = { path = "../crates/mcp-browser" }
-# Commodity engines — all OS-independent, wired on every platform.
+# Commodity engines, all OS-independent, wired on every platform.
 mcp-fs = { path = "../crates/mcp-fs" }
 mcp-proc = { path = "../crates/mcp-proc" }
 mcp-net = { path = "../crates/mcp-net" }
@@ -64,7 +66,7 @@ mcp-input = { path = "../crates/mcp-input" }
 # person does: from outside agentctl, so it is never recorded as ours.
 core-graphics = "0.24"
 
-# Real macOS backend (AXUIElement) — only on macOS.
+# Real macOS backend (AXUIElement), only on macOS.
 [target.'cfg(target_os = "macos")'.dependencies]
 mcp-macos = { path = "../crates/mcp-macos" }
 mcp-window = { path = "../crates/mcp-window" }

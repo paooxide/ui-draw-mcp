@@ -8,7 +8,7 @@
 //!
 //! Skips (rather than fails) when no Chromium binary is installed.
 
-use mcp_browser::{BrowserBackend, CdpBackend, DialogPolicy, CHROME_BINS};
+use mcp_browser::{BrowserBackend, CdpBackend, DialogPolicy, NavPolicy, CHROME_BINS};
 use serde_json::{json, Value};
 
 /// Launching a real browser is the point of this file locally, and an
@@ -27,7 +27,7 @@ async fn tab(port: u64) -> Option<(CdpBackend, String)> {
     if !have_chrome() {
         return None;
     }
-    let b = CdpBackend::new(Vec::new());
+    let b = CdpBackend::new(NavPolicy::default());
     b.connect(None, Some(json!({ "headless": true, "port": port })))
         .await
         .ok()?;
@@ -65,7 +65,7 @@ async fn alert_does_not_wedge_the_tab() {
     assert_eq!(r["result"], 42, "code after alert() must still run");
     assert!(
         started.elapsed().as_secs() < 5,
-        "eval took {:?} — the dialog was not answered",
+        "eval took {:?}, the dialog was not answered",
         started.elapsed()
     );
 
@@ -128,7 +128,7 @@ async fn accept_policy_is_per_target_and_supplies_prompt_text() {
     assert_eq!(c["result"], false);
 }
 
-/// Request logging against a live browser. The tab must still work afterwards —
+/// Request logging against a live browser. The tab must still work afterwards,
 /// a client that reads events for three seconds must not lose its place in the
 /// protocol.
 #[tokio::test(flavor = "multi_thread")]
@@ -198,14 +198,14 @@ async fn intercept_blocks_and_clears_url_patterns() {
 /// Every browser this suite launches must be gone when it ends.
 ///
 /// Before `Drop`, each of these tests left a headless Chrome running with a
-/// profile under $TMPDIR for the life of the machine — so the suite that proves
+/// profile under $TMPDIR for the life of the machine, so the suite that proves
 /// the engine works was also the thing leaking its processes.
 #[tokio::test(flavor = "multi_thread")]
 async fn disconnect_kills_a_launched_browser_and_removes_its_profile() {
     if !have_chrome() {
         return;
     }
-    let b = CdpBackend::new(Vec::new());
+    let b = CdpBackend::new(NavPolicy::default());
     let port = 9358u64;
     if b.connect(None, Some(json!({ "headless": true, "port": port })))
         .await
@@ -236,7 +236,7 @@ async fn kill_is_refused_for_an_attached_browser() {
     if !have_chrome() {
         return;
     }
-    let owner = CdpBackend::new(Vec::new());
+    let owner = CdpBackend::new(NavPolicy::default());
     let port = 9359u64;
     if owner
         .connect(None, Some(json!({ "headless": true, "port": port })))
@@ -245,7 +245,7 @@ async fn kill_is_refused_for_an_attached_browser() {
     {
         return;
     }
-    let attacher = CdpBackend::new(Vec::new());
+    let attacher = CdpBackend::new(NavPolicy::default());
     if attacher.connect(Some(port as u16), None).await.is_err() {
         return;
     }

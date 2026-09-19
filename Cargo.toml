@@ -11,6 +11,7 @@ members = [
     "crates/mcp-browser",
     "crates/mcp-fs",
     "crates/mcp-proc",
+    "crates/mcp-ssrf",
     "crates/mcp-net",
     "crates/mcp-sys",
     "crates/mcp-sec",

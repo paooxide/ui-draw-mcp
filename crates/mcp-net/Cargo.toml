@@ -4,9 +4,12 @@ edition.workspace = true
 version.workspace = true
 rust-version.workspace = true
 license.workspace = true
+# Installed from git, never from crates.io.
+publish = false
 
 [dependencies]
 mcp-types = { path = "../mcp-types" }
+mcp-ssrf = { path = "../mcp-ssrf" }
 serde.workspace = true
 serde_json.workspace = true
 async-trait.workspace = true

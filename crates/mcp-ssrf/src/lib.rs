@@ -1,13 +1,18 @@
-//! SSRF containment for outbound HTTP.
+//! SSRF containment for anything that reaches the network on the agent's
+//! behalf: `http_request`, the host probes, and `browser_navigate`.
 //!
-//! An agent that can make arbitrary HTTP requests from *this* machine is inside
-//! the network perimeter. The classic abuse is not fetching a public page — it
+//! An agent that can make arbitrary requests from *this* machine is inside
+//! the network perimeter. The classic abuse is not fetching a public page. It
 //! is `http://169.254.169.254/` (cloud instance credentials), `http://localhost:*`
 //! (admin panels, unauthenticated internal services), or an RFC1918 address.
 //!
 //! Defence has to happen on the **resolved address**, not the hostname: an
 //! attacker controls DNS, so `evil.example` can resolve to `127.0.0.1`. We
 //! resolve first and check every address the name maps to.
+//!
+//! This is a leaf crate with no dependencies so that every engine can use the
+//! same guard without one engine depending on another (see the layering rules
+//! in `docs/architecture.md`).
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
 
@@ -29,7 +34,7 @@ impl UrlError {
                 format!("host '{h}' is not in network.allowed_hosts")
             }
             UrlError::BlockedAddress(a) => format!(
-                "'{a}' is a private, loopback, or link-local address — blocked to prevent \
+                "'{a}' is a private, loopback, or link-local address, blocked to prevent \
                  access to internal services and cloud metadata"
             ),
             UrlError::Unresolvable(h) => format!("could not resolve host '{h}'"),
@@ -45,7 +50,7 @@ pub struct Parsed {
     pub port: u16,
 }
 
-/// Minimal URL split — enough to extract scheme/host/port for the guard.
+/// Minimal URL split, enough to extract scheme/host/port for the guard.
 /// Deliberately strict: anything unusual is rejected rather than guessed at.
 pub fn parse_url(url: &str) -> Result<Parsed, UrlError> {
     // A URL carrying whitespace or a control character is either malformed or
@@ -110,7 +115,7 @@ pub fn parse_url(url: &str) -> Result<Parsed, UrlError> {
     }
     // Non-ASCII hosts are a homograph problem: `exa\u{43c}ple.com` reads like
     // `example.com` but is a different name. The allowlist is ASCII, so these
-    // could only ever fail closed — but they should fail with a clear reason
+    // could only ever fail closed, but they should fail with a clear reason
     // rather than as an unresolvable name. Punycode is still accepted.
     if !host.is_ascii() {
         return Err(UrlError::Malformed(format!(
@@ -132,7 +137,7 @@ fn is_blocked_v4(ip: &Ipv4Addr) -> bool {
     let o = ip.octets();
     ip.is_loopback()            // 127/8
         || ip.is_private()      // 10/8, 172.16/12, 192.168/16
-        || ip.is_link_local()   // 169.254/16 — cloud metadata lives here
+        || ip.is_link_local()   // 169.254/16, cloud metadata lives here
         || ip.is_broadcast()
         || ip.is_documentation()
         || ip.is_unspecified()  // 0.0.0.0
@@ -184,7 +189,7 @@ fn is_blocked_v6(ip: &Ipv6Addr) -> bool {
 /// `64:ff9b::/96` is the well-known NAT64 prefix (RFC 6052) and `2002::/16` is
 /// 6to4 (RFC 3056). Both are legitimate ways to reach *public* IPv4, so the
 /// embedded address is judged on its own merits rather than the range being
-/// blocked outright — otherwise a NAT64-only network could not reach anything.
+/// blocked outright, otherwise a NAT64-only network could not reach anything.
 fn embedded_v4(seg: &[u16; 8]) -> Option<Ipv4Addr> {
     let from = |hi: u16, lo: u16| {
         Ipv4Addr::new(
@@ -209,7 +214,7 @@ fn embedded_v4(seg: &[u16; 8]) -> Option<Ipv4Addr> {
 #[derive(Debug, Clone, Default)]
 pub struct NetPolicy {
     /// Exact hostnames (or `.suffix` entries) the agent may reach. Empty means
-    /// **nothing** is reachable — the engine refuses rather than opening the
+    /// **nothing** is reachable: the engine refuses rather than opening the
     /// whole internet by default.
     pub allowed_hosts: Vec<String>,
     /// Permit private/loopback targets. Off by default; only sensible for a
@@ -231,7 +236,7 @@ impl NetPolicy {
 
     /// Host-level check for tools that reach a host without a URL (ping,
     /// traceroute, tcp_connect). Same rule as [`Self::check`]: the allowlist,
-    /// then every address the name resolves to — a probe is still a reach-out,
+    /// then every address the name resolves to. A probe is still a reach-out,
     /// and "just a ping" to a metadata address is still a reach-out to it.
     pub fn check_host(&self, host: &str) -> Result<Vec<IpAddr>, String> {
         let host = host.to_ascii_lowercase();

@@ -56,8 +56,14 @@ pub struct PolicyConfig {
     pub mode: Mode,
     /// Apps that `launch` (and app-targeted actions) are allowed to touch.
     pub allowed_apps: Vec<String>,
-    /// URL prefixes the browser engine may navigate to. Empty = no restriction.
+    /// Origins the browser engine may navigate to (`scheme://host[:port][/path]`).
+    /// Empty = any public origin. Either way the resolved address is checked,
+    /// so loopback, private and cloud-metadata targets need `allow_private`.
     pub allowed_origins: Vec<String>,
+    /// Permit `browser_navigate` to loopback/private/link-local targets, for
+    /// driving a local development server. Off by default: the browser is a
+    /// network client inside the perimeter, same as `http_request`.
+    pub browser_allow_private: bool,
     /// Session aborts after this many denied calls (anti-spin).
     pub max_denials: usize,
     /// How many times one session may interrupt a human for approval. Past this
@@ -126,7 +132,7 @@ pub struct PolicyConfig {
     /// Listen address. Loopback only; the transport refuses anything else.
     pub http_bind: String,
     /// Bearer token. Empty means one is generated at startup and printed to
-    /// stderr — better than a memorable default nobody changes.
+    /// stderr, better than a memorable default nobody changes.
     pub http_token: String,
     /// Browser origins allowed to call the endpoint. Empty = any request
     /// carrying an `Origin` header is refused.
@@ -145,6 +151,7 @@ impl Default for PolicyConfig {
                 .map(|s| s.to_string())
                 .collect(),
             allowed_origins: Vec::new(),
+            browser_allow_private: false,
             max_denials: 5,
             max_consent_prompts: 20,
             kill_switch_file: base.join("STOP"),
@@ -242,7 +249,7 @@ impl PolicyConfig {
     ///
     /// `agentctl config print` only ever showed `[policy]`, which is the half
     /// an operator is least likely to get wrong. The parts that decide what the
-    /// agent can actually reach — roots, commands, hosts, services — were
+    /// agent can actually reach (roots, commands, hosts, services) were
     /// invisible.
     pub fn to_redacted_json(&self) -> serde_json::Value {
         use serde_json::json;
@@ -285,7 +292,10 @@ impl PolicyConfig {
                 "allowlist": self.package_allowlist,
                 "denylist": self.package_denylist,
             },
-            "browser": { "allowed_origins": self.allowed_origins },
+            "browser": {
+                "allowed_origins": self.allowed_origins,
+                "allow_private": self.browser_allow_private,
+            },
             "memory": {
                 "store": self.memory_store.display().to_string(),
                 "max_recipes": self.max_recipes,

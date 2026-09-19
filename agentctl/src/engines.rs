@@ -19,6 +19,7 @@ use crate::tools_system::SystemModule;
 /// The slice of config the OS-independent engines need.
 pub struct EngineConfig {
     pub allowed_origins: Vec<String>,
+    pub browser_allow_private: bool,
     pub fs_roots: Vec<std::path::PathBuf>,
     pub allowed_commands: Vec<String>,
     pub allow_shell: bool,
@@ -44,6 +45,7 @@ impl From<&PolicyConfig> for EngineConfig {
     fn from(c: &PolicyConfig) -> Self {
         EngineConfig {
             allowed_origins: c.allowed_origins.clone(),
+            browser_allow_private: c.browser_allow_private,
             fs_roots: c.fs_roots.clone(),
             allowed_commands: c.allowed_commands.clone(),
             allow_shell: c.allow_shell,
@@ -70,8 +72,8 @@ impl From<&PolicyConfig> for EngineConfig {
 ///
 ///
 /// `mcp-policy` carries these as plain numbers so it need not depend on an
-/// engine; the translation — including turning `default_detail` from a string
-/// into a `Detail` — happens here, at the composition root.
+/// engine; the translation (including turning `default_detail` from a string
+/// into a `Detail`) happens here, at the composition root.
 #[cfg(target_os = "macos")]
 pub fn vision_config(c: &PolicyConfig) -> mcp_vision::VisionConfig {
     mcp_vision::VisionConfig {
@@ -124,11 +126,11 @@ pub fn build_stack(cfg: &PolicyConfig) -> (Vec<Arc<dyn ToolModule>>, Wiring) {
     #[cfg(target_os = "macos")]
     let audio_roots = engines.fs_roots.clone();
 
-    // OS-independent engines — wired on every platform. Each one is closed by
+    // OS-independent engines, wired on every platform. Each one is closed by
     // default: with no roots/commands/hosts/services configured it refuses
     // everything rather than falling open.
     {
-        use mcp_browser::{BrowserModule, CdpBackend};
+        use mcp_browser::{BrowserModule, CdpBackend, NavPolicy};
         use mcp_fs::{default_denied, FsModule, Jail};
         use mcp_memory::{MemoryModule, Store as MemoryStore};
         use mcp_net::{NetModule, NetPolicy};
@@ -139,7 +141,7 @@ pub fn build_stack(cfg: &PolicyConfig) -> (Vec<Arc<dyn ToolModule>>, Wiring) {
         use mcp_sys::SysModule;
 
         modules.push(Arc::new(BrowserModule::new(Arc::new(CdpBackend::new(
-            engines.allowed_origins,
+            NavPolicy::new(&engines.allowed_origins, engines.browser_allow_private),
         )))));
 
         let jail = Jail::new(engines.fs_roots.clone(), default_denied());

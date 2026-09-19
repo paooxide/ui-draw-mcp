@@ -4,6 +4,24 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Security
+
+- `browser_navigate` now runs the same resolved-address guard as `http_request`. With
+  `browser.allowed_origins` empty the agent could point the browser at cloud metadata or a loopback
+  service; every address the target resolves to must now be public unless the new
+  `browser.allow_private` is on. Only `http`, `https` and `about:blank` are accepted, since `file:` walks
+  past the filesystem jail and `javascript:` past the `browser_eval` opt-in.
+- `browser.allowed_origins` entries are matched on the parsed origin, not as a string prefix:
+  `https://ok.example` no longer admits `https://ok.example.evil`.
+
+### Changed
+
+- The SSRF guard moved from `mcp-net` into its own dependency-free crate, `mcp-ssrf`, so the browser
+  engine can share it without one engine depending on another. `mcp-net` re-exports it unchanged.
+- Driving a local development server through the browser now needs `browser.allow_private = true`.
+
 ## [0.1.0] - 2026-09-03
 
 First tagged release. An MCP server that gives an AI agent grounded control of a real computer: 107 tools

@@ -16,7 +16,7 @@ Scope note (D12): concrete examples target the MVP crates (`mcp-core`, `mcp-poli
 |---|---|---|---|
 | Unit | OS-independent logic (flatten, validate, map, redact) | `cargo test` | any OS |
 | Golden | text/flatten outputs vs fixtures | `insta` | any OS (fixtures per OS) |
-| Mock/fake | full dispatch loop w/ fake OS backends | `test-support` fakes | any OS |
+| Pipeline | full dispatch loop through the in-process client | `test-support` | any OS |
 | Property | invariants (gate-before-engine, redaction-always) | `proptest` | any OS |
 | Concurrency | races, ordering, deadlock, cancellation | `loom`, `tokio::test(flavor=multi_thread)`, `turmoil` (net, later) | any OS |
 | Policy | allow/deny/consent/budget/redact | `test-support` policy kit | any OS |

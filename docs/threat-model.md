@@ -130,11 +130,15 @@ follow, so a link inside a root pointing at an inode outside it resolves as in-r
 exposes no hard-link primitive, so creating one requires an actor with out-of-band write access inside a
 root, at which point they have that access anyway.
 
-**`browser_navigate` is origin-prefix checked, not IP-guarded.**
-The SSRF guard protects `http_request`; the browser is a general-purpose network client and its navigation
-is checked only against `browser.allowed_origins` prefixes. With that setting empty, the agent can point
-the browser at `169.254.169.254`. **Set `browser.allowed_origins`.** Running the resolved-address check on
-navigation targets is a known improvement, not yet made.
+**`browser_navigate` judges the request, not the response.**
+Navigation targets go through the same resolved-address guard as `http_request`
+(`crates/mcp-browser/src/nav.rs`): only `http`, `https` and `about:blank` are accepted, the allowlist is
+matched on the parsed origin rather than as a string prefix, and every address the host resolves to must be
+public unless `browser.allow_private` is on. What the guard cannot see is what happens after the request
+leaves: a server-side redirect to a private address, or a fetch made by the page's own script, never passes
+through it. `crates/mcp-browser/tests/redteam_navigate.rs::documented_known_gap_server_side_redirects_are_not_seen`
+pins that. Closing it means intercepting requests at the CDP `Fetch` layer, which is not done. **Set
+`browser.allowed_origins`** to the sites the task needs; the address check is a backstop, not the boundary.
 
 **The HTTP transport token is plaintext in `config.toml`.**
 Anyone who can read the file can use the transport. The file is in the user's home directory, and the

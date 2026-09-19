@@ -4,6 +4,8 @@ edition.workspace = true
 version.workspace = true
 rust-version.workspace = true
 license.workspace = true
+# Installed from git, never from crates.io.
+publish = false
 
 [dependencies]
 mcp-types = { path = "../mcp-types" }

@@ -118,8 +118,17 @@ denylist = []
 max_recipes = 500
 
 [browser]
-# URL prefixes `browser_navigate` may go to. Empty = unrestricted.
+# Origins `browser_navigate` may go to, as `scheme://host[:port][/path-prefix]`.
+# Matching is on the parsed origin, so "https://ok.example" does not admit
+# "https://ok.example.evil". Empty = any public origin. Only http, https and
+# about:blank are ever accepted: file:, data: and javascript: bypass controls
+# that exist elsewhere.
 allowed_origins = []
+# Whatever the allowlist says, the address a name resolves to is checked, and
+# loopback, private and link-local targets (cloud metadata lives at
+# 169.254.169.254) are refused. Turn this on to drive a local development
+# server. It does not bypass `allowed_origins`.
+allow_private = false
 
 [vision]
 # Screen-capture cost/legibility trade-offs. These are not security controls:

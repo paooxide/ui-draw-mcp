@@ -73,6 +73,10 @@ fn the_example_is_closed_by_default() {
         "network.allow_private must stay off: it reopens loopback and cloud metadata"
     );
     assert!(
+        !cfg.browser_allow_private,
+        "browser.allow_private must stay off: the browser is a network client inside the perimeter"
+    );
+    assert!(
         !cfg.allow_arbitrary_source,
         "packages.allow_arbitrary_source must stay off: it is malware delivery by another name"
     );

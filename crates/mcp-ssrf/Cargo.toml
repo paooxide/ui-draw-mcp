@@ -1,15 +1,11 @@
 [package]
-name = "mcp-a11y"
+name = "mcp-ssrf"
 edition.workspace = true
 version.workspace = true
 rust-version.workspace = true
 license.workspace = true
 # Installed from git, never from crates.io.
 publish = false
+description = "Resolved-address containment shared by every engine that reaches the network."
 
 [dependencies]
-mcp-types = { path = "../mcp-types" }
-serde.workspace = true
-serde_json.workspace = true
-async-trait.workspace = true
-tracing.workspace = true

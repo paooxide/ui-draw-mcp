@@ -24,7 +24,7 @@ env:
   # point of a developer's machine and an availability gamble on a hosted
   # runner: `brew search` reaches the network, and Chrome may not be installed.
   # Without this the suite is flaky for reasons that have nothing to do with the
-  # change under test — which trains everyone to ignore a red run.
+  # change under test, which trains everyone to ignore a red run.
   AGENTCTL_SKIP_LIVE: "1"
 
 jobs:
@@ -33,7 +33,7 @@ jobs:
   # The desktop engines (perception, input, window, vision, session/power) are
   # `#[cfg(target_os = "macos")]`, so on Linux this compiles the portable half:
   # core, policy, browser, fs, proc, net, sys, sec, pty, pkg, memory. That is
-  # exactly what the cross-platform work needs to keep honest — the portable
+  # exactly what the cross-platform work needs to keep honest: the portable
   # crates must not quietly grow a macOS assumption.
   #
   # Capability jobs that drive real AX/capture/input against a live desktop are
@@ -77,6 +77,7 @@ jobs:
           cargo test -p mcp-policy --test redteam_destructive
           cargo test -p mcp-policy --test example_config
           cargo test -p mcp-net --test redteam_ssrf
+          cargo test -p mcp-browser --test redteam_navigate
           cargo test -p mcp-fs --test redteam_jail
 
       # The example config is what operators copy. Prove the shipped binary
@@ -114,7 +115,7 @@ jobs:
         run: cargo deny check
 
   # A longer fuzz run than a pull request should wait for. The in-repo fuzzer is
-  # deterministic, so this is not "the same test again, slower" — a different
+  # deterministic, so this is not "the same test again, slower": a different
   # seed reaches inputs the pull-request run never generates.
   fuzz-extended:
     name: extended fuzz
