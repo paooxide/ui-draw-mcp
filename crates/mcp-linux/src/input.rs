@@ -125,6 +125,9 @@ impl LinuxBackend {
             sleep(Duration::from_millis(50)).await;
             if let Ok(ws) = a11y::windows_of(&conn, &app).await {
                 if is_active(&ws) {
+                    // Active in the tree is not yet keyboard focus at the
+                    // compositor; let the raise settle before keys are sent.
+                    sleep(Duration::from_millis(120)).await;
                     return Ok(());
                 }
             }
@@ -306,6 +309,10 @@ impl InputBackend for LinuxBackend {
     }
 
     async fn type_text(&self, text: &str) -> Result<(), InputError> {
+        // Open the portal (and answer its dialog) before settling focus: the
+        // dialog steals focus, so confirming the target first would be stale
+        // by the time the first key is sent.
+        self.portal.ensure_ready().await?;
         self.ensure_target_active().await?;
         for sym in keys::keysyms_for_text(text) {
             if self.cancel.load(Ordering::SeqCst) {
@@ -318,6 +325,7 @@ impl InputBackend for LinuxBackend {
 
     async fn key_combo(&self, combo: &str) -> Result<(), InputError> {
         let parsed = keys::parse_combo(combo).map_err(InputError::Failed)?;
+        self.portal.ensure_ready().await?;
         self.ensure_target_active().await?;
         self.press_modifiers(&parsed.modifiers, true).await?;
         let r = self.tap(parsed.key).await;

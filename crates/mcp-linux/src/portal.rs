@@ -358,6 +358,18 @@ impl Portal {
         }
     }
 
+    /// Open the session if it is not already open, so the approval dialog is
+    /// dealt with before any keystroke is sent. Opening it lazily on the first
+    /// key means the dialog steals focus mid-type; warming it up first lets the
+    /// caller settle focus on the target after the dialog closes.
+    pub async fn ensure_ready(&self) -> Result<(), InputError> {
+        let mut guard = self.live.lock().await;
+        if guard.is_none() {
+            *guard = Some(self.open().await?);
+        }
+        Ok(())
+    }
+
     pub async fn key(&self, sym: Keysym, pressed: bool) -> Result<(), InputError> {
         let state = if pressed {
             KeyState::Pressed
