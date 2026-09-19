@@ -595,11 +595,17 @@ async fn x11_write(mime: &str, data: &str) -> Result<(), InputError> {
     let Some((tool, bin)) = clip::X11Tool::detect() else {
         return Err(no_clipboard_path());
     };
+    // stdout AND stderr go to /dev/null on purpose. Once xclip has read the
+    // data it forks a background process to serve the selection until another
+    // client takes it over, and that child inherits any pipe we keep. Capturing
+    // stderr would leave the pipe open in the daemon, so waiting for it to close
+    // never returns. The parent exits as soon as it has forked, so we wait only
+    // on the parent, and bound even that in case a build does not fork.
     let mut child = tokio::process::Command::new(&bin)
         .args(tool.write_args(mime))
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
         .spawn()
         .map_err(|e| InputError::Failed(format!("{bin}: {e}")))?;
     if let Some(mut stdin) = child.stdin.take() {
@@ -607,20 +613,17 @@ async fn x11_write(mime: &str, data: &str) -> Result<(), InputError> {
             .write_all(data.as_bytes())
             .await
             .map_err(|e| InputError::Failed(format!("{bin} stdin: {e}")))?;
-        // xclip holds the selection until its stdin closes.
+        // Closing stdin signals end-of-input; xclip then grabs the selection.
         drop(stdin);
     }
-    let out = child
-        .wait_with_output()
-        .await
-        .map_err(|e| InputError::Failed(format!("{bin}: {e}")))?;
-    if out.status.success() {
-        Ok(())
-    } else {
-        Err(InputError::Failed(format!(
-            "{bin}: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        )))
+    match tokio::time::timeout(std::time::Duration::from_secs(3), child.wait()).await {
+        Ok(Ok(status)) if status.success() => Ok(()),
+        Ok(Ok(status)) => Err(InputError::Failed(format!("{bin} exited with {status}"))),
+        Ok(Err(e)) => Err(InputError::Failed(format!("{bin}: {e}"))),
+        // Some xclip builds serve the selection in the foreground rather than
+        // forking. It has the selection by now, so leave it running and treat
+        // that as success rather than killing it and dropping the clipboard.
+        Err(_elapsed) => Ok(()),
     }
 }
 
