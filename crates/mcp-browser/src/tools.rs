@@ -2,7 +2,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use mcp_types::{
-    CallCtx, Category, Envelope, ErrorCode, ImageContent, Tier, ToolDescriptor, ToolModule,
+    CallCtx, Category, Envelope, ErrorCode, ImageContent, Tier, ToolDescriptor, ToolError,
+    ToolModule,
 };
 use serde_json::{json, Value};
 
@@ -303,6 +304,36 @@ impl BrowserModule {
             self.backend.capture(target, action, args).await,
         )
     }
+
+    async fn assert(&self, args: &Value) -> Envelope {
+        let target = match require(args, "target_id", "browser_assert") {
+            Ok(t) => t,
+            Err(e) => return e,
+        };
+        match self.backend.assert(target, args).await {
+            Ok(v) => {
+                let passed = v.get("passed").and_then(Value::as_bool) == Some(true);
+                if passed {
+                    Envelope::ok("browser_assert", v)
+                } else {
+                    // A failed assertion is an error the harness must see, but
+                    // the per-check detail rides along in `data`.
+                    Envelope {
+                        ok: false,
+                        tool: "browser_assert".into(),
+                        data: Some(v),
+                        error: Some(ToolError {
+                            code: ErrorCode::ActionFailed,
+                            message: "assertion failed".into(),
+                            suggestion: Some("see data.checks for which clause failed".into()),
+                        }),
+                        image: None,
+                    }
+                }
+            }
+            Err(e) => browser_err("browser_assert", e),
+        }
+    }
 }
 
 #[async_trait]
@@ -532,6 +563,32 @@ impl ToolModule for BrowserModule {
                     json!(["target_id"]),
                 ),
             ).untrusted_output(),
+            ToolDescriptor::new(
+                "browser_assert",
+                Category::Browser,
+                Tier::Read,
+                "Settle (optional) then check the page in one call; returns {passed, checks} and \
+                 errors when it fails. Clauses: text/not_text (in page text), url (substring), \
+                 selector (+min_count), no_console_errors and no_failed_requests (need \
+                 browser_capture started). Settle first with wait_selector or \
+                 wait_network_idle.",
+                obj(
+                    json!({
+                        "target_id": { "type": "string" },
+                        "text": { "type": "string", "description": "assert this text is present" },
+                        "not_text": { "type": "string", "description": "assert this text is absent" },
+                        "url": { "type": "string", "description": "assert the URL contains this" },
+                        "selector": { "type": "string", "description": "assert this css selector matches" },
+                        "min_count": { "type": "integer", "description": "selector must match at least this many (default 1)" },
+                        "no_console_errors": { "type": "boolean", "description": "assert no captured console errors (needs browser_capture)" },
+                        "no_failed_requests": { "type": "boolean", "description": "assert no captured non-2xx/failed requests (needs browser_capture)" },
+                        "wait_selector": { "type": "string", "description": "settle: wait for this selector first" },
+                        "wait_network_idle": { "type": "boolean", "description": "settle: wait for network idle first" },
+                        "timeout_ms": { "type": "integer", "description": "settle timeout (default 8000)" }
+                    }),
+                    json!(["target_id"]),
+                ),
+            ).untrusted_output(),
         ]
     }
 
@@ -570,6 +627,7 @@ impl ToolModule for BrowserModule {
             "browser_network" => self.network(&args).await,
             "browser_cookies" => self.cookies(&args).await,
             "browser_capture" => self.capture(&args).await,
+            "browser_assert" => self.assert(&args).await,
             other => Envelope::fail(other, ErrorCode::InvalidArgs, "unknown tool"),
         }
     }
@@ -639,6 +697,11 @@ mod act_tests {
             self.captures.lock().unwrap().push(action.to_string());
             Ok(json!({ "ok": true, "action": action }))
         }
+        async fn assert(&self, _t: &str, spec: &Value) -> Result<Value, BrowserError> {
+            // Echo a passed/failed result driven by a test-only `_pass` flag.
+            let passed = spec.get("_pass").and_then(Value::as_bool).unwrap_or(true);
+            Ok(json!({ "passed": passed, "checks": [{"name":"x","ok":passed}] }))
+        }
     }
 
     fn module() -> (BrowserModule, Arc<Recorder>) {
@@ -695,5 +758,19 @@ mod act_tests {
         assert!(!e.ok);
         assert_eq!(e.error.unwrap().code, ErrorCode::InvalidArgs);
         assert!(rec.captures.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_passing_assert_is_ok_and_a_failing_one_is_an_error_carrying_the_checks() {
+        let (m, _) = module();
+        let ok = m.assert(&json!({"target_id":"T","_pass":true})).await;
+        assert!(ok.ok);
+        assert_eq!(ok.data.unwrap()["passed"], true);
+
+        let bad = m.assert(&json!({"target_id":"T","_pass":false})).await;
+        assert!(!bad.ok, "a failed assertion must surface as an error");
+        assert_eq!(bad.error.as_ref().unwrap().code, ErrorCode::ActionFailed);
+        // The per-check detail still rides along for the harness.
+        assert_eq!(bad.data.unwrap()["passed"], false);
     }
 }

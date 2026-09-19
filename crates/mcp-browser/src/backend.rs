@@ -137,6 +137,9 @@ pub trait BrowserBackend: Send + Sync {
         action: &str,
         opts: &Value,
     ) -> Result<Value, BrowserError>;
+    /// Settle (optional) then evaluate assertions in one call, returning
+    /// `{passed, checks}`. See the tool schema for the clauses.
+    async fn assert(&self, target: &str, spec: &Value) -> Result<Value, BrowserError>;
     /// Release anything this backend started. Default: nothing was started.
     fn shutdown(&self) {}
 }
@@ -1080,6 +1083,69 @@ impl BrowserBackend for CdpBackend {
                 "unknown capture action '{other}' (use start|read|clear)"
             ))),
         }
+    }
+
+    async fn assert(&self, target: &str, spec: &Value) -> Result<Value, BrowserError> {
+        let timeout = spec
+            .get("timeout_ms")
+            .and_then(Value::as_u64)
+            .unwrap_or(8000);
+        let mut settle: Option<Value> = None;
+        // Optional settle before checking, so an assertion right after an
+        // action does not read the pre-action DOM.
+        if let Some(sel) = spec.get("wait_selector").and_then(Value::as_str) {
+            if let Err(e) = self.wait(target, "selector", Some(sel), timeout).await {
+                settle = Some(json!({ "name": "wait_selector", "ok": false, "detail": berr_msg(&e) }));
+            }
+        } else if spec.get("wait_network_idle").and_then(Value::as_bool) == Some(true) {
+            if let Err(e) = self.wait(target, "network_idle", None, timeout).await {
+                settle = Some(json!({ "name": "wait_network_idle", "ok": false, "detail": berr_msg(&e) }));
+            }
+        }
+        let mut c = self.conn(target).await?;
+        let spec_lit = serde_json::to_string(spec).unwrap_or_else(|_| "{}".into());
+        let expr = format!(
+            r#"(function(){{
+  var spec={spec_lit}, checks=[], A=window.__agentctl;
+  var body=document.body?document.body.innerText:'';
+  if(spec.text!=null) checks.push({{name:'text',ok:body.indexOf(spec.text)>=0,detail:spec.text}});
+  if(spec.not_text!=null) checks.push({{name:'not_text',ok:body.indexOf(spec.not_text)<0,detail:spec.not_text}});
+  if(spec.url!=null) checks.push({{name:'url',ok:location.href.indexOf(spec.url)>=0,detail:location.href}});
+  if(spec.selector!=null){{var n=document.querySelectorAll(spec.selector).length;var min=spec.min_count||1;checks.push({{name:'selector',ok:n>=min,detail:spec.selector+' -> '+n+' (min '+min+')'}});}}
+  if(spec.no_console_errors){{ if(!A){{checks.push({{name:'no_console_errors',ok:false,detail:'capture not armed; call browser_capture start first'}});}} else {{ var errs=A.con.filter(function(x){{return x.level==='error'||x.level==='uncaught'||x.level==='unhandledrejection';}}); checks.push({{name:'no_console_errors',ok:errs.length===0,detail:errs.length+' error(s)'}}); }} }}
+  if(spec.no_failed_requests){{ if(!A){{checks.push({{name:'no_failed_requests',ok:false,detail:'capture not armed; call browser_capture start first'}});}} else {{ var bad=A.net.filter(function(x){{return x.ok===false;}}); checks.push({{name:'no_failed_requests',ok:bad.length===0,detail:bad.length+' failed'}}); }} }}
+  return {{checks:checks}};
+}})()"#
+        );
+        let result = Self::eval_value(&mut c, &expr).await?;
+        let mut checks: Vec<Value> = result
+            .get("checks")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if let Some(s) = settle {
+            checks.insert(0, s);
+        }
+        let passed = checks
+            .iter()
+            .all(|c| c.get("ok").and_then(Value::as_bool) == Some(true));
+        if checks.is_empty() {
+            return Err(BrowserError::Failed(
+                "no assertions given (use text/not_text/url/selector/no_console_errors/no_failed_requests)".into(),
+            ));
+        }
+        Ok(json!({ "passed": passed, "checks": checks }))
+    }
+}
+
+/// The message inside a [`BrowserError`], for embedding in an assertion check.
+fn berr_msg(e: &BrowserError) -> String {
+    match e {
+        BrowserError::PermissionDenied(m)
+        | BrowserError::NotFound(m)
+        | BrowserError::Unsupported(m)
+        | BrowserError::Timeout(m)
+        | BrowserError::Failed(m) => m.clone(),
     }
 }
 

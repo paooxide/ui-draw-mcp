@@ -8,7 +8,7 @@ Tiers gate what an agent may call: `read` and `standard` tools are available ins
 enabled category, while a `dangerous` tool additionally has to be named in
 `policy.enable`. Enabling a category never enables its dangerous tools.
 
-**108 tools across 12 categories.**
+**109 tools across 12 categories.**
 
 | Tool | Category | Tier | Summary |
 |---|---|---|---|
@@ -49,6 +49,7 @@ enabled category, while a `dangerous` tool additionally has to be named in
 | [`speak`](#speak) | desktop | standard | Speak text through the speakers. |
 | [`system_settings`](#system-settings) | desktop | standard | Read or change a desktop setting. |
 | [`browser_act`](#browser-act) | browser | standard | Act on a DOM node: click, type, select, hover, focus, scroll_into_view, submit. |
+| [`browser_assert`](#browser-assert) | browser | read | Settle (optional) then check the page in one call; returns {passed, checks} and errors when it fails. |
 | [`browser_capture`](#browser-capture) | browser | dangerous | Regression-test capture. |
 | [`browser_connect`](#browser-connect) | browser | standard | Attach to a Chromium browser started with --remote-debugging-port, or launch a dedicated instance. |
 | [`browser_cookies`](#browser-cookies) | browser | dangerous | Cookie access: get (values redacted), set, or clear. |
@@ -627,6 +628,26 @@ Act on a DOM node: click, type, select, hover, focus, scroll_into_view, submit. 
 | `ref` | string |  | a ref from browser_query/snapshot |
 | `target_id` | string | yes |  |
 | `value` | string |  |  |
+
+### browser-assert
+
+`browser_assert` · read tier
+
+Settle (optional) then check the page in one call; returns {passed, checks} and errors when it fails. Clauses: text/not_text (in page text), url (substring), selector (+min_count), no_console_errors and no_failed_requests (need browser_capture started). Settle first with wait_selector or wait_network_idle.
+
+| Argument | Type | Required | Description |
+|---|---|---|---|
+| `min_count` | integer |  | selector must match at least this many (default 1) |
+| `no_console_errors` | boolean |  | assert no captured console errors (needs browser_capture) |
+| `no_failed_requests` | boolean |  | assert no captured non-2xx/failed requests (needs browser_capture) |
+| `not_text` | string |  | assert this text is absent |
+| `selector` | string |  | assert this css selector matches |
+| `target_id` | string | yes |  |
+| `text` | string |  | assert this text is present |
+| `timeout_ms` | integer |  | settle timeout (default 8000) |
+| `url` | string |  | assert the URL contains this |
+| `wait_network_idle` | boolean |  | settle: wait for network idle first |
+| `wait_selector` | string |  | settle: wait for this selector first |
 
 ### browser-capture
 
