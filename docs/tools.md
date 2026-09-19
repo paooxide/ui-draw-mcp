@@ -8,7 +8,7 @@ Tiers gate what an agent may call: `read` and `standard` tools are available ins
 enabled category, while a `dangerous` tool additionally has to be named in
 `policy.enable`. Enabling a category never enables its dangerous tools.
 
-**107 tools across 12 categories.**
+**108 tools across 12 categories.**
 
 | Tool | Category | Tier | Summary |
 |---|---|---|---|
@@ -49,6 +49,7 @@ enabled category, while a `dangerous` tool additionally has to be named in
 | [`speak`](#speak) | desktop | standard | Speak text through the speakers. |
 | [`system_settings`](#system-settings) | desktop | standard | Read or change a desktop setting. |
 | [`browser_act`](#browser-act) | browser | standard | Act on a DOM node: click, type, select, hover, focus, scroll_into_view, submit. |
+| [`browser_capture`](#browser-capture) | browser | dangerous | Regression-test capture. |
 | [`browser_connect`](#browser-connect) | browser | standard | Attach to a Chromium browser started with --remote-debugging-port, or launch a dedicated instance. |
 | [`browser_cookies`](#browser-cookies) | browser | dangerous | Cookie access: get (values redacted), set, or clear. |
 | [`browser_dialog`](#browser-dialog) | browser | standard | Inspect and control how the page's JavaScript dialogs (alert/confirm/prompt/beforeunload) are answered. |
@@ -626,6 +627,19 @@ Act on a DOM node: click, type, select, hover, focus, scroll_into_view, submit. 
 | `ref` | string |  | a ref from browser_query/snapshot |
 | `target_id` | string | yes |  |
 | `value` | string |  |  |
+
+### browser-capture
+
+`browser_capture` · dangerous tier
+
+Regression-test capture. 'start' installs a page hook (persists across navigations) that records fetch/XHR calls with request+response bodies and console errors/uncaught exceptions. 'read' returns them ('only_errors' keeps failed requests; 'filter' is a substring). 'clear' empties the buffers. Bodies can contain secrets, so this is off unless enabled.
+
+| Argument | Type | Required | Description |
+|---|---|---|---|
+| `action` | one of: start, read, clear |  |  |
+| `filter` | string |  | read: substring filter over rows |
+| `only_errors` | boolean |  | read: keep only non-2xx / failed requests |
+| `target_id` | string | yes |  |
 
 ### browser-connect
 

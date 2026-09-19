@@ -291,6 +291,18 @@ impl BrowserModule {
                 .await,
         )
     }
+
+    async fn capture(&self, args: &Value) -> Envelope {
+        let target = match require(args, "target_id", "browser_capture") {
+            Ok(t) => t,
+            Err(e) => return e,
+        };
+        let action = str_arg(args, "action").unwrap_or("read");
+        result(
+            "browser_capture",
+            self.backend.capture(target, action, args).await,
+        )
+    }
 }
 
 #[async_trait]
@@ -501,6 +513,25 @@ impl ToolModule for BrowserModule {
                     json!(["target_id", "action"]),
                 ),
             ),
+            ToolDescriptor::new(
+                "browser_capture",
+                Category::Browser,
+                Tier::Dangerous,
+                "Regression-test capture. 'start' installs a page hook (persists across \
+                 navigations) that records fetch/XHR calls with request+response bodies and \
+                 console errors/uncaught exceptions. 'read' returns them ('only_errors' keeps \
+                 failed requests; 'filter' is a substring). 'clear' empties the buffers. Bodies \
+                 can contain secrets, so this is off unless enabled.",
+                obj(
+                    json!({
+                        "target_id": { "type": "string" },
+                        "action": { "type": "string", "enum": ["start", "read", "clear"] },
+                        "only_errors": { "type": "boolean", "description": "read: keep only non-2xx / failed requests" },
+                        "filter": { "type": "string", "description": "read: substring filter over rows" }
+                    }),
+                    json!(["target_id"]),
+                ),
+            ).untrusted_output(),
         ]
     }
 
@@ -538,6 +569,7 @@ impl ToolModule for BrowserModule {
             "browser_dialog" => self.dialog(&args).await,
             "browser_network" => self.network(&args).await,
             "browser_cookies" => self.cookies(&args).await,
+            "browser_capture" => self.capture(&args).await,
             other => Envelope::fail(other, ErrorCode::InvalidArgs, "unknown tool"),
         }
     }
@@ -554,6 +586,7 @@ mod act_tests {
     #[derive(Default)]
     struct Recorder {
         acts: Mutex<Vec<String>>,
+        captures: Mutex<Vec<String>>,
     }
 
     #[async_trait]
@@ -602,6 +635,10 @@ mod act_tests {
         async fn cookies(&self, _t: &str, _a: &str, _c: Option<Value>) -> Result<Value, BrowserError> {
             Err(BrowserError::Failed("n/a".into()))
         }
+        async fn capture(&self, _t: &str, action: &str, _o: &Value) -> Result<Value, BrowserError> {
+            self.captures.lock().unwrap().push(action.to_string());
+            Ok(json!({ "ok": true, "action": action }))
+        }
     }
 
     fn module() -> (BrowserModule, Arc<Recorder>) {
@@ -641,5 +678,22 @@ mod act_tests {
         assert!(!e.ok);
         assert_eq!(e.error.unwrap().code, ErrorCode::InvalidArgs);
         assert!(rec.acts.lock().unwrap().is_empty(), "backend must not be called");
+    }
+
+    #[tokio::test]
+    async fn capture_routes_the_action_and_defaults_to_read() {
+        let (m, rec) = module();
+        assert!(m.capture(&json!({"target_id":"T","action":"start"})).await.ok);
+        assert!(m.capture(&json!({"target_id":"T"})).await.ok); // default
+        assert_eq!(*rec.captures.lock().unwrap(), vec!["start", "read"]);
+    }
+
+    #[tokio::test]
+    async fn capture_without_a_target_is_an_invalid_argument() {
+        let (m, rec) = module();
+        let e = m.capture(&json!({"action":"read"})).await;
+        assert!(!e.ok);
+        assert_eq!(e.error.unwrap().code, ErrorCode::InvalidArgs);
+        assert!(rec.captures.lock().unwrap().is_empty());
     }
 }

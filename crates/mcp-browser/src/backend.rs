@@ -128,6 +128,15 @@ pub trait BrowserBackend: Send + Sync {
         action: &str,
         cookie: Option<Value>,
     ) -> Result<Value, BrowserError>;
+    /// Capture buffer for regression testing: `start` installs a page hook
+    /// that records fetch/XHR (with bodies) and console errors/uncaught
+    /// exceptions; `read` returns them; `clear` empties them.
+    async fn capture(
+        &self,
+        target: &str,
+        action: &str,
+        opts: &Value,
+    ) -> Result<Value, BrowserError>;
     /// Release anything this backend started. Default: nothing was started.
     fn shutdown(&self) {}
 }
@@ -323,6 +332,42 @@ function __find(by,q){
   for(var j=0;j<w.length;j++){ if((w[j].textContent||'').trim()===q) return w[j]; }
   return null;
 }
+"#;
+
+/// Page hook that records fetch/XHR (method, url, status, request+response
+/// bodies, bounded) and console errors / uncaught exceptions into ring buffers
+/// on `window.__agentctl`. Installed once per document; idempotent. Bodies can
+/// contain secrets, which is why the tool that installs it is Dangerous-tier
+/// and off unless the operator opts in.
+const JS_CAPTURE_HOOK: &str = r#"
+(function(){
+  if(window.__agentctl_installed) return "already";
+  window.__agentctl_installed=true;
+  var CAP=200, BODY=4000, NET=[], CON=[];
+  window.__agentctl={net:NET,con:CON};
+  function pn(o){ if(NET.length>=CAP)NET.shift(); NET.push(o); }
+  function pc(o){ if(CON.length>=CAP)CON.shift(); CON.push(o); }
+  var of=window.fetch;
+  if(of) window.fetch=function(input,init){
+    var url=(input&&input.url)||input, method=(init&&init.method)||(input&&input.method)||'GET', rb=init&&init.body;
+    return of.apply(this,arguments).then(function(r){
+      var rec={t:'fetch',method:method,url:''+url,status:r.status,ok:r.ok,ts:Date.now()};
+      if(typeof rb==='string') rec.reqBody=rb.slice(0,BODY);
+      var rc=null; try{rc=r.clone();}catch(e){}
+      if(rc){ rc.text().then(function(tx){ rec.respBody=(tx||'').slice(0,BODY); pn(rec); },function(){pn(rec);}); } else pn(rec);
+      return r;
+    },function(err){ pn({t:'fetch',method:method,url:''+url,status:0,ok:false,error:''+err,ts:Date.now()}); throw err; });
+  };
+  var OX=window.XMLHttpRequest;
+  if(OX){ var NX=function(){ var x=new OX(),_o=x.open,_s=x.send,u,m,rb;
+    x.open=function(mm,uu){m=mm;u=uu;return _o.apply(x,arguments);};
+    x.send=function(b){ rb=b; x.addEventListener('loadend',function(){ var rec={t:'xhr',method:m,url:''+u,status:x.status,ok:x.status>=200&&x.status<300,ts:Date.now()}; if(typeof rb==='string')rec.reqBody=rb.slice(0,BODY); try{rec.respBody=(x.responseText||'').slice(0,BODY);}catch(e){} pn(rec); }); return _s.apply(x,arguments); };
+    return x; }; NX.prototype=OX.prototype; window.XMLHttpRequest=NX; }
+  ['error','warn'].forEach(function(lvl){ var o=console[lvl]; console[lvl]=function(){ try{pc({level:lvl,text:[].slice.call(arguments).map(String).join(' ').slice(0,BODY),ts:Date.now()});}catch(e){} return o.apply(console,arguments); }; });
+  window.addEventListener('error',function(e){ pc({level:'uncaught',text:((e.message||'')+' @'+(e.filename||'')+':'+(e.lineno||'')).slice(0,BODY),ts:Date.now()}); });
+  window.addEventListener('unhandledrejection',function(e){ pc({level:'unhandledrejection',text:String(e&&e.reason).slice(0,BODY),ts:Date.now()}); });
+  return "installed";
+})()
 "#;
 
 #[async_trait]
@@ -953,6 +998,86 @@ impl BrowserBackend for CdpBackend {
             }
             other => Err(BrowserError::Failed(format!(
                 "unknown cookies action '{other}'"
+            ))),
+        }
+    }
+
+    async fn capture(
+        &self,
+        target: &str,
+        action: &str,
+        opts: &Value,
+    ) -> Result<Value, BrowserError> {
+        let mut c = self.conn(target).await?;
+        match action {
+            "start" => {
+                // Persist across navigations, and cover the page already open.
+                c.call("Page.enable", json!({})).await.ok();
+                c.call(
+                    "Page.addScriptToEvaluateOnNewDocument",
+                    json!({ "source": JS_CAPTURE_HOOK }),
+                )
+                .await
+                .ok();
+                let now = Self::eval_value(&mut c, JS_CAPTURE_HOOK).await?;
+                Ok(json!({ "ok": true, "current_page": now }))
+            }
+            "clear" => {
+                Self::eval_value(
+                    &mut c,
+                    "(function(){if(window.__agentctl){window.__agentctl.net.length=0;window.__agentctl.con.length=0;}return true;})()",
+                )
+                .await?;
+                Ok(json!({ "ok": true, "cleared": true }))
+            }
+            "read" => {
+                let only_errors = opts.get("only_errors").and_then(Value::as_bool).unwrap_or(false);
+                let filter = opts.get("filter").and_then(Value::as_str).unwrap_or("");
+                let armed = Self::eval_value(&mut c, "!!window.__agentctl_installed").await?;
+                if armed.as_bool() != Some(true) {
+                    return Err(BrowserError::Failed(
+                        "capture is not armed on this page; call browser_capture action='start' first".into(),
+                    ));
+                }
+                let buf = Self::eval_value(
+                    &mut c,
+                    "JSON.stringify(window.__agentctl||{net:[],con:[]})",
+                )
+                .await?;
+                // eval returns the JSON string; parse it back to structured data.
+                let parsed: Value = buf
+                    .as_str()
+                    .and_then(|s| serde_json::from_str(s).ok())
+                    .unwrap_or(buf);
+                let empty = vec![];
+                let net = parsed.get("net").and_then(Value::as_array).unwrap_or(&empty);
+                let con = parsed.get("con").and_then(Value::as_array).unwrap_or(&empty);
+                let keep = |row: &Value, want_bad: bool| -> bool {
+                    if !filter.is_empty()
+                        && !serde_json::to_string(row).unwrap_or_default().contains(filter)
+                    {
+                        return false;
+                    }
+                    if want_bad {
+                        return row.get("ok").and_then(Value::as_bool) == Some(false);
+                    }
+                    true
+                };
+                let net: Vec<Value> = net.iter().filter(|r| keep(r, only_errors)).cloned().collect();
+                let con: Vec<Value> = con
+                    .iter()
+                    .filter(|r| filter.is_empty() || serde_json::to_string(r).unwrap_or_default().contains(filter))
+                    .cloned()
+                    .collect();
+                Ok(json!({
+                    "network": net,
+                    "console": con,
+                    "network_count": net.len(),
+                    "console_count": con.len(),
+                }))
+            }
+            other => Err(BrowserError::Failed(format!(
+                "unknown capture action '{other}' (use start|read|clear)"
             ))),
         }
     }
