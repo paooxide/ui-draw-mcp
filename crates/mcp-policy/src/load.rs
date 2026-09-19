@@ -183,6 +183,24 @@ impl PolicyConfig {
                 ("judge.timeout_ms", Val::Int(i)) if *i > 0 => cfg.judge.timeout_ms = *i as u64,
                 ("judge.threshold", Val::Float(f)) => cfg.judge.threshold = *f,
                 ("judge.threshold", Val::Int(i)) => cfg.judge.threshold = *i as f64,
+                ("judge.destructive_threshold", Val::Float(f)) => {
+                    cfg.judge.destructive_threshold = Some(*f)
+                }
+                ("judge.destructive_threshold", Val::Int(i)) => {
+                    cfg.judge.destructive_threshold = Some(*i as f64)
+                }
+                ("judge.injection_threshold", Val::Float(f)) => {
+                    cfg.judge.injection_threshold = Some(*f)
+                }
+                ("judge.injection_threshold", Val::Int(i)) => {
+                    cfg.judge.injection_threshold = Some(*i as f64)
+                }
+                ("judge.match_threshold", Val::Float(f)) => {
+                    cfg.judge.match_threshold = Some(*f)
+                }
+                ("judge.match_threshold", Val::Int(i)) => {
+                    cfg.judge.match_threshold = Some(*i as f64)
+                }
                 ("judge.max_state_bytes", Val::Int(i)) if *i > 0 => {
                     cfg.judge.max_state_bytes = *i as usize
                 }
@@ -192,7 +210,12 @@ impl PolicyConfig {
                 ("judge.timeout_ms" | "judge.max_state_bytes", _) => {
                     return Err(format!("{key} must be a positive integer"))
                 }
-                ("judge.threshold", _) => return Err(format!("{key} must be a number")),
+                ("judge.threshold"
+                | "judge.destructive_threshold"
+                | "judge.injection_threshold"
+                | "judge.match_threshold", _) => {
+                    return Err(format!("{key} must be a number"))
+                }
                 ("fs.roots", Val::List(v)) => cfg.fs_roots = v.iter().map(PathBuf::from).collect(),
                 ("terminal.allowed_commands", Val::List(v)) => cfg.allowed_commands = v.clone(),
                 ("network.allowed_hosts", Val::List(v)) => cfg.allowed_hosts = v.clone(),
@@ -487,6 +510,43 @@ mod tests {
             "[vision]\npixels_per_token = 0\n",
             "[vision]\ndefault_detail = \"enormous\"\n",
             "[vision]\ndefault_detail = 3\n",
+        ] {
+            assert!(
+                PolicyConfig::from_toml_str(bad).is_err(),
+                "should have rejected: {bad:?}"
+            );
+        }
+    }
+
+    /// The per-use judge thresholds parse (float or integer) and stay unset
+    /// when the operator omits them, so an existing config is unchanged.
+    #[test]
+    fn per_use_judge_thresholds_parse_and_default_to_unset() {
+        let cfg = PolicyConfig::from_toml_str(
+            r#"
+            [judge]
+            threshold = 0.7
+            destructive_threshold = 0.5
+            injection_threshold = 1
+            "#,
+        )
+        .expect("parses");
+        assert_eq!(cfg.judge.destructive_threshold, Some(0.5));
+        assert_eq!(cfg.judge.injection_threshold, Some(1.0));
+        // Left out, so it inherits the general threshold at use.
+        assert_eq!(cfg.judge.match_threshold, None);
+        assert_eq!(cfg.judge.match_threshold(), 0.7);
+    }
+
+    /// A per-use threshold outside 0..=1 is refused at load, just like the
+    /// general one, rather than silently disabling the comparison.
+    #[test]
+    fn an_out_of_range_per_use_judge_threshold_is_rejected() {
+        for bad in [
+            "[judge]\nenabled = \"true\"\nmatch_threshold = 1.5\n",
+            "[judge]\nenabled = \"true\"\ndestructive_threshold = -0.2\n",
+            "[judge]\nenabled = \"true\"\ninjection_threshold = nan\n",
+            "[judge]\nenabled = \"true\"\nmatch_threshold = \"high\"\n",
         ] {
             assert!(
                 PolicyConfig::from_toml_str(bad).is_err(),

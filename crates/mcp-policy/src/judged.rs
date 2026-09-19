@@ -70,7 +70,7 @@ pub async fn judged_destructive(
         )
         .await
     {
-        Ok(p) if p >= j.threshold() => Destructive::Judged(p),
+        Ok(p) if p >= j.destructive_threshold() => Destructive::Judged(p),
         Ok(_) => Destructive::Clean,
         Err(e) => {
             log_skip(&e);
@@ -122,7 +122,7 @@ pub async fn second_opinion_on_content(data: &mut Value, judge: Option<&Arc<Judg
     match asked {
         Ok(p) => {
             obj.insert("judge_injection_probability".into(), json!(round3(p)));
-            if p >= j.threshold() && !already {
+            if p >= j.injection_threshold() && !already {
                 obj.insert("suspicious_instructions".into(), Value::Bool(true));
                 obj.insert("suspicious_matches".into(), json!(["judged"]));
             }

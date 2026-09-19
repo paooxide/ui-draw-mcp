@@ -52,8 +52,22 @@ pub struct JudgeConfig {
     pub base_url: String,
     pub model: String,
     pub timeout_ms: u64,
-    /// A Noul at or above this counts as "yes" wherever a yes tightens.
+    /// A Noul at or above this counts as "yes" wherever a yes tightens. It is
+    /// the fallback for every use below that has no bar of its own.
     pub threshold: f64,
+    /// The bar for the destructive-command second opinion. A yes here escalates
+    /// a command to consent or a denial, so a lower value is *more* cautious.
+    /// `None` falls back to [`threshold`].
+    pub destructive_threshold: Option<f64>,
+    /// The bar for judging that an untrusted result is addressed to a model
+    /// (prompt injection). A yes flags the content. `None` falls back to
+    /// [`threshold`].
+    pub injection_threshold: Option<f64>,
+    /// The bar a ranking's `any_fits` must clear for a semantic pick (an
+    /// element, a dialog button, a recalled recipe) to count as a real match
+    /// rather than a forced choice among poor options. `None` falls back to
+    /// [`threshold`].
+    pub match_threshold: Option<f64>,
     pub max_state_bytes: usize,
 }
 
@@ -65,6 +79,9 @@ impl Default for JudgeConfig {
             model: DEFAULT_MODEL.into(),
             timeout_ms: 4_000,
             threshold: 0.7,
+            destructive_threshold: None,
+            injection_threshold: None,
+            match_threshold: None,
             max_state_bytes: DEFAULT_MAX_STATE_BYTES,
         }
     }
@@ -82,12 +99,10 @@ impl JudgeConfig {
         if self.model.trim().is_empty() {
             return Err("judge.model must not be empty".into());
         }
-        if !(0.0..=1.0).contains(&self.threshold) || self.threshold.is_nan() {
-            return Err(format!(
-                "judge.threshold must be within 0 and 1 (got {})",
-                self.threshold
-            ));
-        }
+        check_threshold("judge.threshold", Some(self.threshold))?;
+        check_threshold("judge.destructive_threshold", self.destructive_threshold)?;
+        check_threshold("judge.injection_threshold", self.injection_threshold)?;
+        check_threshold("judge.match_threshold", self.match_threshold)?;
         if self.timeout_ms == 0 {
             return Err("judge.timeout_ms must be positive".into());
         }
@@ -96,6 +111,35 @@ impl JudgeConfig {
         }
         Ok(())
     }
+
+    /// The bar for the destructive second opinion, falling back to the general
+    /// threshold when it has no override.
+    pub fn destructive_threshold(&self) -> f64 {
+        self.destructive_threshold.unwrap_or(self.threshold)
+    }
+
+    /// The bar for the injection second opinion, falling back to the general
+    /// threshold.
+    pub fn injection_threshold(&self) -> f64 {
+        self.injection_threshold.unwrap_or(self.threshold)
+    }
+
+    /// The bar a ranking's `any_fits` must clear, falling back to the general
+    /// threshold.
+    pub fn match_threshold(&self) -> f64 {
+        self.match_threshold.unwrap_or(self.threshold)
+    }
+}
+
+/// A threshold, when set, must be a real number within 0 and 1: outside that
+/// it can only silently disable or always-fire the comparison it controls.
+fn check_threshold(name: &str, value: Option<f64>) -> Result<(), String> {
+    if let Some(t) = value {
+        if !(0.0..=1.0).contains(&t) || t.is_nan() {
+            return Err(format!("{name} must be within 0 and 1 (got {t})"));
+        }
+    }
+    Ok(())
 }
 
 /// One question. Ids are for code; the meaning lives in the instructions.
@@ -518,6 +562,21 @@ impl Judge {
 
     pub fn threshold(&self) -> f64 {
         self.cfg.threshold
+    }
+
+    /// The bar for the destructive second opinion (see [`JudgeConfig`]).
+    pub fn destructive_threshold(&self) -> f64 {
+        self.cfg.destructive_threshold()
+    }
+
+    /// The bar for the injection second opinion.
+    pub fn injection_threshold(&self) -> f64 {
+        self.cfg.injection_threshold()
+    }
+
+    /// The bar a ranking's `any_fits` must clear to count as a real match.
+    pub fn match_threshold(&self) -> f64 {
+        self.cfg.match_threshold()
     }
 
     /// Cut a text down to the state budget, keeping the head, and say so.
@@ -1072,5 +1131,93 @@ mod tests {
         assert_eq!(j.counters.asked.load(Ordering::Relaxed), 40);
         assert_eq!(j.counters.answered.load(Ordering::Relaxed), 30);
         assert_eq!(j.counters.failed.load(Ordering::Relaxed), 10);
+    }
+
+    // ---- per-use thresholds --------------------------------------------
+
+    #[test]
+    fn an_unset_per_use_threshold_falls_back_to_the_general_one() {
+        let cfg = JudgeConfig {
+            threshold: 0.62,
+            ..JudgeConfig::default()
+        };
+        assert_eq!(cfg.destructive_threshold(), 0.62);
+        assert_eq!(cfg.injection_threshold(), 0.62);
+        assert_eq!(cfg.match_threshold(), 0.62);
+    }
+
+    #[test]
+    fn a_set_per_use_threshold_overrides_the_general_one() {
+        let cfg = JudgeConfig {
+            threshold: 0.7,
+            destructive_threshold: Some(0.4),
+            match_threshold: Some(0.55),
+            ..JudgeConfig::default()
+        };
+        assert_eq!(cfg.destructive_threshold(), 0.4);
+        // injection was left unset, so it still inherits the general bar.
+        assert_eq!(cfg.injection_threshold(), 0.7);
+        assert_eq!(cfg.match_threshold(), 0.55);
+    }
+
+    #[test]
+    fn the_resolvers_agree_between_config_and_judge() {
+        let cfg = JudgeConfig {
+            threshold: 0.7,
+            injection_threshold: Some(0.9),
+            ..JudgeConfig::default()
+        };
+        let j = Judge::with_transport(cfg, Some("k".into()), Box::new(NoTransport));
+        assert_eq!(j.injection_threshold(), 0.9);
+        assert_eq!(j.destructive_threshold(), 0.7);
+        assert_eq!(j.match_threshold(), 0.7);
+    }
+
+    #[test]
+    fn a_valid_config_with_overrides_passes_and_boundaries_hold() {
+        let cfg = JudgeConfig {
+            destructive_threshold: Some(0.0),
+            injection_threshold: Some(1.0),
+            match_threshold: Some(0.5),
+            ..JudgeConfig::default()
+        };
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn an_out_of_range_or_nan_override_is_rejected_at_validate() {
+        for bad in [-0.1_f64, 1.1, f64::NAN, f64::INFINITY] {
+            let cfg = JudgeConfig {
+                destructive_threshold: Some(bad),
+                ..JudgeConfig::default()
+            };
+            assert!(
+                cfg.validate().is_err(),
+                "destructive_threshold {bad} must be rejected"
+            );
+            let cfg = JudgeConfig {
+                match_threshold: Some(bad),
+                ..JudgeConfig::default()
+            };
+            assert!(
+                cfg.validate().is_err(),
+                "match_threshold {bad} must be rejected"
+            );
+        }
+    }
+
+    /// A transport that must never be called: these tests only read config.
+    struct NoTransport;
+    #[async_trait]
+    impl Transport for NoTransport {
+        async fn post(
+            &self,
+            _u: &str,
+            _k: &str,
+            _b: &Value,
+            _t: Duration,
+        ) -> Result<(u16, String), String> {
+            panic!("NoTransport must not be asked to post")
+        }
     }
 }
