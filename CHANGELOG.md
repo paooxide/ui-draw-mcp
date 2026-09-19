@@ -8,6 +8,13 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- **Browser engine built for native regression/UI testing.** `browser_act` can locate by `by`+`query`
+  selector in one call (no separate `browser_query`). `browser_capture` installs a persistent page hook
+  recording fetch/XHR with request/response bodies plus console errors and uncaught exceptions
+  (Dangerous-tier; off unless enabled). `browser_assert` settles then checks text/url/selector and, with
+  capture on, no console errors and no failed requests, returning `{passed, checks}`. `browser_flow`
+  saves and replays a named sequence of steps deterministically, stopping at the first failing step so a
+  green run never needs a model.
 - **More places the judge helps, and per-use thresholds.** `handle_dialogs` takes `intent` and returns a
   `suggestion` naming the button that serves it (advice only; it presses nothing). `memory_find` takes
   `rerank` to reorder recalled recipes by semantic fit to the goal, falling back to success-count order

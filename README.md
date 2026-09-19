@@ -49,7 +49,7 @@ heuristic.
 
 ## What it does
 
-107 tools across 12 categories. The full reference, generated from the server's own descriptors, is
+110 tools across 12 categories. The full reference, generated from the server's own descriptors, is
 [`docs/tools.md`](docs/tools.md).
 
 | Category | Tools | Names | Dangerous |
@@ -58,7 +58,7 @@ heuristic.
 | input | 10 | `clipboard_read`, `clipboard_write`, `drag_drop`, `hover`, `keyboard_shortcut`, `keyboard_type`, `mouse_action`, `scroll`, `set_value`, `ui_action` | 0 |
 | window | 11 | `close_app`, `control_window`, `focus_app`, `handle_dialogs`, `launch`, `list_apps`, `list_windows`, `menu_invoke`, `menu_list`, `menu_open`, `wait_for` | 0 |
 | desktop | 8 | `idle_status`, `lock_screen`, `media_control`, `notify_user`, `play_audio`, `power_control`, `speak`, `system_settings` | 1 |
-| browser | 13 | `browser_act`, `browser_connect`, `browser_cookies`, `browser_dialog`, `browser_disconnect`, `browser_eval`, `browser_navigate`, `browser_network`, `browser_query`, `browser_screenshot`, `browser_snapshot`, `browser_tabs`, `browser_wait` | 3 |
+| browser | 16 | `browser_act`, `browser_assert`, `browser_capture`, `browser_connect`, `browser_cookies`, `browser_dialog`, `browser_disconnect`, `browser_eval`, `browser_flow`, `browser_navigate`, `browser_network`, `browser_query`, `browser_screenshot`, `browser_snapshot`, `browser_tabs`, `browser_wait` | 4 |
 | terminal | 14 | `command_info`, `exec`, `man_page`, `process_list`, `process_signal`, `pty_close`, `pty_list`, `pty_read`, `pty_resize`, `pty_signal`, `pty_spawn`, `pty_write`, `scheduled_tasks`, `service_control` | 4 |
 | filesystem | 15 | `fs_archive`, `fs_copy`, `fs_delete`, `fs_list`, `fs_metadata`, `fs_mkdir`, `fs_move`, `fs_patch`, `fs_read`, `fs_search`, `fs_symlink`, `fs_watch`, `fs_write`, `mount_control`, `storage_inspect` | 2 |
 | network | 8 | `bluetooth_pair`, `dns_lookup`, `firewall_rules`, `http_request`, `network_interfaces`, `network_manage`, `packet_diagnostics`, `socket_inspection` | 4 |
@@ -159,6 +159,34 @@ printf '%s\n' \
   '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"ping","arguments":{}}}' \
   | agentctl serve
 ```
+
+---
+
+## Browser testing
+
+The `browser` engine drives a Chromium over the DevTools Protocol, and it is built for an agent to run
+regressions and UI tests natively:
+
+- `browser_act` acts on a `ref` or, in one call, a `by`+`query` selector (no separate `browser_query`).
+- `browser_capture` installs a page hook (persists across navigations) that records fetch/XHR with
+  request and response bodies, plus console errors and uncaught exceptions. Bodies can hold secrets, so
+  it is Dangerous-tier and off unless enabled.
+- `browser_assert` settles then checks text, URL, a selector's count, and (with capture on) no console
+  errors and no failed requests, returning `{passed, checks}` and an error when it fails.
+- `browser_flow` saves a named sequence of steps and replays it deterministically, stopping at the first
+  failing step. A green run never invokes a model; a failure is where an agent takes over.
+
+Point a Claude (or other MCP) session at agentctl as a server so these are native tool calls rather than a
+shell driver. A minimal project wiring:
+
+```json
+{ "mcpServers": { "agentctl": {
+  "command": "/abs/path/target/release/agentctl", "args": ["serve"],
+  "env": { "AGENTCTL_CONFIG": "/abs/path/agentctl.test.toml" } } } }
+```
+
+with a test profile of `access = "bypass"` (every capability on, no prompts) for a machine you own and are
+watching.
 
 ---
 
