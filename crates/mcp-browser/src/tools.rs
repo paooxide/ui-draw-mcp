@@ -149,15 +149,28 @@ impl BrowserModule {
             Ok(t) => t,
             Err(e) => return e,
         };
-        let node_ref = match require(args, "ref", "browser_act") {
-            Ok(r) => r,
-            Err(e) => return e,
+        // Either a ref from a prior snapshot/query, or a selector resolved in
+        // the same call (one round trip instead of query-then-act).
+        let locator = if let Some(r) = str_arg(args, "ref") {
+            crate::backend::Locator::Ref(r)
+        } else if let Some(q) = str_arg(args, "query") {
+            crate::backend::Locator::Selector {
+                by: str_arg(args, "by").unwrap_or("css"),
+                query: q,
+            }
+        } else {
+            return Envelope::fail_with(
+                "browser_act",
+                ErrorCode::InvalidArgs,
+                "need 'ref' (from browser_query/snapshot) or 'query' (with optional 'by')",
+                "pass ref, or query plus by=css|xpath|text",
+            );
         };
         let action = str_arg(args, "action").unwrap_or("click");
         result(
             "browser_act",
             self.backend
-                .act(target, node_ref, action, str_arg(args, "value"))
+                .act(target, locator, action, str_arg(args, "value"))
                 .await,
         )
     }
@@ -377,15 +390,19 @@ impl ToolModule for BrowserModule {
                 "browser_act",
                 Category::Browser,
                 Tier::Standard,
-                "Act on a DOM node ref: click, type, select, hover, focus, scroll_into_view, submit.",
+                "Act on a DOM node: click, type, select, hover, focus, scroll_into_view, submit. \
+                 Target it with 'ref' (from browser_query/snapshot) or, in one call, with \
+                 'query' plus 'by' (css/xpath/text) to resolve and act without a separate query.",
                 obj(
                     json!({
                         "target_id": { "type": "string" },
-                        "ref": { "type": "string" },
+                        "ref": { "type": "string", "description": "a ref from browser_query/snapshot" },
+                        "by": { "type": "string", "enum": ["css", "xpath", "text"], "description": "how to read 'query' (default css); used when no 'ref'" },
+                        "query": { "type": "string", "description": "selector to resolve and act on in one call, instead of 'ref'" },
                         "action": { "type": "string", "enum": ["click", "type", "select", "hover", "focus", "scroll_into_view", "submit"] },
                         "value": { "type": "string" }
                     }),
-                    json!(["target_id", "ref", "action"]),
+                    json!(["target_id", "action"]),
                 ),
             ).untrusted_output(),
             ToolDescriptor::new(
@@ -523,5 +540,106 @@ impl ToolModule for BrowserModule {
             "browser_cookies" => self.cookies(&args).await,
             other => Envelope::fail(other, ErrorCode::InvalidArgs, "unknown tool"),
         }
+    }
+}
+
+#[cfg(test)]
+mod act_tests {
+    use super::*;
+    use crate::backend::{Locator, Shot};
+    use std::sync::Mutex;
+
+    /// Records how `act` was asked to locate the element; everything else is a
+    /// no-op error, since these tests only exercise the tool-layer wiring.
+    #[derive(Default)]
+    struct Recorder {
+        acts: Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl BrowserBackend for Recorder {
+        async fn connect(&self, _p: Option<u16>, _l: Option<Value>) -> Result<Value, BrowserError> {
+            Err(BrowserError::Failed("n/a".into()))
+        }
+        async fn disconnect(&self, _b: u32, _k: bool) -> Result<Value, BrowserError> {
+            Err(BrowserError::Failed("n/a".into()))
+        }
+        async fn tabs(&self, _b: u32, _a: &str, _t: Option<&str>, _u: Option<&str>) -> Result<Value, BrowserError> {
+            Err(BrowserError::Failed("n/a".into()))
+        }
+        async fn navigate(&self, _t: &str, _a: &str, _u: Option<&str>) -> Result<Value, BrowserError> {
+            Err(BrowserError::Failed("n/a".into()))
+        }
+        async fn snapshot(&self, _t: &str, _m: &str, _r: Option<&str>) -> Result<Value, BrowserError> {
+            Err(BrowserError::Failed("n/a".into()))
+        }
+        async fn query(&self, _t: &str, _by: &str, _q: &str, _a: bool) -> Result<Value, BrowserError> {
+            Err(BrowserError::Failed("n/a".into()))
+        }
+        async fn act(&self, _t: &str, locator: Locator<'_>, action: &str, _v: Option<&str>) -> Result<Value, BrowserError> {
+            let desc = match locator {
+                Locator::Ref(r) => format!("ref:{r}"),
+                Locator::Selector { by, query } => format!("sel:{by}:{query}"),
+            };
+            self.acts.lock().unwrap().push(desc);
+            Ok(json!({ "ok": true, "action": action }))
+        }
+        async fn wait(&self, _t: &str, _c: &str, _a: Option<&str>, _ms: u64) -> Result<Value, BrowserError> {
+            Err(BrowserError::Failed("n/a".into()))
+        }
+        async fn screenshot(&self, _t: &str, _r: Option<&str>) -> Result<Shot, BrowserError> {
+            Err(BrowserError::Failed("n/a".into()))
+        }
+        async fn eval(&self, _t: &str, _e: &str) -> Result<Value, BrowserError> {
+            Err(BrowserError::Failed("n/a".into()))
+        }
+        async fn network(&self, _t: &str, _a: &str, _f: Option<&str>, _h: Option<Value>, _d: Option<u64>) -> Result<Value, BrowserError> {
+            Err(BrowserError::Failed("n/a".into()))
+        }
+        async fn dialog(&self, _t: &str, _p: Option<DialogPolicy>) -> Result<Value, BrowserError> {
+            Err(BrowserError::Failed("n/a".into()))
+        }
+        async fn cookies(&self, _t: &str, _a: &str, _c: Option<Value>) -> Result<Value, BrowserError> {
+            Err(BrowserError::Failed("n/a".into()))
+        }
+    }
+
+    fn module() -> (BrowserModule, Arc<Recorder>) {
+        let rec = Arc::new(Recorder::default());
+        (BrowserModule::new(rec.clone()), rec)
+    }
+
+    #[tokio::test]
+    async fn a_ref_locates_by_ref() {
+        let (m, rec) = module();
+        let e = m.act(&json!({"target_id":"T","ref":"/html/body[1]/button[1]","action":"click"})).await;
+        assert!(e.ok, "{e:?}");
+        assert_eq!(rec.acts.lock().unwrap()[0], "ref:/html/body[1]/button[1]");
+    }
+
+    #[tokio::test]
+    async fn a_query_locates_by_selector_in_one_call() {
+        let (m, rec) = module();
+        let e = m.act(&json!({"target_id":"T","by":"text","query":"Login","action":"click"})).await;
+        assert!(e.ok, "{e:?}");
+        // No separate browser_query was needed: the selector reached act directly.
+        assert_eq!(rec.acts.lock().unwrap()[0], "sel:text:Login");
+    }
+
+    #[tokio::test]
+    async fn a_query_defaults_to_css_when_by_is_omitted() {
+        let (m, rec) = module();
+        let e = m.act(&json!({"target_id":"T","query":"#save","action":"click"})).await;
+        assert!(e.ok, "{e:?}");
+        assert_eq!(rec.acts.lock().unwrap()[0], "sel:css:#save");
+    }
+
+    #[tokio::test]
+    async fn neither_ref_nor_query_is_an_invalid_argument_and_never_calls_the_backend() {
+        let (m, rec) = module();
+        let e = m.act(&json!({"target_id":"T","action":"click"})).await;
+        assert!(!e.ok);
+        assert_eq!(e.error.unwrap().code, ErrorCode::InvalidArgs);
+        assert!(rec.acts.lock().unwrap().is_empty(), "backend must not be called");
     }
 }

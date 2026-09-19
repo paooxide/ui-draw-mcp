@@ -48,7 +48,7 @@ enabled category, while a `dangerous` tool additionally has to be named in
 | [`power_control`](#power-control) | desktop | dangerous | Sleep, log out, restart or shut down. |
 | [`speak`](#speak) | desktop | standard | Speak text through the speakers. |
 | [`system_settings`](#system-settings) | desktop | standard | Read or change a desktop setting. |
-| [`browser_act`](#browser-act) | browser | standard | Act on a DOM node ref: click, type, select, hover, focus, scroll_into_view, submit. |
+| [`browser_act`](#browser-act) | browser | standard | Act on a DOM node: click, type, select, hover, focus, scroll_into_view, submit. |
 | [`browser_connect`](#browser-connect) | browser | standard | Attach to a Chromium browser started with --remote-debugging-port, or launch a dedicated instance. |
 | [`browser_cookies`](#browser-cookies) | browser | dangerous | Cookie access: get (values redacted), set, or clear. |
 | [`browser_dialog`](#browser-dialog) | browser | standard | Inspect and control how the page's JavaScript dialogs (alert/confirm/prompt/beforeunload) are answered. |
@@ -616,12 +616,14 @@ Read or change a desktop setting. Settings the platform does not expose return U
 
 `browser_act` · standard tier
 
-Act on a DOM node ref: click, type, select, hover, focus, scroll_into_view, submit.
+Act on a DOM node: click, type, select, hover, focus, scroll_into_view, submit. Target it with 'ref' (from browser_query/snapshot) or, in one call, with 'query' plus 'by' (css/xpath/text) to resolve and act without a separate query.
 
 | Argument | Type | Required | Description |
 |---|---|---|---|
 | `action` | one of: click, type, select, hover, focus, scroll_into_view, submit | yes |  |
-| `ref` | string | yes |  |
+| `by` | one of: css, xpath, text |  | how to read 'query' (default css); used when no 'ref' |
+| `query` | string |  | selector to resolve and act on in one call, instead of 'ref' |
+| `ref` | string |  | a ref from browser_query/snapshot |
 | `target_id` | string | yes |  |
 | `value` | string |  |  |
 

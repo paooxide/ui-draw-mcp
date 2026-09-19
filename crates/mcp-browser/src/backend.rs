@@ -34,6 +34,15 @@ pub struct Shot {
 
 /// The browser control surface. One real implementation ([`CdpBackend`]); the
 /// trait exists for the same module/engine symmetry the other categories use.
+/// How `act` locates the element to act on: either a `ref` from a prior
+/// snapshot/query, or a selector resolved server-side in the same call (so a
+/// scripted click/type is one round trip, not query-then-act).
+#[derive(Debug, Clone, Copy)]
+pub enum Locator<'a> {
+    Ref(&'a str),
+    Selector { by: &'a str, query: &'a str },
+}
+
 #[async_trait]
 pub trait BrowserBackend: Send + Sync {
     /// Attach to (or launch) a browser; returns a `browser_id`.
@@ -80,7 +89,7 @@ pub trait BrowserBackend: Send + Sync {
     async fn act(
         &self,
         target: &str,
-        node_ref: &str,
+        locator: Locator<'_>,
         action: &str,
         value: Option<&str>,
     ) -> Result<Value, BrowserError>;
@@ -299,6 +308,20 @@ function __xp(el){
 function __resolve(xp){
   var r=document.evaluate(xp, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null);
   return r.singleNodeValue;
+}
+"#;
+
+/// Resolve an element by selector, matching `browser_query`'s `by` values, for
+/// act-by-selector. Text matches a leaf containing the string, then any element
+/// whose exact trimmed text equals it (buttons, links).
+const JS_FIND: &str = r#"
+function __find(by,q){
+  if(by==='css') return document.querySelector(q);
+  if(by==='xpath'){ var r=document.evaluate(q,document,null,XPathResult.FIRST_ORDERED_NODE_TYPE,null); return r.singleNodeValue; }
+  var w=document.querySelectorAll('*');
+  for(var i=0;i<w.length;i++){ if(w[i].children.length===0 && (w[i].innerText||'').indexOf(q)>=0) return w[i]; }
+  for(var j=0;j<w.length;j++){ if((w[j].textContent||'').trim()===q) return w[j]; }
+  return null;
 }
 "#;
 
@@ -615,19 +638,31 @@ impl BrowserBackend for CdpBackend {
     async fn act(
         &self,
         target: &str,
-        node_ref: &str,
+        locator: Locator<'_>,
         action: &str,
         value: Option<&str>,
     ) -> Result<Value, BrowserError> {
         let mut c = self.conn(target).await?;
-        let xp = serde_json::to_string(node_ref).unwrap_or_else(|_| "\"\"".into());
+        // Resolve to an element in the same eval: a `ref` via XPath, or a
+        // selector via `__find`, so a scripted action is one round trip.
+        let resolve = match locator {
+            Locator::Ref(r) => {
+                format!("__resolve({})", serde_json::to_string(r).unwrap_or_else(|_| "\"\"".into()))
+            }
+            Locator::Selector { by, query } => format!(
+                "__find({},{})",
+                serde_json::to_string(by).unwrap_or_else(|_| "\"css\"".into()),
+                serde_json::to_string(query).unwrap_or_else(|_| "\"\"".into()),
+            ),
+        };
         let act = serde_json::to_string(action).unwrap_or_else(|_| "\"click\"".into());
         let val = serde_json::to_string(&value).unwrap_or_else(|_| "null".into());
         let expr = format!(
             r#"(function(){{
   {JS_XPATH}
-  var el=__resolve({xp}), action={act}, value={val};
-  if(!el) return {{ok:false,error:'ref not found'}};
+  {JS_FIND}
+  var el={resolve}, action={act}, value={val};
+  if(!el) return {{ok:false,error:'element not found'}};
   try{{ el.scrollIntoView({{block:'center',inline:'center'}}); }}catch(e){{}}
   switch(action){{
     case 'click': el.click(); break;
