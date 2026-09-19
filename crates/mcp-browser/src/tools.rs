@@ -14,11 +14,21 @@ use crate::cdp::DialogPolicy;
 /// Chromium browser attached over the Chrome DevTools Protocol.
 pub struct BrowserModule {
     backend: Arc<dyn BrowserBackend>,
+    flows: Option<crate::flow::FlowStore>,
 }
 
 impl BrowserModule {
     pub fn new(backend: Arc<dyn BrowserBackend>) -> Self {
-        BrowserModule { backend }
+        BrowserModule {
+            backend,
+            flows: None,
+        }
+    }
+
+    /// Enable `browser_flow` (save/replay UI tests) backed by a JSON file.
+    pub fn with_flow_store(mut self, store: crate::flow::FlowStore) -> Self {
+        self.flows = Some(store);
+        self
     }
 }
 
@@ -334,6 +344,214 @@ impl BrowserModule {
             Err(e) => browser_err("browser_assert", e),
         }
     }
+
+    async fn flow(&self, args: &Value) -> Envelope {
+        let tool = "browser_flow";
+        let Some(store) = self.flows.as_ref() else {
+            return Envelope::fail_with(
+                tool,
+                ErrorCode::UnsupportedOs,
+                "browser_flow is not enabled (no flow store configured)",
+                "run agentctl with a state dir so flows can be saved",
+            );
+        };
+        let action = str_arg(args, "action").unwrap_or("list");
+        match action {
+            "save" => {
+                let Some(name) = str_arg(args, "name") else {
+                    return Envelope::fail(tool, ErrorCode::InvalidArgs, "save needs 'name'");
+                };
+                let Some(steps) = args.get("steps").and_then(Value::as_array) else {
+                    return Envelope::fail(tool, ErrorCode::InvalidArgs, "save needs 'steps' array");
+                };
+                match store.save(name, steps.clone(), now_ms()) {
+                    Ok(f) => Envelope::ok(tool, json!({ "name": f.name, "steps": f.steps.len() })),
+                    Err(e) => flow_err(tool, e),
+                }
+            }
+            "list" => match store.list() {
+                Ok(fs) => {
+                    let rows: Vec<Value> = fs
+                        .iter()
+                        .map(|f| json!({ "name": f.name, "steps": f.steps.len() }))
+                        .collect();
+                    Envelope::ok(tool, json!({ "flows": rows, "count": rows.len() }))
+                }
+                Err(e) => flow_err(tool, e),
+            },
+            "get" => {
+                let Some(name) = str_arg(args, "name") else {
+                    return Envelope::fail(tool, ErrorCode::InvalidArgs, "get needs 'name'");
+                };
+                match store.get(name) {
+                    Ok(Some(f)) => Envelope::ok(tool, json!({ "name": f.name, "steps": f.steps })),
+                    Ok(None) => Envelope::fail(tool, ErrorCode::NotFound, format!("no flow '{name}'")),
+                    Err(e) => flow_err(tool, e),
+                }
+            }
+            "delete" => {
+                let Some(name) = str_arg(args, "name") else {
+                    return Envelope::fail(tool, ErrorCode::InvalidArgs, "delete needs 'name'");
+                };
+                match store.delete(name) {
+                    Ok(removed) => Envelope::ok(tool, json!({ "deleted": removed })),
+                    Err(e) => flow_err(tool, e),
+                }
+            }
+            "run" => {
+                let Some(name) = str_arg(args, "name") else {
+                    return Envelope::fail(tool, ErrorCode::InvalidArgs, "run needs 'name'");
+                };
+                let Some(target) = str_arg(args, "target_id") else {
+                    return Envelope::fail(tool, ErrorCode::InvalidArgs, "run needs 'target_id'");
+                };
+                let flow = match store.get(name) {
+                    Ok(Some(f)) => f,
+                    Ok(None) => {
+                        return Envelope::fail(tool, ErrorCode::NotFound, format!("no flow '{name}'"))
+                    }
+                    Err(e) => return flow_err(tool, e),
+                };
+                let cont = args
+                    .get("continue_on_error")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                self.replay(tool, target, &flow, cont).await
+            }
+            other => Envelope::fail(tool, ErrorCode::InvalidArgs, format!("unknown action '{other}'")),
+        }
+    }
+
+    /// Replay a flow's steps against `target`, stopping at the first failure
+    /// unless `cont`. A green run never invokes a model.
+    async fn replay(
+        &self,
+        tool: &str,
+        target: &str,
+        flow: &crate::flow::Flow,
+        cont: bool,
+    ) -> Envelope {
+        let mut results = Vec::new();
+        let mut passed = true;
+        for (i, step) in flow.steps.iter().enumerate() {
+            let (ok, detail) = self.run_step(target, step).await;
+            results.push(json!({ "i": i, "op": step.get("op"), "ok": ok, "detail": detail }));
+            if !ok {
+                passed = false;
+                if !cont {
+                    break;
+                }
+            }
+        }
+        let data = json!({
+            "name": flow.name, "passed": passed,
+            "ran": results.len(), "steps": results,
+        });
+        if passed {
+            Envelope::ok(tool, data)
+        } else {
+            Envelope {
+                ok: false,
+                tool: tool.into(),
+                data: Some(data),
+                error: Some(ToolError {
+                    code: ErrorCode::ActionFailed,
+                    message: format!("flow '{}' failed", flow.name),
+                    suggestion: Some("see data.steps for the failing step".into()),
+                }),
+                image: None,
+            }
+        }
+    }
+
+    /// Execute one replay step. Returns (ok, detail).
+    async fn run_step(&self, target: &str, step: &Value) -> (bool, Value) {
+        let op = step.get("op").and_then(Value::as_str).unwrap_or("");
+        let r: Result<Value, BrowserError> = match op {
+            "navigate" => {
+                self.backend
+                    .navigate(
+                        target,
+                        str_arg(step, "action").unwrap_or("goto"),
+                        str_arg(step, "url"),
+                    )
+                    .await
+            }
+            "act" => {
+                let locator = if let Some(r) = str_arg(step, "ref") {
+                    crate::backend::Locator::Ref(r)
+                } else if let Some(q) = str_arg(step, "query") {
+                    crate::backend::Locator::Selector {
+                        by: str_arg(step, "by").unwrap_or("css"),
+                        query: q,
+                    }
+                } else {
+                    return (false, json!("act step needs 'ref' or 'query'"));
+                };
+                self.backend
+                    .act(
+                        target,
+                        locator,
+                        str_arg(step, "action").unwrap_or("click"),
+                        str_arg(step, "value"),
+                    )
+                    .await
+            }
+            "wait" => {
+                let (cond, arg) = if let Some(sel) = str_arg(step, "selector") {
+                    ("selector", Some(sel))
+                } else if step.get("navigation").is_some() {
+                    ("navigation", None)
+                } else {
+                    ("network_idle", None)
+                };
+                let t = step.get("timeout_ms").and_then(Value::as_u64).unwrap_or(10_000);
+                self.backend.wait(target, cond, arg, t).await
+            }
+            "capture" => {
+                self.backend
+                    .capture(target, str_arg(step, "action").unwrap_or("start"), step)
+                    .await
+            }
+            "assert" => match self.backend.assert(target, step).await {
+                // An assert's own pass/fail is the step's ok.
+                Ok(v) => {
+                    let passed = v.get("passed").and_then(Value::as_bool) == Some(true);
+                    return (passed, v);
+                }
+                Err(e) => Err(e),
+            },
+            other => return (false, json!(format!("unknown step op '{other}'"))),
+        };
+        match r {
+            Ok(v) => (true, v),
+            Err(e) => (false, json!(browser_err_msg(&e))),
+        }
+    }
+}
+
+fn now_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
+}
+
+fn flow_err(tool: &str, e: crate::flow::FlowError) -> Envelope {
+    match e {
+        crate::flow::FlowError::Invalid(m) => Envelope::fail(tool, ErrorCode::InvalidArgs, m),
+        crate::flow::FlowError::Io(m) => Envelope::fail(tool, ErrorCode::ActionFailed, m),
+    }
+}
+
+fn browser_err_msg(e: &BrowserError) -> String {
+    match e {
+        BrowserError::PermissionDenied(m)
+        | BrowserError::NotFound(m)
+        | BrowserError::Unsupported(m)
+        | BrowserError::Timeout(m)
+        | BrowserError::Failed(m) => m.clone(),
+    }
 }
 
 #[async_trait]
@@ -589,6 +807,27 @@ impl ToolModule for BrowserModule {
                     json!(["target_id"]),
                 ),
             ).untrusted_output(),
+            ToolDescriptor::new(
+                "browser_flow",
+                Category::Browser,
+                Tier::Standard,
+                "Save and replay a browser UI test. 'save' (name + steps) records a flow; 'run' \
+                 (name + target_id) replays it deterministically, stopping at the first failing \
+                 step (set continue_on_error to run all); 'list'/'get'/'delete' manage them. A \
+                 step is {op: navigate|act|wait|capture|assert, ...} using the same fields as \
+                 those tools (e.g. {op:'act',by:'text',query:'Login',action:'click'}, \
+                 {op:'assert',text:'Welcome'}). A green run never needs a model.",
+                obj(
+                    json!({
+                        "action": { "type": "string", "enum": ["save", "run", "list", "get", "delete"] },
+                        "name": { "type": "string" },
+                        "target_id": { "type": "string", "description": "run: the tab to replay against" },
+                        "steps": { "type": "array", "items": { "type": "object" }, "description": "save: the ordered steps" },
+                        "continue_on_error": { "type": "boolean", "description": "run: keep going past a failed step" }
+                    }),
+                    json!(["action"]),
+                ),
+            ).untrusted_output(),
         ]
     }
 
@@ -628,6 +867,7 @@ impl ToolModule for BrowserModule {
             "browser_cookies" => self.cookies(&args).await,
             "browser_capture" => self.capture(&args).await,
             "browser_assert" => self.assert(&args).await,
+            "browser_flow" => self.flow(&args).await,
             other => Envelope::fail(other, ErrorCode::InvalidArgs, "unknown tool"),
         }
     }
@@ -658,8 +898,8 @@ mod act_tests {
         async fn tabs(&self, _b: u32, _a: &str, _t: Option<&str>, _u: Option<&str>) -> Result<Value, BrowserError> {
             Err(BrowserError::Failed("n/a".into()))
         }
-        async fn navigate(&self, _t: &str, _a: &str, _u: Option<&str>) -> Result<Value, BrowserError> {
-            Err(BrowserError::Failed("n/a".into()))
+        async fn navigate(&self, _t: &str, a: &str, _u: Option<&str>) -> Result<Value, BrowserError> {
+            Ok(json!({ "ok": true, "action": a }))
         }
         async fn snapshot(&self, _t: &str, _m: &str, _r: Option<&str>) -> Result<Value, BrowserError> {
             Err(BrowserError::Failed("n/a".into()))
@@ -675,8 +915,8 @@ mod act_tests {
             self.acts.lock().unwrap().push(desc);
             Ok(json!({ "ok": true, "action": action }))
         }
-        async fn wait(&self, _t: &str, _c: &str, _a: Option<&str>, _ms: u64) -> Result<Value, BrowserError> {
-            Err(BrowserError::Failed("n/a".into()))
+        async fn wait(&self, _t: &str, c: &str, _a: Option<&str>, _ms: u64) -> Result<Value, BrowserError> {
+            Ok(json!({ "settled": true, "condition": c }))
         }
         async fn screenshot(&self, _t: &str, _r: Option<&str>) -> Result<Shot, BrowserError> {
             Err(BrowserError::Failed("n/a".into()))
@@ -707,6 +947,15 @@ mod act_tests {
     fn module() -> (BrowserModule, Arc<Recorder>) {
         let rec = Arc::new(Recorder::default());
         (BrowserModule::new(rec.clone()), rec)
+    }
+
+    fn module_with_flows(tag: &str) -> BrowserModule {
+        use crate::flow::FlowStore;
+        let mut p = std::env::temp_dir();
+        p.push(format!("agentctl-flowtool-{tag}-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        BrowserModule::new(Arc::new(Recorder::default()))
+            .with_flow_store(FlowStore::new(p, 50, 50))
     }
 
     #[tokio::test]
@@ -772,5 +1021,55 @@ mod act_tests {
         assert_eq!(bad.error.as_ref().unwrap().code, ErrorCode::ActionFailed);
         // The per-check detail still rides along for the harness.
         assert_eq!(bad.data.unwrap()["passed"], false);
+    }
+
+    #[tokio::test]
+    async fn a_saved_flow_replays_green_and_reports_each_step() {
+        let m = module_with_flows("green");
+        let save = m
+            .flow(&json!({"action":"save","name":"login","steps":[
+                {"op":"navigate","url":"https://x"},
+                {"op":"wait","network_idle":true},
+                {"op":"assert","target_id":"ignored","_pass":true}
+            ]}))
+            .await;
+        assert!(save.ok, "{save:?}");
+        let run = m.flow(&json!({"action":"run","name":"login","target_id":"T"})).await;
+        assert!(run.ok, "green flow should pass: {run:?}");
+        let d = run.data.unwrap();
+        assert_eq!(d["passed"], true);
+        assert_eq!(d["ran"], 3);
+    }
+
+    #[tokio::test]
+    async fn a_failing_step_stops_the_run_and_marks_it_failed() {
+        let m = module_with_flows("red");
+        m.flow(&json!({"action":"save","name":"f","steps":[
+            {"op":"navigate","url":"https://x"},
+            {"op":"assert","_pass":false},
+            {"op":"navigate","url":"https://never-reached"}
+        ]}))
+        .await;
+        let run = m.flow(&json!({"action":"run","name":"f","target_id":"T"})).await;
+        assert!(!run.ok, "a failing flow is an error");
+        let d = run.data.unwrap();
+        assert_eq!(d["passed"], false);
+        assert_eq!(d["ran"], 2, "stops at the failing assert, third step not reached");
+    }
+
+    #[tokio::test]
+    async fn run_without_a_target_is_an_invalid_argument() {
+        let m = module_with_flows("notgt");
+        m.flow(&json!({"action":"save","name":"f","steps":[{"op":"navigate"}]})).await;
+        let e = m.flow(&json!({"action":"run","name":"f"})).await;
+        assert!(!e.ok);
+        assert_eq!(e.error.unwrap().code, ErrorCode::InvalidArgs);
+    }
+
+    #[tokio::test]
+    async fn flow_is_disabled_without_a_store() {
+        let (m, _) = module();
+        let e = m.flow(&json!({"action":"list"})).await;
+        assert!(!e.ok, "no store configured means the tool is unavailable");
     }
 }

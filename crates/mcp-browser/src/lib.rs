@@ -5,10 +5,12 @@
 
 mod backend;
 mod cdp;
+mod flow;
 mod nav;
 mod tools;
 
 pub use backend::{BrowserBackend, BrowserError, CdpBackend, Shot, CHROME_BINS};
 pub use cdp::DialogPolicy;
+pub use flow::{Flow, FlowStore};
 pub use nav::{NavDenied, NavPolicy};
 pub use tools::BrowserModule;

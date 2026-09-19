@@ -154,7 +154,7 @@ pub fn build_stack(cfg: &PolicyConfig) -> (Vec<Arc<dyn ToolModule>>, Wiring) {
     // default: with no roots/commands/hosts/services configured it refuses
     // everything rather than falling open.
     {
-        use mcp_browser::{BrowserModule, CdpBackend, NavPolicy};
+        use mcp_browser::{BrowserModule, CdpBackend, FlowStore, NavPolicy};
         use mcp_fs::{default_denied, FsModule, Jail};
         use mcp_memory::{MemoryModule, Store as MemoryStore};
         use mcp_net::{NetModule, NetPolicy};
@@ -164,9 +164,17 @@ pub fn build_stack(cfg: &PolicyConfig) -> (Vec<Arc<dyn ToolModule>>, Wiring) {
         use mcp_sec::SecModule;
         use mcp_sys::SysModule;
 
-        modules.push(Arc::new(BrowserModule::new(Arc::new(CdpBackend::new(
-            NavPolicy::new(&engines.allowed_origins, engines.browser_allow_private),
-        )))));
+        modules.push(Arc::new(
+            BrowserModule::new(Arc::new(CdpBackend::new(NavPolicy::new(
+                &engines.allowed_origins,
+                engines.browser_allow_private,
+            ))))
+            .with_flow_store(FlowStore::new(
+                state_dir(cfg).join("browser_flows.json"),
+                200,
+                200,
+            )),
+        ));
 
         let jail = Jail::new(engines.fs_roots.clone(), default_denied());
         modules.push(Arc::new(FsModule::new(jail, 1_000_000, 500)));

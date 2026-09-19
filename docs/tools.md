@@ -8,7 +8,7 @@ Tiers gate what an agent may call: `read` and `standard` tools are available ins
 enabled category, while a `dangerous` tool additionally has to be named in
 `policy.enable`. Enabling a category never enables its dangerous tools.
 
-**109 tools across 12 categories.**
+**110 tools across 12 categories.**
 
 | Tool | Category | Tier | Summary |
 |---|---|---|---|
@@ -56,6 +56,7 @@ enabled category, while a `dangerous` tool additionally has to be named in
 | [`browser_dialog`](#browser-dialog) | browser | standard | Inspect and control how the page's JavaScript dialogs (alert/confirm/prompt/beforeunload) are answered. |
 | [`browser_disconnect`](#browser-disconnect) | browser | standard | Disconnect from a browser. |
 | [`browser_eval`](#browser-eval) | browser | dangerous | Evaluate arbitrary JavaScript in the page context; result is JSON-serialized. |
+| [`browser_flow`](#browser-flow) | browser | standard | Save and replay a browser UI test. |
 | [`browser_navigate`](#browser-navigate) | browser | standard | Navigate a tab: goto a url, or go back/forward/reload. |
 | [`browser_network`](#browser-network) | browser | dangerous | Network control. |
 | [`browser_query`](#browser-query) | browser | read | Resolve node ref(s) by css selector, xpath, or visible text. |
@@ -722,6 +723,20 @@ Evaluate arbitrary JavaScript in the page context; result is JSON-serialized. Ar
 |---|---|---|---|
 | `expression` | string | yes |  |
 | `target_id` | string | yes |  |
+
+### browser-flow
+
+`browser_flow` · standard tier
+
+Save and replay a browser UI test. 'save' (name + steps) records a flow; 'run' (name + target_id) replays it deterministically, stopping at the first failing step (set continue_on_error to run all); 'list'/'get'/'delete' manage them. A step is {op: navigate|act|wait|capture|assert, ...} using the same fields as those tools (e.g. {op:'act',by:'text',query:'Login',action:'click'}, {op:'assert',text:'Welcome'}). A green run never needs a model.
+
+| Argument | Type | Required | Description |
+|---|---|---|---|
+| `action` | one of: save, run, list, get, delete | yes |  |
+| `continue_on_error` | boolean |  | run: keep going past a failed step |
+| `name` | string |  |  |
+| `steps` | array&lt;object&gt; |  | save: the ordered steps |
+| `target_id` | string |  | run: the tab to replay against |
 
 ### browser-navigate
 
