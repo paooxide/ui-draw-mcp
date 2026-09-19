@@ -15,6 +15,7 @@ pub struct WindowModule {
     backend: Arc<dyn WindowBackend>,
     evaluator: WaitEvaluator,
     allowed_apps: Vec<String>,
+    judge: Option<Arc<mcp_judge::Judge>>,
 }
 
 impl WindowModule {
@@ -27,12 +28,15 @@ impl WindowModule {
             evaluator: WaitEvaluator::new(backend.clone(), a11y),
             backend,
             allowed_apps,
+            judge: None,
         }
     }
 
-    /// Give `wait_for`'s evaluator the judge that answers a `judge` condition.
+    /// Give `wait_for`'s evaluator the judge that answers a `judge` condition,
+    /// and `handle_dialogs` the judge that ranks buttons against an intent.
     pub fn with_judge(mut self, judge: Arc<mcp_judge::Judge>) -> Self {
-        self.evaluator = self.evaluator.with_judge(judge);
+        self.evaluator = self.evaluator.with_judge(judge.clone());
+        self.judge = Some(judge);
         self
     }
 
@@ -158,23 +162,67 @@ impl WindowModule {
                 }
             },
         };
-        match self
+        let intent = str_arg(args, "intent");
+        let ds = match self
             .backend
             .list_dialogs(str_arg(args, "app").as_deref(), scope)
             .await
         {
-            Ok(ds) => {
-                // A password prompt is a hand-back-to-the-human signal, not
-                // something to fill in: surface it at the top level so it
-                // cannot be missed in a list.
-                let credential = ds.iter().any(|d| d.has_secure_field);
-                Envelope::ok(
-                    tool,
-                    json!({ "dialogs": ds, "count": ds.len(), "credential_prompt": credential }),
-                )
+            Ok(ds) => ds,
+            Err(e) => return win_err(tool, e),
+        };
+        // A password prompt is a hand-back-to-the-human signal, not something
+        // to fill in: surface it at the top level so it cannot be missed.
+        let credential = ds.iter().any(|d| d.has_secure_field);
+        let mut data = json!({
+            "dialogs": ds,
+            "count": ds.len(),
+            "credential_prompt": credential,
+        });
+        // When the caller says what it is trying to do, ask the judge which
+        // button serves that intent. This only advises: it does not press
+        // anything, and the agent still acts through `ui_action` on a ref from
+        // `get_ui_tree`. Modelled on `find_elements`' `describe`.
+        if let Some(intent) = intent {
+            match self.suggest_button(&intent, &ds).await {
+                Ok(suggestion) => data["suggestion"] = suggestion,
+                Err(e) => return e,
             }
-            Err(e) => win_err(tool, e),
         }
+        Envelope::ok(tool, data)
+    }
+
+    /// Rank the buttons across the listed dialogs against `intent`. Returns the
+    /// suggestion JSON, or a ready-to-return failure envelope.
+    async fn suggest_button(
+        &self,
+        intent: &str,
+        ds: &[crate::backend::DialogInfo],
+    ) -> Result<Value, Envelope> {
+        let tool = "handle_dialogs";
+        let Some(judge) = self.judge.as_ref().filter(|j| j.enabled()) else {
+            return Err(Envelope::fail_with(
+                tool,
+                ErrorCode::UnsupportedOs,
+                "'intent' needs the judge, which is not enabled",
+                "set [judge] enabled = \"true\" and provide TYPESAFE_API_KEY, or read the buttons and press one with ui_action yourself",
+            ));
+        };
+        let candidates = button_candidates(ds);
+        if candidates.is_empty() {
+            // Nothing to choose between; not an error, just no suggestion.
+            return Ok(json!({ "none": true, "reason": "the dialogs expose no buttons" }));
+        }
+        rank_dialog_buttons(judge, intent, ds, &candidates)
+            .await
+            .map_err(|e| {
+                Envelope::fail_with(
+                    tool,
+                    ErrorCode::ActionFailed,
+                    format!("could not rank the buttons: {}", e.message()),
+                    "read the buttons and choose one yourself",
+                )
+            })
     }
 
     async fn menu_list(&self, args: &Value) -> Envelope {
@@ -348,10 +396,14 @@ impl ToolModule for WindowModule {
                 "List open dialogs, sheets, popovers and menus, with their buttons, message \
                  text and which button Return/Escape activates. scope='system' also finds \
                  prompts raised by another process, such as macOS authentication panels. \
-                 Press a button with ui_action on the matching ref from get_ui_tree.",
+                 Press a button with ui_action on the matching ref from get_ui_tree. Pass \
+                 'intent' (what you are trying to do) to have the judge suggest which button \
+                 serves it, in 'suggestion' (advice only; it presses nothing); needs the \
+                 judge enabled).",
                 json!({"type":"object","properties":{
                     "app":{"type":"string"},
-                    "scope":{"type":"string","enum":["app","system"]}
+                    "scope":{"type":"string","enum":["app","system"]},
+                    "intent":{"type":"string","description":"what you are trying to accomplish; the judge suggests the button that serves it"}
                 },"required":[]}),
             ).untrusted_output(),
             ToolDescriptor::new(
@@ -420,4 +472,211 @@ fn win_err(tool: &str, e: WindowError) -> Envelope {
         WindowError::Failed(m) => (ErrorCode::ActionFailed, m),
     };
     Envelope::fail(tool, code, msg)
+}
+
+/// Build the ranking candidates from every button on every listed dialog,
+/// keyed `"<dialogId>:<label>"` so identical labels in two dialogs (two
+/// "OK"s) stay distinct.
+fn button_candidates(ds: &[crate::backend::DialogInfo]) -> std::collections::BTreeMap<String, String> {
+    let mut candidates = std::collections::BTreeMap::new();
+    for d in ds {
+        for b in &d.buttons {
+            let where_ = d.title.as_deref().unwrap_or(&d.kind);
+            candidates.insert(
+                format!("{}:{}", d.id, b),
+                format!("Button \"{b}\" in the dialog \"{where_}\""),
+            );
+        }
+    }
+    candidates
+}
+
+/// Split a `"<dialogId>:<label>"` candidate key back into its parts. A label
+/// may itself contain a colon, so only the first is the separator; a key with
+/// no colon (which the judge should never return) keeps the whole string as
+/// the label.
+fn parse_button_choice(choice: &str) -> (Option<u32>, String) {
+    match choice.split_once(':') {
+        Some((id, label)) => (id.parse().ok(), label.to_string()),
+        None => (None, choice.to_string()),
+    }
+}
+
+/// Ask the judge which button serves the intent, and shape the answer. The
+/// caller has already checked the judge is enabled and that there is at least
+/// one candidate.
+async fn rank_dialog_buttons(
+    judge: &mcp_judge::Judge,
+    intent: &str,
+    ds: &[crate::backend::DialogInfo],
+    candidates: &std::collections::BTreeMap<String, String>,
+) -> Result<Value, mcp_judge::JudgeError> {
+    let state = json!({
+        "intent": intent,
+        "dialogs": ds,
+        "candidates": candidates,
+    });
+    let r = judge
+        .rank(
+            state,
+            "Which candidate button in `candidates` should be pressed to accomplish `intent`? Judge from each button's label and the text of the dialog it belongs to, shown in `dialogs`. Do not choose a destructive or irreversible button unless `intent` clearly asks for it.",
+            candidates,
+        )
+        .await?;
+    let (dialog, button) = parse_button_choice(&r.choice);
+    Ok(json!({
+        "button": button,
+        "dialog": dialog,
+        "confidence": r.confidence,
+        "any_fits": r.any_fits,
+        // A real match, not the least-bad of poor options.
+        "confident": r.any_fits >= judge.match_threshold(),
+    }))
+}
+
+#[cfg(test)]
+mod dialog_suggestion_tests {
+    use super::*;
+    use crate::backend::DialogInfo;
+    use async_trait::async_trait;
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    fn dialog(id: u32, title: &str, buttons: &[&str]) -> DialogInfo {
+        DialogInfo {
+            id,
+            app: Some("Editor".into()),
+            title: Some(title.into()),
+            kind: "dialog".into(),
+            bounds: None,
+            buttons: buttons.iter().map(|s| s.to_string()).collect(),
+            text: vec!["Do you want to save changes?".into()],
+            default_button: buttons.first().map(|s| s.to_string()),
+            cancel_button: None,
+            has_secure_field: false,
+        }
+    }
+
+    /// A transport that replays one scripted reply and records the request.
+    struct Scripted {
+        reply: Mutex<Option<Result<(u16, String), String>>>,
+        sent: Mutex<Option<Value>>,
+    }
+    #[async_trait]
+    impl mcp_judge::Transport for Scripted {
+        async fn post(
+            &self,
+            _url: &str,
+            _key: &str,
+            body: &Value,
+            _t: Duration,
+        ) -> Result<(u16, String), String> {
+            *self.sent.lock().unwrap() = Some(body.clone());
+            self.reply
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap_or_else(|| Err("script exhausted".into()))
+        }
+    }
+
+    fn judge_with(reply: Result<(u16, String), String>) -> (mcp_judge::Judge, std::sync::Arc<Scripted>) {
+        let s = std::sync::Arc::new(Scripted {
+            reply: Mutex::new(Some(reply)),
+            sent: Mutex::new(None),
+        });
+        let cfg = mcp_judge::JudgeConfig {
+            enabled: true,
+            match_threshold: Some(0.6),
+            ..mcp_judge::JudgeConfig::default()
+        };
+        struct Wrap(std::sync::Arc<Scripted>);
+        #[async_trait]
+        impl mcp_judge::Transport for Wrap {
+            async fn post(
+                &self,
+                url: &str,
+                key: &str,
+                body: &Value,
+                t: Duration,
+            ) -> Result<(u16, String), String> {
+                self.0.post(url, key, body, t).await
+            }
+        }
+        let j = mcp_judge::Judge::with_transport(cfg, Some("k".into()), Box::new(Wrap(s.clone())));
+        (j, s)
+    }
+
+    #[test]
+    fn candidates_key_each_button_by_dialog_and_survive_duplicate_labels() {
+        let ds = [dialog(0, "Save", &["Save", "Discard"]), dialog(1, "Quit", &["Save"])];
+        let c = button_candidates(&ds);
+        assert_eq!(c.len(), 3, "the two 'Save' buttons stay distinct");
+        assert!(c.contains_key("0:Save"));
+        assert!(c.contains_key("1:Save"));
+        assert!(c.contains_key("0:Discard"));
+    }
+
+    #[test]
+    fn no_buttons_yields_no_candidates() {
+        assert!(button_candidates(&[dialog(0, "Empty", &[])]).is_empty());
+    }
+
+    #[test]
+    fn a_choice_key_splits_back_into_dialog_and_label_even_with_a_colon_in_the_label() {
+        assert_eq!(parse_button_choice("3:Save As…"), (Some(3), "Save As…".into()));
+        assert_eq!(parse_button_choice("0:Time: now"), (Some(0), "Time: now".into()));
+        assert_eq!(parse_button_choice("weird"), (None, "weird".into()));
+    }
+
+    #[tokio::test]
+    async fn a_confident_pick_names_the_button_and_its_dialog() {
+        let ds = [dialog(0, "Save", &["Save", "Discard", "Cancel"])];
+        let candidates = button_candidates(&ds);
+        let body = r#"{"answers":{
+            "pick":{"type":"choice","choice":"0:Save","probabilities":{"0:Save":0.9,"0:Discard":0.05,"0:Cancel":0.05},"confidence":0.9},
+            "any":{"type":"noul","noul":0.95}
+        }}"#;
+        let (j, sent) = judge_with(Ok((200, body.into())));
+        let out = rank_dialog_buttons(&j, "save my work", &ds, &candidates)
+            .await
+            .unwrap();
+        assert_eq!(out["button"], "Save");
+        assert_eq!(out["dialog"], 0);
+        assert_eq!(out["confident"], true);
+        // The intent and the dialog text both went to the model as state.
+        let s = sent.sent.lock().unwrap().clone().unwrap();
+        assert_eq!(s["state"]["intent"], "save my work");
+        assert!(s["state"]["dialogs"][0]["text"][0]
+            .as_str()
+            .unwrap()
+            .contains("save changes"));
+    }
+
+    #[tokio::test]
+    async fn a_pick_no_candidate_really_fits_is_marked_not_confident() {
+        let ds = [dialog(0, "Save", &["Save", "Discard"])];
+        let candidates = button_candidates(&ds);
+        // any_fits below match_threshold (0.6): the model forced a pick.
+        let body = r#"{"answers":{
+            "pick":{"type":"choice","choice":"0:Save","probabilities":{"0:Save":0.55,"0:Discard":0.45},"confidence":0.51},
+            "any":{"type":"noul","noul":0.2}
+        }}"#;
+        let (j, _) = judge_with(Ok((200, body.into())));
+        let out = rank_dialog_buttons(&j, "reboot the machine", &ds, &candidates)
+            .await
+            .unwrap();
+        assert_eq!(out["confident"], false, "any_fits 0.2 < 0.6");
+        assert_eq!(out["any_fits"], 0.2);
+    }
+
+    #[tokio::test]
+    async fn a_judge_failure_surfaces_as_an_error_not_a_wrong_button() {
+        let ds = [dialog(0, "Save", &["Save"])];
+        let candidates = button_candidates(&ds);
+        let (j, _) = judge_with(Ok((500, "boom".into())));
+        assert!(rank_dialog_buttons(&j, "save", &ds, &candidates)
+            .await
+            .is_err());
+    }
 }
