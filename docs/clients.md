@@ -136,6 +136,10 @@ visit. `agentctl doctor` prints each one:
 - **Consent dialog.** Risky actions in interactive mode raise a `zenity` question with Deny as the
   default, or a critical notification with Allow and Deny buttons when zenity is not installed. Both time
   out to Deny. With neither installed, everything that needs consent is denied.
+- **Clipboard.** GNOME's Mutter does not implement the `wlr-data-control` protocol a background client
+  needs, so `clipboard_read` and `clipboard_write` fall back to `xclip` or `xsel` over XWayland when one
+  is installed, and otherwise report that they cannot reach the clipboard. On KDE and wlroots the native
+  Wayland path works with nothing extra. `agentctl doctor` says which applies.
 
 Two things Wayland hides from every client, and therefore from `agentctl`: where a window is on the
 screen, and where the pointer is. Tree coordinates from Wayland-native applications are window-relative,

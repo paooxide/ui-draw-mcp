@@ -385,21 +385,38 @@ async fn clipboard_round_trips_and_is_restored() {
         return;
     }
     let c = client("linux-clip");
+    let nonce = format!("agentctl-clip-{}", mcp_policy::now_ms());
+    let w = c
+        .call(
+            "clipboard_write",
+            json!({ "format": "text", "data": &nonce }),
+        )
+        .await;
+    if !w.ok {
+        // GNOME/Mutter implements no data-control protocol and this machine
+        // has no X11 clipboard tool to bridge it. That is a real platform
+        // limitation, and the contract is that it says so rather than lying.
+        let e = w.error.unwrap();
+        assert_eq!(e.code, ErrorCode::UnsupportedOs, "{}", e.message);
+        assert!(
+            e.message.contains("data-control") || e.message.contains("clipboard"),
+            "the refusal must name the limitation: {}",
+            e.message
+        );
+        eprintln!("skipping the round-trip: {}", e.message);
+        return;
+    }
+    // Where a write worked, a read must return what was written.
     let before = c.call("clipboard_read", json!({ "format": "text" })).await;
     let original = before
         .data
         .as_ref()
         .and_then(|d| d["data"].as_str().map(String::from));
-    let nonce = format!("agentctl-clip-{}", mcp_policy::now_ms());
-    c.ok(
-        "clipboard_write",
-        json!({ "format": "text", "data": &nonce }),
-    )
-    .await;
     let after = c.ok("clipboard_read", json!({ "format": "text" })).await;
     assert_eq!(after["data"].as_str(), Some(nonce.as_str()), "{after}");
     if let Some(orig) = original {
-        c.ok("clipboard_write", json!({ "format": "text", "data": orig }))
+        let _ = c
+            .call("clipboard_write", json!({ "format": "text", "data": orig }))
             .await;
     }
 }

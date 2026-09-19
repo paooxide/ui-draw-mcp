@@ -157,6 +157,19 @@ pub async fn doctor(state_dir: &Path) -> Doctor {
         fix: "the first synthetic-input call raises a system dialog; approve it once and the grant is remembered",
     });
 
+    // The Wayland clipboard needs a protocol Mutter lacks; note whether a
+    // bridge exists.
+    let x11_clip = crate::clip::X11Tool::detect();
+    d.checks.push(Check {
+        name: "clipboard",
+        ok: true,
+        detail: match &x11_clip {
+            Some((_, bin)) => format!("wl-clipboard, with {bin} as an XWayland fallback"),
+            None => "wl-clipboard only; on GNOME this fails (no data-control), install xclip or xsel to bridge it".into(),
+        },
+        fix: "",
+    });
+
     let consent = which("zenity").or_else(|| which("notify-send"));
     d.checks.push(Check {
         name: "consent dialog",

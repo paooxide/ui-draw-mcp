@@ -25,6 +25,8 @@ mod a11y;
 #[cfg(target_os = "linux")]
 mod backend;
 #[cfg(target_os = "linux")]
+mod clip;
+#[cfg(target_os = "linux")]
 mod desktop;
 #[cfg(target_os = "linux")]
 mod doctor;

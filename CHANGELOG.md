@@ -41,6 +41,8 @@ All notable changes to this project are documented here. The format follows
   value), bus devices, sysctl, process maps and telemetry from `/sys` and `/proc`.
 - A Linux live suite (`agentctl/tests/live_linux.rs`): the read-only half runs on any graphical session,
   the acting half behind `AGENTCTL_LIVE_GUI=1`.
+- The Linux clipboard falls back to `xclip` or `xsel` over XWayland where the compositor withholds the
+  `wlr-data-control` protocol (GNOME/Mutter), and reports the limitation clearly where no bridge exists.
 
 ### Fixed
 

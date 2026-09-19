@@ -23,6 +23,7 @@ use xkeysym::Keysym;
 
 use crate::a11y;
 use crate::backend::LinuxBackend;
+use crate::clip;
 use crate::keys::{self, Modifier};
 use crate::portal::button_code;
 
@@ -437,56 +438,34 @@ impl InputBackend for LinuxBackend {
     }
 
     async fn clipboard_read(&self, format: ClipFormat) -> Result<ClipData, InputError> {
-        use wl_clipboard_rs::paste::{get_contents, ClipboardType, MimeType, Seat};
-        let mime = match format {
-            ClipFormat::Text => MimeType::Text,
-            ClipFormat::Html => MimeType::Specific("text/html"),
-            other => {
-                return Err(InputError::Unsupported(format!(
-                    "clipboard_read {other:?} not supported"
-                )))
-            }
+        let Some(mime) = clip::mime_for(format) else {
+            return Err(InputError::Unsupported(format!(
+                "clipboard_read {format:?} is not supported (text and html only)"
+            )));
         };
-        let data = tokio::task::spawn_blocking(move || {
-            use std::io::Read;
-            match get_contents(ClipboardType::Regular, Seat::Unspecified, mime) {
-                Ok((mut reader, _mime)) => {
-                    let mut buf = Vec::new();
-                    reader
-                        .read_to_end(&mut buf)
-                        .map_err(|e| InputError::Failed(format!("clipboard read: {e}")))?;
-                    Ok(Some(String::from_utf8_lossy(&buf).into_owned()))
-                }
-                Err(wl_clipboard_rs::paste::Error::NoSeats)
-                | Err(wl_clipboard_rs::paste::Error::ClipboardEmpty)
-                | Err(wl_clipboard_rs::paste::Error::NoMimeType) => Ok(None),
-                Err(e) => Err(InputError::Failed(format!("clipboard read: {e}"))),
+        // The Wayland path first; the X11 bridge only if the compositor
+        // withholds the protocol, so a machine that has both keeps using
+        // the native one.
+        match wl_read(format).await {
+            Ok(data) => Ok(ClipData { format, data }),
+            Err(InputError::Failed(m)) if clip::missing_protocol(&m) => {
+                let data = x11_read(mime).await?;
+                Ok(ClipData { format, data })
             }
-        })
-        .await
-        .map_err(|e| InputError::Failed(format!("clipboard task: {e}")))??;
-        Ok(ClipData { format, data })
+            Err(e) => Err(e),
+        }
     }
 
     async fn clipboard_write(&self, format: ClipFormat, data: &str) -> Result<(), InputError> {
-        use wl_clipboard_rs::copy::{MimeType, Options, Source};
-        let mime = match format {
-            ClipFormat::Text => MimeType::Text,
-            ClipFormat::Html => MimeType::Specific("text/html".into()),
-            other => {
-                return Err(InputError::Unsupported(format!(
-                    "clipboard_write {other:?} not supported"
-                )))
-            }
+        let Some(mime) = clip::mime_for(format) else {
+            return Err(InputError::Unsupported(format!(
+                "clipboard_write {format:?} is not supported (text and html only)"
+            )));
         };
-        let bytes: Box<[u8]> = data.as_bytes().into();
-        tokio::task::spawn_blocking(move || {
-            Options::new()
-                .copy(Source::Bytes(bytes), mime)
-                .map_err(|e| InputError::Failed(format!("clipboard write: {e}")))
-        })
-        .await
-        .map_err(|e| InputError::Failed(format!("clipboard task: {e}")))?
+        match wl_write(format, data).await {
+            Err(InputError::Failed(m)) if clip::missing_protocol(&m) => x11_write(mime, data).await,
+            other => other,
+        }
     }
 
     /// Where synthetic input will land: the pinned target if it is still on
@@ -515,6 +494,115 @@ impl InputBackend for LinuxBackend {
 
     fn cancel_pending(&self) {
         self.cancel.store(true, Ordering::SeqCst);
+    }
+}
+
+/// The Wayland clipboard read (`wlr-data-control`). `Failed` carries the raw
+/// message so the caller can spot the missing-protocol case.
+async fn wl_read(format: ClipFormat) -> Result<Option<String>, InputError> {
+    use wl_clipboard_rs::paste::{get_contents, ClipboardType, MimeType, Seat};
+    let mime = match format {
+        ClipFormat::Html => MimeType::Specific("text/html"),
+        _ => MimeType::Text,
+    };
+    tokio::task::spawn_blocking(move || {
+        use std::io::Read;
+        match get_contents(ClipboardType::Regular, Seat::Unspecified, mime) {
+            Ok((mut reader, _mime)) => {
+                let mut buf = Vec::new();
+                reader
+                    .read_to_end(&mut buf)
+                    .map_err(|e| InputError::Failed(format!("clipboard read: {e}")))?;
+                Ok(Some(String::from_utf8_lossy(&buf).into_owned()))
+            }
+            Err(wl_clipboard_rs::paste::Error::NoSeats)
+            | Err(wl_clipboard_rs::paste::Error::ClipboardEmpty)
+            | Err(wl_clipboard_rs::paste::Error::NoMimeType) => Ok(None),
+            Err(e) => Err(InputError::Failed(format!("clipboard read: {e}"))),
+        }
+    })
+    .await
+    .map_err(|e| InputError::Failed(format!("clipboard task: {e}")))?
+}
+
+async fn wl_write(format: ClipFormat, data: &str) -> Result<(), InputError> {
+    use wl_clipboard_rs::copy::{MimeType, Options, Source};
+    let mime = match format {
+        ClipFormat::Html => MimeType::Specific("text/html".into()),
+        _ => MimeType::Text,
+    };
+    let bytes: Box<[u8]> = data.as_bytes().into();
+    tokio::task::spawn_blocking(move || {
+        Options::new()
+            .copy(Source::Bytes(bytes), mime)
+            .map_err(|e| InputError::Failed(format!("clipboard write: {e}")))
+    })
+    .await
+    .map_err(|e| InputError::Failed(format!("clipboard task: {e}")))?
+}
+
+/// No data-control protocol: name the limitation and the two ways out.
+fn no_clipboard_path() -> InputError {
+    InputError::Unsupported(
+        "this compositor (GNOME/Mutter) does not implement the wlr-data-control \
+         clipboard protocol, and no X11 clipboard tool was found to bridge \
+         it; install xclip or xsel, or use a compositor that supports \
+         data-control"
+            .into(),
+    )
+}
+
+/// Read the clipboard through an X11 tool over XWayland.
+async fn x11_read(mime: &str) -> Result<Option<String>, InputError> {
+    let Some((tool, bin)) = clip::X11Tool::detect() else {
+        return Err(no_clipboard_path());
+    };
+    let out = tokio::process::Command::new(&bin)
+        .args(tool.read_args(mime))
+        .stdin(std::process::Stdio::null())
+        .output()
+        .await
+        .map_err(|e| InputError::Failed(format!("{bin}: {e}")))?;
+    if !out.status.success() {
+        // An empty clipboard is a non-zero exit for xclip, not a fault.
+        return Ok(None);
+    }
+    let s = String::from_utf8_lossy(&out.stdout).into_owned();
+    Ok(if s.is_empty() { None } else { Some(s) })
+}
+
+/// Write the clipboard through an X11 tool over XWayland.
+async fn x11_write(mime: &str, data: &str) -> Result<(), InputError> {
+    use tokio::io::AsyncWriteExt;
+    let Some((tool, bin)) = clip::X11Tool::detect() else {
+        return Err(no_clipboard_path());
+    };
+    let mut child = tokio::process::Command::new(&bin)
+        .args(tool.write_args(mime))
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| InputError::Failed(format!("{bin}: {e}")))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(data.as_bytes())
+            .await
+            .map_err(|e| InputError::Failed(format!("{bin} stdin: {e}")))?;
+        // xclip holds the selection until its stdin closes.
+        drop(stdin);
+    }
+    let out = child
+        .wait_with_output()
+        .await
+        .map_err(|e| InputError::Failed(format!("{bin}: {e}")))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(InputError::Failed(format!(
+            "{bin}: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )))
     }
 }
 
