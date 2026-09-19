@@ -15,6 +15,9 @@ All notable changes to this project are documented here. The format follows
   capture on, no console errors and no failed requests, returning `{passed, checks}`. `browser_flow`
   saves and replays a named sequence of steps deterministically, stopping at the first failing step so a
   green run never needs a model.
+- **`agentctl test`** replays saved flows against an attached Chromium and reports each flow's result plus
+  the issues it hit (failing step, console errors, failed requests), writing a `--json` report and exiting
+  non-zero on failure (or on any issue with `--strict`) for CI.
 - **More places the judge helps, and per-use thresholds.** `handle_dialogs` takes `intent` and returns a
   `suggestion` naming the button that serves it (advice only; it presses nothing). `memory_find` takes
   `rerank` to reorder recalled recipes by semantic fit to the goal, falling back to success-count order

@@ -8,6 +8,7 @@ use agentctl::{build_modules, consent_provider, new_session_id, tools_doc};
 use mcp_core::{HttpConfig, HttpTransport, PROTOCOL_VERSION};
 use mcp_policy::{AuditSink, PolicyConfig};
 use mcp_types::Category;
+use serde_json::{json, Value};
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
@@ -29,6 +30,7 @@ async fn main() -> std::io::Result<()> {
             Ok(())
         }
         "bridge" => bridge(&args).await,
+        "test" => test_cmd(&args).await,
         "transcript" => transcript_cmd(&args),
         "config" if args.get(2).map(String::as_str) == Some("print") => {
             config_print();
@@ -322,6 +324,255 @@ async fn bridge(args: &[String]) -> std::io::Result<()> {
     Ok(())
 }
 
+/// `agentctl test [names...]` replays saved `browser_flow` UI tests against an
+/// attached Chromium and reports pass/fail plus the issues each flow hit
+/// (failing step, console errors, failed requests). Exit 1 on any failure, or
+/// on any issue with `--strict`. A green run never invokes a model.
+async fn test_cmd(args: &[String]) -> std::io::Result<()> {
+    use mcp_browser::{BrowserModule, CdpBackend, FlowStore, NavPolicy};
+    use mcp_types::{CallCtx, CancelToken, ToolModule};
+
+    let cfg = config_or_exit();
+    let dir = state_dir(&cfg);
+    let port: u16 = flag(args, "--attach")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(9222);
+    let strict = has(args, "--strict");
+    let json_out = flag(args, "--json");
+    let names = positional_flows(args);
+
+    let backend = Arc::new(CdpBackend::new(NavPolicy::new(
+        &cfg.allowed_origins,
+        cfg.browser_allow_private,
+    )));
+    let module = BrowserModule::new(backend)
+        .with_flow_store(FlowStore::new(dir.join("browser_flows.json"), 200, 200));
+    let ctx = CallCtx::new(new_session_id(), CancelToken::new());
+
+    let conn = module
+        .call("browser_connect", json!({ "attach": { "port": port } }), &ctx)
+        .await;
+    if !conn.ok {
+        eprintln!(
+            "agentctl test: could not attach to Chromium on 127.0.0.1:{port}.\n  \
+             Start it with --remote-debugging-port={port}, or pass --attach <port>."
+        );
+        if let Some(e) = conn.error {
+            eprintln!("  {}", e.message);
+        }
+        std::process::exit(2);
+    }
+    let browser_id = conn
+        .data
+        .as_ref()
+        .and_then(|d| d.get("browser_id"))
+        .and_then(Value::as_u64)
+        .unwrap_or(1);
+
+    let flows: Vec<String> = if names.is_empty() {
+        let list = module
+            .call("browser_flow", json!({ "action": "list" }), &ctx)
+            .await;
+        list.data
+            .as_ref()
+            .and_then(|d| d.get("flows"))
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|f| f.get("name").and_then(Value::as_str).map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default()
+    } else {
+        names
+    };
+    if flows.is_empty() {
+        eprintln!("agentctl test: no saved flows to run. Record one with browser_flow first.");
+        std::process::exit(2);
+    }
+
+    eprintln!(
+        "agentctl test: {} flow(s) against 127.0.0.1:{port}",
+        flows.len()
+    );
+    let mut reports: Vec<Value> = Vec::new();
+    for name in &flows {
+        // A fresh tab per flow, so page state does not leak between tests.
+        let tab = module
+            .call(
+                "browser_tabs",
+                json!({ "browser_id": browser_id, "action": "open", "url": "about:blank" }),
+                &ctx,
+            )
+            .await;
+        let target = tab
+            .data
+            .as_ref()
+            .and_then(|d| d.get("target_id"))
+            .and_then(Value::as_str)
+            .map(String::from);
+        let Some(target) = target else {
+            reports.push(json!({ "name": name, "passed": false, "error": "could not open a tab",
+                "console_errors": [], "failed_requests": [] }));
+            continue;
+        };
+        // Arm capture so even a passing flow reports console errors / failed
+        // requests it happened to trigger.
+        let _ = module
+            .call("browser_capture", json!({ "target_id": target, "action": "start" }), &ctx)
+            .await;
+        let run = module
+            .call(
+                "browser_flow",
+                json!({ "action": "run", "name": name, "target_id": target }),
+                &ctx,
+            )
+            .await;
+        let cap = module
+            .call("browser_capture", json!({ "target_id": target, "action": "read" }), &ctx)
+            .await;
+        let _ = module
+            .call(
+                "browser_tabs",
+                json!({ "browser_id": browser_id, "action": "close", "target_id": target }),
+                &ctx,
+            )
+            .await;
+        reports.push(build_flow_report(name, &run, &cap));
+    }
+
+    let (passed, failed, issue_flows) = print_report(&reports, strict);
+    if let Some(p) = json_out {
+        let doc = json!({ "passed": passed, "failed": failed, "flows": reports });
+        let text = serde_json::to_string_pretty(&doc).unwrap_or_default() + "\n";
+        if let Err(e) = std::fs::write(p, text) {
+            eprintln!("agentctl test: could not write {p}: {e}");
+        } else {
+            eprintln!("wrote report to {p}");
+        }
+    }
+    let bad = failed > 0 || (strict && issue_flows > 0);
+    std::process::exit(if bad { 1 } else { 0 });
+}
+
+/// Flow names passed positionally, skipping flags and the values of the flags
+/// that take one.
+fn positional_flows(args: &[String]) -> Vec<String> {
+    let value_flags = ["--attach", "--json", "--config"];
+    let mut out = Vec::new();
+    let mut i = 2; // args[0]=bin, args[1]="test"
+    while i < args.len() {
+        let a = &args[i];
+        if a.starts_with("--") {
+            i += if value_flags.contains(&a.as_str()) { 2 } else { 1 };
+            continue;
+        }
+        out.push(a.clone());
+        i += 1;
+    }
+    out
+}
+
+/// Fold a flow's replay envelope and its capture into one report row.
+fn build_flow_report(name: &str, run: &mcp_types::Envelope, cap: &mcp_types::Envelope) -> Value {
+    let rd = run.data.clone().unwrap_or_else(|| json!({}));
+    let steps = rd.get("steps").cloned().unwrap_or_else(|| json!([]));
+    let failing = steps
+        .as_array()
+        .and_then(|a| {
+            a.iter()
+                .find(|s| s.get("ok").and_then(Value::as_bool) == Some(false))
+                .cloned()
+        })
+        .unwrap_or(Value::Null);
+    let cd = cap.data.clone().unwrap_or_else(|| json!({}));
+    let is_err_level = |c: &&Value| {
+        matches!(
+            c.get("level").and_then(Value::as_str),
+            Some("error") | Some("uncaught") | Some("unhandledrejection")
+        )
+    };
+    let console_errors: Vec<Value> = cd
+        .get("console")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter(is_err_level).cloned().collect())
+        .unwrap_or_default();
+    let failed_requests: Vec<Value> = cd
+        .get("network")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter(|n| n.get("ok").and_then(Value::as_bool) == Some(false))
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+    json!({
+        "name": name,
+        "passed": run.ok,
+        "ran": rd.get("ran").cloned().unwrap_or(json!(0)),
+        "failing_step": failing,
+        "console_errors": console_errors,
+        "failed_requests": failed_requests,
+        "steps": steps,
+    })
+}
+
+/// Print the human report; return (passed, failed, flows-with-issues).
+fn print_report(reports: &[Value], strict: bool) -> (usize, usize, usize) {
+    let arr_len = |v: &Value, k: &str| v.get(k).and_then(Value::as_array).map(|a| a.len()).unwrap_or(0);
+    let (mut passed, mut failed, mut issue_flows) = (0usize, 0usize, 0usize);
+    println!();
+    for r in reports {
+        let name = r.get("name").and_then(Value::as_str).unwrap_or("?");
+        let ok = r.get("passed").and_then(Value::as_bool).unwrap_or(false);
+        let ran = r.get("ran").and_then(Value::as_u64).unwrap_or(0);
+        let ce = arr_len(r, "console_errors");
+        let fr = arr_len(r, "failed_requests");
+        if ce > 0 || fr > 0 {
+            issue_flows += 1;
+        }
+        println!("  [{}] {name}  ({ran} step(s) ran)", if ok { "PASS" } else { "FAIL" });
+        if ok {
+            passed += 1;
+        } else {
+            failed += 1;
+            if let Some(err) = r.get("error").and_then(Value::as_str) {
+                println!("       error: {err}");
+            }
+            let fs = &r["failing_step"];
+            if !fs.is_null() {
+                let op = fs.get("op").and_then(Value::as_str).unwrap_or("?");
+                let detail = serde_json::to_string(&fs["detail"]).unwrap_or_default();
+                let detail: String = detail.chars().take(200).collect();
+                println!("       failing step: {op} -> {detail}");
+            }
+        }
+        if ce > 0 {
+            println!("       console errors: {ce}");
+            for c in r["console_errors"].as_array().into_iter().flatten().take(5) {
+                println!("         - {}", c.get("text").and_then(Value::as_str).unwrap_or(""));
+            }
+        }
+        if fr > 0 {
+            println!("       failed requests: {fr}");
+            for n in r["failed_requests"].as_array().into_iter().flatten().take(5) {
+                let m = n.get("method").and_then(Value::as_str).unwrap_or("?");
+                let st = n.get("status").and_then(Value::as_u64).unwrap_or(0);
+                let u = n.get("url").and_then(Value::as_str).unwrap_or("");
+                println!("         - {m} {st} {u}");
+            }
+        }
+    }
+    let extra = if strict && issue_flows > 0 {
+        format!(", {issue_flows} with issues (strict)")
+    } else {
+        String::new()
+    };
+    println!("\n{passed} passed, {failed} failed{extra}");
+    (passed, failed, issue_flows)
+}
+
 /// Rebuild a transcript from an audit log — how a session driven by a client
 /// we do not control (Claude Code, Cursor) gets recorded.
 fn transcript_cmd(args: &[String]) -> std::io::Result<()> {
@@ -579,8 +830,76 @@ fn print_help() {
          \x20   config print     Print the effective configuration\n\
          \x20   tools            Print the tool reference (--all, --json)\n\
          \x20   bridge           Drive this server with Gemini (--task, --list-models, --prune)\n\
+         \x20   test             Replay saved browser_flow UI tests (--attach, --json, --strict)\n\
          \x20   transcript       Rebuild a session record from an audit log\n\
          \x20   help             Show this help\n",
         env!("CARGO_PKG_VERSION")
     );
+}
+
+#[cfg(test)]
+mod test_cmd_tests {
+    use super::*;
+
+    fn s(v: &[&str]) -> Vec<String> {
+        v.iter().map(|x| x.to_string()).collect()
+    }
+
+    #[test]
+    fn positional_flows_skips_flags_and_their_values() {
+        let a = s(&["agentctl", "test", "login", "--attach", "9333", "checkout", "--strict", "--json", "/tmp/r.json"]);
+        assert_eq!(positional_flows(&a), vec!["login", "checkout"]);
+        // No names, only flags: empty (means "all flows").
+        assert!(positional_flows(&s(&["agentctl", "test", "--strict"])).is_empty());
+    }
+
+    fn env_ok(data: Value) -> mcp_types::Envelope {
+        mcp_types::Envelope { ok: true, tool: "t".into(), data: Some(data), error: None, image: None }
+    }
+    fn env_fail(data: Value) -> mcp_types::Envelope {
+        mcp_types::Envelope {
+            ok: false,
+            tool: "t".into(),
+            data: Some(data),
+            error: Some(mcp_types::ToolError { code: mcp_types::ErrorCode::ActionFailed, message: "x".into(), suggestion: None }),
+            image: None,
+        }
+    }
+
+    #[test]
+    fn a_failing_flow_report_carries_the_failing_step_and_captured_issues() {
+        let run = env_fail(json!({
+            "name": "f", "passed": false, "ran": 2,
+            "steps": [
+                {"i":0,"op":"navigate","ok":true,"detail":{}},
+                {"i":1,"op":"assert","ok":false,"detail":{"passed":false}}
+            ]
+        }));
+        let cap = env_ok(json!({
+            "console": [
+                {"level":"error","text":"TypeError: boom"},
+                {"level":"warn","text":"ignored"}
+            ],
+            "network": [
+                {"method":"GET","url":"https://x/ok","status":200,"ok":true},
+                {"method":"POST","url":"https://x/orders","status":500,"ok":false}
+            ]
+        }));
+        let r = build_flow_report("f", &run, &cap);
+        assert_eq!(r["passed"], false);
+        assert_eq!(r["failing_step"]["op"], "assert");
+        // Only error-level console entries and non-2xx requests are issues.
+        assert_eq!(r["console_errors"].as_array().unwrap().len(), 1);
+        assert_eq!(r["failed_requests"].as_array().unwrap().len(), 1);
+        assert_eq!(r["failed_requests"][0]["status"], 500);
+    }
+
+    #[test]
+    fn print_report_counts_pass_fail_and_issue_flows() {
+        let clean_pass = build_flow_report("a", &env_ok(json!({"passed":true,"ran":3,"steps":[]})), &env_ok(json!({"console":[],"network":[]})));
+        let pass_with_issue = build_flow_report("b", &env_ok(json!({"passed":true,"ran":1,"steps":[]})), &env_ok(json!({"console":[{"level":"error","text":"e"}],"network":[]})));
+        let fail = build_flow_report("c", &env_fail(json!({"passed":false,"ran":1,"steps":[{"i":0,"op":"assert","ok":false,"detail":{}}]})), &env_ok(json!({"console":[],"network":[]})));
+        let (passed, failed, issues) = print_report(&[clean_pass, pass_with_issue, fail], false);
+        assert_eq!((passed, failed, issues), (2, 1, 1));
+    }
 }

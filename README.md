@@ -188,6 +188,19 @@ shell driver. A minimal project wiring:
 with a test profile of `access = "bypass"` (every capability on, no prompts) for a machine you own and are
 watching.
 
+For unattended/CI runs, `agentctl test` replays saved flows against an attached Chromium and reports
+each flow's result plus the issues it hit (failing step, console errors, failed requests). It exits
+non-zero on any failure, so it drops into a pipeline:
+
+```sh
+chromium --remote-debugging-port=9222 --user-data-dir=/tmp/p &   # or any Chromium
+agentctl test                       # all saved flows
+agentctl test checkout login        # named flows
+agentctl test --json report.json --strict   # machine report; issues also fail
+```
+
+A green run never invokes a model; a failure is where an agent session takes over.
+
 ---
 
 ## The judge (optional)
