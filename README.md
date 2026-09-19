@@ -168,22 +168,30 @@ The deterministic checks decide everything they can. What they cannot decide is 
 buttons is the one that saves, whether the text a page returned is talking to the model, whether a typed
 line would wipe a disk when the pattern list did not match. With `[judge]` enabled, those questions go to a
 System One model (TypeSafe's `jev`), which answers a typed question with a probability in about a hundred
-milliseconds. Four places use it:
+milliseconds. Where it is used:
 
 - `find_elements` takes `describe` ("the button that saves the document") and returns the candidates
   ranked, each with a probability, plus whether anything fits at all.
+- `handle_dialogs` takes `intent` ("save my work") and returns a `suggestion` naming the button that
+  serves it. Advice only: it presses nothing, and the agent still acts through `ui_action` on a ref.
+- `memory_find` takes `rerank` to reorder recalled recipes by how well each one's goal fits yours, rather
+  than by success count alone. It falls back to success-count order when the judge cannot answer.
 - `wait_for` and every `expect` clause take `judge`, a plain-language claim about the UI, and report the
   probability alongside the structural result.
 - Results marked untrusted get a second opinion on whether their text is addressed to a model. The flag
   can be added, never removed.
 - Text headed for a shell gets a second opinion after the destructive patterns. A yes escalates to consent
   or a denial; a no changes nothing.
+- `agentctl bridge --prune` asks the judge which tools a task plausibly needs and declares only those to
+  the model, always keeping a core observe/wait set.
 
 **A judgment can only tighten.** Nothing it says is consulted on an allow path, so a wrong, absent or
 manipulated answer makes the server more careful, never less. When the service is unreachable, the
 deterministic answer stands and the failure is counted. The key comes from `TYPESAFE_API_KEY`, `.env` or
 `~/.agentctl/typesafe.key`, never from the config file or an argument. What is sent leaves the machine:
 element names, window titles, page text after redaction, typed commands, never a secure field's value.
+The `threshold` bar applies everywhere by default; `destructive_threshold`, `injection_threshold` and
+`match_threshold` tune the destructive second opinion, the injection flag and semantic ranking separately.
 See [`docs/threat-model.md`](docs/threat-model.md) §7.
 
 ---

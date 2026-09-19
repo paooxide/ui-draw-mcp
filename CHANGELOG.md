@@ -8,6 +8,18 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- **More places the judge helps, and per-use thresholds.** `handle_dialogs` takes `intent` and returns a
+  `suggestion` naming the button that serves it (advice only; it presses nothing). `memory_find` takes
+  `rerank` to reorder recalled recipes by semantic fit to the goal, falling back to success-count order
+  when the judge is unavailable. `agentctl bridge --prune` lets the reference client ask the judge which
+  tools a task plausibly needs and declares only those to the model, always keeping a core observe/wait
+  set and degrading to the full list. `[judge]` now takes optional `destructive_threshold`,
+  `injection_threshold` and `match_threshold`, each falling back to `threshold`, so the destructive second
+  opinion, the injection flag and semantic ranking can be tuned separately.
+- **Clipboard image and file-list formats (Linux).** `clipboard_read`/`clipboard_write` handle
+  `format: "image"` (a base64 PNG) and `format: "files"` (a newline-separated `text/uri-list`) in addition
+  to text and HTML, over the Wayland `wlr-data-control` path or the XWayland `xclip` fallback (`xsel`
+  carries text only, and says so).
 - **One-word permission profiles.** `policy.access = "ask" | "auto" | "bypass"` replaces enabling each
   category and naming each dangerous tool. All three turn on every capability; `ask` confirms a dangerous
   tool or destructive action through the dialog, `auto` runs unattended but refuses a clearly destructive

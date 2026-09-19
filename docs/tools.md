@@ -232,7 +232,7 @@ Read text off the screen, with a box for each line in screen coordinates. The fa
 
 `clipboard_read` · standard tier
 
-Read the clipboard.
+Read the clipboard. 'text'/'html' return the string in 'data'; 'image' returns a base64 PNG in 'data'; 'files' returns a newline-separated list of file:// URIs.
 
 | Argument | Type | Required | Description |
 |---|---|---|---|
@@ -242,7 +242,7 @@ Read the clipboard.
 
 `clipboard_write` · standard tier
 
-Write the clipboard. Set 'secret' if the data is sensitive.
+Write the clipboard. For 'image', 'data' is a base64 PNG; for 'files', it is a newline-separated list of file:// URIs; otherwise it is the literal text. Set 'secret' if the data is sensitive.
 
 | Argument | Type | Required | Description |
 |---|---|---|---|
@@ -437,11 +437,12 @@ Pin this session to an application: bring it forward and make every later get_ui
 
 `handle_dialogs` · read tier
 
-List open dialogs, sheets, popovers and menus, with their buttons, message text and which button Return/Escape activates. scope='system' also finds prompts raised by another process, such as macOS authentication panels. Press a button with ui_action on the matching ref from get_ui_tree.
+List open dialogs, sheets, popovers and menus, with their buttons, message text and which button Return/Escape activates. scope='system' also finds prompts raised by another process, such as macOS authentication panels. Press a button with ui_action on the matching ref from get_ui_tree. Pass 'intent' (what you are trying to do) to have the judge suggest which button serves it, in 'suggestion' (advice only; it presses nothing); needs the judge enabled).
 
 | Argument | Type | Required | Description |
 |---|---|---|---|
 | `app` | string |  |  |
+| `intent` | string |  | what you are trying to accomplish; the judge suggests the button that serves it |
 | `scope` | one of: app, system |  |  |
 
 ### launch
@@ -1394,12 +1395,13 @@ No arguments.
 
 `memory_find` · read tier
 
-Look up recorded sequences for a goal. Exact (normalized) match wins; otherwise substring matches ranked by success count. Omit 'goal' to list everything.
+Look up recorded sequences for a goal. Exact (normalized) match wins; otherwise substring matches ranked by success count. Omit 'goal' to list everything. Set 'rerank' to reorder the matches by how well each recipe's goal fits yours, judged semantically (needs the judge enabled); the order and a 'ranking' block are reported, and it falls back to success-count order if the judge is unavailable.
 
 | Argument | Type | Required | Description |
 |---|---|---|---|
 | `goal` | string |  |  |
 | `limit` | integer |  |  |
+| `rerank` | boolean |  | reorder matches by semantic fit to 'goal' using the judge |
 
 ### memory-forget
 
