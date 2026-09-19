@@ -16,6 +16,9 @@ use serde_json::{json, Value};
 /// can assert the engine is never reached past a deny.
 struct MockModule {
     calls: Arc<AtomicUsize>,
+    /// The args the engine actually received, so a test can prove redaction
+    /// touched only the logged copy, not what the tool ran with.
+    last_args: Arc<std::sync::Mutex<Option<Value>>>,
 }
 
 #[async_trait]
@@ -46,8 +49,9 @@ impl ToolModule for MockModule {
         ]
     }
 
-    async fn call(&self, name: &str, _args: Value, _ctx: &CallCtx) -> Envelope {
+    async fn call(&self, name: &str, args: Value, _ctx: &CallCtx) -> Envelope {
         self.calls.fetch_add(1, Ordering::SeqCst);
+        *self.last_args.lock().unwrap() = Some(args);
         Envelope::ok(name, json!({ "ran": true }))
     }
 
@@ -88,6 +92,7 @@ fn server_with_consent(
     let calls = Arc::new(AtomicUsize::new(0));
     let module = Arc::new(MockModule {
         calls: calls.clone(),
+        last_args: Arc::new(std::sync::Mutex::new(None)),
     });
     let registry = Registry::build(vec![module]).unwrap();
     let human = Arc::new(ScriptedHuman {
@@ -113,6 +118,7 @@ fn server_with(config: PolicyConfig) -> (Server, Arc<AtomicUsize>, Arc<Policy>) 
     let calls = Arc::new(AtomicUsize::new(0));
     let module = Arc::new(MockModule {
         calls: calls.clone(),
+        last_args: Arc::new(std::sync::Mutex::new(None)),
     });
     let registry = Registry::build(vec![module]).unwrap();
     let policy = Arc::new(Policy::new(config, AuditSink::memory(), Redactor::empty()));
@@ -804,4 +810,56 @@ async fn a_tripped_kill_switch_blocks_resource_reads() {
         .unwrap();
     let v: Value = serde_json::from_str(&out).unwrap();
     assert!(v["error"].is_object());
+}
+
+/// A call the agent flags `secret` (a password to type) must be redacted from
+/// the audit log, while the engine still receives the real value. This is what
+/// makes entering a password safe: it reaches the OS, it never reaches the
+/// append-only log.
+#[tokio::test]
+async fn a_secret_flagged_payload_is_redacted_in_the_audit_but_not_for_the_engine() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let last_args = Arc::new(std::sync::Mutex::new(None));
+    let module = Arc::new(MockModule {
+        calls: calls.clone(),
+        last_args: last_args.clone(),
+    });
+    let registry = Registry::build(vec![module]).unwrap();
+    let config = PolicyConfig {
+        categories: vec![Category::Vision],
+        ..PolicyConfig::default()
+    };
+    let policy = Arc::new(Policy::new(config, AuditSink::memory(), Redactor::empty()));
+    let server = Server::new(registry, policy.clone(), "test-session");
+
+    let env = server
+        .dispatch_call(
+            "vision_probe",
+            json!({ "text": "hunter2", "secret": true, "ref": "@e9" }),
+        )
+        .await;
+    assert!(env.ok);
+
+    // The engine ran with the real password.
+    let got = last_args.lock().unwrap().clone().unwrap();
+    assert_eq!(got["text"], "hunter2");
+
+    // The audit kept the flag but not the password.
+    let recs = policy.audit_sink().memory_records();
+    let pre = recs
+        .iter()
+        .find(|r| r["phase"] == "pre" && r["tool"] == "vision_probe")
+        .expect("a pre-audit record");
+    let logged = &pre["args_redacted"];
+    assert_eq!(logged["secret"], true);
+    assert_eq!(logged["ref"], "@e9");
+    assert_ne!(
+        logged["text"], "hunter2",
+        "the password must not be in the log"
+    );
+    assert!(
+        logged["text"].as_str().unwrap().contains("redacted"),
+        "expected a redaction marker, got {}",
+        logged["text"]
+    );
 }

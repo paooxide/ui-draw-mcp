@@ -24,7 +24,7 @@ enabled category, while a `dangerous` tool additionally has to be named in
 | [`drag_drop`](#drag-drop) | input | standard | Press-move-release drag from one point/ref to another. |
 | [`hover`](#hover) | input | standard | Move the pointer over an element ref or point (reveals tooltips/hover menus). |
 | [`keyboard_shortcut`](#keyboard-shortcut) | input | standard | Press a key or chord, e.g. |
-| [`keyboard_type`](#keyboard-type) | input | standard | Type Unicode text. |
+| [`keyboard_type`](#keyboard-type) | input | standard | Type Unicode text into the focused window. |
 | [`mouse_action`](#mouse-action) | input | standard | Coordinate pointer action (screen control). |
 | [`scroll`](#scroll) | input | standard | Scroll at an element ref or a point. |
 | [`set_value`](#set-value) | input | standard | Set the value of a text element by ref (accessibility SetValue). |
@@ -242,12 +242,13 @@ Read the clipboard.
 
 `clipboard_write` · standard tier
 
-Write the clipboard.
+Write the clipboard. Set 'secret' if the data is sensitive.
 
 | Argument | Type | Required | Description |
 |---|---|---|---|
 | `data` | string | yes |  |
 | `format` | one of: text, html, image, files |  |  |
+| `secret` | boolean |  | the text is a password or other secret: keep it out of the audit log and never send it to the judge |
 
 ### drag-drop
 
@@ -297,7 +298,7 @@ Press a key or chord, e.g. return, escape, cmd+s, cmd+shift+n.
 
 `keyboard_type` · standard tier
 
-Type Unicode text. If 'ref' is given, focus it first. Does not press return.
+Type Unicode text into the focused window. If 'ref' is given, focus it                  first. Does not press return. Set 'secret' when typing a password so it is                  kept out of the audit log and never sent to the judge.
 
 | Argument | Type | Required | Description |
 |---|---|---|---|
@@ -311,6 +312,7 @@ Type Unicode text. If 'ref' is given, focus it first. Does not press return.
 | `expect.timeout_ms` | integer |  | give up after this long (max 30000) |
 | `expect.window` | string |  | wait until a window with this title exists |
 | `ref` | string |  | optional element to focus first |
+| `secret` | boolean |  | the text is a password or other secret: keep it out of the audit log and never send it to the judge |
 | `text` | string | yes |  |
 
 ### mouse-action
@@ -354,7 +356,7 @@ Scroll at an element ref or a point.
 
 `set_value` · standard tier
 
-Set the value of a text element by ref (accessibility SetValue).
+Set the value of a text element by ref (accessibility SetValue). This works                  on a background window and needs no focus. Set 'secret' for a password.
 
 | Argument | Type | Required | Description |
 |---|---|---|---|
@@ -368,6 +370,7 @@ Set the value of a text element by ref (accessibility SetValue).
 | `expect.timeout_ms` | integer |  | give up after this long (max 30000) |
 | `expect.window` | string |  | wait until a window with this title exists |
 | `ref` | string | yes |  |
+| `secret` | boolean |  | the text is a password or other secret: keep it out of the audit log and never send it to the judge |
 | `text` | string | yes |  |
 
 ### ui-action
@@ -899,12 +902,13 @@ Start an interactive shell in a real PTY, for programs that need a terminal (vim
 
 `pty_write` · standard tier
 
-Send input to a session and return what it printed, ANSI-stripped. Include a trailing newline to submit a command. Destructive commands are gated.
+Send input to a session and return what it printed, ANSI-stripped. Include a trailing newline to submit a command. Destructive commands are gated. Set 'secret' when sending a password to a prompt (e.g. sudo) so it is kept out of the audit log and never sent to the judge.
 
 | Argument | Type | Required | Description |
 |---|---|---|---|
 | `data` | string | yes |  |
 | `read_timeout_ms` | integer |  |  |
+| `secret` | boolean |  | the data is a password or other secret: keep it out of the audit log and never send it to the judge |
 | `session_id` | integer | yes |  |
 
 ### scheduled-tasks

@@ -257,11 +257,18 @@ impl PtyModule {
         };
         // A PTY write *is* shell input, the one place the destructive gate is
         // unambiguously in scope. The patterns decide first; the judge can
-        // only add to what they found.
+        // only add to what they found. A secret (a password piped to a prompt)
+        // skips the remote judge; the offline pattern check still runs.
+        let secret = args.get("secret").and_then(Value::as_bool).unwrap_or(false);
+        let judge = if secret {
+            None
+        } else {
+            self.policy.judge.as_ref()
+        };
         let verdict = mcp_policy::judged_destructive(
             data,
             &self.policy.destructive_patterns,
-            self.policy.judge.as_ref(),
+            judge,
             "an interactive shell (pty)",
         )
         .await;
@@ -430,9 +437,12 @@ impl ToolModule for PtyModule {
                 Category::Terminal,
                 Tier::Standard,
                 "Send input to a session and return what it printed, ANSI-stripped. Include a \
-                 trailing newline to submit a command. Destructive commands are gated.",
+                 trailing newline to submit a command. Destructive commands are gated. Set \
+                 'secret' when sending a password to a prompt (e.g. sudo) so it is kept out \
+                 of the audit log and never sent to the judge.",
                 json!({"type":"object","properties":{
                     "session_id":sid,"data":{"type":"string"},
+                    "secret":{"type":"boolean","description":"the data is a password or other secret: keep it out of the audit log and never send it to the judge"},
                     "read_timeout_ms":{"type":"integer"}},"required":["session_id","data"]}),
             )
             .untrusted_output(),

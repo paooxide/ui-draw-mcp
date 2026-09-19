@@ -276,16 +276,23 @@ impl InputModule {
     /// When the target cannot be determined at all, destructive text is treated
     /// as if it *were* headed for a terminal. Unknown destination is not
     /// evidence of safety.
-    async fn destructive_check(&self, tool: &str, text: &str) -> Option<Envelope> {
+    async fn destructive_check(&self, tool: &str, text: &str, secret: bool) -> Option<Envelope> {
         let target = self.backend.input_target().or_else(|| self.current_app());
         let is_term = screens_as_terminal(target.as_deref(), &self.policy.terminal_apps);
         if !is_term {
             return None;
         }
+        // A secret (a password the operator handed us to type) must never be
+        // sent to the remote judge; the offline pattern check still runs.
+        let judge = if secret {
+            None
+        } else {
+            self.policy.judge.as_ref()
+        };
         let verdict = mcp_policy::judged_destructive(
             text,
             &self.policy.destructive_patterns,
-            self.policy.judge.as_ref(),
+            judge,
             &format!(
                 "a terminal ({})",
                 target.as_deref().unwrap_or("unknown application")
@@ -368,7 +375,8 @@ impl InputModule {
         let Some(text) = args.get("text").and_then(Value::as_str) else {
             return Envelope::fail(tool, ErrorCode::InvalidArgs, "missing 'text'");
         };
-        if let Some(deny) = self.destructive_check(tool, text).await {
+        let secret = args.get("secret").and_then(Value::as_bool).unwrap_or(false);
+        if let Some(deny) = self.destructive_check(tool, text, secret).await {
             return deny;
         }
         let (node_id, _) = match self.resolve_ref(tool, reff) {
@@ -386,7 +394,8 @@ impl InputModule {
         let Some(text) = args.get("text").and_then(Value::as_str) else {
             return Envelope::fail(tool, ErrorCode::InvalidArgs, "missing 'text'");
         };
-        if let Some(deny) = self.destructive_check(tool, text).await {
+        let secret = args.get("secret").and_then(Value::as_bool).unwrap_or(false);
+        if let Some(deny) = self.destructive_check(tool, text, secret).await {
             return deny;
         }
         if let Some(reff) = args.get("ref").and_then(Value::as_str) {
@@ -561,7 +570,8 @@ impl InputModule {
         let Some(data) = args.get("data").and_then(Value::as_str) else {
             return Envelope::fail(tool, ErrorCode::InvalidArgs, "missing 'data'");
         };
-        if let Some(deny) = self.destructive_check(tool, data).await {
+        let secret = args.get("secret").and_then(Value::as_bool).unwrap_or(false);
+        if let Some(deny) = self.destructive_check(tool, data, secret).await {
             return deny;
         }
         match self.backend.clipboard_write(format, data).await {
@@ -604,18 +614,20 @@ impl ToolModule for InputModule {
                 "set_value",
                 Category::Input,
                 Tier::Standard,
-                "Set the value of a text element by ref (accessibility SetValue).",
+                "Set the value of a text element by ref (accessibility SetValue). This works                  on a background window and needs no focus. Set 'secret' for a password.",
                 json!({"type":"object","properties":{
                     "ref":{"type":"string"},"text":{"type":"string"},
+                    "secret":{"type":"boolean","description":"the text is a password or other secret: keep it out of the audit log and never send it to the judge"},
                     "expect": expect_schema()},"required":["ref","text"]}),
             ).idempotent(true),
             ToolDescriptor::new(
                 "keyboard_type",
                 Category::Input,
                 Tier::Standard,
-                "Type Unicode text. If 'ref' is given, focus it first. Does not press return.",
+                "Type Unicode text into the focused window. If 'ref' is given, focus it                  first. Does not press return. Set 'secret' when typing a password so it is                  kept out of the audit log and never sent to the judge.",
                 json!({"type":"object","properties":{
                     "text":{"type":"string"},"ref":{"type":"string","description":"optional element to focus first"},
+                    "secret":{"type":"boolean","description":"the text is a password or other secret: keep it out of the audit log and never send it to the judge"},
                     "expect": expect_schema()},"required":["text"]}),
             ),
             ToolDescriptor::new(
@@ -680,8 +692,8 @@ impl ToolModule for InputModule {
                 "clipboard_write",
                 Category::Input,
                 Tier::Standard,
-                "Write the clipboard.",
-                json!({"type":"object","properties":{"format":{"type":"string","enum":["text","html","image","files"]},"data":{"type":"string"}},"required":["data"]}),
+                "Write the clipboard. Set 'secret' if the data is sensitive.",
+                json!({"type":"object","properties":{"format":{"type":"string","enum":["text","html","image","files"]},"data":{"type":"string"},"secret":{"type":"boolean","description":"the text is a password or other secret: keep it out of the audit log and never send it to the judge"}},"required":["data"]}),
             ).idempotent(true),
         ]
     }

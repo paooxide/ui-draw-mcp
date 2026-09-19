@@ -155,6 +155,10 @@ impl Server {
         pre.tier = Some(tier.clone());
         let mut redacted_args = args.clone();
         self.policy.redact(&mut redacted_args);
+        // A call the agent flagged `secret` (a password to type) must not leave
+        // its payload in the append-only audit; the engine still gets the real
+        // `args`, only this logged copy is redacted.
+        mcp_policy::redact_flagged_payload(&mut redacted_args);
         pre.args_redacted = Some(redacted_args.clone());
 
         // 4a. Rehearsal. Reads still run — an agent cannot plan without

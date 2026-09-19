@@ -188,6 +188,22 @@ See [`docs/threat-model.md`](docs/threat-model.md) §7.
 
 ---
 
+## Entering a password
+
+The owner can have the agent enter a password, in a terminal prompt or a GUI field, by passing it as an
+argument. Mark the call `secret: true` on `keyboard_type`, `set_value`, `pty_write` or `clipboard_write`,
+and two things happen: the value is replaced with a length marker in the append-only audit log, and it is
+never sent to the judge. The action still carries the real value to the OS. Without the flag the payload
+would be logged verbatim, so the flag is the difference between a password that persists and one that does
+not.
+
+Two limits worth knowing. A GUI password field's *contents* are never readable (secure fields are redacted
+from every perception tool), but writing to one is allowed, which is what entering a password needs. And on
+Wayland `keyboard_type` needs the target window focused; `set_value` on a field ref does not, so for a
+background login form `set_value` with `secret: true` is the robust choice.
+
+---
+
 ## Configuration
 
 Settings live in `~/.agentctl/config.toml`, or wherever `$AGENTCTL_CONFIG` points.

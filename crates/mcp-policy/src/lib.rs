@@ -29,7 +29,7 @@ pub use injection::{flag_untrusted, suspicious_instructions};
 pub use judged::{judged_destructive, second_opinion_on_content, Destructive};
 pub use killswitch::KillSwitch;
 pub use mcp_judge;
-pub use redact::Redactor;
+pub use redact::{redact_flagged_payload, Redactor};
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 pub use consent::DialogConsent;

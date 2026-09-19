@@ -8,6 +8,11 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- **Secret-safe input.** `keyboard_type`, `set_value`, `pty_write` and `clipboard_write` take
+  `secret: true` for entering a password the owner provides. The payload is redacted from the append-only
+  audit log (length marker only) and is never sent to the judge, while the real value still reaches the OS.
+  The destructive-pattern check still runs offline. Without the flag, typed text is logged verbatim as
+  before.
 - **The judge** (`mcp-judge`, `[judge]` in the config, off by default): typed judgments from a System One
   model (TypeSafe's `jev`), consulted only where a judgment can tighten a decision or rank candidates.
   `find_elements` takes `describe` and returns candidates ranked with probabilities; `wait_for` and

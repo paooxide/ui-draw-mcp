@@ -198,6 +198,15 @@ toolkit reports over AT-SPI start at (0, 0). A `mouse_action` aimed with those n
 place. Coordinates read from `capture_screen` or `ocr_region` are screen-global and correct, and
 `ui_action` on a ref needs no coordinate at all. XWayland and X11 applications report global bounds.
 
+**A provided password is kept out of the log and away from the judge.**
+The owner may hand the agent a password to type. A call flagged `secret: true` (`keyboard_type`,
+`set_value`, `pty_write`, `clipboard_write`) has its payload replaced with a length marker in the audit log
+(`mcp_policy::redact_flagged_payload`, applied to the logged copy only, in `mcp-core::server`), and the
+offline destructive-pattern check still runs while the remote judge is skipped, so the secret never leaves
+the machine for TypeSafe. The real value still reaches the OS. The length is visible in the marker; the
+value is not. Without the flag the payload is logged verbatim, which is the documented default for ordinary
+typed text. A GUI secure field's contents remain unreadable through every perception tool regardless.
+
 **The judge is a second opinion, not a boundary.**
 `[judge]` sends text to a remote model and gets a probability back. Its own documentation says adversarial
 content can move its answers, so it is wired where that cannot matter: `judged_destructive` runs the
