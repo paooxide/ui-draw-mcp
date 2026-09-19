@@ -52,6 +52,7 @@ fn input_to_window(e: InputError) -> WindowError {
         InputError::PermissionDenied(m) => WindowError::PermissionDenied(m),
         InputError::NotFound(m) => WindowError::NotFound(m),
         InputError::Unsupported(m) => WindowError::Unsupported(m),
+        InputError::InvalidArgs(m) => WindowError::Failed(m),
         InputError::Failed(m) => WindowError::Failed(m),
     }
 }

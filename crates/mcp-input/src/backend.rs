@@ -134,6 +134,9 @@ pub enum InputError {
     /// The element's backend handle is gone (snapshot superseded).
     NotFound(String),
     Unsupported(String),
+    /// The caller passed something malformed (e.g. clipboard image data that
+    /// is not valid base64).
+    InvalidArgs(String),
     Failed(String),
 }
 

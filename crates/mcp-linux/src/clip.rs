@@ -14,13 +14,15 @@ use std::path::Path;
 
 use mcp_input::ClipFormat;
 
-/// The MIME type a format maps to, or `None` for formats no path supports.
-pub fn mime_for(format: ClipFormat) -> Option<&'static str> {
+/// The MIME type a format maps to. Every format has one: an image rides the
+/// clipboard as PNG, and a file list as `text/uri-list` (the freedesktop
+/// convention, one `file://` URI per line).
+pub fn mime_for(format: ClipFormat) -> &'static str {
     match format {
-        ClipFormat::Text => Some("text/plain"),
-        ClipFormat::Html => Some("text/html"),
-        // Images and file lists are not carried by the text clipboard here.
-        ClipFormat::Image | ClipFormat::Files => None,
+        ClipFormat::Text => "text/plain",
+        ClipFormat::Html => "text/html",
+        ClipFormat::Image => "image/png",
+        ClipFormat::Files => "text/uri-list",
     }
 }
 
@@ -55,6 +57,16 @@ impl X11Tool {
             }
         }
         None
+    }
+
+    /// Whether this tool can carry `format`. `xclip` speaks arbitrary MIME
+    /// types, so it handles all four; `xsel` only ever touches the text
+    /// selection, so an image or a file list has no representation through it.
+    pub fn supports(self, format: ClipFormat) -> bool {
+        match self {
+            X11Tool::Xclip => true,
+            X11Tool::Xsel => matches!(format, ClipFormat::Text | ClipFormat::Html),
+        }
     }
 
     /// Argv to read the clipboard as `mime`. `xsel` ignores the MIME type,
@@ -105,11 +117,27 @@ mod tests {
     }
 
     #[test]
-    fn formats_map_to_mime_or_are_refused() {
-        assert_eq!(mime_for(ClipFormat::Text), Some("text/plain"));
-        assert_eq!(mime_for(ClipFormat::Html), Some("text/html"));
-        assert_eq!(mime_for(ClipFormat::Image), None);
-        assert_eq!(mime_for(ClipFormat::Files), None);
+    fn every_format_maps_to_a_mime_type() {
+        assert_eq!(mime_for(ClipFormat::Text), "text/plain");
+        assert_eq!(mime_for(ClipFormat::Html), "text/html");
+        assert_eq!(mime_for(ClipFormat::Image), "image/png");
+        assert_eq!(mime_for(ClipFormat::Files), "text/uri-list");
+    }
+
+    #[test]
+    fn xsel_carries_only_text_but_xclip_carries_everything() {
+        for f in [
+            ClipFormat::Text,
+            ClipFormat::Html,
+            ClipFormat::Image,
+            ClipFormat::Files,
+        ] {
+            assert!(X11Tool::Xclip.supports(f), "xclip should carry {f:?}");
+        }
+        assert!(X11Tool::Xsel.supports(ClipFormat::Text));
+        assert!(X11Tool::Xsel.supports(ClipFormat::Html));
+        assert!(!X11Tool::Xsel.supports(ClipFormat::Image));
+        assert!(!X11Tool::Xsel.supports(ClipFormat::Files));
     }
 
     #[test]

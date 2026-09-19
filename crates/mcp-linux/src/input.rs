@@ -456,32 +456,30 @@ impl InputBackend for LinuxBackend {
     }
 
     async fn clipboard_read(&self, format: ClipFormat) -> Result<ClipData, InputError> {
-        let Some(mime) = clip::mime_for(format) else {
-            return Err(InputError::Unsupported(format!(
-                "clipboard_read {format:?} is not supported (text and html only)"
-            )));
-        };
+        let mime = clip::mime_for(format);
         // The Wayland path first; the X11 bridge only if the compositor
         // withholds the protocol, so a machine that has both keeps using
         // the native one.
-        match wl_read(format).await {
-            Ok(data) => Ok(ClipData { format, data }),
+        let bytes = match wl_read(format).await {
+            Ok(b) => b,
             Err(InputError::Failed(m)) if clip::missing_protocol(&m) => {
-                let data = x11_read(mime).await?;
-                Ok(ClipData { format, data })
+                x11_read(format, mime).await?
             }
-            Err(e) => Err(e),
-        }
+            Err(e) => return Err(e),
+        };
+        Ok(ClipData {
+            format,
+            data: bytes.map(|b| encode_clip(format, &b)),
+        })
     }
 
     async fn clipboard_write(&self, format: ClipFormat, data: &str) -> Result<(), InputError> {
-        let Some(mime) = clip::mime_for(format) else {
-            return Err(InputError::Unsupported(format!(
-                "clipboard_write {format:?} is not supported (text and html only)"
-            )));
-        };
-        match wl_write(format, data).await {
-            Err(InputError::Failed(m)) if clip::missing_protocol(&m) => x11_write(mime, data).await,
+        let mime = clip::mime_for(format);
+        let bytes = decode_clip(format, data)?;
+        match wl_write(format, bytes.clone()).await {
+            Err(InputError::Failed(m)) if clip::missing_protocol(&m) => {
+                x11_write(format, mime, bytes).await
+            }
             other => other,
         }
     }
@@ -515,14 +513,54 @@ impl InputBackend for LinuxBackend {
     }
 }
 
+/// How a clipboard payload crosses the JSON boundary: an image is opaque
+/// bytes and rides as base64; everything else is text (UTF-8, lossy on the
+/// rare non-text byte).
+fn encode_clip(format: ClipFormat, bytes: &[u8]) -> String {
+    match format {
+        ClipFormat::Image => {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD.encode(bytes)
+        }
+        _ => String::from_utf8_lossy(bytes).into_owned(),
+    }
+}
+
+/// The inverse of [`encode_clip`]: an image arrives as base64 and is decoded
+/// to the PNG bytes; other formats are UTF-8 already.
+fn decode_clip(format: ClipFormat, data: &str) -> Result<Vec<u8>, InputError> {
+    match format {
+        ClipFormat::Image => {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD
+                .decode(data.trim())
+                .map_err(|e| {
+                    InputError::InvalidArgs(format!(
+                        "clipboard image data must be base64-encoded PNG: {e}"
+                    ))
+                })
+        }
+        _ => Ok(data.as_bytes().to_vec()),
+    }
+}
+
+/// The MIME wl-clipboard should ask for. Text stays `MimeType::Text` (which
+/// tries the several text spellings a source might advertise); the rest name
+/// the exact type.
+fn wl_paste_mime(format: ClipFormat) -> wl_clipboard_rs::paste::MimeType<'static> {
+    use wl_clipboard_rs::paste::MimeType;
+    match format {
+        ClipFormat::Text => MimeType::Text,
+        _ => MimeType::Specific(clip::mime_for(format)),
+    }
+}
+
 /// The Wayland clipboard read (`wlr-data-control`). `Failed` carries the raw
-/// message so the caller can spot the missing-protocol case.
-async fn wl_read(format: ClipFormat) -> Result<Option<String>, InputError> {
-    use wl_clipboard_rs::paste::{get_contents, ClipboardType, MimeType, Seat};
-    let mime = match format {
-        ClipFormat::Html => MimeType::Specific("text/html"),
-        _ => MimeType::Text,
-    };
+/// message so the caller can spot the missing-protocol case. Returns the raw
+/// bytes so a PNG survives the trip.
+async fn wl_read(format: ClipFormat) -> Result<Option<Vec<u8>>, InputError> {
+    use wl_clipboard_rs::paste::{get_contents, ClipboardType, Seat};
+    let mime = wl_paste_mime(format);
     tokio::task::spawn_blocking(move || {
         use std::io::Read;
         match get_contents(ClipboardType::Regular, Seat::Unspecified, mime) {
@@ -531,7 +569,7 @@ async fn wl_read(format: ClipFormat) -> Result<Option<String>, InputError> {
                 reader
                     .read_to_end(&mut buf)
                     .map_err(|e| InputError::Failed(format!("clipboard read: {e}")))?;
-                Ok(Some(String::from_utf8_lossy(&buf).into_owned()))
+                Ok(Some(buf))
             }
             Err(wl_clipboard_rs::paste::Error::NoSeats)
             | Err(wl_clipboard_rs::paste::Error::ClipboardEmpty)
@@ -543,13 +581,13 @@ async fn wl_read(format: ClipFormat) -> Result<Option<String>, InputError> {
     .map_err(|e| InputError::Failed(format!("clipboard task: {e}")))?
 }
 
-async fn wl_write(format: ClipFormat, data: &str) -> Result<(), InputError> {
+async fn wl_write(format: ClipFormat, bytes: Vec<u8>) -> Result<(), InputError> {
     use wl_clipboard_rs::copy::{MimeType, Options, Source};
     let mime = match format {
-        ClipFormat::Html => MimeType::Specific("text/html".into()),
-        _ => MimeType::Text,
+        ClipFormat::Text => MimeType::Text,
+        _ => MimeType::Specific(clip::mime_for(format).into()),
     };
-    let bytes: Box<[u8]> = data.as_bytes().into();
+    let bytes: Box<[u8]> = bytes.into();
     tokio::task::spawn_blocking(move || {
         Options::new()
             .copy(Source::Bytes(bytes), mime)
@@ -570,11 +608,24 @@ fn no_clipboard_path() -> InputError {
     )
 }
 
-/// Read the clipboard through an X11 tool over XWayland.
-async fn x11_read(mime: &str) -> Result<Option<String>, InputError> {
+/// An X11 tool that cannot carry `format` (xsel and a non-text format).
+fn x11_cannot_carry(tool: clip::X11Tool, format: ClipFormat) -> InputError {
+    InputError::Unsupported(format!(
+        "the only X11 clipboard tool found ({tool:?}) carries text only, so it \
+         cannot handle {format:?}; install xclip, or use a compositor that \
+         implements the wlr-data-control protocol"
+    ))
+}
+
+/// Read the clipboard through an X11 tool over XWayland. Returns raw bytes so
+/// an image survives.
+async fn x11_read(format: ClipFormat, mime: &str) -> Result<Option<Vec<u8>>, InputError> {
     let Some((tool, bin)) = clip::X11Tool::detect() else {
         return Err(no_clipboard_path());
     };
+    if !tool.supports(format) {
+        return Err(x11_cannot_carry(tool, format));
+    }
     let out = tokio::process::Command::new(&bin)
         .args(tool.read_args(mime))
         .stdin(std::process::Stdio::null())
@@ -585,16 +636,22 @@ async fn x11_read(mime: &str) -> Result<Option<String>, InputError> {
         // An empty clipboard is a non-zero exit for xclip, not a fault.
         return Ok(None);
     }
-    let s = String::from_utf8_lossy(&out.stdout).into_owned();
-    Ok(if s.is_empty() { None } else { Some(s) })
+    Ok(if out.stdout.is_empty() {
+        None
+    } else {
+        Some(out.stdout)
+    })
 }
 
 /// Write the clipboard through an X11 tool over XWayland.
-async fn x11_write(mime: &str, data: &str) -> Result<(), InputError> {
+async fn x11_write(format: ClipFormat, mime: &str, data: Vec<u8>) -> Result<(), InputError> {
     use tokio::io::AsyncWriteExt;
     let Some((tool, bin)) = clip::X11Tool::detect() else {
         return Err(no_clipboard_path());
     };
+    if !tool.supports(format) {
+        return Err(x11_cannot_carry(tool, format));
+    }
     // stdout AND stderr go to /dev/null on purpose. Once xclip has read the
     // data it forks a background process to serve the selection until another
     // client takes it over, and that child inherits any pipe we keep. Capturing
@@ -610,7 +667,7 @@ async fn x11_write(mime: &str, data: &str) -> Result<(), InputError> {
         .map_err(|e| InputError::Failed(format!("{bin}: {e}")))?;
     if let Some(mut stdin) = child.stdin.take() {
         stdin
-            .write_all(data.as_bytes())
+            .write_all(&data)
             .await
             .map_err(|e| InputError::Failed(format!("{bin} stdin: {e}")))?;
         // Closing stdin signals end-of-input; xclip then grabs the selection.
@@ -736,4 +793,47 @@ async fn selection_iface<'a>(
         .selection()
         .await
         .map_err(|e| iface_err("selection", e))
+}
+
+#[cfg(test)]
+mod clip_tests {
+    use super::{decode_clip, encode_clip};
+    use mcp_input::ClipFormat;
+
+    #[test]
+    fn text_html_and_files_round_trip_as_utf8() {
+        for f in [ClipFormat::Text, ClipFormat::Html, ClipFormat::Files] {
+            let s = "file:///tmp/a\nfile:///tmp/b";
+            let bytes = decode_clip(f, s).unwrap();
+            assert_eq!(bytes, s.as_bytes());
+            assert_eq!(encode_clip(f, &bytes), s);
+        }
+    }
+
+    #[test]
+    fn an_image_round_trips_through_base64_including_non_utf8_bytes() {
+        // A PNG signature followed by a byte that is not valid UTF-8 (0xFF),
+        // which a text round trip would corrupt.
+        let png = [0x89u8, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0xff, 0x00];
+        let b64 = encode_clip(ClipFormat::Image, &png);
+        assert!(!b64.contains('\u{fffd}'), "base64 is ASCII, never lossy");
+        let back = decode_clip(ClipFormat::Image, &b64).unwrap();
+        assert_eq!(back, png, "the exact PNG bytes survive the trip");
+    }
+
+    #[test]
+    fn surrounding_whitespace_on_base64_image_data_is_tolerated() {
+        let b64 = encode_clip(ClipFormat::Image, &[1, 2, 3, 4]);
+        let padded = format!("  \n{b64}\n ");
+        assert_eq!(decode_clip(ClipFormat::Image, &padded).unwrap(), [1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn malformed_base64_image_data_is_an_invalid_argument() {
+        let e = decode_clip(ClipFormat::Image, "not!base64!").unwrap_err();
+        assert!(
+            matches!(e, mcp_input::InputError::InvalidArgs(_)),
+            "expected InvalidArgs, got {e:?}"
+        );
+    }
 }

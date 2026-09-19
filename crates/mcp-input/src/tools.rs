@@ -33,7 +33,7 @@ pub struct InputPolicy {
 /// `rm -rf` typed into VS Code's panel runs exactly as it would in Terminal.app,
 /// and the accessibility API cannot tell the editor pane from the terminal pane
 /// (Electron and GPUI both render their own text). Treating the whole app as a
-/// terminal over-triggers on source files that merely contain the string — the
+/// terminal over-triggers on source files that merely contain the string, the
 /// safe direction to be wrong in, and it only ever asks rather than refuses.
 pub fn default_terminal_apps() -> Vec<String> {
     [
@@ -108,7 +108,7 @@ fn parse_modifiers(tool: &str, args: &Value) -> Result<Vec<String>, Envelope> {
 /// Should text typed at `target` be screened as shell input?
 ///
 /// `None` means the destination could not be determined, and that is treated as
-/// a terminal. An unknown destination is not evidence of safety — and the case
+/// a terminal. An unknown destination is not evidence of safety, and the case
 /// that produces it is exactly the dangerous one: an app that exposes no
 /// accessibility tree, which is what Electron and GPUI editors do.
 pub fn screens_as_terminal(target: Option<&str>, terminal_apps: &[String]) -> bool {
@@ -272,7 +272,7 @@ impl InputModule {
     ///
     /// The target is whatever will actually receive the keystrokes, not the app
     /// in the last snapshot. Asking the snapshot lets a destructive command
-    /// straight through whenever the two disagree — and they always disagree for
+    /// straight through whenever the two disagree, and they always disagree for
     /// an app with no accessibility tree, where the snapshot is empty and the
     /// check silently evaluates to "not a terminal".
     ///
@@ -590,7 +590,7 @@ impl InputModule {
 /// The `expect` clause the action tools accept.
 ///
 /// It belongs *inside* `properties`, next to the other arguments. Hoisting it
-/// to the top level of the schema — which is where it started — leaves it
+/// to the top level of the schema (which is where it started) leaves it
 /// undeclared: a client reading the schema properly never learns the argument
 /// exists, and the act-and-confirm round trip silently goes unused.
 fn expect_schema() -> serde_json::Value {
@@ -691,14 +691,19 @@ impl ToolModule for InputModule {
                 "clipboard_read",
                 Category::Input,
                 Tier::Standard,
-                "Read the clipboard.",
+                "Read the clipboard. 'text'/'html' return the string in 'data'; \
+                 'image' returns a base64 PNG in 'data'; 'files' returns a \
+                 newline-separated list of file:// URIs.",
                 json!({"type":"object","properties":{"format":{"type":"string","enum":["text","html","image","files"]}},"required":[]}),
             ).untrusted_output(),
             ToolDescriptor::new(
                 "clipboard_write",
                 Category::Input,
                 Tier::Standard,
-                "Write the clipboard. Set 'secret' if the data is sensitive.",
+                "Write the clipboard. For 'image', 'data' is a base64 PNG; for \
+                 'files', it is a newline-separated list of file:// URIs; \
+                 otherwise it is the literal text. Set 'secret' if the data is \
+                 sensitive.",
                 json!({"type":"object","properties":{"format":{"type":"string","enum":["text","html","image","files"]},"data":{"type":"string"},"secret":{"type":"boolean","description":"the text is a password or other secret: keep it out of the audit log and never send it to the judge"}},"required":["data"]}),
             ).idempotent(true),
         ]
@@ -769,6 +774,7 @@ fn input_err(tool: &str, e: InputError) -> Envelope {
         InputError::PermissionDenied(m) => (ErrorCode::PermDenied, m),
         InputError::NotFound(m) => (ErrorCode::StaleRef, m),
         InputError::Unsupported(m) => (ErrorCode::UnsupportedOs, m),
+        InputError::InvalidArgs(m) => (ErrorCode::InvalidArgs, m),
         InputError::Failed(m) => (ErrorCode::ActionFailed, m),
     };
     Envelope::fail(tool, code, msg)
@@ -784,7 +790,7 @@ mod tests {
 
     /// The gap this closes: an editor's integrated terminal runs the same shell
     /// as Terminal.app, so `rm -rf` typed into VS Code's panel is exactly as
-    /// destructive — but the old list stopped at dedicated terminal emulators.
+    /// destructive, but the old list stopped at dedicated terminal emulators.
     #[test]
     fn editors_with_integrated_terminals_are_screened() {
         for app in [
