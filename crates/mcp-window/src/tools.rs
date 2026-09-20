@@ -194,6 +194,9 @@ impl WindowModule {
 
     /// Rank the buttons across the listed dialogs against `intent`. Returns the
     /// suggestion JSON, or a ready-to-return failure envelope.
+    // Envelope is intentionally large (it carries an optional image); it is the
+    // Err type here only as a control-flow shortcut for an early return.
+    #[allow(clippy::result_large_err)]
     async fn suggest_button(
         &self,
         intent: &str,
