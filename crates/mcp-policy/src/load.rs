@@ -195,9 +195,7 @@ impl PolicyConfig {
                 ("judge.injection_threshold", Val::Int(i)) => {
                     cfg.judge.injection_threshold = Some(*i as f64)
                 }
-                ("judge.match_threshold", Val::Float(f)) => {
-                    cfg.judge.match_threshold = Some(*f)
-                }
+                ("judge.match_threshold", Val::Float(f)) => cfg.judge.match_threshold = Some(*f),
                 ("judge.match_threshold", Val::Int(i)) => {
                     cfg.judge.match_threshold = Some(*i as f64)
                 }
@@ -210,12 +208,13 @@ impl PolicyConfig {
                 ("judge.timeout_ms" | "judge.max_state_bytes", _) => {
                     return Err(format!("{key} must be a positive integer"))
                 }
-                ("judge.threshold"
-                | "judge.destructive_threshold"
-                | "judge.injection_threshold"
-                | "judge.match_threshold", _) => {
-                    return Err(format!("{key} must be a number"))
-                }
+                (
+                    "judge.threshold"
+                    | "judge.destructive_threshold"
+                    | "judge.injection_threshold"
+                    | "judge.match_threshold",
+                    _,
+                ) => return Err(format!("{key} must be a number")),
                 ("fs.roots", Val::List(v)) => cfg.fs_roots = v.iter().map(PathBuf::from).collect(),
                 ("terminal.allowed_commands", Val::List(v)) => cfg.allowed_commands = v.clone(),
                 ("network.allowed_hosts", Val::List(v)) => cfg.allowed_hosts = v.clone(),

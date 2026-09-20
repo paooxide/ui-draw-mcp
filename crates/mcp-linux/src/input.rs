@@ -825,7 +825,10 @@ mod clip_tests {
     fn surrounding_whitespace_on_base64_image_data_is_tolerated() {
         let b64 = encode_clip(ClipFormat::Image, &[1, 2, 3, 4]);
         let padded = format!("  \n{b64}\n ");
-        assert_eq!(decode_clip(ClipFormat::Image, &padded).unwrap(), [1, 2, 3, 4]);
+        assert_eq!(
+            decode_clip(ClipFormat::Image, &padded).unwrap(),
+            [1, 2, 3, 4]
+        );
     }
 
     #[test]

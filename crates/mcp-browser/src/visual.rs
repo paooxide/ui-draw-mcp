@@ -75,7 +75,9 @@ impl VisualStore {
     ) -> Result<Baseline, VisualError> {
         let name = name.trim();
         if name.is_empty() {
-            return Err(VisualError::Invalid("baseline name must not be empty".into()));
+            return Err(VisualError::Invalid(
+                "baseline name must not be empty".into(),
+            ));
         }
         if png_base64.is_empty() {
             return Err(VisualError::Invalid("baseline image is empty".into()));
@@ -115,7 +117,10 @@ mod tests {
 
     fn store(tag: &str) -> VisualStore {
         let mut p = std::env::temp_dir();
-        p.push(format!("agentctl-baselines-{tag}-{}.json", std::process::id()));
+        p.push(format!(
+            "agentctl-baselines-{tag}-{}.json",
+            std::process::id()
+        ));
         let _ = std::fs::remove_file(&p);
         VisualStore::new(p, 3)
     }
@@ -137,8 +142,14 @@ mod tests {
     #[test]
     fn empty_name_or_image_is_rejected() {
         let s = store("bad");
-        assert!(matches!(s.save("", "x".into(), 0, 0, 1), Err(VisualError::Invalid(_))));
-        assert!(matches!(s.save("n", "".into(), 0, 0, 1), Err(VisualError::Invalid(_))));
+        assert!(matches!(
+            s.save("", "x".into(), 0, 0, 1),
+            Err(VisualError::Invalid(_))
+        ));
+        assert!(matches!(
+            s.save("n", "".into(), 0, 0, 1),
+            Err(VisualError::Invalid(_))
+        ));
     }
 
     #[test]
@@ -148,6 +159,9 @@ mod tests {
         s.save("b", "x".into(), 0, 0, 1).unwrap();
         s.save("c", "x".into(), 0, 0, 1).unwrap();
         assert!(s.save("d", "x".into(), 0, 0, 1).is_err(), "cap is 3");
-        assert!(s.save("a", "y".into(), 0, 0, 2).is_ok(), "replace at cap is ok");
+        assert!(
+            s.save("a", "y".into(), 0, 0, 2).is_ok(),
+            "replace at cap is ok"
+        );
     }
 }

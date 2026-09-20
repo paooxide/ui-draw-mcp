@@ -498,7 +498,10 @@ impl BrowserModule {
         let (name, tolerance, node_ref) = match v {
             Value::String(s) => (s.clone(), 0.01_f64, None),
             _ => (
-                v.get("name").and_then(Value::as_str).unwrap_or("").to_string(),
+                v.get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
                 v.get("tolerance").and_then(Value::as_f64).unwrap_or(0.01),
                 v.get("ref").and_then(Value::as_str).map(String::from),
             ),
@@ -524,7 +527,10 @@ impl BrowserModule {
                 Err(e) => fail(format!("baseline save failed: {e:?}")),
             };
         };
-        let diff = match self.visual_diff(target, &base.png_base64, &shot.base64).await {
+        let diff = match self
+            .visual_diff(target, &base.png_base64, &shot.base64)
+            .await
+        {
             Ok(d) => d,
             Err(e) => return fail(format!("diff failed: {}", browser_err_msg(&e))),
         };
@@ -537,7 +543,10 @@ impl BrowserModule {
             return json!({ "name": "visual", "ok": false,
                 "detail": format!("dimensions changed {b} -> {c}"), "diff": diff });
         }
-        let ratio = diff.get("diff_ratio").and_then(Value::as_f64).unwrap_or(1.0);
+        let ratio = diff
+            .get("diff_ratio")
+            .and_then(Value::as_f64)
+            .unwrap_or(1.0);
         json!({
             "name": "visual",
             "ok": ratio <= tolerance,
@@ -573,7 +582,11 @@ impl BrowserModule {
         let dims: Vec<String> = uo
             .get("dims")
             .and_then(Value::as_array)
-            .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect::<Vec<_>>())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect::<Vec<_>>()
+            })
             .filter(|v| !v.is_empty())
             .unwrap_or_else(|| {
                 ["clarity", "hierarchy", "affordance", "consistency"]
@@ -583,13 +596,19 @@ impl BrowserModule {
             });
         let gate = uo.get("gate").and_then(Value::as_bool).unwrap_or(false);
         let min = uo.get("min").and_then(Value::as_f64).unwrap_or(0.5);
-        let skipped = |d: String| json!({ "name": "ux", "ok": true, "advisory": true, "detail": d });
+        let skipped =
+            |d: String| json!({ "name": "ux", "ok": true, "advisory": true, "detail": d });
         let Some(judge) = self.judge.as_ref() else {
             return skipped("judge not configured; skipped".into());
         };
         let facts = match self.backend.eval(target, UX_FACTS_JS).await {
             Ok(v) => v.get("result").cloned().unwrap_or_else(|| json!({})),
-            Err(e) => return skipped(format!("could not read page facts: {}", browser_err_msg(&e))),
+            Err(e) => {
+                return skipped(format!(
+                    "could not read page facts: {}",
+                    browser_err_msg(&e)
+                ))
+            }
         };
         let mut qs = std::collections::BTreeMap::new();
         for d in &dims {
@@ -645,7 +664,11 @@ impl BrowserModule {
                     return Envelope::fail(tool, ErrorCode::InvalidArgs, "save needs 'name'");
                 };
                 let Some(steps) = args.get("steps").and_then(Value::as_array) else {
-                    return Envelope::fail(tool, ErrorCode::InvalidArgs, "save needs 'steps' array");
+                    return Envelope::fail(
+                        tool,
+                        ErrorCode::InvalidArgs,
+                        "save needs 'steps' array",
+                    );
                 };
                 match store.save(name, steps.clone(), now_ms()) {
                     Ok(f) => Envelope::ok(tool, json!({ "name": f.name, "steps": f.steps.len() })),
@@ -668,7 +691,9 @@ impl BrowserModule {
                 };
                 match store.get(name) {
                     Ok(Some(f)) => Envelope::ok(tool, json!({ "name": f.name, "steps": f.steps })),
-                    Ok(None) => Envelope::fail(tool, ErrorCode::NotFound, format!("no flow '{name}'")),
+                    Ok(None) => {
+                        Envelope::fail(tool, ErrorCode::NotFound, format!("no flow '{name}'"))
+                    }
                     Err(e) => flow_err(tool, e),
                 }
             }
@@ -691,7 +716,11 @@ impl BrowserModule {
                 let flow = match store.get(name) {
                     Ok(Some(f)) => f,
                     Ok(None) => {
-                        return Envelope::fail(tool, ErrorCode::NotFound, format!("no flow '{name}'"))
+                        return Envelope::fail(
+                            tool,
+                            ErrorCode::NotFound,
+                            format!("no flow '{name}'"),
+                        )
                     }
                     Err(e) => return flow_err(tool, e),
                 };
@@ -701,7 +730,11 @@ impl BrowserModule {
                     .unwrap_or(false);
                 self.replay(tool, target, &flow, cont).await
             }
-            other => Envelope::fail(tool, ErrorCode::InvalidArgs, format!("unknown action '{other}'")),
+            other => Envelope::fail(
+                tool,
+                ErrorCode::InvalidArgs,
+                format!("unknown action '{other}'"),
+            ),
         }
     }
 
@@ -797,7 +830,10 @@ impl BrowserModule {
                 } else {
                     ("network_idle", None)
                 };
-                let t = step.get("timeout_ms").and_then(Value::as_u64).unwrap_or(10_000);
+                let t = step
+                    .get("timeout_ms")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(10_000);
                 self.backend.wait(target, cond, arg, t).await
             }
             "capture" => {
@@ -1219,19 +1255,47 @@ mod act_tests {
         async fn disconnect(&self, _b: u32, _k: bool) -> Result<Value, BrowserError> {
             Err(BrowserError::Failed("n/a".into()))
         }
-        async fn tabs(&self, _b: u32, _a: &str, _t: Option<&str>, _u: Option<&str>) -> Result<Value, BrowserError> {
+        async fn tabs(
+            &self,
+            _b: u32,
+            _a: &str,
+            _t: Option<&str>,
+            _u: Option<&str>,
+        ) -> Result<Value, BrowserError> {
             Err(BrowserError::Failed("n/a".into()))
         }
-        async fn navigate(&self, _t: &str, a: &str, _u: Option<&str>) -> Result<Value, BrowserError> {
+        async fn navigate(
+            &self,
+            _t: &str,
+            a: &str,
+            _u: Option<&str>,
+        ) -> Result<Value, BrowserError> {
             Ok(json!({ "ok": true, "action": a }))
         }
-        async fn snapshot(&self, _t: &str, _m: &str, _r: Option<&str>) -> Result<Value, BrowserError> {
+        async fn snapshot(
+            &self,
+            _t: &str,
+            _m: &str,
+            _r: Option<&str>,
+        ) -> Result<Value, BrowserError> {
             Err(BrowserError::Failed("n/a".into()))
         }
-        async fn query(&self, _t: &str, _by: &str, _q: &str, _a: bool) -> Result<Value, BrowserError> {
+        async fn query(
+            &self,
+            _t: &str,
+            _by: &str,
+            _q: &str,
+            _a: bool,
+        ) -> Result<Value, BrowserError> {
             Err(BrowserError::Failed("n/a".into()))
         }
-        async fn act(&self, _t: &str, locator: Locator<'_>, action: &str, _v: Option<&str>) -> Result<Value, BrowserError> {
+        async fn act(
+            &self,
+            _t: &str,
+            locator: Locator<'_>,
+            action: &str,
+            _v: Option<&str>,
+        ) -> Result<Value, BrowserError> {
             let desc = match locator {
                 Locator::Ref(r) => format!("ref:{r}"),
                 Locator::Selector { by, query } => format!("sel:{by}:{query}"),
@@ -1239,7 +1303,13 @@ mod act_tests {
             self.acts.lock().unwrap().push(desc);
             Ok(json!({ "ok": true, "action": action }))
         }
-        async fn wait(&self, _t: &str, c: &str, _a: Option<&str>, _ms: u64) -> Result<Value, BrowserError> {
+        async fn wait(
+            &self,
+            _t: &str,
+            c: &str,
+            _a: Option<&str>,
+            _ms: u64,
+        ) -> Result<Value, BrowserError> {
             Ok(json!({ "settled": true, "condition": c }))
         }
         async fn screenshot(&self, _t: &str, _r: Option<&str>) -> Result<Shot, BrowserError> {
@@ -1248,13 +1318,25 @@ mod act_tests {
         async fn eval(&self, _t: &str, _e: &str) -> Result<Value, BrowserError> {
             Err(BrowserError::Failed("n/a".into()))
         }
-        async fn network(&self, _t: &str, _a: &str, _f: Option<&str>, _h: Option<Value>, _d: Option<u64>) -> Result<Value, BrowserError> {
+        async fn network(
+            &self,
+            _t: &str,
+            _a: &str,
+            _f: Option<&str>,
+            _h: Option<Value>,
+            _d: Option<u64>,
+        ) -> Result<Value, BrowserError> {
             Err(BrowserError::Failed("n/a".into()))
         }
         async fn dialog(&self, _t: &str, _p: Option<DialogPolicy>) -> Result<Value, BrowserError> {
             Err(BrowserError::Failed("n/a".into()))
         }
-        async fn cookies(&self, _t: &str, _a: &str, _c: Option<Value>) -> Result<Value, BrowserError> {
+        async fn cookies(
+            &self,
+            _t: &str,
+            _a: &str,
+            _c: Option<Value>,
+        ) -> Result<Value, BrowserError> {
             Err(BrowserError::Failed("n/a".into()))
         }
         async fn capture(&self, _t: &str, action: &str, _o: &Value) -> Result<Value, BrowserError> {
@@ -1266,8 +1348,18 @@ mod act_tests {
             let passed = spec.get("_pass").and_then(Value::as_bool).unwrap_or(true);
             Ok(json!({ "passed": passed, "checks": [{"name":"x","ok":passed}] }))
         }
-        async fn set_viewport(&self, _t: &str, w: u32, h: u32, m: bool, s: f64) -> Result<Value, BrowserError> {
-            self.viewports.lock().unwrap().push(format!("{w}x{h} mobile={m} scale={s}"));
+        async fn set_viewport(
+            &self,
+            _t: &str,
+            w: u32,
+            h: u32,
+            m: bool,
+            s: f64,
+        ) -> Result<Value, BrowserError> {
+            self.viewports
+                .lock()
+                .unwrap()
+                .push(format!("{w}x{h} mobile={m} scale={s}"));
             Ok(json!({ "width": w, "height": h, "mobile": m }))
         }
     }
@@ -1280,16 +1372,20 @@ mod act_tests {
     fn module_with_flows(tag: &str) -> BrowserModule {
         use crate::flow::FlowStore;
         let mut p = std::env::temp_dir();
-        p.push(format!("agentctl-flowtool-{tag}-{}.json", std::process::id()));
+        p.push(format!(
+            "agentctl-flowtool-{tag}-{}.json",
+            std::process::id()
+        ));
         let _ = std::fs::remove_file(&p);
-        BrowserModule::new(Arc::new(Recorder::default()))
-            .with_flow_store(FlowStore::new(p, 50, 50))
+        BrowserModule::new(Arc::new(Recorder::default())).with_flow_store(FlowStore::new(p, 50, 50))
     }
 
     #[tokio::test]
     async fn a_ref_locates_by_ref() {
         let (m, rec) = module();
-        let e = m.act(&json!({"target_id":"T","ref":"/html/body[1]/button[1]","action":"click"})).await;
+        let e = m
+            .act(&json!({"target_id":"T","ref":"/html/body[1]/button[1]","action":"click"}))
+            .await;
         assert!(e.ok, "{e:?}");
         assert_eq!(rec.acts.lock().unwrap()[0], "ref:/html/body[1]/button[1]");
     }
@@ -1297,7 +1393,9 @@ mod act_tests {
     #[tokio::test]
     async fn a_query_locates_by_selector_in_one_call() {
         let (m, rec) = module();
-        let e = m.act(&json!({"target_id":"T","by":"text","query":"Login","action":"click"})).await;
+        let e = m
+            .act(&json!({"target_id":"T","by":"text","query":"Login","action":"click"}))
+            .await;
         assert!(e.ok, "{e:?}");
         // No separate browser_query was needed: the selector reached act directly.
         assert_eq!(rec.acts.lock().unwrap()[0], "sel:text:Login");
@@ -1306,7 +1404,9 @@ mod act_tests {
     #[tokio::test]
     async fn a_query_defaults_to_css_when_by_is_omitted() {
         let (m, rec) = module();
-        let e = m.act(&json!({"target_id":"T","query":"#save","action":"click"})).await;
+        let e = m
+            .act(&json!({"target_id":"T","query":"#save","action":"click"}))
+            .await;
         assert!(e.ok, "{e:?}");
         assert_eq!(rec.acts.lock().unwrap()[0], "sel:css:#save");
     }
@@ -1317,13 +1417,20 @@ mod act_tests {
         let e = m.act(&json!({"target_id":"T","action":"click"})).await;
         assert!(!e.ok);
         assert_eq!(e.error.unwrap().code, ErrorCode::InvalidArgs);
-        assert!(rec.acts.lock().unwrap().is_empty(), "backend must not be called");
+        assert!(
+            rec.acts.lock().unwrap().is_empty(),
+            "backend must not be called"
+        );
     }
 
     #[tokio::test]
     async fn capture_routes_the_action_and_defaults_to_read() {
         let (m, rec) = module();
-        assert!(m.capture(&json!({"target_id":"T","action":"start"})).await.ok);
+        assert!(
+            m.capture(&json!({"target_id":"T","action":"start"}))
+                .await
+                .ok
+        );
         assert!(m.capture(&json!({"target_id":"T"})).await.ok); // default
         assert_eq!(*rec.captures.lock().unwrap(), vec!["start", "read"]);
     }
@@ -1331,9 +1438,15 @@ mod act_tests {
     #[tokio::test]
     async fn viewport_passes_dimensions_through_and_a_flow_step_reaches_the_backend() {
         let (m, rec) = module();
-        assert!(m.viewport(&json!({"target_id":"T","width":390,"height":844,"mobile":true})).await.ok);
+        assert!(
+            m.viewport(&json!({"target_id":"T","width":390,"height":844,"mobile":true}))
+                .await
+                .ok
+        );
         // A viewport step in a replayed flow reaches the same backend call.
-        let (ok, _) = m.run_step("T", &json!({"op":"viewport","width":1280,"height":800})).await;
+        let (ok, _) = m
+            .run_step("T", &json!({"op":"viewport","width":1280,"height":800}))
+            .await;
         assert!(ok);
         let v = rec.viewports.lock().unwrap();
         assert_eq!(v[0], "390x844 mobile=true scale=1");
@@ -1374,7 +1487,9 @@ mod act_tests {
             ]}))
             .await;
         assert!(save.ok, "{save:?}");
-        let run = m.flow(&json!({"action":"run","name":"login","target_id":"T"})).await;
+        let run = m
+            .flow(&json!({"action":"run","name":"login","target_id":"T"}))
+            .await;
         assert!(run.ok, "green flow should pass: {run:?}");
         let d = run.data.unwrap();
         assert_eq!(d["passed"], true);
@@ -1390,17 +1505,23 @@ mod act_tests {
             {"op":"navigate","url":"https://never-reached"}
         ]}))
         .await;
-        let run = m.flow(&json!({"action":"run","name":"f","target_id":"T"})).await;
+        let run = m
+            .flow(&json!({"action":"run","name":"f","target_id":"T"}))
+            .await;
         assert!(!run.ok, "a failing flow is an error");
         let d = run.data.unwrap();
         assert_eq!(d["passed"], false);
-        assert_eq!(d["ran"], 2, "stops at the failing assert, third step not reached");
+        assert_eq!(
+            d["ran"], 2,
+            "stops at the failing assert, third step not reached"
+        );
     }
 
     #[tokio::test]
     async fn run_without_a_target_is_an_invalid_argument() {
         let m = module_with_flows("notgt");
-        m.flow(&json!({"action":"save","name":"f","steps":[{"op":"navigate"}]})).await;
+        m.flow(&json!({"action":"save","name":"f","steps":[{"op":"navigate"}]}))
+            .await;
         let e = m.flow(&json!({"action":"run","name":"f"})).await;
         assert!(!e.ok);
         assert_eq!(e.error.unwrap().code, ErrorCode::InvalidArgs);

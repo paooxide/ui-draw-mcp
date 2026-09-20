@@ -164,8 +164,8 @@ mod tests {
     /// tools plus several task-specific ones.
     fn tools() -> Vec<Value> {
         vec![
-            tool("get_ui_tree"),  // core
-            tool("wait_for"),     // core
+            tool("get_ui_tree"), // core
+            tool("wait_for"),    // core
             tool("keyboard_type"),
             tool("browser_navigate"),
             tool("exec"),
@@ -173,7 +173,10 @@ mod tests {
         ]
     }
 
-    struct Reply(Mutex<Option<Result<(u16, String), String>>>, Mutex<Option<Value>>);
+    struct Reply(
+        Mutex<Option<Result<(u16, String), String>>>,
+        Mutex<Option<Value>>,
+    );
     #[async_trait]
     impl Transport for Reply {
         async fn post(
@@ -231,14 +234,24 @@ mod tests {
         let p = prune(&j, "open a website and type into it", &tools()).await;
         assert!(p.judged);
         // Core tools survive regardless; the two high scorers are kept.
-        for keep in ["get_ui_tree", "wait_for", "keyboard_type", "browser_navigate"] {
+        for keep in [
+            "get_ui_tree",
+            "wait_for",
+            "keyboard_type",
+            "browser_navigate",
+        ] {
             assert!(p.kept.contains(&keep.to_string()), "should keep {keep}");
         }
         assert_eq!(p.dropped, vec!["exec", "volume_set"]);
         // Order is preserved.
         assert_eq!(
             p.tools.iter().filter_map(name_of).collect::<Vec<_>>(),
-            vec!["get_ui_tree", "wait_for", "keyboard_type", "browser_navigate"]
+            vec![
+                "get_ui_tree",
+                "wait_for",
+                "keyboard_type",
+                "browser_navigate"
+            ]
         );
         // Core tools are never even asked about (no wasted questions).
         let body = sent.1.lock().unwrap().clone().unwrap();
@@ -267,7 +280,10 @@ mod tests {
     async fn a_judge_failure_keeps_the_whole_list() {
         let (j, _) = judge(Ok((500, "boom".into())));
         let p = prune(&j, "anything", &tools()).await;
-        assert!(!p.judged, "a failure must not be reported as a judged prune");
+        assert!(
+            !p.judged,
+            "a failure must not be reported as a judged prune"
+        );
         assert_eq!(p.tools.len(), tools().len());
         assert!(p.dropped.is_empty());
     }
@@ -275,7 +291,11 @@ mod tests {
     #[tokio::test]
     async fn a_disabled_judge_keeps_the_whole_list_without_asking() {
         let cfg = JudgeConfig::default(); // enabled = false
-        let j = Judge::with_transport(cfg, Some("k".into()), Box::new(Reply(Mutex::new(None), Mutex::new(None))));
+        let j = Judge::with_transport(
+            cfg,
+            Some("k".into()),
+            Box::new(Reply(Mutex::new(None), Mutex::new(None))),
+        );
         let p = prune(&j, "anything", &tools()).await;
         assert!(!p.judged);
         assert_eq!(p.tools.len(), tools().len());

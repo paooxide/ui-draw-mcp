@@ -792,7 +792,10 @@ impl BrowserBackend for CdpBackend {
         // selector via `__find`, so a scripted action is one round trip.
         let resolve = match locator {
             Locator::Ref(r) => {
-                format!("__resolve({})", serde_json::to_string(r).unwrap_or_else(|_| "\"\"".into()))
+                format!(
+                    "__resolve({})",
+                    serde_json::to_string(r).unwrap_or_else(|_| "\"\"".into())
+                )
             }
             Locator::Selector { by, query } => format!(
                 "__find({},{})",
@@ -1164,7 +1167,10 @@ impl BrowserBackend for CdpBackend {
                 Ok(json!({ "ok": true, "cleared": true }))
             }
             "read" => {
-                let only_errors = opts.get("only_errors").and_then(Value::as_bool).unwrap_or(false);
+                let only_errors = opts
+                    .get("only_errors")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
                 let filter = opts.get("filter").and_then(Value::as_str).unwrap_or("");
                 let armed = Self::eval_value(&mut c, "!!window.__agentctl_installed").await?;
                 if armed.as_bool() != Some(true) {
@@ -1172,22 +1178,28 @@ impl BrowserBackend for CdpBackend {
                         "capture is not armed on this page; call browser_capture action='start' first".into(),
                     ));
                 }
-                let buf = Self::eval_value(
-                    &mut c,
-                    "JSON.stringify(window.__agentctl||{net:[],con:[]})",
-                )
-                .await?;
+                let buf =
+                    Self::eval_value(&mut c, "JSON.stringify(window.__agentctl||{net:[],con:[]})")
+                        .await?;
                 // eval returns the JSON string; parse it back to structured data.
                 let parsed: Value = buf
                     .as_str()
                     .and_then(|s| serde_json::from_str(s).ok())
                     .unwrap_or(buf);
                 let empty = vec![];
-                let net = parsed.get("net").and_then(Value::as_array).unwrap_or(&empty);
-                let con = parsed.get("con").and_then(Value::as_array).unwrap_or(&empty);
+                let net = parsed
+                    .get("net")
+                    .and_then(Value::as_array)
+                    .unwrap_or(&empty);
+                let con = parsed
+                    .get("con")
+                    .and_then(Value::as_array)
+                    .unwrap_or(&empty);
                 let keep = |row: &Value, want_bad: bool| -> bool {
                     if !filter.is_empty()
-                        && !serde_json::to_string(row).unwrap_or_default().contains(filter)
+                        && !serde_json::to_string(row)
+                            .unwrap_or_default()
+                            .contains(filter)
                     {
                         return false;
                     }
@@ -1196,10 +1208,19 @@ impl BrowserBackend for CdpBackend {
                     }
                     true
                 };
-                let net: Vec<Value> = net.iter().filter(|r| keep(r, only_errors)).cloned().collect();
+                let net: Vec<Value> = net
+                    .iter()
+                    .filter(|r| keep(r, only_errors))
+                    .cloned()
+                    .collect();
                 let con: Vec<Value> = con
                     .iter()
-                    .filter(|r| filter.is_empty() || serde_json::to_string(r).unwrap_or_default().contains(filter))
+                    .filter(|r| {
+                        filter.is_empty()
+                            || serde_json::to_string(r)
+                                .unwrap_or_default()
+                                .contains(filter)
+                    })
                     .cloned()
                     .collect();
                 Ok(json!({
@@ -1225,11 +1246,14 @@ impl BrowserBackend for CdpBackend {
         // action does not read the pre-action DOM.
         if let Some(sel) = spec.get("wait_selector").and_then(Value::as_str) {
             if let Err(e) = self.wait(target, "selector", Some(sel), timeout).await {
-                settle = Some(json!({ "name": "wait_selector", "ok": false, "detail": berr_msg(&e) }));
+                settle =
+                    Some(json!({ "name": "wait_selector", "ok": false, "detail": berr_msg(&e) }));
             }
         } else if spec.get("wait_network_idle").and_then(Value::as_bool) == Some(true) {
             if let Err(e) = self.wait(target, "network_idle", None, timeout).await {
-                settle = Some(json!({ "name": "wait_network_idle", "ok": false, "detail": berr_msg(&e) }));
+                settle = Some(
+                    json!({ "name": "wait_network_idle", "ok": false, "detail": berr_msg(&e) }),
+                );
             }
         }
         let mut c = self.conn(target).await?;
@@ -1509,8 +1533,12 @@ mod tests {
         // flatpak system wrapper is present and lands after the natives.
         let sys = "/var/lib/flatpak/exports/bin/com.google.Chrome";
         let (sys_i, nat_i) = (
-            c.iter().position(|p| p == sys).expect("system flatpak path"),
-            c.iter().position(|p| p == "/usr/bin/google-chrome").unwrap(),
+            c.iter()
+                .position(|p| p == sys)
+                .expect("system flatpak path"),
+            c.iter()
+                .position(|p| p == "/usr/bin/google-chrome")
+                .unwrap(),
         );
         assert!(sys_i > nat_i, "flatpak is a fallback, tried after natives");
         // the per-user path is built from HOME.

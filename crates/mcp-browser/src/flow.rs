@@ -127,7 +127,10 @@ mod tests {
     #[test]
     fn save_get_list_delete_round_trip() {
         let s = store("rt");
-        let steps = vec![json!({"op":"navigate","url":"https://x"}), json!({"op":"assert","text":"hi"})];
+        let steps = vec![
+            json!({"op":"navigate","url":"https://x"}),
+            json!({"op":"assert","text":"hi"}),
+        ];
         let f = s.save("login", steps.clone(), 1).unwrap();
         assert_eq!(f.steps.len(), 2);
         assert_eq!(s.get("login").unwrap().unwrap().steps, steps);
@@ -150,7 +153,10 @@ mod tests {
     #[test]
     fn empty_name_or_no_steps_is_rejected() {
         let s = store("bad");
-        assert!(matches!(s.save("", vec![json!({})], 1), Err(FlowError::Invalid(_))));
+        assert!(matches!(
+            s.save("", vec![json!({})], 1),
+            Err(FlowError::Invalid(_))
+        ));
         assert!(matches!(s.save("x", vec![], 1), Err(FlowError::Invalid(_))));
     }
 

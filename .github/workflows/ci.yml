@@ -84,7 +84,7 @@ jobs:
       # The reference is generated from the descriptors the server actually
       # serves, so a schema change that skips the regeneration is a doc that
       # lies to whoever writes an agent against it. Both legs build every
-      # engine now, so both must render the same 107 tools.
+      # engine now, so both must render the same tool reference.
       - name: Tool reference is up to date
         run: cargo run -q -p agentctl -- tools --markdown --all | diff -u docs/tools.md -
 

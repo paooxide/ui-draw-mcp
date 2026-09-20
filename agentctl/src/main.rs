@@ -363,11 +363,19 @@ async fn test_cmd(args: &[String]) -> std::io::Result<()> {
     let launched = attach_port.is_none();
     let conn = if let Some(port) = attach_port {
         module
-            .call("browser_connect", json!({ "attach": { "port": port } }), &ctx)
+            .call(
+                "browser_connect",
+                json!({ "attach": { "port": port } }),
+                &ctx,
+            )
             .await
     } else {
         module
-            .call("browser_connect", json!({ "launch": { "headless": headless } }), &ctx)
+            .call(
+                "browser_connect",
+                json!({ "launch": { "headless": headless } }),
+                &ctx,
+            )
             .await
     };
     if !conn.ok {
@@ -441,15 +449,21 @@ async fn test_cmd(args: &[String]) -> std::io::Result<()> {
             .and_then(Value::as_str)
             .map(String::from);
         let Some(target) = target else {
-            reports.push(json!({ "name": name, "passed": false, "error": "could not open a tab",
+            reports.push(
+                json!({ "name": name, "passed": false, "error": "could not open a tab",
                 "ms": flow_started.elapsed().as_millis() as u64,
-                "console_errors": [], "failed_requests": [] }));
+                "console_errors": [], "failed_requests": [] }),
+            );
             continue;
         };
         // Arm capture so even a passing flow reports console errors / failed
         // requests it happened to trigger.
         let _ = module
-            .call("browser_capture", json!({ "target_id": target, "action": "start" }), &ctx)
+            .call(
+                "browser_capture",
+                json!({ "target_id": target, "action": "start" }),
+                &ctx,
+            )
             .await;
         let run = module
             .call(
@@ -459,7 +473,11 @@ async fn test_cmd(args: &[String]) -> std::io::Result<()> {
             )
             .await;
         let cap = module
-            .call("browser_capture", json!({ "target_id": target, "action": "read" }), &ctx)
+            .call(
+                "browser_capture",
+                json!({ "target_id": target, "action": "read" }),
+                &ctx,
+            )
             .await;
         let _ = module
             .call(
@@ -488,7 +506,8 @@ async fn test_cmd(args: &[String]) -> std::io::Result<()> {
     let (passed, failed, issue_flows) = print_report(&reports, strict);
     println!("total {total_ms} ms");
     if let Some(p) = json_out {
-        let doc = json!({ "passed": passed, "failed": failed, "total_ms": total_ms, "flows": reports });
+        let doc =
+            json!({ "passed": passed, "failed": failed, "total_ms": total_ms, "flows": reports });
         let text = serde_json::to_string_pretty(&doc).unwrap_or_default() + "\n";
         if let Err(e) = std::fs::write(p, text) {
             eprintln!("agentctl test: could not write {p}: {e}");
@@ -529,7 +548,11 @@ fn positional_flows(args: &[String]) -> Vec<String> {
     while i < args.len() {
         let a = &args[i];
         if a.starts_with("--") {
-            i += if value_flags.contains(&a.as_str()) { 2 } else { 1 };
+            i += if value_flags.contains(&a.as_str()) {
+                2
+            } else {
+                1
+            };
             continue;
         }
         out.push(a.clone());
@@ -575,16 +598,24 @@ fn build_flow_report(name: &str, run: &mcp_types::Envelope, cap: &mcp_types::Env
     // UX checks (a11y / style / component / visual / ux) surfaced from every
     // assert step, so a report shows them even on a flow that passed overall
     // (a ux review is advisory) and names the ones that failed.
-    let is_ux = |n: &str| {
-        matches!(n, "a11y" | "style" | "visual" | "ux") || n.starts_with("component")
-    };
+    let is_ux =
+        |n: &str| matches!(n, "a11y" | "style" | "visual" | "ux") || n.starts_with("component");
     let ux_checks: Vec<Value> = steps
         .as_array()
         .map(|arr| {
             arr.iter()
-                .filter_map(|s| s.get("detail").and_then(|d| d.get("checks")).and_then(Value::as_array))
+                .filter_map(|s| {
+                    s.get("detail")
+                        .and_then(|d| d.get("checks"))
+                        .and_then(Value::as_array)
+                })
                 .flatten()
-                .filter(|c| c.get("name").and_then(Value::as_str).map(is_ux).unwrap_or(false))
+                .filter(|c| {
+                    c.get("name")
+                        .and_then(Value::as_str)
+                        .map(is_ux)
+                        .unwrap_or(false)
+                })
                 .cloned()
                 .collect()
         })
@@ -603,7 +634,12 @@ fn build_flow_report(name: &str, run: &mcp_types::Envelope, cap: &mcp_types::Env
 
 /// Print the human report; return (passed, failed, flows-with-issues).
 fn print_report(reports: &[Value], strict: bool) -> (usize, usize, usize) {
-    let arr_len = |v: &Value, k: &str| v.get(k).and_then(Value::as_array).map(|a| a.len()).unwrap_or(0);
+    let arr_len = |v: &Value, k: &str| {
+        v.get(k)
+            .and_then(Value::as_array)
+            .map(|a| a.len())
+            .unwrap_or(0)
+    };
     let (mut passed, mut failed, mut issue_flows) = (0usize, 0usize, 0usize);
     println!();
     for r in reports {
@@ -642,12 +678,20 @@ fn print_report(reports: &[Value], strict: bool) -> (usize, usize, usize) {
         if ce > 0 {
             println!("       console errors: {ce}");
             for c in r["console_errors"].as_array().into_iter().flatten().take(5) {
-                println!("         - {}", c.get("text").and_then(Value::as_str).unwrap_or(""));
+                println!(
+                    "         - {}",
+                    c.get("text").and_then(Value::as_str).unwrap_or("")
+                );
             }
         }
         if fr > 0 {
             println!("       failed requests: {fr}");
-            for n in r["failed_requests"].as_array().into_iter().flatten().take(5) {
+            for n in r["failed_requests"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .take(5)
+            {
                 let m = n.get("method").and_then(Value::as_str).unwrap_or("?");
                 let st = n.get("status").and_then(Value::as_u64).unwrap_or(0);
                 let u = n.get("url").and_then(Value::as_str).unwrap_or("");
@@ -966,7 +1010,17 @@ mod test_cmd_tests {
 
     #[test]
     fn positional_flows_skips_flags_and_their_values() {
-        let a = s(&["agentctl", "test", "login", "--attach", "9333", "checkout", "--strict", "--json", "/tmp/r.json"]);
+        let a = s(&[
+            "agentctl",
+            "test",
+            "login",
+            "--attach",
+            "9333",
+            "checkout",
+            "--strict",
+            "--json",
+            "/tmp/r.json",
+        ]);
         assert_eq!(positional_flows(&a), vec!["login", "checkout"]);
         // No names, only flags: empty (means "all flows").
         assert!(positional_flows(&s(&["agentctl", "test", "--strict"])).is_empty());
@@ -981,8 +1035,14 @@ mod test_cmd_tests {
     #[test]
     fn explicit_headed_headless_flags_win_over_the_display() {
         // Explicit flags decide regardless of the environment.
-        assert!(resolve_launch_headless(&s(&["agentctl", "test", "--headless"])));
-        assert!(!resolve_launch_headless(&s(&["agentctl", "test", "--headed"])));
+        assert!(resolve_launch_headless(&s(&[
+            "agentctl",
+            "test",
+            "--headless"
+        ])));
+        assert!(!resolve_launch_headless(&s(&[
+            "agentctl", "test", "--headed"
+        ])));
     }
 
     #[test]
@@ -1014,14 +1074,24 @@ mod test_cmd_tests {
     }
 
     fn env_ok(data: Value) -> mcp_types::Envelope {
-        mcp_types::Envelope { ok: true, tool: "t".into(), data: Some(data), error: None, image: None }
+        mcp_types::Envelope {
+            ok: true,
+            tool: "t".into(),
+            data: Some(data),
+            error: None,
+            image: None,
+        }
     }
     fn env_fail(data: Value) -> mcp_types::Envelope {
         mcp_types::Envelope {
             ok: false,
             tool: "t".into(),
             data: Some(data),
-            error: Some(mcp_types::ToolError { code: mcp_types::ErrorCode::ActionFailed, message: "x".into(), suggestion: None }),
+            error: Some(mcp_types::ToolError {
+                code: mcp_types::ErrorCode::ActionFailed,
+                message: "x".into(),
+                suggestion: None,
+            }),
             image: None,
         }
     }
@@ -1056,9 +1126,23 @@ mod test_cmd_tests {
 
     #[test]
     fn print_report_counts_pass_fail_and_issue_flows() {
-        let clean_pass = build_flow_report("a", &env_ok(json!({"passed":true,"ran":3,"steps":[]})), &env_ok(json!({"console":[],"network":[]})));
-        let pass_with_issue = build_flow_report("b", &env_ok(json!({"passed":true,"ran":1,"steps":[]})), &env_ok(json!({"console":[{"level":"error","text":"e"}],"network":[]})));
-        let fail = build_flow_report("c", &env_fail(json!({"passed":false,"ran":1,"steps":[{"i":0,"op":"assert","ok":false,"detail":{}}]})), &env_ok(json!({"console":[],"network":[]})));
+        let clean_pass = build_flow_report(
+            "a",
+            &env_ok(json!({"passed":true,"ran":3,"steps":[]})),
+            &env_ok(json!({"console":[],"network":[]})),
+        );
+        let pass_with_issue = build_flow_report(
+            "b",
+            &env_ok(json!({"passed":true,"ran":1,"steps":[]})),
+            &env_ok(json!({"console":[{"level":"error","text":"e"}],"network":[]})),
+        );
+        let fail = build_flow_report(
+            "c",
+            &env_fail(
+                json!({"passed":false,"ran":1,"steps":[{"i":0,"op":"assert","ok":false,"detail":{}}]}),
+            ),
+            &env_ok(json!({"console":[],"network":[]})),
+        );
         let (passed, failed, issues) = print_report(&[clean_pass, pass_with_issue, fail], false);
         assert_eq!((passed, failed, issues), (2, 1, 1));
     }

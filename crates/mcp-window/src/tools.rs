@@ -477,7 +477,9 @@ fn win_err(tool: &str, e: WindowError) -> Envelope {
 /// Build the ranking candidates from every button on every listed dialog,
 /// keyed `"<dialogId>:<label>"` so identical labels in two dialogs (two
 /// "OK"s) stay distinct.
-fn button_candidates(ds: &[crate::backend::DialogInfo]) -> std::collections::BTreeMap<String, String> {
+fn button_candidates(
+    ds: &[crate::backend::DialogInfo],
+) -> std::collections::BTreeMap<String, String> {
     let mut candidates = std::collections::BTreeMap::new();
     for d in ds {
         for b in &d.buttons {
@@ -580,7 +582,9 @@ mod dialog_suggestion_tests {
         }
     }
 
-    fn judge_with(reply: Result<(u16, String), String>) -> (mcp_judge::Judge, std::sync::Arc<Scripted>) {
+    fn judge_with(
+        reply: Result<(u16, String), String>,
+    ) -> (mcp_judge::Judge, std::sync::Arc<Scripted>) {
         let s = std::sync::Arc::new(Scripted {
             reply: Mutex::new(Some(reply)),
             sent: Mutex::new(None),
@@ -609,7 +613,10 @@ mod dialog_suggestion_tests {
 
     #[test]
     fn candidates_key_each_button_by_dialog_and_survive_duplicate_labels() {
-        let ds = [dialog(0, "Save", &["Save", "Discard"]), dialog(1, "Quit", &["Save"])];
+        let ds = [
+            dialog(0, "Save", &["Save", "Discard"]),
+            dialog(1, "Quit", &["Save"]),
+        ];
         let c = button_candidates(&ds);
         assert_eq!(c.len(), 3, "the two 'Save' buttons stay distinct");
         assert!(c.contains_key("0:Save"));
@@ -624,8 +631,14 @@ mod dialog_suggestion_tests {
 
     #[test]
     fn a_choice_key_splits_back_into_dialog_and_label_even_with_a_colon_in_the_label() {
-        assert_eq!(parse_button_choice("3:Save As…"), (Some(3), "Save As…".into()));
-        assert_eq!(parse_button_choice("0:Time: now"), (Some(0), "Time: now".into()));
+        assert_eq!(
+            parse_button_choice("3:Save As…"),
+            (Some(3), "Save As…".into())
+        );
+        assert_eq!(
+            parse_button_choice("0:Time: now"),
+            (Some(0), "Time: now".into())
+        );
         assert_eq!(parse_button_choice("weird"), (None, "weird".into()));
     }
 
