@@ -22,7 +22,7 @@ use mcp_types::Category;
 use serde_json::json;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use test_support::{live_gui_enabled, test_policy, InProcClient};
+use test_support::{live_gui_enabled, skip_live, test_policy, InProcClient};
 
 /// Apps this suite is allowed to drive. Nothing else can be launched or typed
 /// into even if a step goes wrong.
@@ -280,6 +280,14 @@ async fn calculator_adds_by_clicking_named_buttons() {
 /// window. Read-only: no synthetic input, so this one needs no GUI gate.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_input_target_is_reported_or_permission_is_denied() {
+    // Read-only, so it needs no GUI gate, but it still drives a real desktop:
+    // skip it where live tests are off (CI sets AGENTCTL_SKIP_LIVE). A hosted
+    // runner can report Accessibility as trusted yet have no focused target,
+    // which would fire the assertion for reasons that are not a real fault.
+    if skip_live() {
+        eprintln!("skipping: AGENTCTL_SKIP_LIVE is set");
+        return;
+    }
     use mcp_input::InputBackend;
     let backend = mcp_macos::MacosBackend::new();
     let target = backend.input_target();

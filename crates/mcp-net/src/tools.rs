@@ -976,6 +976,13 @@ mod extended_tests {
     fn ctx() -> CallCtx {
         CallCtx::new("t", CancelToken::new())
     }
+    /// Skip tests that shell out to a system binary a hosted CI runner may not
+    /// have (`lsof`, `nmcli`). CI sets `AGENTCTL_SKIP_LIVE`; a developer's
+    /// machine has them, so these run there. Matches the gate the live-test
+    /// suites use.
+    fn skip_live() -> bool {
+        std::env::var_os("AGENTCTL_SKIP_LIVE").is_some_and(|v| v != "0")
+    }
     fn module(hosts: Vec<&str>) -> NetModule {
         NetModule::new(
             NetPolicy {
@@ -989,6 +996,10 @@ mod extended_tests {
 
     #[tokio::test]
     async fn socket_inspection_finds_real_listeners_with_owners() {
+        if skip_live() {
+            eprintln!("skipping: AGENTCTL_SKIP_LIVE is set (needs lsof)");
+            return;
+        }
         let env = module(vec![])
             .call("socket_inspection", json!({ "proto": "tcp" }), &ctx())
             .await;
@@ -1078,6 +1089,10 @@ mod extended_tests {
 
     #[tokio::test]
     async fn wifi_and_vpn_state_are_readable() {
+        if skip_live() {
+            eprintln!("skipping: AGENTCTL_SKIP_LIVE is set (needs nmcli)");
+            return;
+        }
         let m = module(vec![]);
         let vpn = m
             .call("network_manage", json!({ "action": "vpn_status" }), &ctx())
