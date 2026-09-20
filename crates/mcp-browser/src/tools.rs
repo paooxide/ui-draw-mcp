@@ -345,6 +345,25 @@ impl BrowserModule {
         }
     }
 
+    async fn viewport(&self, args: &Value) -> Envelope {
+        let target = match require(args, "target_id", "browser_viewport") {
+            Ok(t) => t,
+            Err(e) => return e,
+        };
+        let width = args.get("width").and_then(Value::as_u64).unwrap_or(0) as u32;
+        let height = args.get("height").and_then(Value::as_u64).unwrap_or(0) as u32;
+        let mobile = args.get("mobile").and_then(Value::as_bool).unwrap_or(false);
+        let scale = args.get("scale").and_then(Value::as_f64).unwrap_or(1.0);
+        match self
+            .backend
+            .set_viewport(target, width, height, mobile, scale)
+            .await
+        {
+            Ok(v) => Envelope::ok("browser_viewport", v),
+            Err(e) => browser_err("browser_viewport", e),
+        }
+    }
+
     async fn flow(&self, args: &Value) -> Envelope {
         let tool = "browser_flow";
         let Some(store) = self.flows.as_ref() else {
@@ -495,6 +514,15 @@ impl BrowserModule {
                         str_arg(step, "action").unwrap_or("click"),
                         str_arg(step, "value"),
                     )
+                    .await
+            }
+            "viewport" => {
+                let width = step.get("width").and_then(Value::as_u64).unwrap_or(0) as u32;
+                let height = step.get("height").and_then(Value::as_u64).unwrap_or(0) as u32;
+                let mobile = step.get("mobile").and_then(Value::as_bool).unwrap_or(false);
+                let scale = step.get("scale").and_then(Value::as_f64).unwrap_or(1.0);
+                self.backend
+                    .set_viewport(target, width, height, mobile, scale)
                     .await
             }
             "wait" => {
@@ -696,6 +724,24 @@ impl ToolModule for BrowserModule {
                 ),
             ),
             ToolDescriptor::new(
+                "browser_viewport",
+                Category::Browser,
+                Tier::Standard,
+                "Emulate a viewport for responsive testing: override the page's device metrics \
+                 (width/height, optionally mobile and a device scale factor). Call with width=0 \
+                 (or omitted) to clear the override and restore the real window size.",
+                obj(
+                    json!({
+                        "target_id": { "type": "string" },
+                        "width": { "type": "integer", "description": "css px; 0 clears the override" },
+                        "height": { "type": "integer", "description": "css px" },
+                        "mobile": { "type": "boolean", "description": "emulate a mobile device (touch, meta viewport)" },
+                        "scale": { "type": "number", "description": "device scale factor (default 1)" }
+                    }),
+                    json!(["target_id"]),
+                ),
+            ),
+            ToolDescriptor::new(
                 "browser_eval",
                 Category::Browser,
                 Tier::Dangerous,
@@ -786,9 +832,13 @@ impl ToolModule for BrowserModule {
                 Category::Browser,
                 Tier::Read,
                 "Settle (optional) then check the page in one call; returns {passed, checks} and \
-                 errors when it fails. Clauses: text/not_text (in page text), url (substring), \
-                 selector (+min_count), no_console_errors and no_failed_requests (need \
-                 browser_capture started). Settle first with wait_selector or \
+                 errors when it fails. Functional clauses: text/not_text (in page text), url \
+                 (substring), selector (+min_count), no_console_errors and no_failed_requests \
+                 (need browser_capture started). UX clauses: a11y (built-in WCAG rules: alt text, \
+                 form labels, control names, contrast, target size, positive tabindex, duplicate \
+                 ids, page lang), style (design-token conformance: colors/fonts/font_sizes/spacing \
+                 allow-lists), component (role/visible/states of one element). 'within' scopes the \
+                 UX clauses to a component subtree. Settle first with wait_selector or \
                  wait_network_idle.",
                 obj(
                     json!({
@@ -800,6 +850,10 @@ impl ToolModule for BrowserModule {
                         "min_count": { "type": "integer", "description": "selector must match at least this many (default 1)" },
                         "no_console_errors": { "type": "boolean", "description": "assert no captured console errors (needs browser_capture)" },
                         "no_failed_requests": { "type": "boolean", "description": "assert no captured non-2xx/failed requests (needs browser_capture)" },
+                        "within": { "type": "string", "description": "scope a11y/style/component checks to this css root (component testing)" },
+                        "a11y": { "description": "true, or {ignore:[rules], contrast:false, target_size:false, contrast_sample:N} to run the built-in accessibility audit" },
+                        "style": { "type": "object", "description": "design-token conformance: {colors:[], fonts:[], font_sizes:[], spacing:[]} allow-lists; off-token values fail" },
+                        "component": { "type": "object", "description": "{selector, visible, role, states:{disabled,expanded,checked,...}} assertions on one element" },
                         "wait_selector": { "type": "string", "description": "settle: wait for this selector first" },
                         "wait_network_idle": { "type": "boolean", "description": "settle: wait for network idle first" },
                         "timeout_ms": { "type": "integer", "description": "settle timeout (default 8000)" }
@@ -861,6 +915,7 @@ impl ToolModule for BrowserModule {
             "browser_act" => self.act(&args).await,
             "browser_wait" => self.wait(&args).await,
             "browser_screenshot" => self.screenshot(&args).await,
+            "browser_viewport" => self.viewport(&args).await,
             "browser_eval" => self.eval(&args).await,
             "browser_dialog" => self.dialog(&args).await,
             "browser_network" => self.network(&args).await,
@@ -885,6 +940,7 @@ mod act_tests {
     struct Recorder {
         acts: Mutex<Vec<String>>,
         captures: Mutex<Vec<String>>,
+        viewports: Mutex<Vec<String>>,
     }
 
     #[async_trait]
@@ -942,6 +998,10 @@ mod act_tests {
             let passed = spec.get("_pass").and_then(Value::as_bool).unwrap_or(true);
             Ok(json!({ "passed": passed, "checks": [{"name":"x","ok":passed}] }))
         }
+        async fn set_viewport(&self, _t: &str, w: u32, h: u32, m: bool, s: f64) -> Result<Value, BrowserError> {
+            self.viewports.lock().unwrap().push(format!("{w}x{h} mobile={m} scale={s}"));
+            Ok(json!({ "width": w, "height": h, "mobile": m }))
+        }
     }
 
     fn module() -> (BrowserModule, Arc<Recorder>) {
@@ -998,6 +1058,18 @@ mod act_tests {
         assert!(m.capture(&json!({"target_id":"T","action":"start"})).await.ok);
         assert!(m.capture(&json!({"target_id":"T"})).await.ok); // default
         assert_eq!(*rec.captures.lock().unwrap(), vec!["start", "read"]);
+    }
+
+    #[tokio::test]
+    async fn viewport_passes_dimensions_through_and_a_flow_step_reaches_the_backend() {
+        let (m, rec) = module();
+        assert!(m.viewport(&json!({"target_id":"T","width":390,"height":844,"mobile":true})).await.ok);
+        // A viewport step in a replayed flow reaches the same backend call.
+        let (ok, _) = m.run_step("T", &json!({"op":"viewport","width":1280,"height":800})).await;
+        assert!(ok);
+        let v = rec.viewports.lock().unwrap();
+        assert_eq!(v[0], "390x844 mobile=true scale=1");
+        assert_eq!(v[1], "1280x800 mobile=false scale=1");
     }
 
     #[tokio::test]

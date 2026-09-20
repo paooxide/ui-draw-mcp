@@ -8,7 +8,7 @@ Tiers gate what an agent may call: `read` and `standard` tools are available ins
 enabled category, while a `dangerous` tool additionally has to be named in
 `policy.enable`. Enabling a category never enables its dangerous tools.
 
-**110 tools across 12 categories.**
+**111 tools across 12 categories.**
 
 | Tool | Category | Tier | Summary |
 |---|---|---|---|
@@ -63,6 +63,7 @@ enabled category, while a `dangerous` tool additionally has to be named in
 | [`browser_screenshot`](#browser-screenshot) | browser | read | Capture a PNG of the page (or a single element by ref). |
 | [`browser_snapshot`](#browser-snapshot) | browser | read | Flatten a page into interactable node refs (dom/accessibility) or raw text. |
 | [`browser_tabs`](#browser-tabs) | browser | standard | List/open/activate/close tabs (targets) of a connected browser. |
+| [`browser_viewport`](#browser-viewport) | browser | standard | Emulate a viewport for responsive testing: override the page's device metrics (width/height, optionally mobile and a device scale factor). |
 | [`browser_wait`](#browser-wait) | browser | read | Wait for a settle signal: a selector to appear, navigation to complete, or the network to idle. |
 | [`command_info`](#command-info) | terminal | read | Resolve a command and capture its own --help and --version. |
 | [`exec`](#exec) | terminal | dangerous | Run an allowlisted command. |
@@ -634,21 +635,25 @@ Act on a DOM node: click, type, select, hover, focus, scroll_into_view, submit. 
 
 `browser_assert` · read tier
 
-Settle (optional) then check the page in one call; returns {passed, checks} and errors when it fails. Clauses: text/not_text (in page text), url (substring), selector (+min_count), no_console_errors and no_failed_requests (need browser_capture started). Settle first with wait_selector or wait_network_idle.
+Settle (optional) then check the page in one call; returns {passed, checks} and errors when it fails. Functional clauses: text/not_text (in page text), url (substring), selector (+min_count), no_console_errors and no_failed_requests (need browser_capture started). UX clauses: a11y (built-in WCAG rules: alt text, form labels, control names, contrast, target size, positive tabindex, duplicate ids, page lang), style (design-token conformance: colors/fonts/font_sizes/spacing allow-lists), component (role/visible/states of one element). 'within' scopes the UX clauses to a component subtree. Settle first with wait_selector or wait_network_idle.
 
 | Argument | Type | Required | Description |
 |---|---|---|---|
+| `a11y` | any |  | true, or {ignore:[rules], contrast:false, target_size:false, contrast_sample:N} to run the built-in accessibility audit |
+| `component` | object |  | {selector, visible, role, states:{disabled,expanded,checked,...}} assertions on one element |
 | `min_count` | integer |  | selector must match at least this many (default 1) |
 | `no_console_errors` | boolean |  | assert no captured console errors (needs browser_capture) |
 | `no_failed_requests` | boolean |  | assert no captured non-2xx/failed requests (needs browser_capture) |
 | `not_text` | string |  | assert this text is absent |
 | `selector` | string |  | assert this css selector matches |
+| `style` | object |  | design-token conformance: {colors:[], fonts:[], font_sizes:[], spacing:[]} allow-lists; off-token values fail |
 | `target_id` | string | yes |  |
 | `text` | string |  | assert this text is present |
 | `timeout_ms` | integer |  | settle timeout (default 8000) |
 | `url` | string |  | assert the URL contains this |
 | `wait_network_idle` | boolean |  | settle: wait for network idle first |
 | `wait_selector` | string |  | settle: wait for this selector first |
+| `within` | string |  | scope a11y/style/component checks to this css root (component testing) |
 
 ### browser-capture
 
@@ -812,6 +817,20 @@ List/open/activate/close tabs (targets) of a connected browser.
 | `browser_id` | integer | yes |  |
 | `target_id` | string |  |  |
 | `url` | string |  |  |
+
+### browser-viewport
+
+`browser_viewport` · standard tier
+
+Emulate a viewport for responsive testing: override the page's device metrics (width/height, optionally mobile and a device scale factor). Call with width=0 (or omitted) to clear the override and restore the real window size.
+
+| Argument | Type | Required | Description |
+|---|---|---|---|
+| `height` | integer |  | css px |
+| `mobile` | boolean |  | emulate a mobile device (touch, meta viewport) |
+| `scale` | number |  | device scale factor (default 1) |
+| `target_id` | string | yes |  |
+| `width` | integer |  | css px; 0 clears the override |
 
 ### browser-wait
 

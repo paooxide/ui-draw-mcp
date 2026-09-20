@@ -103,6 +103,16 @@ pub trait BrowserBackend: Send + Sync {
     ) -> Result<Value, BrowserError>;
     /// Screenshot the page or one element.
     async fn screenshot(&self, target: &str, node_ref: Option<&str>) -> Result<Shot, BrowserError>;
+    /// Emulate a viewport for responsive testing (device metrics override).
+    /// `width == 0` clears the override and restores the real window size.
+    async fn set_viewport(
+        &self,
+        target: &str,
+        width: u32,
+        height: u32,
+        mobile: bool,
+        scale: f64,
+    ) -> Result<Value, BrowserError>;
     /// Evaluate arbitrary JS in the page (dangerous).
     async fn eval(&self, target: &str, expression: &str) -> Result<Value, BrowserError>;
     /// Network inspection/mutation (dangerous).
@@ -382,6 +392,78 @@ const JS_CAPTURE_HOOK: &str = r#"
   return "installed";
 })()
 "#;
+
+/// The assertion engine, evaluated in the page. `__SPEC__` is replaced with the
+/// JSON spec before evaluation (a raw string, so no brace-escaping). It runs
+/// every clause the spec asks for and returns `{checks:[{name,ok,detail,...}]}`.
+/// Clauses: text/not_text/url/selector (+min_count), no_console_errors,
+/// no_failed_requests, a11y (built-in WCAG rules), style (design-token
+/// conformance), component (state assertions), all optionally scoped to
+/// `within` (a component root selector).
+const JS_ASSERT: &str = r##"(function(){
+  var spec=__SPEC__, checks=[], A=window.__agentctl;
+  var root=document;
+  if(spec.within!=null){ root=document.querySelector(spec.within); if(!root){ checks.push({name:'within',ok:false,detail:'root not found: '+spec.within}); return {checks:checks}; } }
+  var scopeText = (root===document ? (document.body?document.body.innerText:'') : (root.innerText||''));
+  function visible(el){ if(!el||el.nodeType!==1) return false; var s=getComputedStyle(el); if(s.display==='none'||s.visibility==='hidden'||parseFloat(s.opacity)===0) return false; var r=el.getBoundingClientRect(); return r.width>0&&r.height>0; }
+  function pc(c){ var m=/rgba?\(([\d.]+),\s*([\d.]+),\s*([\d.]+)(?:,\s*([\d.]+))?\)/.exec(c||''); if(!m) return null; return {r:+m[1],g:+m[2],b:+m[3],a:m[4]==null?1:+m[4]}; }
+  function lum(c){ function f(v){ v/=255; return v<=0.03928? v/12.92 : Math.pow((v+0.055)/1.055,2.4); } return 0.2126*f(c.r)+0.7152*f(c.g)+0.0722*f(c.b); }
+  function ratio(a,b){ var L1=lum(a),L2=lum(b),hi=Math.max(L1,L2),lo=Math.min(L1,L2); return (hi+0.05)/(lo+0.05); }
+  function effBg(el){ var e=el; while(e&&e.nodeType===1){ var c=pc(getComputedStyle(e).backgroundColor); if(c&&c.a>0) return c; e=e.parentElement; } return {r:255,g:255,b:255,a:1}; }
+  function accName(el){ return (el.getAttribute('aria-label')||el.getAttribute('title')||el.textContent||'').trim(); }
+  function sel(el){ var s=el.tagName.toLowerCase(); if(el.id) s+='#'+el.id; else if(el.className&&typeof el.className==='string'){ var c=el.className.trim().split(/\s+/).slice(0,2).join('.'); if(c) s+='.'+c; } return s; }
+
+  if(spec.text!=null) checks.push({name:'text',ok:scopeText.indexOf(spec.text)>=0,detail:spec.text});
+  if(spec.not_text!=null) checks.push({name:'not_text',ok:scopeText.indexOf(spec.not_text)<0,detail:spec.not_text});
+  if(spec.url!=null) checks.push({name:'url',ok:location.href.indexOf(spec.url)>=0,detail:location.href});
+  if(spec.selector!=null){ var n=root.querySelectorAll(spec.selector).length; var min=spec.min_count||1; checks.push({name:'selector',ok:n>=min,detail:spec.selector+' -> '+n+' (min '+min+')'}); }
+  if(spec.no_console_errors){ if(!A){checks.push({name:'no_console_errors',ok:false,detail:'capture not armed; call browser_capture start first'});} else { var errs=A.con.filter(function(x){return x.level==='error'||x.level==='uncaught'||x.level==='unhandledrejection';}); checks.push({name:'no_console_errors',ok:errs.length===0,detail:errs.length+' error(s)'}); } }
+  if(spec.no_failed_requests){ if(!A){checks.push({name:'no_failed_requests',ok:false,detail:'capture not armed; call browser_capture start first'});} else { var bad=A.net.filter(function(x){return x.ok===false;}); checks.push({name:'no_failed_requests',ok:bad.length===0,detail:bad.length+' failed'}); } }
+
+  if(spec.a11y){
+    var ao=(typeof spec.a11y==='object')?spec.a11y:{}, ignore=ao.ignore||[], viols=[];
+    function add(rule,el,detail){ if(ignore.indexOf(rule)>=0) return; var v={rule:rule,el:el?sel(el):null}; if(detail)v.detail=detail; viols.push(v); }
+    if(!(document.documentElement.getAttribute('lang')||'').trim()) add('html-has-lang',document.documentElement);
+    root.querySelectorAll('img').forEach(function(im){ if(im.getAttribute('aria-hidden')==='true'||im.getAttribute('role')==='presentation') return; if(im.getAttribute('alt')==null) add('image-alt',im); });
+    root.querySelectorAll('input,select,textarea').forEach(function(f){ var t=(f.getAttribute('type')||'').toLowerCase(); if(t==='hidden'||t==='submit'||t==='button'||t==='reset') return; var id=f.getAttribute('id'); var lbl=(id&&document.querySelector('label[for="'+(window.CSS&&CSS.escape?CSS.escape(id):id)+'"]'))||f.closest('label')||f.getAttribute('aria-label')||f.getAttribute('aria-labelledby')||f.getAttribute('title'); if(!lbl) add('form-label',f); });
+    root.querySelectorAll('button,a[href],[role="button"]').forEach(function(b){ if(!visible(b)) return; if(!accName(b)&&!b.querySelector('img[alt]:not([alt=""])')) add('control-name',b); });
+    root.querySelectorAll('[tabindex]').forEach(function(t){ if(parseInt(t.getAttribute('tabindex'),10)>0) add('tabindex-positive',t); });
+    var seen={}; document.querySelectorAll('[id]').forEach(function(e){ var id=e.id; if(seen[id]) add('duplicate-id',e); else seen[id]=1; });
+    if(ao.target_size!==false){ root.querySelectorAll('button,a[href],[role="button"],input:not([type=hidden]),select').forEach(function(b){ if(!visible(b)) return; var r=b.getBoundingClientRect(); if(r.width<24||r.height<24) add('target-size',b,Math.round(r.width)+'x'+Math.round(r.height)); }); }
+    if(ao.contrast!==false){ var textEls=[]; var walk=root.querySelectorAll('*'); for(var wi=0;wi<walk.length&&textEls.length<400;wi++){ var e=walk[wi]; if(!visible(e)) continue; var direct=''; for(var ci=0;ci<e.childNodes.length;ci++){ var cn=e.childNodes[ci]; if(cn.nodeType===3) direct+=cn.nodeValue; } if(direct.trim().length>=2) textEls.push(e); }
+      var lim=ao.contrast_sample||150; for(var i=0;i<textEls.length&&i<lim;i++){ var el=textEls[i], st=getComputedStyle(el), fg=pc(st.color); if(!fg) continue; var bg=effBg(el), rr=ratio(fg,bg), fs=parseFloat(st.fontSize), bold=(parseInt(st.fontWeight,10)||400)>=700, large=(fs>=24)||(fs>=18.66&&bold), need=large?3:4.5; if(rr<need-0.05) add('contrast',el,rr.toFixed(2)+':1 (need '+need+')'); } }
+    checks.push({name:'a11y',ok:viols.length===0,detail:viols.length+' violation(s)',violations:viols.slice(0,60)});
+  }
+
+  if(spec.style){
+    var so=spec.style;
+    function norm(c){ c=(c||'').trim(); var h=/^#([0-9a-f]{3}|[0-9a-f]{6})$/i.exec(c); if(h){ var x=h[1]; if(x.length===3) x=x[0]+x[0]+x[1]+x[1]+x[2]+x[2]; return parseInt(x.slice(0,2),16)+','+parseInt(x.slice(2,4),16)+','+parseInt(x.slice(4,6),16); } var p=pc(c); return p?(p.r+','+p.g+','+p.b):c.toLowerCase(); }
+    var aCol=(so.colors||[]).map(norm), aFont=(so.fonts||[]).map(function(f){return String(f).toLowerCase();}), aSize=(so.font_sizes||[]).map(parseFloat), aSpace=(so.spacing||[]).map(parseFloat);
+    var off=[], lim=so.sample_limit||600, cnt=0, els=root.querySelectorAll('*');
+    for(var j=0;j<els.length&&cnt<lim;j++){ var el=els[j]; if(!visible(el)) continue; cnt++; var s=getComputedStyle(el);
+      if(aCol.length){ var col=norm(s.color); if(col&&aCol.indexOf(col)<0&&off.length<80) off.push({prop:'color',value:s.color,el:sel(el)}); var bp=pc(s.backgroundColor); if(bp&&bp.a>0){ var bn=norm(s.backgroundColor); if(aCol.indexOf(bn)<0&&off.length<80) off.push({prop:'background-color',value:s.backgroundColor,el:sel(el)}); } }
+      if(aFont.length){ var fam=(s.fontFamily||'').toLowerCase(); if(!aFont.some(function(a){return fam.indexOf(a)>=0;})&&off.length<80) off.push({prop:'font-family',value:s.fontFamily,el:sel(el)}); }
+      if(aSize.length){ var fsz=parseFloat(s.fontSize); if(aSize.indexOf(fsz)<0&&off.length<80) off.push({prop:'font-size',value:s.fontSize,el:sel(el)}); }
+      if(aSpace.length){ ['marginTop','marginRight','marginBottom','marginLeft','paddingTop','paddingRight','paddingBottom','paddingLeft'].forEach(function(p){ var v=parseFloat(s[p]); if(v>0&&aSpace.indexOf(v)<0&&off.length<80) off.push({prop:p,value:s[p],el:sel(el)}); }); }
+    }
+    checks.push({name:'style',ok:off.length===0,detail:off.length+' off-token value(s)',offenders:off.slice(0,60)});
+  }
+
+  if(spec.component){
+    var co=spec.component, target=(spec.within?root:(co.selector?document.querySelector(co.selector):root));
+    if(!target){ checks.push({name:'component',ok:false,detail:'component root not found'}); }
+    else {
+      if(co.visible!=null) checks.push({name:'component.visible',ok:visible(target)===!!co.visible,detail:'visible='+visible(target)});
+      if(co.role!=null){ var rl=target.getAttribute('role'); checks.push({name:'component.role',ok:rl===co.role,detail:'role='+rl}); }
+      if(co.states){ Object.keys(co.states).forEach(function(k){ var want=co.states[k], got;
+        if(k==='disabled') got=target.disabled===true||target.getAttribute('aria-disabled')==='true';
+        else if(k==='checked') got=target.checked===true||target.getAttribute('aria-checked')==='true';
+        else got=(target.getAttribute('aria-'+k)==='true')||(target.getAttribute('aria-'+k)===String(want));
+        checks.push({name:'component.'+k,ok:(got===want)||(String(got)===String(want)),detail:k+'='+got}); }); }
+    }
+  }
+  return {checks:checks};
+})()"##;
 
 #[async_trait]
 impl BrowserBackend for CdpBackend {
@@ -847,6 +929,39 @@ impl BrowserBackend for CdpBackend {
         })
     }
 
+    async fn set_viewport(
+        &self,
+        target: &str,
+        width: u32,
+        height: u32,
+        mobile: bool,
+        scale: f64,
+    ) -> Result<Value, BrowserError> {
+        let mut c = self.conn(target).await?;
+        if width == 0 {
+            c.call("Emulation.clearDeviceMetricsOverride", json!({}))
+                .await?;
+            return Ok(json!({ "cleared": true }));
+        }
+        let dsf = if scale > 0.0 { scale } else { 1.0 };
+        c.call(
+            "Emulation.setDeviceMetricsOverride",
+            json!({
+                "width": width,
+                "height": height,
+                "deviceScaleFactor": dsf,
+                "mobile": mobile,
+            }),
+        )
+        .await?;
+        Ok(json!({
+            "width": width,
+            "height": height,
+            "mobile": mobile,
+            "device_scale_factor": dsf,
+        }))
+    }
+
     async fn eval(&self, target: &str, expression: &str) -> Result<Value, BrowserError> {
         let mut c = self.conn(target).await?;
         let v = Self::eval_value(&mut c, expression).await?;
@@ -1119,19 +1234,7 @@ impl BrowserBackend for CdpBackend {
         }
         let mut c = self.conn(target).await?;
         let spec_lit = serde_json::to_string(spec).unwrap_or_else(|_| "{}".into());
-        let expr = format!(
-            r#"(function(){{
-  var spec={spec_lit}, checks=[], A=window.__agentctl;
-  var body=document.body?document.body.innerText:'';
-  if(spec.text!=null) checks.push({{name:'text',ok:body.indexOf(spec.text)>=0,detail:spec.text}});
-  if(spec.not_text!=null) checks.push({{name:'not_text',ok:body.indexOf(spec.not_text)<0,detail:spec.not_text}});
-  if(spec.url!=null) checks.push({{name:'url',ok:location.href.indexOf(spec.url)>=0,detail:location.href}});
-  if(spec.selector!=null){{var n=document.querySelectorAll(spec.selector).length;var min=spec.min_count||1;checks.push({{name:'selector',ok:n>=min,detail:spec.selector+' -> '+n+' (min '+min+')'}});}}
-  if(spec.no_console_errors){{ if(!A){{checks.push({{name:'no_console_errors',ok:false,detail:'capture not armed; call browser_capture start first'}});}} else {{ var errs=A.con.filter(function(x){{return x.level==='error'||x.level==='uncaught'||x.level==='unhandledrejection';}}); checks.push({{name:'no_console_errors',ok:errs.length===0,detail:errs.length+' error(s)'}}); }} }}
-  if(spec.no_failed_requests){{ if(!A){{checks.push({{name:'no_failed_requests',ok:false,detail:'capture not armed; call browser_capture start first'}});}} else {{ var bad=A.net.filter(function(x){{return x.ok===false;}}); checks.push({{name:'no_failed_requests',ok:bad.length===0,detail:bad.length+' failed'}}); }} }}
-  return {{checks:checks}};
-}})()"#
-        );
+        let expr = JS_ASSERT.replace("__SPEC__", &spec_lit);
         let result = Self::eval_value(&mut c, &expr).await?;
         let mut checks: Vec<Value> = result
             .get("checks")
@@ -1146,7 +1249,9 @@ impl BrowserBackend for CdpBackend {
             .all(|c| c.get("ok").and_then(Value::as_bool) == Some(true));
         if checks.is_empty() {
             return Err(BrowserError::Failed(
-                "no assertions given (use text/not_text/url/selector/no_console_errors/no_failed_requests)".into(),
+                "no assertions given (use text/not_text/url/selector/no_console_errors/\
+                 no_failed_requests/a11y/style/component)"
+                    .into(),
             ));
         }
         Ok(json!({ "passed": passed, "checks": checks }))

@@ -49,7 +49,7 @@ heuristic.
 
 ## What it does
 
-110 tools across 12 categories. The full reference, generated from the server's own descriptors, is
+111 tools across 12 categories. The full reference, generated from the server's own descriptors, is
 [`docs/tools.md`](docs/tools.md).
 
 | Category | Tools | Names | Dangerous |
@@ -58,7 +58,7 @@ heuristic.
 | input | 10 | `clipboard_read`, `clipboard_write`, `drag_drop`, `hover`, `keyboard_shortcut`, `keyboard_type`, `mouse_action`, `scroll`, `set_value`, `ui_action` | 0 |
 | window | 11 | `close_app`, `control_window`, `focus_app`, `handle_dialogs`, `launch`, `list_apps`, `list_windows`, `menu_invoke`, `menu_list`, `menu_open`, `wait_for` | 0 |
 | desktop | 8 | `idle_status`, `lock_screen`, `media_control`, `notify_user`, `play_audio`, `power_control`, `speak`, `system_settings` | 1 |
-| browser | 16 | `browser_act`, `browser_assert`, `browser_capture`, `browser_connect`, `browser_cookies`, `browser_dialog`, `browser_disconnect`, `browser_eval`, `browser_flow`, `browser_navigate`, `browser_network`, `browser_query`, `browser_screenshot`, `browser_snapshot`, `browser_tabs`, `browser_wait` | 4 |
+| browser | 17 | `browser_act`, `browser_assert`, `browser_capture`, `browser_connect`, `browser_cookies`, `browser_dialog`, `browser_disconnect`, `browser_eval`, `browser_flow`, `browser_navigate`, `browser_network`, `browser_query`, `browser_screenshot`, `browser_snapshot`, `browser_tabs`, `browser_viewport`, `browser_wait` | 4 |
 | terminal | 14 | `command_info`, `exec`, `man_page`, `process_list`, `process_signal`, `pty_close`, `pty_list`, `pty_read`, `pty_resize`, `pty_signal`, `pty_spawn`, `pty_write`, `scheduled_tasks`, `service_control` | 4 |
 | filesystem | 15 | `fs_archive`, `fs_copy`, `fs_delete`, `fs_list`, `fs_metadata`, `fs_mkdir`, `fs_move`, `fs_patch`, `fs_read`, `fs_search`, `fs_symlink`, `fs_watch`, `fs_write`, `mount_control`, `storage_inspect` | 2 |
 | network | 8 | `bluetooth_pair`, `dns_lookup`, `firewall_rules`, `http_request`, `network_interfaces`, `network_manage`, `packet_diagnostics`, `socket_inspection` | 4 |

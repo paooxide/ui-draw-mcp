@@ -8,6 +8,14 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- **UX testing: accessibility, design-token style, component and responsive checks.** `browser_assert`
+  gained UX clauses that ride the same `{passed, checks}` flow and `agentctl test` report as the functional
+  ones: `a11y` runs a built-in WCAG audit (alt text, form labels, control names, colour contrast, target
+  size, positive tabindex, duplicate ids, page lang); `style` checks computed colours/fonts/font-sizes/
+  spacing against allow-lists and flags off-token values; `component` asserts one element's role, visibility
+  and states (disabled/expanded/checked/...); `within` scopes any of these to a component subtree. New
+  `browser_viewport` tool (and `viewport` flow step) emulates device metrics for responsive testing.
+
 - **Browser engine built for native regression/UI testing.** `browser_act` can locate by `by`+`query`
   selector in one call (no separate `browser_query`). `browser_capture` installs a persistent page hook
   recording fetch/XHR with request/response bodies plus console errors and uncaught exceptions
