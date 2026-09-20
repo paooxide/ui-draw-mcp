@@ -1,0 +1,45 @@
+name: Bug report
+description: Something the server does wrong, or a control that does not hold.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Not for security vulnerabilities. A policy bypass, containment escape, secret leak or
+        kill-switch/audit tampering goes through **Security → Report a vulnerability** (see SECURITY.md),
+        never a public issue.
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+      description: Output of `agentctl --version`, or the commit SHA.
+      placeholder: "0.1.0 / abcdef1"
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Platform
+      options: ["Linux", "macOS", "Other (say below)"]
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened vs. what you expected
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction
+      description: The smallest steps that reproduce it, and the relevant config with secrets removed.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Audit / logs
+      description: Relevant lines from `~/.agentctl/audit/<session>.jsonl` or stderr. Redact secrets.
+      render: shell

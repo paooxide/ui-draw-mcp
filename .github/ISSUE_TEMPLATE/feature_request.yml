@@ -1,0 +1,20 @@
+name: Feature request
+description: A capability or improvement you would like.
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What are you trying to do that the server does not let you do today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed direction
+      description: A tool, a config option, a behaviour. Rough is fine.
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered

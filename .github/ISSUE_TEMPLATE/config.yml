@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/paooxide/ui-draw-mcp/security/advisories/new
+    about: Report a policy bypass, containment escape, secret leak or kill-switch/audit issue privately. Never in a public issue.
+  - name: Question or discussion
+    url: https://github.com/paooxide/ui-draw-mcp/discussions
+    about: Usage questions and open-ended discussion.

@@ -1,0 +1,11 @@
+# Default owner for everything, so every PR gets a review request.
+* @paooxide
+
+# Security-sensitive surfaces: the policy kernel, the security crate, the
+# supply-chain gate and the CI/release workflows. Changes here always need the
+# maintainer, per the security-tier process in CONTRIBUTING.md.
+/crates/mcp-policy/ @paooxide
+/crates/mcp-sec/    @paooxide
+/crates/mcp-ssrf/   @paooxide
+/deny.toml          @paooxide
+/.github/           @paooxide
