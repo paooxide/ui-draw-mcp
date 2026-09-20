@@ -15,9 +15,18 @@ All notable changes to this project are documented here. The format follows
   capture on, no console errors and no failed requests, returning `{passed, checks}`. `browser_flow`
   saves and replays a named sequence of steps deterministically, stopping at the first failing step so a
   green run never needs a model.
-- **`agentctl test`** replays saved flows against an attached Chromium and reports each flow's result plus
-  the issues it hit (failing step, console errors, failed requests), writing a `--json` report and exiting
-  non-zero on failure (or on any issue with `--strict`) for CI.
+- **`agentctl test`** replays saved flows and reports each flow's result, elapsed time and the issues it
+  hit (failing step, console errors, failed requests), writing a `--json` report (per-flow and total ms)
+  and exiting non-zero on failure (or on any issue with `--strict`) for CI. With no `--attach` it launches
+  its own throwaway browser and stops it when done; it shows a window when a display is present (so a local
+  run can be watched) and stays headless in CI, with `--headed`/`--headless` to force either way.
+- **The browser engine can launch any installed Chromium-family browser and always stops the tree it
+  started.** Launch discovery now covers Chrome, Chromium, Edge and Brave across native, snap and flatpak
+  locations (the engine speaks CDP, so Firefox and Safari remain unsupported). Each launch takes its own
+  free port rather
+  than a fixed one, so back-to-back launches never collide. A launched browser is stopped with a CDP
+  `Browser.close`, the only thing that reaps a sandboxed (flatpak/snap) browser's whole process tree,
+  which a signal to the launcher cannot reach.
 - **More places the judge helps, and per-use thresholds.** `handle_dialogs` takes `intent` and returns a
   `suggestion` naming the button that serves it (advice only; it presses nothing). `memory_find` takes
   `rerank` to reorder recalled recipes by semantic fit to the goal, falling back to success-count order

@@ -164,8 +164,9 @@ printf '%s\n' \
 
 ## Browser testing
 
-The `browser` engine drives a Chromium over the DevTools Protocol, and it is built for an agent to run
-regressions and UI tests natively:
+The `browser` engine drives a Chromium-family browser (Chrome, Chromium, Edge or Brave) over the DevTools
+Protocol, and it is built for an agent to run regressions and UI tests natively. Firefox and Safari speak
+different protocols and are not supported.
 
 - `browser_act` acts on a `ref` or, in one call, a `by`+`query` selector (no separate `browser_query`).
 - `browser_capture` installs a page hook (persists across navigations) that records fetch/XHR with
@@ -188,15 +189,19 @@ shell driver. A minimal project wiring:
 with a test profile of `access = "bypass"` (every capability on, no prompts) for a machine you own and are
 watching.
 
-For unattended/CI runs, `agentctl test` replays saved flows against an attached Chromium and reports
-each flow's result plus the issues it hit (failing step, console errors, failed requests). It exits
-non-zero on any failure, so it drops into a pipeline:
+`agentctl test` replays saved flows and reports each flow's result, its elapsed time, and the issues it
+hit (failing step, console errors, failed requests). With no `--attach` it launches its own throwaway
+browser (any Chromium-family browser it finds: Chrome, Chromium, Edge or Brave, native or flatpak) and
+stops it again when done; a fresh one per flow means no state leaks between tests. By default it shows a window when a display is present, so
+you can watch the run, and stays headless in CI where there is none. It exits non-zero on any failure, so
+it drops into a pipeline:
 
 ```sh
-chromium --remote-debugging-port=9222 --user-data-dir=/tmp/p &   # or any Chromium
-agentctl test                       # all saved flows
+agentctl test                       # all saved flows (headed if a display exists, else headless)
 agentctl test checkout login        # named flows
-agentctl test --json report.json --strict   # machine report; issues also fail
+agentctl test --headless            # force headless (or --headed to force a window)
+agentctl test --attach 9222         # reuse a Chromium you started with --remote-debugging-port=9222
+agentctl test --json report.json --strict   # machine report (per-flow + total ms); issues also fail
 ```
 
 A green run never invokes a model; a failure is where an agent session takes over.

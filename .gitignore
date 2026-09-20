@@ -17,3 +17,8 @@ docs/planning.md
 docs/implementation-plan.md
 docs/research-notes.md
 PROGRESS.md
+
+# Local, machine-specific runner config: absolute paths and a bypass profile,
+# not for a public tree. Copy the committed examples to make your own.
+.mcp.json
+agentctl.test.toml

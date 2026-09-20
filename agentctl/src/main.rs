@@ -331,15 +331,19 @@ async fn bridge(args: &[String]) -> std::io::Result<()> {
 async fn test_cmd(args: &[String]) -> std::io::Result<()> {
     use mcp_browser::{BrowserModule, CdpBackend, FlowStore, NavPolicy};
     use mcp_types::{CallCtx, CancelToken, ToolModule};
+    use std::time::Instant;
 
     let cfg = config_or_exit();
     let dir = state_dir(&cfg);
-    let port: u16 = flag(args, "--attach")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(9222);
     let strict = has(args, "--strict");
     let json_out = flag(args, "--json");
     let names = positional_flows(args);
+    // `--attach <port>` reuses a browser you started (its own session, its own
+    // headed/headless). With no `--attach`, the runner launches a throwaway
+    // browser and, unless overridden, shows a window when a display is present
+    // so you can watch the run, and stays headless in CI where there is none.
+    let attach_port = flag(args, "--attach").and_then(|s| s.parse::<u16>().ok());
+    let headless = resolve_launch_headless(args);
 
     let backend = Arc::new(CdpBackend::new(NavPolicy::new(
         &cfg.allowed_origins,
@@ -349,14 +353,28 @@ async fn test_cmd(args: &[String]) -> std::io::Result<()> {
         .with_flow_store(FlowStore::new(dir.join("browser_flows.json"), 200, 200));
     let ctx = CallCtx::new(new_session_id(), CancelToken::new());
 
-    let conn = module
-        .call("browser_connect", json!({ "attach": { "port": port } }), &ctx)
-        .await;
+    let launched = attach_port.is_none();
+    let conn = if let Some(port) = attach_port {
+        module
+            .call("browser_connect", json!({ "attach": { "port": port } }), &ctx)
+            .await
+    } else {
+        module
+            .call("browser_connect", json!({ "launch": { "headless": headless } }), &ctx)
+            .await
+    };
     if !conn.ok {
-        eprintln!(
-            "agentctl test: could not attach to Chromium on 127.0.0.1:{port}.\n  \
-             Start it with --remote-debugging-port={port}, or pass --attach <port>."
-        );
+        match attach_port {
+            Some(port) => eprintln!(
+                "agentctl test: could not attach to Chromium on 127.0.0.1:{port}.\n  \
+                 Start it with --remote-debugging-port={port}, or drop --attach to launch one."
+            ),
+            None => eprintln!(
+                "agentctl test: could not launch a browser.\n  \
+                 Install Chrome/Chromium (native or flatpak com.google.Chrome), or start one \
+                 yourself and pass --attach <port>."
+            ),
+        }
         if let Some(e) = conn.error {
             eprintln!("  {}", e.message);
         }
@@ -391,12 +409,16 @@ async fn test_cmd(args: &[String]) -> std::io::Result<()> {
         std::process::exit(2);
     }
 
-    eprintln!(
-        "agentctl test: {} flow(s) against 127.0.0.1:{port}",
-        flows.len()
-    );
+    let where_ = match attach_port {
+        Some(port) => format!("attached browser on 127.0.0.1:{port}"),
+        None if headless => "a launched headless browser".to_string(),
+        None => "a launched headed browser".to_string(),
+    };
+    eprintln!("agentctl test: {} flow(s) against {where_}", flows.len());
+    let started = Instant::now();
     let mut reports: Vec<Value> = Vec::new();
     for name in &flows {
+        let flow_started = Instant::now();
         // A fresh tab per flow, so page state does not leak between tests.
         let tab = module
             .call(
@@ -413,6 +435,7 @@ async fn test_cmd(args: &[String]) -> std::io::Result<()> {
             .map(String::from);
         let Some(target) = target else {
             reports.push(json!({ "name": name, "passed": false, "error": "could not open a tab",
+                "ms": flow_started.elapsed().as_millis() as u64,
                 "console_errors": [], "failed_requests": [] }));
             continue;
         };
@@ -438,12 +461,27 @@ async fn test_cmd(args: &[String]) -> std::io::Result<()> {
                 &ctx,
             )
             .await;
-        reports.push(build_flow_report(name, &run, &cap));
+        let mut row = build_flow_report(name, &run, &cap);
+        row["ms"] = json!(flow_started.elapsed().as_millis() as u64);
+        reports.push(row);
+    }
+    let total_ms = started.elapsed().as_millis() as u64;
+
+    // A browser we launched is ours to stop; one you attached is left running.
+    if launched {
+        let _ = module
+            .call(
+                "browser_disconnect",
+                json!({ "browser_id": browser_id, "kill": true }),
+                &ctx,
+            )
+            .await;
     }
 
     let (passed, failed, issue_flows) = print_report(&reports, strict);
+    println!("total {total_ms} ms");
     if let Some(p) = json_out {
-        let doc = json!({ "passed": passed, "failed": failed, "flows": reports });
+        let doc = json!({ "passed": passed, "failed": failed, "total_ms": total_ms, "flows": reports });
         let text = serde_json::to_string_pretty(&doc).unwrap_or_default() + "\n";
         if let Err(e) = std::fs::write(p, text) {
             eprintln!("agentctl test: could not write {p}: {e}");
@@ -453,6 +491,26 @@ async fn test_cmd(args: &[String]) -> std::io::Result<()> {
     }
     let bad = failed > 0 || (strict && issue_flows > 0);
     std::process::exit(if bad { 1 } else { 0 });
+}
+
+/// Whether a launched test browser should be headless. Explicit flags win;
+/// otherwise show a window when a display is present (so a local run can be
+/// watched) and stay headless in CI, where there is none. Only consulted when
+/// the runner launches its own browser, not with `--attach`.
+fn resolve_launch_headless(args: &[String]) -> bool {
+    if has(args, "--headless") {
+        return true;
+    }
+    if has(args, "--headed") {
+        return false;
+    }
+    !display_present()
+}
+
+/// True when a graphical session is available to show a browser window.
+fn display_present() -> bool {
+    let set = |k: &str| std::env::var(k).map(|v| !v.is_empty()).unwrap_or(false);
+    set("WAYLAND_DISPLAY") || set("DISPLAY")
 }
 
 /// Flow names passed positionally, skipping flags and the values of the flags
@@ -532,7 +590,15 @@ fn print_report(reports: &[Value], strict: bool) -> (usize, usize, usize) {
         if ce > 0 || fr > 0 {
             issue_flows += 1;
         }
-        println!("  [{}] {name}  ({ran} step(s) ran)", if ok { "PASS" } else { "FAIL" });
+        let took = r
+            .get("ms")
+            .and_then(Value::as_u64)
+            .map(|m| format!(", {m} ms"))
+            .unwrap_or_default();
+        println!(
+            "  [{}] {name}  ({ran} step(s) ran{took})",
+            if ok { "PASS" } else { "FAIL" }
+        );
         if ok {
             passed += 1;
         } else {
@@ -830,7 +896,7 @@ fn print_help() {
          \x20   config print     Print the effective configuration\n\
          \x20   tools            Print the tool reference (--all, --json)\n\
          \x20   bridge           Drive this server with Gemini (--task, --list-models, --prune)\n\
-         \x20   test             Replay saved browser_flow UI tests (--attach, --json, --strict)\n\
+         \x20   test             Replay saved browser_flow UI tests (--attach, --headed/--headless, --json, --strict)\n\
          \x20   transcript       Rebuild a session record from an audit log\n\
          \x20   help             Show this help\n",
         env!("CARGO_PKG_VERSION")
@@ -851,6 +917,47 @@ mod test_cmd_tests {
         assert_eq!(positional_flows(&a), vec!["login", "checkout"]);
         // No names, only flags: empty (means "all flows").
         assert!(positional_flows(&s(&["agentctl", "test", "--strict"])).is_empty());
+        // The headed/headless flags are not names and take no value.
+        assert!(positional_flows(&s(&["agentctl", "test", "--headed"])).is_empty());
+        assert_eq!(
+            positional_flows(&s(&["agentctl", "test", "--headless", "login"])),
+            vec!["login"]
+        );
+    }
+
+    #[test]
+    fn explicit_headed_headless_flags_win_over_the_display() {
+        // Explicit flags decide regardless of the environment.
+        assert!(resolve_launch_headless(&s(&["agentctl", "test", "--headless"])));
+        assert!(!resolve_launch_headless(&s(&["agentctl", "test", "--headed"])));
+    }
+
+    #[test]
+    fn auto_headless_follows_the_display() {
+        // Serialize env mutation; other tests read these too.
+        let saved = (
+            std::env::var("WAYLAND_DISPLAY").ok(),
+            std::env::var("DISPLAY").ok(),
+        );
+        std::env::remove_var("WAYLAND_DISPLAY");
+        std::env::remove_var("DISPLAY");
+        // No display, no flags -> headless.
+        assert!(resolve_launch_headless(&s(&["agentctl", "test"])));
+        // A display present -> headed.
+        std::env::set_var("DISPLAY", ":0");
+        assert!(!resolve_launch_headless(&s(&["agentctl", "test"])));
+        // An empty value is treated as absent.
+        std::env::set_var("DISPLAY", "");
+        assert!(resolve_launch_headless(&s(&["agentctl", "test"])));
+        // restore
+        match saved.0 {
+            Some(v) => std::env::set_var("WAYLAND_DISPLAY", v),
+            None => std::env::remove_var("WAYLAND_DISPLAY"),
+        }
+        match saved.1 {
+            Some(v) => std::env::set_var("DISPLAY", v),
+            None => std::env::remove_var("DISPLAY"),
+        }
     }
 
     fn env_ok(data: Value) -> mcp_types::Envelope {

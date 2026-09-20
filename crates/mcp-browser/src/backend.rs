@@ -161,6 +161,13 @@ struct Launched {
     id: u32,
     child: std::process::Child,
     user_data_dir: Option<std::path::PathBuf>,
+    /// Where the browser's own CDP endpoint answers, so it can be asked to quit
+    /// itself. Killing the launcher process is not enough for a sandboxed
+    /// (flatpak/snap) Chrome: it reparents its real processes out of our
+    /// process group, so only `Browser.close` over CDP tears the whole tree
+    /// down. Always loopback, but kept explicit alongside the port.
+    host: String,
+    port: u16,
 }
 
 /// The real Chrome DevTools Protocol backend.
@@ -200,6 +207,9 @@ impl CdpBackend {
                 browser_id = l.id,
                 "stopping browser launched by this session"
             );
+            // Ask the browser to quit itself first (reaches a sandboxed tree a
+            // signal cannot), then reap the launcher and delete the profile.
+            browser_close_blocking(&l.host, l.port);
             reap_one(l.child, l.user_data_dir.as_deref());
         }
     }
@@ -412,6 +422,8 @@ impl BrowserBackend for CdpBackend {
                     id,
                     child,
                     user_data_dir,
+                    host: host.clone(),
+                    port,
                 });
         }
         self.browsers
@@ -458,6 +470,9 @@ impl BrowserBackend for CdpBackend {
         match (kill, mine) {
             (true, Some(l)) => {
                 profile_removed = l.user_data_dir.is_some();
+                // Graceful CDP quit first, so a sandboxed browser's whole
+                // process tree goes down, not just the launcher we hold.
+                let _ = browser_close(&l.host, l.port).await;
                 reap_one(l.child, l.user_data_dir.as_deref());
                 killed = true;
             }
@@ -1149,16 +1164,54 @@ fn berr_msg(e: &BrowserError) -> String {
     }
 }
 
-/// Common macOS/Linux Chromium binary locations, tried in order.
+/// Common macOS/Linux locations for a Chromium-family browser, tried in order.
+/// The engine speaks the Chrome DevTools Protocol, so any of these (Chrome,
+/// Chromium, Edge, Brave, Vivaldi, Opera) works; Firefox and Safari do not
+/// speak CDP and are not launchable here.
 pub const CHROME_BINS: &[&str] = &[
     "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
     "/Applications/Chromium.app/Contents/MacOS/Chromium",
     "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
     "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
     "/usr/bin/google-chrome",
+    "/usr/bin/google-chrome-stable",
     "/usr/bin/chromium",
     "/usr/bin/chromium-browser",
+    "/snap/bin/chromium",
+    "/usr/bin/microsoft-edge",
+    "/usr/bin/microsoft-edge-stable",
+    "/usr/bin/brave-browser",
+    "/usr/bin/brave",
+    "/usr/bin/vivaldi",
+    "/usr/bin/vivaldi-stable",
+    "/usr/bin/opera",
 ];
+
+/// Browser binaries to try, in priority order: the native locations first,
+/// then the flatpak exported wrappers. A flatpak export is a tiny shell script
+/// that `exec`s `flatpak run <app> "$@"`, so it forwards our Chrome flags
+/// verbatim and can be launched exactly like a native binary. Including it
+/// means a Chrome installed only as a flatpak (common on Fedora and other
+/// distros) is launchable without the operator pre-starting it by hand.
+fn browser_bin_candidates() -> Vec<String> {
+    // The flatpak app ids whose exported wrappers we can exec directly.
+    const FLATPAK_APPS: &[&str] = &[
+        "com.google.Chrome",
+        "org.chromium.Chromium",
+        "com.microsoft.Edge",
+        "com.brave.Browser",
+    ];
+    let mut v: Vec<String> = CHROME_BINS.iter().map(|s| (*s).to_string()).collect();
+    for app in FLATPAK_APPS {
+        v.push(format!("/var/lib/flatpak/exports/bin/{app}"));
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        for app in FLATPAK_APPS {
+            v.push(format!("{home}/.local/share/flatpak/exports/bin/{app}"));
+        }
+    }
+    v
+}
 
 /// Last line of defence: a server that exits without calling `shutdown` still
 /// takes its browsers with it. Modelled on `mcp_pty::PtySession`, which kills
@@ -1176,6 +1229,46 @@ impl Drop for CdpBackend {
 /// shape, for *our* pid, was created by us and may be deleted.
 fn own_profile_dir(port: u16) -> std::path::PathBuf {
     std::env::temp_dir().join(format!("agentctl-cdp-{}-{port}", std::process::id()))
+}
+
+/// Ask a launched browser to quit itself over CDP (`Browser.close`).
+///
+/// This is the reliable way to stop a browser we launched. A native Chrome
+/// exits when we kill the child we hold, but a flatpak or snap Chrome is run
+/// behind a launcher and re-parents its real processes (via `zypak`/`bwrap`)
+/// out of our process group, so neither `child.kill()` nor a process-group
+/// signal reaches them. Telling the browser to close itself does: it tears
+/// down its own tree wherever it lives. Best-effort: a browser that never came
+/// up, or has already gone, simply is not there to answer.
+async fn browser_close(host: &str, port: u16) -> Result<(), BrowserError> {
+    let ver = http_json(host, port, "GET", "/json/version").await?;
+    let ws = ver
+        .get("webSocketDebuggerUrl")
+        .and_then(Value::as_str)
+        .ok_or_else(|| BrowserError::Failed("no browser webSocketDebuggerUrl".into()))?;
+    let mut conn = CdpConn::connect(ws).await?;
+    // The browser may drop the socket as it exits; a send that lands is enough,
+    // so a read error on the reply is not a failure.
+    let _ = conn.call("Browser.close", json!({})).await;
+    Ok(())
+}
+
+/// Synchronous `browser_close` for the sync reap paths (`shutdown`, `Drop`).
+///
+/// Runs the async close on a throwaway current-thread runtime on a fresh
+/// thread, which keeps it safe to call whether or not an outer Tokio runtime is
+/// active (`block_on` inside a runtime thread would panic). Fully best-effort.
+fn browser_close_blocking(host: &str, port: u16) {
+    let (h, p) = (host.to_string(), port);
+    let _ = std::thread::spawn(move || {
+        if let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            let _ = rt.block_on(browser_close(&h, p));
+        }
+    })
+    .join();
 }
 
 /// Stop one launched browser and remove the profile directory we created for
@@ -1199,9 +1292,28 @@ fn reap_one(mut child: std::process::Child, user_data_dir: Option<&std::path::Pa
 /// its profile directory for the life of the machine.
 type Launch = (String, u16, std::process::Child, Option<std::path::PathBuf>);
 
+/// Pick a currently-free loopback TCP port by binding `:0` and reading back the
+/// assigned port, then releasing it. There is a small window between release and
+/// Chrome binding it, but each launch getting its own port is what matters: a
+/// fixed port collides when two launches overlap, or when one browser is still
+/// shutting down (it holds the port a moment after `Browser.close` returns), and
+/// the next launch then attaches to the dying browser instead of its own.
+fn free_port() -> Result<u16, BrowserError> {
+    let l = std::net::TcpListener::bind(("127.0.0.1", 0))
+        .map_err(|e| BrowserError::Failed(format!("could not pick a free port: {e}")))?;
+    l.local_addr()
+        .map(|a| a.port())
+        .map_err(|e| BrowserError::Failed(format!("could not read chosen port: {e}")))
+}
+
 async fn launch_browser(spec: &Value) -> Result<Launch, BrowserError> {
     use tokio::time::{sleep, Duration};
-    let port = spec.get("port").and_then(Value::as_u64).unwrap_or(9333) as u16;
+    // An explicit port is honoured (e.g. to attach DevTools by hand); otherwise
+    // each launch gets its own free port so back-to-back launches never collide.
+    let port = match spec.get("port").and_then(Value::as_u64) {
+        Some(p) => p as u16,
+        None => free_port()?,
+    };
     let headless = spec
         .get("headless")
         .and_then(Value::as_bool)
@@ -1215,12 +1327,15 @@ async fn launch_browser(spec: &Value) -> Result<Launch, BrowserError> {
         }
     };
     let user_data_dir = user_data_dir.to_string_lossy().into_owned();
-    let bin = CHROME_BINS
+    let candidates = browser_bin_candidates();
+    let bin = candidates
         .iter()
         .find(|p| std::path::Path::new(p).exists())
         .ok_or_else(|| {
             BrowserError::NotFound(
-                "no Chromium binary found; attach to a running browser instead".into(),
+                "no Chromium binary found (looked for native Chrome/Chromium and flatpak \
+                 com.google.Chrome); attach to a running browser instead"
+                    .into(),
             )
         })?;
 
@@ -1274,6 +1389,43 @@ mod tests {
             format!("agentctl-cdp-{}-9333", std::process::id()),
             "the pid must be in the name"
         );
+    }
+
+    /// Discovery lists native locations first, then the flatpak wrappers, and
+    /// folds `$HOME` into the per-user flatpak path so a Chrome installed only
+    /// as a flatpak is still found.
+    #[test]
+    fn candidates_include_native_then_flatpak() {
+        std::env::set_var("HOME", "/home/tester");
+        let c = browser_bin_candidates();
+        // native paths come from the const, in order, at the front.
+        assert_eq!(c[0], CHROME_BINS[0]);
+        assert!(c.iter().any(|p| p == "/usr/bin/google-chrome"));
+        // flatpak system wrapper is present and lands after the natives.
+        let sys = "/var/lib/flatpak/exports/bin/com.google.Chrome";
+        let (sys_i, nat_i) = (
+            c.iter().position(|p| p == sys).expect("system flatpak path"),
+            c.iter().position(|p| p == "/usr/bin/google-chrome").unwrap(),
+        );
+        assert!(sys_i > nat_i, "flatpak is a fallback, tried after natives");
+        // the per-user path is built from HOME.
+        assert!(c
+            .iter()
+            .any(|p| p == "/home/tester/.local/share/flatpak/exports/bin/com.google.Chrome"));
+    }
+
+    /// A picked port is real and usable: nonzero, and free right after (the
+    /// listener is dropped), so Chrome can bind it. Two picks in a row should
+    /// differ, which is the whole point of not using a fixed port.
+    #[test]
+    fn free_port_is_usable_and_varies() {
+        let a = free_port().expect("pick a port");
+        assert!(a != 0, "a real port was chosen");
+        // Bindable again now that free_port released it.
+        let l = std::net::TcpListener::bind(("127.0.0.1", a)).expect("port is free to bind");
+        drop(l);
+        let b = free_port().expect("pick another port");
+        assert_ne!(a, b, "successive picks are distinct");
     }
 
     /// An operator-supplied profile is never deleted: `launch_browser` records
