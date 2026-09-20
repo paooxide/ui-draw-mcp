@@ -280,9 +280,19 @@ mod tests {
             allow_shell: true,
             ..policy()
         };
-        let out = run("printf '%0.sx' {1..500}", &[], None, &p, true)
-            .await
-            .unwrap();
+        // A literal string well over the cap. Not a brace expansion or `seq`:
+        // `run(shell=true)` uses `/bin/sh`, which is dash on many Linux CI
+        // runners and expands neither `{1..500}` nor much else, so the command
+        // has to emit its bytes without relying on shell features.
+        let out = run(
+            "printf xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+            &[],
+            None,
+            &p,
+            true,
+        )
+        .await
+        .unwrap();
         assert!(out.stdout.len() <= 16);
         assert!(out.stdout_truncated);
     }
