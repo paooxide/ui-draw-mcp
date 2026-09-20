@@ -8,9 +8,11 @@ mod cdp;
 mod flow;
 mod nav;
 mod tools;
+mod visual;
 
 pub use backend::{BrowserBackend, BrowserError, CdpBackend, Shot, CHROME_BINS};
 pub use cdp::DialogPolicy;
 pub use flow::{Flow, FlowStore};
 pub use nav::{NavDenied, NavPolicy};
 pub use tools::BrowserModule;
+pub use visual::{Baseline, VisualStore};

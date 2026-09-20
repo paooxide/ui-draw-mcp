@@ -907,6 +907,7 @@ name = "mcp-browser"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "mcp-judge",
  "mcp-ssrf",
  "mcp-types",
  "serde",

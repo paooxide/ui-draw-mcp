@@ -15,6 +15,8 @@ use crate::cdp::DialogPolicy;
 pub struct BrowserModule {
     backend: Arc<dyn BrowserBackend>,
     flows: Option<crate::flow::FlowStore>,
+    baselines: Option<crate::visual::VisualStore>,
+    judge: Option<Arc<mcp_judge::Judge>>,
 }
 
 impl BrowserModule {
@@ -22,6 +24,8 @@ impl BrowserModule {
         BrowserModule {
             backend,
             flows: None,
+            baselines: None,
+            judge: None,
         }
     }
 
@@ -30,7 +34,89 @@ impl BrowserModule {
         self.flows = Some(store);
         self
     }
+
+    /// Enable the `visual` assert clause (baseline screenshot + pixel diff).
+    pub fn with_visual_store(mut self, store: crate::visual::VisualStore) -> Self {
+        self.baselines = Some(store);
+        self
+    }
+
+    /// Enable the `ux` assert clause (judge-scored heuristic review; advisory).
+    pub fn with_judge(mut self, judge: Arc<mcp_judge::Judge>) -> Self {
+        self.judge = Some(judge);
+        self
+    }
 }
+
+/// Assert clauses evaluated in the page by the backend. `visual` and `ux` are
+/// handled at the module layer instead (they need the baseline store / judge).
+const JS_ASSERT_KEYS: &[&str] = &[
+    "text",
+    "not_text",
+    "url",
+    "selector",
+    "no_console_errors",
+    "no_failed_requests",
+    "a11y",
+    "style",
+    "component",
+];
+
+/// A per-dimension UX instruction for the judge. Known dimensions get a focused
+/// prompt; an unknown one gets a sensible generic prompt so callers can add
+/// their own without a code change.
+fn ux_instruction(dim: &str) -> String {
+    match dim {
+        "clarity" => {
+            "The screen's purpose and its primary action are immediately clear to a first-time user."
+        }
+        "hierarchy" => {
+            "The visual hierarchy guides the eye: the most important element stands out and the \
+             grouping of related content is logical."
+        }
+        "affordance" => {
+            "Interactive elements clearly look interactive and their labels say what they will do."
+        }
+        "consistency" => {
+            "Labels, terminology and controls are consistent with each other and with common \
+             platform conventions."
+        }
+        other => return format!("From a UX standpoint, the screen exhibits good {other}."),
+    }
+    .to_string()
+}
+
+/// Gather the page facts the UX judge reasons over: title, url, headings,
+/// action labels, field names and a bounded slice of visible text.
+const UX_FACTS_JS: &str = r#"(function(){
+  function txt(el){ return ((el&&el.innerText)||'').trim().replace(/\s+/g,' '); }
+  var main=document.querySelector('main')||document.body;
+  var h=[].slice.call(main.querySelectorAll('h1,h2,h3')).map(txt).filter(Boolean).slice(0,20);
+  var a=[].slice.call(main.querySelectorAll('button,a[href],[role=button]')).map(function(b){return (b.getAttribute('aria-label')||txt(b));}).filter(Boolean).slice(0,30);
+  var f=[].slice.call(main.querySelectorAll('input,select,textarea')).map(function(i){return i.getAttribute('placeholder')||i.getAttribute('name')||i.getAttribute('type')||'field';}).slice(0,30);
+  return { title: document.title, url: location.href, headings: h, actions: a, fields: f, text: txt(main).slice(0,2000) };
+})()"#;
+
+/// Decode two base64 PNGs, compare them pixel-for-pixel on a canvas, and return
+/// the changed-pixel ratio plus a bounding box. `__BASE__`/`__CUR__` are
+/// replaced with base64 (the base64 alphabet has no quotes, so single-quoting
+/// is safe). A small per-pixel threshold ignores antialiasing noise.
+const VISUAL_DIFF_JS: &str = r#"(async function(){
+  var A='__BASE__', B='__CUR__';
+  function load(src){ return new Promise(function(res,rej){ var im=new Image(); im.onload=function(){res(im);}; im.onerror=function(){rej(new Error('decode failed'));}; im.src='data:image/png;base64,'+src; }); }
+  var ia, ib;
+  try{ ia=await load(A); ib=await load(B); }catch(e){ return {error:String(e&&e.message||e)}; }
+  if(ia.width!==ib.width||ia.height!==ib.height){ return {dims_match:false, base:ia.width+'x'+ia.height, cur:ib.width+'x'+ib.height, diff_ratio:1}; }
+  var w=ia.width, h=ia.height;
+  function ctx(){ try{ var c=new OffscreenCanvas(w,h); return c.getContext('2d',{willReadFrequently:true}); }catch(e){ var cv=document.createElement('canvas'); cv.width=w; cv.height=h; return cv.getContext('2d',{willReadFrequently:true}); } }
+  var xa=ctx(), xb=ctx();
+  xa.drawImage(ia,0,0); xb.drawImage(ib,0,0);
+  var da=xa.getImageData(0,0,w,h).data, db=xb.getImageData(0,0,w,h).data;
+  var thr=16, changed=0, minx=w, miny=h, maxx=-1, maxy=-1;
+  for(var i=0;i<da.length;i+=4){ var d=Math.abs(da[i]-db[i])+Math.abs(da[i+1]-db[i+1])+Math.abs(da[i+2]-db[i+2])+Math.abs(da[i+3]-db[i+3]); if(d>thr){ changed++; var p=i/4, px=p%w, py=(p/w)|0; if(px<minx)minx=px; if(px>maxx)maxx=px; if(py<miny)miny=py; if(py>maxy)maxy=py; } }
+  var total=w*h;
+  return { dims_match:true, w:w, h:h, changed:changed, total:total, diff_ratio: total? changed/total : 0, bbox: (maxx>=0)? {x:minx,y:miny,w:maxx-minx+1,h:maxy-miny+1} : null };
+})()"#;
 
 fn str_arg<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
     args.get(key).and_then(Value::as_str)
@@ -320,7 +406,7 @@ impl BrowserModule {
             Ok(t) => t,
             Err(e) => return e,
         };
-        match self.backend.assert(target, args).await {
+        match self.assert_full(target, args).await {
             Ok(v) => {
                 let passed = v.get("passed").and_then(Value::as_bool) == Some(true);
                 if passed {
@@ -361,6 +447,184 @@ impl BrowserModule {
         {
             Ok(v) => Envelope::ok("browser_viewport", v),
             Err(e) => browser_err("browser_viewport", e),
+        }
+    }
+
+    /// The whole assertion: the in-page JS clauses (via the backend), plus the
+    /// `visual` diff and `ux` review, which need this layer's baseline store and
+    /// judge. Returns the same `{passed, checks}` shape as the backend, so the
+    /// flow engine and `agentctl test` report treat every clause alike.
+    async fn assert_full(&self, target: &str, spec: &Value) -> Result<Value, BrowserError> {
+        let mut checks: Vec<Value> = Vec::new();
+        let wants_visual = spec.get("visual").is_some();
+        let wants_ux = spec.get("ux").is_some();
+        let wants_js = JS_ASSERT_KEYS.iter().any(|k| spec.get(*k).is_some());
+        // Run the in-page clauses when the spec asks for one, or when it asks
+        // for nothing here at all (so a plain functional assert still reaches
+        // the backend); skip only when the spec is purely visual/ux.
+        if wants_js || (!wants_visual && !wants_ux) {
+            let r = self.backend.assert(target, spec).await?;
+            if let Some(arr) = r.get("checks").and_then(Value::as_array) {
+                checks.extend(arr.iter().cloned());
+            }
+        }
+        if spec.get("visual").is_some() {
+            checks.push(self.visual_check(target, spec).await);
+        }
+        if spec.get("ux").is_some() {
+            checks.push(self.ux_check(target, spec).await);
+        }
+        if checks.is_empty() {
+            return Err(BrowserError::Failed(
+                "no assertions given (text/not_text/url/selector/no_console_errors/\
+                 no_failed_requests/a11y/style/component/visual/ux)"
+                    .into(),
+            ));
+        }
+        let passed = checks
+            .iter()
+            .all(|c| c.get("ok").and_then(Value::as_bool) == Some(true));
+        Ok(json!({ "passed": passed, "checks": checks }))
+    }
+
+    /// Visual regression: screenshot now, compare to a stored baseline. The
+    /// first run for a name saves the baseline and passes; later runs pass when
+    /// the changed-pixel ratio is within tolerance and the dimensions match.
+    /// Any internal failure becomes a failing check rather than aborting the
+    /// whole assertion, so it reports cleanly.
+    async fn visual_check(&self, target: &str, spec: &Value) -> Value {
+        let fail = |d: String| json!({ "name": "visual", "ok": false, "detail": d });
+        let v = &spec["visual"];
+        let (name, tolerance, node_ref) = match v {
+            Value::String(s) => (s.clone(), 0.01_f64, None),
+            _ => (
+                v.get("name").and_then(Value::as_str).unwrap_or("").to_string(),
+                v.get("tolerance").and_then(Value::as_f64).unwrap_or(0.01),
+                v.get("ref").and_then(Value::as_str).map(String::from),
+            ),
+        };
+        if name.trim().is_empty() {
+            return fail("visual needs a baseline name".into());
+        }
+        let Some(store) = self.baselines.as_ref() else {
+            return fail("visual store not configured (run with a state dir)".into());
+        };
+        let shot = match self.backend.screenshot(target, node_ref.as_deref()).await {
+            Ok(s) => s,
+            Err(e) => return fail(format!("screenshot failed: {}", browser_err_msg(&e))),
+        };
+        let base = match store.get(&name) {
+            Ok(b) => b,
+            Err(e) => return fail(format!("baseline load failed: {e:?}")),
+        };
+        let Some(base) = base else {
+            return match store.save(&name, shot.base64, shot.width, shot.height, now_ms()) {
+                Ok(_) => json!({ "name": "visual", "ok": true, "created": true,
+                    "detail": format!("baseline created: {name}") }),
+                Err(e) => fail(format!("baseline save failed: {e:?}")),
+            };
+        };
+        let diff = match self.visual_diff(target, &base.png_base64, &shot.base64).await {
+            Ok(d) => d,
+            Err(e) => return fail(format!("diff failed: {}", browser_err_msg(&e))),
+        };
+        if let Some(err) = diff.get("error").and_then(Value::as_str) {
+            return fail(format!("diff error: {err}"));
+        }
+        if diff.get("dims_match").and_then(Value::as_bool) != Some(true) {
+            let b = diff.get("base").and_then(Value::as_str).unwrap_or("?");
+            let c = diff.get("cur").and_then(Value::as_str).unwrap_or("?");
+            return json!({ "name": "visual", "ok": false,
+                "detail": format!("dimensions changed {b} -> {c}"), "diff": diff });
+        }
+        let ratio = diff.get("diff_ratio").and_then(Value::as_f64).unwrap_or(1.0);
+        json!({
+            "name": "visual",
+            "ok": ratio <= tolerance,
+            "detail": format!("{:.2}% changed (tol {:.2}%)", ratio * 100.0, tolerance * 100.0),
+            "diff": diff,
+        })
+    }
+
+    /// Diff two base64 PNGs in the page: decode both, compare pixels on a canvas,
+    /// return the changed ratio and a bounding box. Done in-page to avoid an
+    /// image-decoding dependency and to keep the whole comparison in one place.
+    async fn visual_diff(
+        &self,
+        target: &str,
+        base_b64: &str,
+        cur_b64: &str,
+    ) -> Result<Value, BrowserError> {
+        let expr = VISUAL_DIFF_JS
+            .replace("__BASE__", base_b64)
+            .replace("__CUR__", cur_b64);
+        let out = self.backend.eval(target, &expr).await?;
+        Ok(out.get("result").cloned().unwrap_or(Value::Null))
+    }
+
+    /// Judge-scored UX review: gather page facts, ask the judge one Noul per
+    /// dimension (clarity/hierarchy/affordance/consistency by default), and
+    /// report the scores. Advisory by default (never fails the run); set
+    /// `ux.gate=true` (+ optional `ux.min`) to fail when a dimension is low.
+    /// Degrades to a skipped, passing check when no judge is configured or the
+    /// judge is unreachable, so it never blocks a run on its own absence.
+    async fn ux_check(&self, target: &str, spec: &Value) -> Value {
+        let uo = &spec["ux"];
+        let dims: Vec<String> = uo
+            .get("dims")
+            .and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect::<Vec<_>>())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| {
+                ["clarity", "hierarchy", "affordance", "consistency"]
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect()
+            });
+        let gate = uo.get("gate").and_then(Value::as_bool).unwrap_or(false);
+        let min = uo.get("min").and_then(Value::as_f64).unwrap_or(0.5);
+        let skipped = |d: String| json!({ "name": "ux", "ok": true, "advisory": true, "detail": d });
+        let Some(judge) = self.judge.as_ref() else {
+            return skipped("judge not configured; skipped".into());
+        };
+        let facts = match self.backend.eval(target, UX_FACTS_JS).await {
+            Ok(v) => v.get("result").cloned().unwrap_or_else(|| json!({})),
+            Err(e) => return skipped(format!("could not read page facts: {}", browser_err_msg(&e))),
+        };
+        let mut qs = std::collections::BTreeMap::new();
+        for d in &dims {
+            qs.insert(
+                d.clone(),
+                mcp_judge::Question::Noul {
+                    instructions: ux_instruction(d),
+                    criteria: None,
+                },
+            );
+        }
+        match judge.ask(facts, qs).await {
+            Ok(ans) => {
+                let mut scores = serde_json::Map::new();
+                let mut low = Vec::new();
+                for d in &dims {
+                    if let Some(mcp_judge::Answer::Noul { noul }) = ans.answers.get(d) {
+                        let p = noul.clamp(0.0, 1.0);
+                        scores.insert(d.clone(), json!((p * 100.0).round() / 100.0));
+                        if p < min {
+                            low.push(d.clone());
+                        }
+                    }
+                }
+                let ok = !gate || low.is_empty();
+                json!({
+                    "name": "ux",
+                    "ok": ok,
+                    "advisory": !gate,
+                    "detail": format!("{} scored, {} below {:.2}", scores.len(), low.len(), min),
+                    "scores": scores,
+                    "low": low,
+                })
+            }
+            Err(e) => skipped(format!("judge unavailable: {}", e.message())),
         }
     }
 
@@ -541,7 +805,7 @@ impl BrowserModule {
                     .capture(target, str_arg(step, "action").unwrap_or("start"), step)
                     .await
             }
-            "assert" => match self.backend.assert(target, step).await {
+            "assert" => match self.assert_full(target, step).await {
                 // An assert's own pass/fail is the step's ok.
                 Ok(v) => {
                     let passed = v.get("passed").and_then(Value::as_bool) == Some(true);
@@ -837,8 +1101,10 @@ impl ToolModule for BrowserModule {
                  (need browser_capture started). UX clauses: a11y (built-in WCAG rules: alt text, \
                  form labels, control names, contrast, target size, positive tabindex, duplicate \
                  ids, page lang), style (design-token conformance: colors/fonts/font_sizes/spacing \
-                 allow-lists), component (role/visible/states of one element). 'within' scopes the \
-                 UX clauses to a component subtree. Settle first with wait_selector or \
+                 allow-lists), component (role/visible/states of one element), visual (screenshot vs a \
+                 saved baseline: first run saves it, later runs diff within tolerance), ux (judge-scored \
+                 heuristics: clarity/hierarchy/affordance/consistency; advisory unless gate=true). 'within' \
+                 scopes the DOM UX clauses to a component subtree. Settle first with wait_selector or \
                  wait_network_idle.",
                 obj(
                     json!({
@@ -854,6 +1120,8 @@ impl ToolModule for BrowserModule {
                         "a11y": { "description": "true, or {ignore:[rules], contrast:false, target_size:false, contrast_sample:N} to run the built-in accessibility audit" },
                         "style": { "type": "object", "description": "design-token conformance: {colors:[], fonts:[], font_sizes:[], spacing:[]} allow-lists; off-token values fail" },
                         "component": { "type": "object", "description": "{selector, visible, role, states:{disabled,expanded,checked,...}} assertions on one element" },
+                        "visual": { "description": "baseline name, or {name, tolerance, ref}; first run saves the baseline, later runs diff the screenshot within tolerance (default 0.01)" },
+                        "ux": { "type": "object", "description": "judge-scored review: {dims:[clarity,hierarchy,affordance,consistency], gate:false, min:0.5}; advisory unless gate=true" },
                         "wait_selector": { "type": "string", "description": "settle: wait for this selector first" },
                         "wait_network_idle": { "type": "boolean", "description": "settle: wait for network idle first" },
                         "timeout_ms": { "type": "integer", "description": "settle timeout (default 8000)" }

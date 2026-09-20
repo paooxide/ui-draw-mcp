@@ -15,6 +15,13 @@ All notable changes to this project are documented here. The format follows
   spacing against allow-lists and flags off-token values; `component` asserts one element's role, visibility
   and states (disabled/expanded/checked/...); `within` scopes any of these to a component subtree. New
   `browser_viewport` tool (and `viewport` flow step) emulates device metrics for responsive testing.
+- **UX testing: visual regression and a judge-scored UX review.** `browser_assert` gained `visual`
+  (screenshot vs a named baseline: the first run saves it, later runs diff the pixels in-page and fail past
+  a tolerance or on a dimension change) and `ux` (the judge scores clarity/hierarchy/affordance/consistency
+  over the page's facts; advisory by default and skipped when the judge is off, `gate:true` makes a low
+  dimension fail). Baselines are a file-backed store next to the flow store. `agentctl test` now surfaces
+  every UX check (a11y violations, off-token values, visual diff, UX scores) per flow in its report, so a
+  run shows them even when it passed overall.
 
 - **Browser engine built for native regression/UI testing.** `browser_act` can locate by `by`+`query`
   selector in one call (no separate `browser_query`). `browser_capture` installs a persistent page hook

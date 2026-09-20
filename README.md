@@ -177,6 +177,28 @@ different protocols and are not supported.
 - `browser_flow` saves a named sequence of steps and replays it deterministically, stopping at the first
   failing step. A green run never invokes a model; a failure is where an agent takes over.
 
+### UX suite
+
+`browser_assert` also carries UX clauses, so accessibility, design-system and visual checks ride the same
+`{passed, checks}` flow, `browser_flow` and `agentctl test` report as the functional ones:
+
+- **Accessibility** (`a11y: true`) runs a built-in WCAG audit: alt text, form labels, control names, colour
+  contrast, target size, positive tabindex, duplicate ids and page lang. `{ignore:[...]}` drops rules.
+- **Style / design tokens** (`style: {colors, fonts, font_sizes, spacing}`) flags computed values that are
+  not on the allow-lists, so a UI that drifts off the design system fails.
+- **Component** (`component: {selector, role, visible, states}`) asserts one element's role, visibility and
+  ARIA states; `within` scopes the a11y/style checks to that component's subtree.
+- **Responsive** — `browser_viewport` (or a `viewport` flow step) emulates device metrics, so a flow can
+  assert at phone, tablet and desktop widths.
+- **Visual regression** (`visual: "name"`) screenshots and compares to a saved baseline; the first run
+  saves it, later runs fail when the changed-pixel ratio exceeds `tolerance` or the dimensions change.
+- **Judge UX review** (`ux: {dims:[...]}`) scores clarity, hierarchy, affordance and consistency with the
+  judge. Advisory by default (it never fails a run, and degrades to skipped when the judge is off); set
+  `gate: true` to fail when a dimension falls below `min`. An AI opinion is a signal, not a real user.
+
+A flow step is just an assert with these fields, e.g. `{op:"viewport",width:390,height:844,mobile:true}`
+then `{op:"assert",a11y:true}`, `{op:"assert",visual:"home"}`, `{op:"assert",ux:{}}`.
+
 Point a Claude (or other MCP) session at agentctl as a server so these are native tool calls rather than a
 shell driver. A minimal project wiring:
 

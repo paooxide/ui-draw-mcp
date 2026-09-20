@@ -635,7 +635,7 @@ Act on a DOM node: click, type, select, hover, focus, scroll_into_view, submit. 
 
 `browser_assert` · read tier
 
-Settle (optional) then check the page in one call; returns {passed, checks} and errors when it fails. Functional clauses: text/not_text (in page text), url (substring), selector (+min_count), no_console_errors and no_failed_requests (need browser_capture started). UX clauses: a11y (built-in WCAG rules: alt text, form labels, control names, contrast, target size, positive tabindex, duplicate ids, page lang), style (design-token conformance: colors/fonts/font_sizes/spacing allow-lists), component (role/visible/states of one element). 'within' scopes the UX clauses to a component subtree. Settle first with wait_selector or wait_network_idle.
+Settle (optional) then check the page in one call; returns {passed, checks} and errors when it fails. Functional clauses: text/not_text (in page text), url (substring), selector (+min_count), no_console_errors and no_failed_requests (need browser_capture started). UX clauses: a11y (built-in WCAG rules: alt text, form labels, control names, contrast, target size, positive tabindex, duplicate ids, page lang), style (design-token conformance: colors/fonts/font_sizes/spacing allow-lists), component (role/visible/states of one element), visual (screenshot vs a saved baseline: first run saves it, later runs diff within tolerance), ux (judge-scored heuristics: clarity/hierarchy/affordance/consistency; advisory unless gate=true). 'within' scopes the DOM UX clauses to a component subtree. Settle first with wait_selector or wait_network_idle.
 
 | Argument | Type | Required | Description |
 |---|---|---|---|
@@ -651,6 +651,8 @@ Settle (optional) then check the page in one call; returns {passed, checks} and 
 | `text` | string |  | assert this text is present |
 | `timeout_ms` | integer |  | settle timeout (default 8000) |
 | `url` | string |  | assert the URL contains this |
+| `ux` | object |  | judge-scored review: {dims:[clarity,hierarchy,affordance,consistency], gate:false, min:0.5}; advisory unless gate=true |
+| `visual` | any |  | baseline name, or {name, tolerance, ref}; first run saves the baseline, later runs diff the screenshot within tolerance (default 0.01) |
 | `wait_network_idle` | boolean |  | settle: wait for network idle first |
 | `wait_selector` | string |  | settle: wait for this selector first |
 | `within` | string |  | scope a11y/style/component checks to this css root (component testing) |

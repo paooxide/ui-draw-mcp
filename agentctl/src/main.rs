@@ -349,8 +349,15 @@ async fn test_cmd(args: &[String]) -> std::io::Result<()> {
         &cfg.allowed_origins,
         cfg.browser_allow_private,
     )));
+    // The judge powers the `ux` assert clause; a disabled judge just skips it.
+    let judge = mcp_policy::mcp_judge::Judge::from_config(cfg.judge.clone(), &dir);
     let module = BrowserModule::new(backend)
-        .with_flow_store(FlowStore::new(dir.join("browser_flows.json"), 200, 200));
+        .with_flow_store(FlowStore::new(dir.join("browser_flows.json"), 200, 200))
+        .with_visual_store(mcp_browser::VisualStore::new(
+            dir.join("browser_baselines.json"),
+            500,
+        ))
+        .with_judge(judge);
     let ctx = CallCtx::new(new_session_id(), CancelToken::new());
 
     let launched = attach_port.is_none();
@@ -565,6 +572,23 @@ fn build_flow_report(name: &str, run: &mcp_types::Envelope, cap: &mcp_types::Env
                 .collect()
         })
         .unwrap_or_default();
+    // UX checks (a11y / style / component / visual / ux) surfaced from every
+    // assert step, so a report shows them even on a flow that passed overall
+    // (a ux review is advisory) and names the ones that failed.
+    let is_ux = |n: &str| {
+        matches!(n, "a11y" | "style" | "visual" | "ux") || n.starts_with("component")
+    };
+    let ux_checks: Vec<Value> = steps
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|s| s.get("detail").and_then(|d| d.get("checks")).and_then(Value::as_array))
+                .flatten()
+                .filter(|c| c.get("name").and_then(Value::as_str).map(is_ux).unwrap_or(false))
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
     json!({
         "name": name,
         "passed": run.ok,
@@ -572,6 +596,7 @@ fn build_flow_report(name: &str, run: &mcp_types::Envelope, cap: &mcp_types::Env
         "failing_step": failing,
         "console_errors": console_errors,
         "failed_requests": failed_requests,
+        "ux_checks": ux_checks,
         "steps": steps,
     })
 }
@@ -627,6 +652,34 @@ fn print_report(reports: &[Value], strict: bool) -> (usize, usize, usize) {
                 let st = n.get("status").and_then(Value::as_u64).unwrap_or(0);
                 let u = n.get("url").and_then(Value::as_str).unwrap_or("");
                 println!("         - {m} {st} {u}");
+            }
+        }
+        let ux = r.get("ux_checks").and_then(Value::as_array);
+        if ux.map(|a| !a.is_empty()).unwrap_or(false) {
+            println!("       ux checks:");
+            for c in ux.into_iter().flatten() {
+                let cn = c.get("name").and_then(Value::as_str).unwrap_or("?");
+                let cok = c.get("ok").and_then(Value::as_bool).unwrap_or(false);
+                let detail = c.get("detail").and_then(Value::as_str).unwrap_or("");
+                println!("         [{}] {cn}: {detail}", if cok { "ok" } else { "X" });
+                // Name the first few violations/offenders so the report is actionable.
+                for key in ["violations", "offenders", "low"] {
+                    if let Some(items) = c.get(key).and_then(Value::as_array) {
+                        for it in items.iter().take(5) {
+                            let line = it
+                                .as_str()
+                                .map(String::from)
+                                .unwrap_or_else(|| serde_json::to_string(it).unwrap_or_default());
+                            println!("             - {line}");
+                        }
+                    }
+                }
+                if let Some(scores) = c.get("scores").and_then(Value::as_object) {
+                    let s: Vec<String> = scores.iter().map(|(k, v)| format!("{k} {v}")).collect();
+                    if !s.is_empty() {
+                        println!("             scores: {}", s.join(", "));
+                    }
+                }
             }
         }
     }

@@ -10,6 +10,7 @@ publish = false
 [dependencies]
 mcp-types = { path = "../mcp-types" }
 mcp-ssrf = { path = "../mcp-ssrf" }
+mcp-judge = { path = "../mcp-judge" }
 serde.workspace = true
 serde_json.workspace = true
 async-trait.workspace = true
