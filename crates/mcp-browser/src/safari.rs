@@ -678,6 +678,13 @@ fn automation_not_enabled(error: &str, message: &str) -> bool {
 }
 
 fn parse_http_response(buf: &[u8]) -> Result<Value, BrowserError> {
+    if buf.is_empty() {
+        return Err(BrowserError::Failed(
+            "safaridriver closed the connection without answering; it exited or crashed \
+             while handling the request"
+                .into(),
+        ));
+    }
     let sep = buf
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
@@ -840,6 +847,14 @@ Content-Length: 174\r\n\r\n\
         // safaridriver gives up on a session after about 30 s.
         assert!(SESSION_CREATE_TIMEOUT > Duration::from_secs(30));
         assert!(SESSION_CREATE_TIMEOUT > DEFAULT_TIMEOUT);
+    }
+
+    #[test]
+    fn an_empty_reply_says_the_driver_went_away() {
+        assert!(matches!(
+            parse_http_response(b""),
+            Err(BrowserError::Failed(m)) if m.contains("closed the connection")
+        ));
     }
 
     #[test]
