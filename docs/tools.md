@@ -791,7 +791,7 @@ Attach to a Chromium browser started with --remote-debugging-port, or launch a d
 | `launch` | object |  |  |
 | `launch.browser` | one of: chromium, safari |  | chromium (default) launches an auto-discovered Chrome/Chromium; safari launches experimental Safari via safaridriver (macOS only) |
 | `launch.headless` | boolean |  |  |
-| `launch.port` | integer |  |  |
+| `launch.port` | integer |  | remote-debugging port; omit or 0 to let Chrome pick a free one (the connect result reports it) |
 | `launch.profile` | string |  | saved profile name to auto-restore upon connecting |
 | `launch.url` | string |  | first page to open; Safari only (Chromium: use browser_navigate); checked against the navigation policy |
 | `launch.user_data_dir` | string |  |  |

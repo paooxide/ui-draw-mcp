@@ -1917,6 +1917,10 @@ impl BrowserBackend for CdpBackend {
             }
         };
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        let owned_profile = started
+            .as_ref()
+            .and_then(|(_, d)| d.as_ref())
+            .map(|d| d.to_string_lossy().into_owned());
         if let Some((child, user_data_dir)) = started {
             self.launched
                 .lock()
@@ -1937,13 +1941,18 @@ impl BrowserBackend for CdpBackend {
                 host: host.clone(),
                 port,
             });
-        Ok(json!({
+        let mut out = json!({
             "browser_id": id,
             "host": host,
             "port": port,
             "browser": ver.get("Browser"),
             "protocol": ver.get("Protocol-Version"),
-        }))
+        });
+        // Only a profile we created (and will delete on disconnect) is reported.
+        if let Some(dir) = owned_profile {
+            out["owned_user_data_dir"] = json!(dir);
+        }
+        Ok(out)
     }
 
     fn shutdown(&self) {
@@ -4845,8 +4854,22 @@ impl Drop for CdpBackend {
 /// Keyed on the pid as well as the port so two concurrent servers never share
 /// a profile, and so ownership is decidable: only a directory matching this
 /// shape, for *our* pid, was created by us and may be deleted.
-fn own_profile_dir(port: u16) -> std::path::PathBuf {
-    std::env::temp_dir().join(format!("agentctl-cdp-{}-{port}", std::process::id()))
+fn own_profile_dir(seq: u64) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("agentctl-cdp-{}-{seq}", std::process::id()))
+}
+
+/// Parse the first line of Chrome's `DevToolsActivePort` file, which holds the
+/// port it actually bound. Returns `None` for a missing, partial or non-port
+/// first line (a reader can catch the file empty), and for `0`, which is never
+/// a bound port.
+fn parse_devtools_active_port(contents: &str) -> Option<u16> {
+    contents
+        .lines()
+        .next()?
+        .trim()
+        .parse::<u16>()
+        .ok()
+        .filter(|p| *p != 0)
 }
 
 /// Ask a launched browser to quit itself over CDP (`Browser.close`).
@@ -5081,27 +5104,23 @@ fn reap_one(mut child: std::process::Child, user_data_dir: Option<&std::path::Pa
 /// its profile directory for the life of the machine.
 type Launch = (String, u16, std::process::Child, Option<std::path::PathBuf>);
 
-/// Pick a currently-free loopback TCP port by binding `:0` and reading back the
-/// assigned port, then releasing it. There is a small window between release and
-/// Chrome binding it, but each launch getting its own port is what matters: a
-/// fixed port collides when two launches overlap, or when one browser is still
-/// shutting down (it holds the port a moment after `Browser.close` returns), and
-/// the next launch then attaches to the dying browser instead of its own.
-fn free_port() -> Result<u16, BrowserError> {
-    let l = std::net::TcpListener::bind(("127.0.0.1", 0))
-        .map_err(|e| BrowserError::Failed(format!("could not pick a free port: {e}")))?;
-    l.local_addr()
-        .map(|a| a.port())
-        .map_err(|e| BrowserError::Failed(format!("could not read chosen port: {e}")))
-}
+/// Distinguishes the profile directories of launches inside one process, now
+/// that the port is unknown until Chrome has started.
+static PROFILE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 async fn launch_browser(spec: &Value) -> Result<Launch, BrowserError> {
     use tokio::time::{sleep, Duration};
-    // An explicit port is honoured (e.g. to attach DevTools by hand); otherwise
-    // each launch gets its own free port so back-to-back launches never collide.
-    let port = match spec.get("port").and_then(Value::as_u64) {
-        Some(p) => p as u16,
-        None => free_port()?,
+    // An explicit port is honoured (e.g. to attach DevTools by hand). Omitted or
+    // 0 means "let Chrome choose": it binds an ephemeral port itself and reports
+    // it in `DevToolsActivePort`, so there is no pick-then-release window for
+    // another process to take the port in, and back-to-back launches never collide.
+    let requested_port = match spec.get("port").and_then(Value::as_u64) {
+        None | Some(0) => 0,
+        Some(p) => u16::try_from(p).map_err(|_| {
+            BrowserError::Failed(format!(
+                "launch.port {p} is not a valid TCP port (0 or 1-65535)"
+            ))
+        })?,
     };
     let headless = spec
         .get("headless")
@@ -5111,10 +5130,15 @@ async fn launch_browser(spec: &Value) -> Result<Launch, BrowserError> {
     let (user_data_dir, owned) = match spec.get("user_data_dir").and_then(Value::as_str) {
         Some(p) => (std::path::PathBuf::from(p), None),
         None => {
-            let d = own_profile_dir(port);
+            let d = own_profile_dir(PROFILE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
             (d.clone(), Some(d))
         }
     };
+    // A profile reused from an earlier run still holds that run's port; Chrome
+    // rewrites the file once it is listening, so clear it or we would read the
+    // stale one.
+    let active_port_file = user_data_dir.join("DevToolsActivePort");
+    let _ = std::fs::remove_file(&active_port_file);
     let user_data_dir = user_data_dir.to_string_lossy().into_owned();
     let candidates = browser_bin_candidates();
     let bin = candidates
@@ -5129,7 +5153,7 @@ async fn launch_browser(spec: &Value) -> Result<Launch, BrowserError> {
         })?;
 
     let mut cmd = std::process::Command::new(bin);
-    cmd.arg(format!("--remote-debugging-port={port}"))
+    cmd.arg(format!("--remote-debugging-port={requested_port}"))
         .arg(format!("--user-data-dir={user_data_dir}"))
         .arg("--no-first-run")
         .arg("--no-default-browser-check");
@@ -5142,21 +5166,30 @@ async fn launch_browser(spec: &Value) -> Result<Launch, BrowserError> {
         .spawn()
         .map_err(|e| BrowserError::Failed(format!("spawn {bin}: {e}")))?;
 
-    // Poll for readiness (~8s).
+    // Poll for readiness (~8s): first learn the port, then wait for CDP.
+    let mut port = (requested_port != 0).then_some(requested_port);
     for _ in 0..40 {
-        if http_json("127.0.0.1", port, "GET", "/json/version")
-            .await
-            .is_ok()
-        {
-            return Ok(("127.0.0.1".to_string(), port, child, owned));
+        if port.is_none() {
+            port = std::fs::read_to_string(&active_port_file)
+                .ok()
+                .and_then(|c| parse_devtools_active_port(&c));
+        }
+        if let Some(p) = port {
+            if http_json("127.0.0.1", p, "GET", "/json/version")
+                .await
+                .is_ok()
+            {
+                return Ok(("127.0.0.1".to_string(), p, child, owned));
+            }
         }
         sleep(Duration::from_millis(200)).await;
     }
     // It never came up, so nothing else will ever hold this handle.
     reap_one(child, owned.as_deref());
-    Err(BrowserError::Timeout(format!(
-        "launched browser but CDP port {port} never came up"
-    )))
+    Err(BrowserError::Timeout(match port {
+        Some(p) => format!("launched browser but CDP port {p} never came up"),
+        None => "launched browser but it never reported a DevTools port".to_string(),
+    }))
 }
 
 #[cfg(test)]
@@ -5332,17 +5365,36 @@ mod tests {
     /// so two servers never share a profile, and so "did we create this?" is
     /// decidable from the path alone rather than from a guess about the port.
     #[test]
-    fn own_profile_dir_is_pid_and_port_scoped() {
-        let a = own_profile_dir(9333);
-        let b = own_profile_dir(9334);
-        assert_ne!(a, b, "different ports get different profiles");
+    fn own_profile_dir_is_pid_and_launch_scoped() {
+        let a = own_profile_dir(1);
+        let b = own_profile_dir(2);
+        assert_ne!(a, b, "different launches get different profiles");
         assert!(a.starts_with(std::env::temp_dir()));
         let name = a.file_name().unwrap().to_string_lossy().into_owned();
         assert_eq!(
             name,
-            format!("agentctl-cdp-{}-9333", std::process::id()),
+            format!("agentctl-cdp-{}-1", std::process::id()),
             "the pid must be in the name"
         );
+    }
+
+    /// Chrome writes the bound port on the first line of `DevToolsActivePort`
+    /// and the browser websocket path on the second; only the port matters.
+    #[test]
+    fn devtools_active_port_reads_first_line() {
+        assert_eq!(
+            parse_devtools_active_port("40123\n/devtools/browser/abc-def\n"),
+            Some(40123)
+        );
+        assert_eq!(parse_devtools_active_port("9222"), Some(9222));
+        assert_eq!(parse_devtools_active_port("  65535 \r\nx"), Some(65535));
+        // Missing, half-written or nonsense contents are "not ready yet".
+        assert_eq!(parse_devtools_active_port(""), None);
+        assert_eq!(parse_devtools_active_port("\n/devtools/browser/x"), None);
+        assert_eq!(parse_devtools_active_port("abc\n"), None);
+        assert_eq!(parse_devtools_active_port("0\n"), None);
+        assert_eq!(parse_devtools_active_port("65536\n"), None);
+        assert_eq!(parse_devtools_active_port("-1\n"), None);
     }
 
     /// Discovery lists native locations first, then the flatpak wrappers, and
@@ -5372,20 +5424,6 @@ mod tests {
             .any(|p| p == "/home/tester/.local/share/flatpak/exports/bin/com.google.Chrome"));
     }
 
-    /// A picked port is real and usable: nonzero, and free right after (the
-    /// listener is dropped), so Chrome can bind it. Two picks in a row should
-    /// differ, which is the whole point of not using a fixed port.
-    #[test]
-    fn free_port_is_usable_and_varies() {
-        let a = free_port().expect("pick a port");
-        assert!(a != 0, "a real port was chosen");
-        // Bindable again now that free_port released it.
-        let l = std::net::TcpListener::bind(("127.0.0.1", a)).expect("port is free to bind");
-        drop(l);
-        let b = free_port().expect("pick another port");
-        assert_ne!(a, b, "successive picks are distinct");
-    }
-
     /// An operator-supplied profile is never deleted: `launch_browser` records
     /// `None` for it, and `reap_one` only removes what it is given.
     #[test]
@@ -5396,7 +5434,7 @@ mod tests {
         // Mirrors the branch in launch_browser: supplied => not owned.
         let owned: Option<std::path::PathBuf> = match supplied {
             Some(_) => None,
-            None => Some(own_profile_dir(9999)),
+            None => Some(own_profile_dir(9)),
         };
         assert!(owned.is_none(), "a supplied profile must never be deleted");
     }

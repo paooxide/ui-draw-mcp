@@ -8,6 +8,12 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- **`browser_connect` `launch.port = 0`** (also the default when `port` is omitted) lets Chrome choose its own
+  remote-debugging port: the launch passes `--remote-debugging-port=0` and reads the bound port from the
+  profile's `DevToolsActivePort`, which the connect result reports as `port` (plus `owned_user_data_dir` for a
+  profile the launch created). The old pick-a-free-port,
+  release, then hope approach left a window for another process to take the port first. An explicit non-zero
+  port is still honoured, and the live test suites now all launch on port 0 so they can run in parallel.
 - **Reproducible latency bench** (`cargo run --release --example bench -- --n 30`, see `docs/bench/`).
   It starts `agentctl serve` over stdio under a temporary config and times `ping`, `list_windows`,
   `capture_screen`, `ocr_region`, and `browser_snapshot` and `browser_act` against a local fixture page, after

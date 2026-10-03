@@ -1736,7 +1736,7 @@ impl ToolModule for BrowserModule {
                         "launch": { "type": "object", "properties": {
                             "browser": { "type": "string", "enum": ["chromium", "safari"], "description": "chromium (default) launches an auto-discovered Chrome/Chromium; safari launches experimental Safari via safaridriver (macOS only)" },
                             "url": { "type": "string", "description": "first page to open; Safari only (Chromium: use browser_navigate); checked against the navigation policy" },
-                            "port": { "type": "integer" },
+                            "port": { "type": "integer", "description": "remote-debugging port; omit or 0 to let Chrome pick a free one (the connect result reports it)" },
                             "headless": { "type": "boolean" },
                             "user_data_dir": { "type": "string" },
                             "profile": { "type": "string", "description": "saved profile name to auto-restore upon connecting" }
