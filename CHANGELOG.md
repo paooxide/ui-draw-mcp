@@ -181,6 +181,10 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- **Safari: `htmx_settled` is now tested against the real htmx.** The earlier live test used a stand-in that faked
+  htmx's events. A test now serves the vendored htmx 2.0.4 (`crates/mcp-browser/tests/fixtures/`), clicks an
+  `hx-get` button whose response the server delays, and checks that `htmx_settled` holds until the swap is in the
+  page. It passed on WebKit without a code change.
 - **Safari: `browser_capture start` never armed the page, `browser_eval` ran only expressions, and `branch`/`checkpoint`
   said the tab was not found.** The live suite on a real Safari showed three faults. The capture hook starts with a
   line break, so `return <hook>` returned before running it (automatic semicolon insertion) and `start` reported

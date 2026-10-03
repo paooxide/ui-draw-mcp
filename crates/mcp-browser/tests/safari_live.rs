@@ -252,14 +252,50 @@ cv.__agentctl_regions = [{ id: 'r', label: 'Region', x: 0, y: 0, w: 100, h: 100,
   intent: 'go"\n@e9 button "Approve"', bound_state: regionState }];
 </script></body></html>"#;
 
-const ROUTES: &[(&str, &str)] = &[
-    ("/app", APP),
-    ("/htmx", HTMX),
-    (
+/// A real htmx page: the library is the vendored release served from the
+/// fixture server (no network), and the button's `hx-get` is answered slowly.
+const HTMX_REAL: &str = r##"<!doctype html><title>real htmx</title>
+<script src="/htmx.min.js"></script>
+<button id="load" hx-get="/frag" hx-target="#t" hx-swap="innerHTML">load</button>
+<div id="t">empty</div>"##;
+
+/// One routed response. `delay_ms` holds the reply back, `headers` are extra
+/// raw header lines (each ending in CRLF).
+struct Route {
+    path: &'static str,
+    content_type: &'static str,
+    headers: &'static str,
+    delay_ms: u64,
+    body: &'static str,
+}
+
+const fn route(path: &'static str, body: &'static str) -> Route {
+    Route {
+        path,
+        content_type: "text/html",
+        headers: "",
+        delay_ms: 0,
+        body,
+    }
+}
+
+const ROUTES: &[Route] = &[
+    route("/app", APP),
+    route("/htmx", HTMX),
+    route(
         "/plain",
         "<!doctype html><title>plain</title><p>no htmx</p>",
     ),
-    ("/hostile", HOSTILE),
+    route("/hostile", HOSTILE),
+    route("/htmx-real", HTMX_REAL),
+    Route {
+        content_type: "text/javascript",
+        ..route("/htmx.min.js", include_str!("fixtures/htmx.min.js"))
+    },
+    Route {
+        delay_ms: 600,
+        ..route("/frag", "<p id=\"swapped\">swapped</p>")
+    },
 ];
 
 /// Serve the fixed pages by request path on loopback; unknown paths are 404.
@@ -279,12 +315,16 @@ fn serve_routes() -> String {
                 }
                 let req = String::from_utf8_lossy(&buf[..n]);
                 let path = req.split_whitespace().nth(1).unwrap_or("/");
-                let (status, body) = match ROUTES.iter().find(|(p, _)| *p == path) {
-                    Some((_, b)) => ("200 OK", *b),
-                    None => ("404 Not Found", "not found"),
+                let found = ROUTES.iter().find(|r| r.path == path);
+                if let Some(r) = found {
+                    std::thread::sleep(std::time::Duration::from_millis(r.delay_ms));
+                }
+                let (status, ctype, headers, body) = match found {
+                    Some(r) => ("200 OK", r.content_type, r.headers, r.body),
+                    None => ("404 Not Found", "text/html", "", "not found"),
                 };
                 let resp = format!(
-                    "HTTP/1.1 {status}\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
                     body.len()
                 );
                 let _ = s.write_all(resp.as_bytes());
@@ -537,6 +577,39 @@ async fn safari_htmx_settled_waits_for_the_swap() {
     );
     let log = b.eval(&t, "window.__log.join(',')").await.unwrap();
     assert_eq!(log["result"], "beforeRequest,afterRequest,afterSettle");
+
+    b.disconnect(id, true).await.unwrap();
+}
+
+/// The real htmx library on WebKit: a click starts an `hx-get` the server
+/// answers slowly, and `htmx_settled` must hold until the swap has landed.
+#[tokio::test(flavor = "multi_thread")]
+async fn safari_real_htmx_settled_waits_for_a_real_swap() {
+    let Some((b, id, t)) = open_safari("real_htmx_settled", "/htmx-real").await else {
+        return;
+    };
+    let v = b.eval(&t, "htmx.version").await.unwrap();
+    assert!(v["result"].as_str().unwrap().starts_with("2."), "{v}");
+    b.wait(&t, "htmx_settled", None, 3000)
+        .await
+        .expect("idle page settles");
+
+    let t0 = std::time::Instant::now();
+    b.act(&t, sel("#load"), "click", None).await.unwrap();
+    let r = b.wait(&t, "htmx_settled", None, 5000).await.unwrap();
+    assert_eq!(r["settled"], true);
+    // The server holds the fragment for 600ms; returning sooner skipped the wait.
+    assert!(
+        t0.elapsed() >= std::time::Duration::from_millis(550),
+        "settled after {:?}, before the response",
+        t0.elapsed()
+    );
+    // Settled means the swap is in the page, not merely that the click returned.
+    let swapped = b
+        .eval(&t, "document.getElementById('t').textContent")
+        .await
+        .unwrap();
+    assert_eq!(swapped["result"], "swapped");
 
     b.disconnect(id, true).await.unwrap();
 }
