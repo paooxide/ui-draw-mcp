@@ -6,7 +6,8 @@
 //! (or whether it is still there).
 //!
 //! Skipped when `AGENTCTL_SKIP_LIVE` is set or no Chrome binary is found.
-//! CDP ports 9517 and 9518.
+
+mod common;
 
 use std::sync::{Arc, Mutex};
 
@@ -23,12 +24,12 @@ fn have_chrome() -> bool {
     !skip_live() && CHROME_BINS.iter().any(|p| std::path::Path::new(p).exists())
 }
 
-async fn tab(port: u64) -> Option<(CdpBackend, String)> {
+async fn tab() -> Option<(CdpBackend, String)> {
     if !have_chrome() {
         return None;
     }
     let b = CdpBackend::new(NavPolicy::new(&[], true));
-    b.connect(None, Some(json!({ "headless": true, "port": port })))
+    b.connect(None, Some(json!({ "headless": true, "port": 0 })))
         .await
         .ok()?;
     let tabs = b.tabs(1, "list", None, None).await.ok()?;
@@ -55,23 +56,28 @@ async fn serve(site: Arc<Site>) -> (String, tokio::sync::oneshot::Sender<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let port = listener.local_addr().expect("addr").port();
     let (tx, mut rx) = tokio::sync::oneshot::channel::<()>();
+    // Tells every connection task to let go of its socket when the server stops.
+    let (down_tx, down_rx) = tokio::sync::watch::channel(false);
     tokio::spawn(async move {
         loop {
             tokio::select! {
-                _ = &mut rx => break,
+                _ = &mut rx => {
+                    let _ = down_tx.send(true);
+                    break;
+                }
                 res = listener.accept() => {
                     let Ok((mut stream, _)) = res else { continue };
                     let site = site.clone();
+                    let mut down = down_rx.clone();
                     tokio::spawn(async move {
                         let mut buf = [0u8; 2048];
-                        let n = tokio::time::timeout(
-                            std::time::Duration::from_millis(400),
-                            stream.read(&mut buf),
-                        )
-                        .await
-                        .ok()
-                        .and_then(Result::ok)
-                        .unwrap_or(0);
+                        // Idle speculative sockets are closed the moment the
+                        // server stops, or Chrome could reuse one and the
+                        // server would never really be "down".
+                        let n = tokio::select! {
+                            _ = down.changed() => 0,
+                            r = stream.read(&mut buf) => r.unwrap_or(0),
+                        };
                         if n == 0 {
                             return;
                         }
@@ -136,7 +142,7 @@ async fn assert_cache_is_in_play(b: &CdpBackend, t: &str, site: &Site, z: &str, 
 /// page nobody fetched; it must say it could not reach the page.
 #[tokio::test(flavor = "multi_thread")]
 async fn rollback_does_not_serve_a_cached_page_when_the_server_is_down() {
-    let Some((b, t)) = tab(9517).await else {
+    let Some((b, t)) = tab().await else {
         return;
     };
     let site = Arc::new(Site::default());
@@ -151,8 +157,13 @@ async fn rollback_does_not_serve_a_cached_page_when_the_server_is_down() {
     b.navigate(&t, "goto", Some(&other)).await.expect("to b");
 
     let _ = stop.send(());
-    tokio::time::sleep(std::time::Duration::from_millis(800)).await;
     let host = base.trim_start_matches("http://").to_string();
+    common::wait_until(
+        "the fixture server to stop accepting",
+        std::time::Duration::from_secs(5),
+        || async { TcpStream::connect(host.as_str()).await.is_err() },
+    )
+    .await;
     assert!(
         TcpStream::connect(host.as_str()).await.is_err(),
         "fixture server should be down"
@@ -173,7 +184,7 @@ async fn rollback_does_not_serve_a_cached_page_when_the_server_is_down() {
 /// server says now (it fetched), and says it bypassed the cache.
 #[tokio::test(flavor = "multi_thread")]
 async fn rollback_loads_the_servers_current_page_not_the_cached_one() {
-    let Some((b, t)) = tab(9518).await else {
+    let Some((b, t)) = tab().await else {
         return;
     };
     let site = Arc::new(Site::default());

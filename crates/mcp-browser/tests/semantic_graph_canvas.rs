@@ -6,6 +6,8 @@
 //! real CDP mouse input at the region centre; the pages below only react to
 //! trusted events, so a synthetic-`MouseEvent` implementation would fail.
 
+mod common;
+
 use mcp_browser::{BrowserBackend, BrowserError, CdpBackend, Locator, NavPolicy, CHROME_BINS};
 use serde_json::json;
 use std::fs;
@@ -21,13 +23,13 @@ fn have_chrome() -> bool {
     !skip_live() && CHROME_BINS.iter().any(|p| std::path::Path::new(p).exists())
 }
 
-async fn tab(port: u64) -> Option<(CdpBackend, String)> {
+async fn tab() -> Option<(CdpBackend, String)> {
     if !have_chrome() {
         return None;
     }
     // Allow private / loopback addresses for local test fixtures
     let b = CdpBackend::new(NavPolicy::new(&[], true));
-    b.connect(None, Some(json!({ "headless": true, "port": port })))
+    b.connect(None, Some(json!({ "headless": true, "port": 0 })))
         .await
         .ok()?;
     let tabs = b.tabs(1, "list", None, None).await.ok()?;
@@ -39,6 +41,22 @@ async fn tab(port: u64) -> Option<(CdpBackend, String)> {
         .as_str()?
         .to_string();
     Some((b, target))
+}
+
+/// Poll until `expr` is truthy in the page, instead of guessing how long the
+/// page's scripts take.
+async fn wait_for_page(b: &CdpBackend, t: &str, expr: &str) {
+    common::wait_until(
+        &format!("page to satisfy {expr}"),
+        std::time::Duration::from_secs(10),
+        || async {
+            b.eval(t, expr)
+                .await
+                .map(|v| v["result"] == true)
+                .unwrap_or(false)
+        },
+    )
+    .await;
 }
 
 fn fixture_content(filename: &str) -> String {
@@ -82,7 +100,7 @@ async fn serve_html(content: String) -> (String, tokio::sync::oneshot::Sender<()
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_canvas_calculator_published_regions_and_actions() {
-    let Some((b, t)) = tab(9490).await else {
+    let Some((b, t)) = tab().await else {
         return;
     };
 
@@ -92,8 +110,12 @@ async fn test_canvas_calculator_published_regions_and_actions() {
         .await
         .expect("navigate failed");
 
-    // Let the canvas render
-    tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+    wait_for_page(
+        &b,
+        &t,
+        "document.readyState==='complete' && !!document.querySelector('canvas').__agentctl_regions",
+    )
+    .await;
 
     // 1. Take snapshot and verify canvas buttons are indexed as interactable refs
     let snap = b.snapshot(&t, "dom", None).await.expect("snapshot failed");
@@ -189,7 +211,7 @@ async fn test_canvas_calculator_published_regions_and_actions() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_spa_state_and_shadow_dom_traversal() {
-    let Some((b, t)) = tab(9491).await else {
+    let Some((b, t)) = tab().await else {
         return;
     };
 
@@ -199,7 +221,12 @@ async fn test_spa_state_and_shadow_dom_traversal() {
         .await
         .expect("navigate failed");
 
-    tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+    wait_for_page(
+        &b,
+        &t,
+        "document.readyState==='complete' && !!customElements.get('order-summary-widget')",
+    )
+    .await;
 
     // 1. Take snapshot and verify semantic intent, bound state, and shadow DOM elements
     let snap = b.snapshot(&t, "dom", None).await.expect("snapshot failed");
@@ -343,12 +370,17 @@ fn node_ref_by_name(nodes: &[serde_json::Value], name: &str) -> String {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_canvas_click_is_trusted_scaled_and_awkward_id_round_trips() {
-    let Some((b, t)) = tab(9492).await else {
+    let Some((b, t)) = tab().await else {
         return;
     };
     let (url, _shutdown) = serve_html(SCALED_PAGE.to_string()).await;
     b.navigate(&t, "goto", Some(&url)).await.expect("navigate");
-    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+    wait_for_page(
+        &b,
+        &t,
+        "document.readyState==='complete' && !!document.getElementById('c').__agentctl_regions",
+    )
+    .await;
 
     let nodes = nodes_of(&b, &t).await;
     let children: Vec<_> = nodes
@@ -433,12 +465,17 @@ async fn test_canvas_click_is_trusted_scaled_and_awkward_id_round_trips() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_canvas_region_unsupported_actions_and_hover() {
-    let Some((b, t)) = tab(9493).await else {
+    let Some((b, t)) = tab().await else {
         return;
     };
     let (url, _shutdown) = serve_html(SCALED_PAGE.to_string()).await;
     b.navigate(&t, "goto", Some(&url)).await.expect("navigate");
-    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+    wait_for_page(
+        &b,
+        &t,
+        "document.readyState==='complete' && !!document.getElementById('c').__agentctl_regions",
+    )
+    .await;
 
     let nodes = nodes_of(&b, &t).await;
     let region_ref = node_ref_by_name(&nodes, "left");
@@ -468,7 +505,7 @@ async fn test_canvas_region_unsupported_actions_and_hover() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_canvas_region_outside_viewport_is_an_error() {
-    let Some((b, t)) = tab(9494).await else {
+    let Some((b, t)) = tab().await else {
         return;
     };
     let html = r#"<!DOCTYPE html><html><body style="margin:0">
@@ -480,7 +517,12 @@ c.addEventListener('pointerdown', () => c.setAttribute('data-hit', 'yes'));
 </script></body></html>"#;
     let (url, _shutdown) = serve_html(html.to_string()).await;
     b.navigate(&t, "goto", Some(&url)).await.expect("navigate");
-    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+    wait_for_page(
+        &b,
+        &t,
+        "document.readyState==='complete' && !!document.getElementById('c').__agentctl_regions",
+    )
+    .await;
 
     let nodes = nodes_of(&b, &t).await;
     let far_ref = nodes
@@ -532,12 +574,17 @@ cv.__agentctl_regions = [{
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_hostile_semantic_fields_are_sanitized_and_capped() {
-    let Some((b, t)) = tab(9495).await else {
+    let Some((b, t)) = tab().await else {
         return;
     };
     let (url, _shutdown) = serve_html(HOSTILE_PAGE.to_string()).await;
     b.navigate(&t, "goto", Some(&url)).await.expect("navigate");
-    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+    wait_for_page(
+        &b,
+        &t,
+        "!!(document.getElementById('cv') || {}).__agentctl_regions",
+    )
+    .await;
 
     // Must succeed despite cyclic and 100 KB page values.
     let nodes = nodes_of(&b, &t).await;

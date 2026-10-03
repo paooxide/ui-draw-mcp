@@ -5,6 +5,8 @@
 //! in for the *engine*, not for the OS: what is under test is that the server
 //! trips the token, which is pure protocol and policy logic.
 
+mod common;
+
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -86,7 +88,10 @@ async fn a_stop_file_created_mid_call_cancels_the_running_call() {
     let (server, stop) = server_in(dir.path());
     let started = Instant::now();
     let touch = async {
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        common::wait_until("1 call(s) in flight", Duration::from_secs(3), || async {
+            server.inflight_count() == 1
+        })
+        .await;
         std::fs::write(&stop, "stop\n").unwrap();
     };
     let (env, ()) = tokio::join!(server.dispatch_call("spin_wait", json!({})), touch);
@@ -104,7 +109,10 @@ async fn an_in_process_trip_cancels_every_running_call() {
     let (server, _stop) = server_in(dir.path());
     let started = Instant::now();
     let trip = async {
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        common::wait_until("2 call(s) in flight", Duration::from_secs(3), || async {
+            server.inflight_count() == 2
+        })
+        .await;
         server
             .policy()
             .trip_kill_switch("cancel-session", "human took over");
@@ -125,14 +133,22 @@ async fn a_cancel_notification_stops_only_the_named_request() {
     let (server, _stop) = server_in(dir.path());
     let started = Instant::now();
     let cancel = async {
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        common::wait_until("2 call(s) in flight", Duration::from_secs(3), || async {
+            server.inflight_count() == 2
+        })
+        .await;
         // A string "1" is not the integer 1, and an unknown id is ignored.
         assert!(server.handle_line(&cancel_line(json!("1"))).await.is_none());
         assert!(server.handle_line(&cancel_line(json!(99))).await.is_none());
+        // Negative assertion: the ignored cancels must leave both calls running,
+        // so give them a window in which they could wrongly take effect.
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(server.inflight_count(), 2);
         server.handle_line(&cancel_line(json!(1))).await;
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        common::wait_until("1 call(s) in flight", Duration::from_secs(3), || async {
+            server.inflight_count() == 1
+        })
+        .await;
         // The other call is still running; stop it so the test can finish.
         assert_eq!(server.inflight_count(), 1);
         server.handle_line(&cancel_line(json!(2))).await;
@@ -207,7 +223,10 @@ async fn a_kill_switch_stop_is_still_answered_on_stdio() {
     let (server, _stop) = server_in(dir.path());
     let line = call_line(5);
     let trip = async {
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        common::wait_until("1 call(s) in flight", Duration::from_secs(3), || async {
+            server.inflight_count() == 1
+        })
+        .await;
         server
             .policy()
             .trip_kill_switch("cancel-session", "human took over");

@@ -2,7 +2,6 @@
 //! challenge handshake, and `browser_wait network_idle`.
 //!
 //! Skipped when `AGENTCTL_SKIP_LIVE` is set or no Chrome binary is found.
-//! CDP ports 9500-9509 only.
 
 use std::sync::Arc;
 
@@ -24,12 +23,12 @@ fn have_chrome() -> bool {
     !skip_live() && CHROME_BINS.iter().any(|p| std::path::Path::new(p).exists())
 }
 
-async fn tab(port: u64) -> Option<(Arc<CdpBackend>, String)> {
+async fn tab() -> Option<(Arc<CdpBackend>, String)> {
     if !have_chrome() {
         return None;
     }
     let b = CdpBackend::new(NavPolicy::new(&[], true));
-    b.connect(None, Some(json!({ "headless": true, "port": port })))
+    b.connect(None, Some(json!({ "headless": true, "port": 0 })))
         .await
         .ok()?;
     let tabs = b.tabs(1, "list", None, None).await.ok()?;
@@ -125,7 +124,7 @@ async fn act(b: &CdpBackend, t: &str, css: &str, action: &str, value: Option<&st
 
 #[tokio::test(flavor = "multi_thread")]
 async fn recorded_flow_round_trips_through_browser_flow_without_secrets() {
-    let Some((b, t)) = tab(9505).await else {
+    let Some((b, t)) = tab().await else {
         return;
     };
     let (base, stop) = serve_html(FIXTURE.to_string()).await;
@@ -260,6 +259,8 @@ async fn serve_site() -> (String, tokio::sync::oneshot::Sender<()>) {
                         let req = String::from_utf8_lossy(&buf[..n]).to_string();
                         let path = req.split_whitespace().nth(1).unwrap_or("/").to_string();
                         let body = if path.starts_with("/b") {
+                            // Fixture behaviour, not a readiness wait: page B is
+                            // deliberately slow so the recorder sees a late load.
                             tokio::time::sleep(std::time::Duration::from_millis(300)).await;
                             r#"<!doctype html><body><h1>page b</h1>
 <input id="b-in">
@@ -291,7 +292,7 @@ async fn serve_site() -> (String, tokio::sync::oneshot::Sender<()>) {
 /// recorders lose everything after the first unload.
 #[tokio::test(flavor = "multi_thread")]
 async fn recording_survives_navigation_and_replays() {
-    let Some((b, t)) = tab(9509).await else {
+    let Some((b, t)) = tab().await else {
         return;
     };
     let (base, stop) = serve_site().await;
@@ -438,7 +439,7 @@ async fn recording_survives_navigation_and_replays() {
 /// page for the person recording) and say what it answered.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_dialog_during_recording_does_not_freeze_the_page_and_is_reported() {
-    let Some((b, t)) = tab(9504).await else {
+    let Some((b, t)) = tab().await else {
         return;
     };
     let html = r#"<!doctype html><body>
@@ -473,7 +474,7 @@ async fn a_dialog_during_recording_does_not_freeze_the_page_and_is_reported() {
 /// with the password supplied at run time and never lands in the flow store.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_recorded_login_replays_with_supplied_secrets_and_stores_none() {
-    let Some((b, t)) = tab(9502).await else {
+    let Some((b, t)) = tab().await else {
         return;
     };
     const PASSWORD: &str = "correct-horse-battery";
@@ -608,7 +609,7 @@ async fn a_recorded_login_replays_with_supplied_secrets_and_stores_none() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn recorder_redaction_matches_rust_rule_and_never_captures_value() {
-    let Some((b, t)) = tab(9500).await else {
+    let Some((b, t)) = tab().await else {
         return;
     };
     // (type, name, id suffix, autocomplete). The id is `f{i}{suffix}`, so the
@@ -704,7 +705,7 @@ async fn recorder_redaction_matches_rust_rule_and_never_captures_value() {
 /// or textarea (whose `innerText` is its value) must record no text at all.
 #[tokio::test(flavor = "multi_thread")]
 async fn clicked_text_is_kept_only_for_plain_labels() {
-    let Some((b, t)) = tab(9501).await else {
+    let Some((b, t)) = tab().await else {
         return;
     };
     let html = r##"<!doctype html><body>
@@ -758,7 +759,7 @@ async fn clicked_text_is_kept_only_for_plain_labels() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn challenge_detect_and_clearance_use_the_real_eval_shape() {
-    let Some((b, t)) = tab(9506).await else {
+    let Some((b, t)) = tab().await else {
         return;
     };
     // An OTP input that a "human" fills in once the wait has begun. The fill
@@ -805,7 +806,7 @@ async fn challenge_detect_and_clearance_use_the_real_eval_shape() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn browser_wait_network_idle_is_accepted_and_settles() {
-    let Some((b, t)) = tab(9507).await else {
+    let Some((b, t)) = tab().await else {
         return;
     };
     let (base, stop) = serve_html("<!doctype html><body>idle</body>".to_string()).await;
@@ -837,7 +838,7 @@ async fn tabs_open_obeys_the_navigation_policy() {
         &["https://allowed.example".to_string()],
         false,
     ));
-    b.connect(None, Some(json!({ "headless": true, "port": 9508 })))
+    b.connect(None, Some(json!({ "headless": true, "port": 0 })))
         .await
         .expect("launch");
     let count = |v: Value| v["tabs"].as_array().map(|a| a.len()).unwrap_or(0);

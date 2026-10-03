@@ -6,7 +6,8 @@
 //! Linux); without those it skips and says so.
 //!
 //! Skipped when `AGENTCTL_SKIP_LIVE` is set or no Chrome binary is found.
-//! CDP ports 9511-9513.
+
+mod common;
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -27,12 +28,12 @@ fn have_chrome() -> bool {
     !skip_live() && CHROME_BINS.iter().any(|p| std::path::Path::new(p).exists())
 }
 
-async fn tab(port: u64, headless: bool) -> Option<(Arc<CdpBackend>, String)> {
+async fn tab(headless: bool) -> Option<(Arc<CdpBackend>, String)> {
     if !have_chrome() {
         return None;
     }
     let b = CdpBackend::new(NavPolicy::new(&[], true));
-    b.connect(None, Some(json!({ "headless": headless, "port": port })))
+    b.connect(None, Some(json!({ "headless": headless, "port": 0 })))
         .await
         .ok()?;
     let tabs = b.tabs(1, "list", None, None).await.ok()?;
@@ -93,6 +94,16 @@ async fn serve(log: Arc<Mutex<Vec<String>>>) -> (String, tokio::sync::oneshot::S
     (format!("http://127.0.0.1:{port}"), tx)
 }
 
+/// Wait until the page has reported (via `/done?...`) that its confirm returned.
+async fn wait_for_beacon(log: &Arc<Mutex<Vec<String>>>, what: &str) {
+    common::wait_until(
+        &format!("the page to report {what}"),
+        Duration::from_secs(10),
+        || async { log.lock().unwrap().iter().any(|p| p.contains(what)) },
+    )
+    .await;
+}
+
 fn ctx() -> CallCtx {
     CallCtx::new("test", CancelToken::new())
 }
@@ -135,10 +146,11 @@ fn pos(steps: &[Value], op: &str) -> usize {
 /// does not (the default is to dismiss).
 #[tokio::test(flavor = "multi_thread")]
 async fn recording_with_accept_answers_the_dialog_and_the_flow_reproduces_it() {
-    let Some((b, t)) = tab(9511, true).await else {
+    let Some((b, t)) = tab(true).await else {
         return;
     };
-    let (base, stop) = serve(Arc::default()).await;
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let (base, stop) = serve(log.clone()).await;
     let dir = std::env::temp_dir().join(format!("agentctl-dlg-acc-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::create_dir_all(&dir);
@@ -162,7 +174,10 @@ async fn recording_with_accept_answers_the_dialog_and_the_flow_reproduces_it() {
     assert_eq!(start.data.as_ref().unwrap()["dialogs"], "accept");
 
     click_ask(&b, &t).await;
-    tokio::time::sleep(Duration::from_millis(1_200)).await;
+    // Wait on the page's own beacon, not on an eval of the page: an eval would
+    // attach a second automation session, whose default policy dismisses the
+    // dialog and so changes the very thing under test.
+    wait_for_beacon(&log, "r=true").await;
     assert_eq!(
         js(&b, &t, "document.getElementById('o').textContent").await,
         "r:true",
@@ -266,10 +281,11 @@ async fn recording_with_accept_answers_the_dialog_and_the_flow_reproduces_it() {
 /// unknown value is an argument error.
 #[tokio::test(flavor = "multi_thread")]
 async fn headless_recording_defaults_to_dismiss_and_refuses_human() {
-    let Some((b, t)) = tab(9513, true).await else {
+    let Some((b, t)) = tab(true).await else {
         return;
     };
-    let (base, stop) = serve(Arc::default()).await;
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let (base, stop) = serve(log.clone()).await;
     let m = BrowserModule::new(b.clone());
     b.navigate(&t, "goto", Some(&format!("{base}/")))
         .await
@@ -313,7 +329,10 @@ async fn headless_recording_defaults_to_dismiss_and_refuses_human() {
     assert!(start.ok, "{start:?}");
     assert_eq!(start.data.as_ref().unwrap()["dialogs"], "dismiss");
     click_ask(&b, &t).await;
-    tokio::time::sleep(Duration::from_millis(1_200)).await;
+    // Wait on the page's own beacon, not on an eval of the page: an eval would
+    // attach a second automation session, whose default policy dismisses the
+    // dialog and so changes the very thing under test.
+    wait_for_beacon(&log, "r=false").await;
     assert_eq!(
         js(&b, &t, "document.getElementById('o').textContent").await,
         "r:false"
@@ -368,7 +387,7 @@ async fn headed_recording_leaves_the_dialog_to_the_person_and_records_their_answ
         eprintln!("skipping: set AGENTCTL_LIVE_GUI=1 to run the headed dialog test");
         return;
     }
-    let Some((b, t)) = tab(9512, false).await else {
+    let Some((b, t)) = tab(false).await else {
         return;
     };
     let log = Arc::new(Mutex::new(Vec::new()));
@@ -393,6 +412,8 @@ async fn headed_recording_leaves_the_dialog_to_the_person_and_records_their_answ
     );
 
     click_ask(&b, &t).await;
+    // Negative assertion: the recorder must NOT answer a dialog that is the
+    // person's to answer, so give it a window in which it could wrongly do so.
     tokio::time::sleep(Duration::from_millis(2_000)).await;
     assert!(
         log.lock().unwrap().is_empty(),

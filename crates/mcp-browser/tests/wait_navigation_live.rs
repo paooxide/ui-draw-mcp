@@ -1,7 +1,6 @@
 //! Live tests (real headless Chrome) for `browser_wait navigation`.
 //!
 //! Skipped when `AGENTCTL_SKIP_LIVE` is set or no Chrome binary is found.
-//! CDP ports 9503-9505 and 9514-9516.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -20,12 +19,12 @@ fn have_chrome() -> bool {
     !skip_live() && CHROME_BINS.iter().any(|p| std::path::Path::new(p).exists())
 }
 
-async fn tab(port: u64) -> Option<(Arc<CdpBackend>, String)> {
+async fn tab() -> Option<(Arc<CdpBackend>, String)> {
     if !have_chrome() {
         return None;
     }
     let b = CdpBackend::new(NavPolicy::new(&[], true));
-    b.connect(None, Some(json!({ "headless": true, "port": port })))
+    b.connect(None, Some(json!({ "headless": true, "port": 0 })))
         .await
         .ok()?;
     let tabs = b.tabs(1, "list", None, None).await.ok()?;
@@ -62,6 +61,8 @@ async fn serve(delay_ms: u64) -> (String, tokio::sync::oneshot::Sender<()>) {
                             .unwrap_or("/")
                             .to_string();
                         let body = if path.starts_with("/slow") {
+                            // Fixture behaviour, not a readiness wait: /slow is
+                            // slow on purpose, to outlast the navigation window.
                             tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                             "<!doctype html><body><h1 id=\"which\">slow page</h1></body>"
                         } else {
@@ -105,7 +106,7 @@ const SLOW_MS: u64 = 800;
 /// new document commits, so this passes with or without the document marker.
 #[tokio::test(flavor = "multi_thread")]
 async fn wait_navigation_after_goto_does_not_return_on_the_old_document() {
-    let Some((b, t)) = tab(9503).await else {
+    let Some((b, t)) = tab().await else {
         return;
     };
     let (base, stop) = serve(SLOW_MS).await;
@@ -165,7 +166,7 @@ async fn wait_navigation_after_goto_does_not_return_on_the_old_document() {
 /// click until the navigation commits, so it passes without the marker too.
 #[tokio::test(flavor = "multi_thread")]
 async fn wait_navigation_after_a_click_waits_for_the_new_document() {
-    let Some((b, t)) = tab(9504).await else {
+    let Some((b, t)) = tab().await else {
         return;
     };
     let (base, stop) = serve(SLOW_MS).await;
@@ -237,7 +238,7 @@ async fn wait_navigation_after_a_click_waits_for_the_new_document() {
 /// `readyState` returns on it and the flow carries on against the wrong page.
 #[tokio::test(flavor = "multi_thread")]
 async fn wait_navigation_after_a_deferred_navigation_waits_for_the_new_page() {
-    let Some((b, t)) = tab(9505).await else {
+    let Some((b, t)) = tab().await else {
         return;
     };
     let (base, stop) = serve(SLOW_MS).await;
@@ -312,6 +313,7 @@ async fn serve_site() -> (String, tokio::sync::oneshot::Sender<()>) {
                                 } else {
                                     SLOW_MS
                                 };
+                                // Fixture behaviour: a revisit is slow on purpose.
                                 tokio::time::sleep(Duration::from_millis(ms)).await;
                             }
                             format!(
@@ -374,7 +376,7 @@ async fn wait_nav(m: &BrowserModule, t: &str, extra: Value) -> mcp_types::Envelo
 /// commits, so this passes with or without the marker back/forward now plant.
 #[tokio::test(flavor = "multi_thread")]
 async fn wait_navigation_after_back_and_forward_waits_for_the_history_entry() {
-    let Some((b, t)) = tab(9514).await else {
+    let Some((b, t)) = tab().await else {
         return;
     };
     let (base, stop) = serve_site().await;
@@ -436,7 +438,7 @@ async fn wait_navigation_after_back_and_forward_waits_for_the_history_entry() {
 /// waiting for a replacement that will never come.
 #[tokio::test(flavor = "multi_thread")]
 async fn wait_navigation_after_back_within_the_same_document_settles() {
-    let Some((b, t)) = tab(9515).await else {
+    let Some((b, t)) = tab().await else {
         return;
     };
     let (base, stop) = serve_site().await;
@@ -475,7 +477,7 @@ async fn wait_navigation_after_back_within_the_same_document_settles() {
 /// waits for the navigation and reports it.
 #[tokio::test(flavor = "multi_thread")]
 async fn wait_navigation_window_can_be_raised_for_a_late_navigation() {
-    let Some((b, t)) = tab(9516).await else {
+    let Some((b, t)) = tab().await else {
         return;
     };
     let (base, stop) = serve_site().await;

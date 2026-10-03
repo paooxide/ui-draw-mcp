@@ -4,7 +4,9 @@
 //! typing, so two properties are only meaningful against a live browser: the
 //! value must never be parsed as HTML (DOM XSS), and a secret must never be
 //! put on screen. Skips (rather than fails) when no Chromium is installed or
-//! `AGENTCTL_SKIP_LIVE=1`. Uses CDP ports 9480-9489 only.
+//! `AGENTCTL_SKIP_LIVE=1`.
+
+mod common;
 
 use mcp_browser::showcase::ShowcaseConfig;
 use mcp_browser::{BrowserBackend, CdpBackend, Locator, NavPolicy, CHROME_BINS};
@@ -19,18 +21,19 @@ const PAGE: &str = r#"document.body.innerHTML =
   '<input id="t" type="text"><input id="p" type="password">' +
   '<input id="otp" autocomplete="one-time-code">'; true"#;
 
-/// Launch a throwaway headless browser on `port`, with the fixture page and
-/// showcase on. Returns `(backend, browser_id, target_id)`.
-async fn page(port: u64) -> Option<(CdpBackend, u32, String)> {
+/// Launch a throwaway headless browser on a port Chrome picks, with the fixture
+/// page and showcase on. Returns `(backend, browser_id, target_id, port)`.
+async fn page() -> Option<(CdpBackend, u32, String, u16)> {
     if !have_chrome() {
         return None;
     }
     let b = CdpBackend::new(NavPolicy::default());
     let c = b
-        .connect(None, Some(json!({ "headless": true, "port": port })))
+        .connect(None, Some(json!({ "headless": true, "port": 0 })))
         .await
         .ok()?;
     let id = c["browser_id"].as_u64()? as u32;
+    let port = c["port"].as_u64()? as u16;
     let tabs = b.tabs(id, "list", None, None).await.ok()?;
     let target = tabs["tabs"][0]["target_id"].as_str()?.to_string();
     b.navigate(&target, "goto", Some("about:blank"))
@@ -40,7 +43,7 @@ async fn page(port: u64) -> Option<(CdpBackend, u32, String)> {
     b.showcase(&target, Some(ShowcaseConfig::snappy()))
         .await
         .ok()?;
-    Some((b, id, target))
+    Some((b, id, target, port))
 }
 
 fn sel(q: &str) -> Locator<'_> {
@@ -64,12 +67,14 @@ const HUD: &str = "(document.getElementById('agentctl_showcase_hud')||{}).textCo
 
 #[tokio::test(flavor = "multi_thread")]
 async fn agent_text_is_never_parsed_as_html() {
-    let Some((b, id, t)) = page(9480).await else {
+    let Some((b, id, t, _)) = page().await else {
         return;
     };
     let payload = r#"<img src=x onerror="window.__pwned=1">"#;
     b.act(&t, sel("#t"), "type", Some(payload)).await.unwrap();
-    // Let a would-be onerror handler run before looking.
+    // Negative assertion: give a would-be onerror handler a window to run, then
+    // check that it did not. Nothing observable says "it will never run", so
+    // this window is the test.
     tokio::time::sleep(std::time::Duration::from_millis(400)).await;
 
     let pwned = b.eval(&t, "typeof window.__pwned").await.unwrap();
@@ -89,7 +94,7 @@ async fn agent_text_is_never_parsed_as_html() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn secrets_are_masked_and_the_hud_does_not_linger() {
-    let Some((b, id, t)) = page(9481).await else {
+    let Some((b, id, t, _)) = page().await else {
         return;
     };
     let secret = "hunter2-SECRET";
@@ -121,7 +126,12 @@ async fn secrets_are_masked_and_the_hud_does_not_linger() {
     assert_eq!(v.unwrap()["result"], secret);
 
     // After the fade the text is removed, not merely hidden.
-    tokio::time::sleep(std::time::Duration::from_millis(2300)).await;
+    common::wait_until(
+        "the HUD text to fade out",
+        std::time::Duration::from_secs(10),
+        || async { text_of(&b, &t, HUD).await.is_empty() },
+    )
+    .await;
     assert_eq!(text_of(&b, &t, HUD).await, "");
     let body = text_of(&b, &t, "document.body.innerText").await;
     assert!(!body.contains("visible-text"), "HUD lingers: {body}");
@@ -130,7 +140,7 @@ async fn secrets_are_masked_and_the_hud_does_not_linger() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn fill_form_shows_the_value_and_masks_passwords() {
-    let Some((b, id, t)) = page(9482).await else {
+    let Some((b, id, t, _)) = page().await else {
         return;
     };
     let fields: Value = json!([{ "selector": "#t", "value": "alice" }]);
@@ -151,7 +161,7 @@ async fn fill_form_shows_the_value_and_masks_passwords() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn disabling_showcase_removes_the_overlay() {
-    let Some((b, id, t)) = page(9483).await else {
+    let Some((b, id, t, port)) = page().await else {
         return;
     };
     b.act(&t, sel("#t"), "type", Some("hello")).await.unwrap();
@@ -178,7 +188,7 @@ async fn disabling_showcase_removes_the_overlay() {
     // The browser is still ours to reap at shutdown, but the tab is
     // unreachable by id now, so check via a fresh connection to its port.
     let b2 = CdpBackend::new(NavPolicy::default());
-    let c = b2.connect(Some(9483), None).await.unwrap();
+    let c = b2.connect(Some(port), None).await.unwrap();
     let id2 = c["browser_id"].as_u64().unwrap() as u32;
     let tabs = b2.tabs(id2, "list", None, None).await.unwrap();
     let t2 = tabs["tabs"][0]["target_id"].as_str().unwrap().to_string();

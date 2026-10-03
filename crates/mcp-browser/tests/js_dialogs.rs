@@ -23,12 +23,12 @@ fn have_chrome() -> bool {
 }
 
 /// Launch a throwaway headless browser and return `(backend, target_id)`.
-async fn tab(port: u64) -> Option<(CdpBackend, String)> {
+async fn tab() -> Option<(CdpBackend, String)> {
     if !have_chrome() {
         return None;
     }
     let b = CdpBackend::new(NavPolicy::default());
-    b.connect(None, Some(json!({ "headless": true, "port": port })))
+    b.connect(None, Some(json!({ "headless": true, "port": 0 })))
         .await
         .ok()?;
     let tabs = b.tabs(1, "list", None, None).await.ok()?;
@@ -53,7 +53,7 @@ fn dialog_of(v: &Value) -> Option<&Value> {
 /// the call must return promptly rather than sit until the CDP timeout.
 #[tokio::test(flavor = "multi_thread")]
 async fn alert_does_not_wedge_the_tab() {
-    let Some((b, t)) = tab(9351).await else {
+    let Some((b, t)) = tab().await else {
         return;
     };
 
@@ -83,7 +83,7 @@ async fn alert_does_not_wedge_the_tab() {
 /// just because an agent happened to evaluate something.
 #[tokio::test(flavor = "multi_thread")]
 async fn confirm_defaults_to_no_and_prompt_to_null() {
-    let Some((b, t)) = tab(9352).await else {
+    let Some((b, t)) = tab().await else {
         return;
     };
 
@@ -100,7 +100,7 @@ async fn confirm_defaults_to_no_and_prompt_to_null() {
 /// reaches `prompt()`.
 #[tokio::test(flavor = "multi_thread")]
 async fn accept_policy_is_per_target_and_supplies_prompt_text() {
-    let Some((b, t)) = tab(9353).await else {
+    let Some((b, t)) = tab().await else {
         return;
     };
 
@@ -133,13 +133,16 @@ async fn accept_policy_is_per_target_and_supplies_prompt_text() {
 /// protocol.
 #[tokio::test(flavor = "multi_thread")]
 async fn network_log_records_real_requests() {
-    let Some((b, t)) = tab(9354).await else {
+    let Some((b, t)) = tab().await else {
         return;
     };
 
     // Kick off fetches while the log window is open.
     let target = t.clone();
     let bg = async {
+        // Orders the fetches after the log window has opened. The log call
+        // reports nothing when it starts listening, so there is no event to
+        // wait for instead.
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         let _ = b
             .eval(
@@ -170,7 +173,7 @@ async fn network_log_records_real_requests() {
 /// `intercept` blocks by URL pattern, and clears when given an empty list.
 #[tokio::test(flavor = "multi_thread")]
 async fn intercept_blocks_and_clears_url_patterns() {
-    let Some((b, t)) = tab(9355).await else {
+    let Some((b, t)) = tab().await else {
         return;
     };
 
@@ -206,14 +209,17 @@ async fn disconnect_kills_a_launched_browser_and_removes_its_profile() {
         return;
     }
     let b = CdpBackend::new(NavPolicy::default());
-    let port = 9358u64;
-    if b.connect(None, Some(json!({ "headless": true, "port": port })))
+    let Ok(conn) = b
+        .connect(None, Some(json!({ "headless": true, "port": 0 })))
         .await
-        .is_err()
-    {
+    else {
         return;
-    }
-    let profile = std::env::temp_dir().join(format!("agentctl-cdp-{}-{port}", std::process::id()));
+    };
+    let profile = std::path::PathBuf::from(
+        conn["owned_user_data_dir"]
+            .as_str()
+            .expect("a launched browser reports the profile it owns"),
+    );
     assert!(profile.exists(), "launching should create the profile dir");
 
     let out = b.disconnect(1, true).await.expect("disconnect");
@@ -237,16 +243,15 @@ async fn kill_is_refused_for_an_attached_browser() {
         return;
     }
     let owner = CdpBackend::new(NavPolicy::default());
-    let port = 9359u64;
-    if owner
-        .connect(None, Some(json!({ "headless": true, "port": port })))
+    let Ok(conn) = owner
+        .connect(None, Some(json!({ "headless": true, "port": 0 })))
         .await
-        .is_err()
-    {
+    else {
         return;
-    }
+    };
+    let port = conn["port"].as_u64().expect("connect reports the port") as u16;
     let attacher = CdpBackend::new(NavPolicy::default());
-    if attacher.connect(Some(port as u16), None).await.is_err() {
+    if attacher.connect(Some(port), None).await.is_err() {
         return;
     }
     let err = attacher.disconnect(1, true).await;

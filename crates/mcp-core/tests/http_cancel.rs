@@ -5,6 +5,8 @@
 //! The module here polls its cancel token as the glide loop does; what is under
 //! test is the transport and server plumbing, not an OS engine.
 
+mod common;
+
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -161,6 +163,8 @@ async fn a_cancel_post_without_the_token_does_not_reach_the_call() {
 
     let refused = post(f.addr, "wrong-token-wrong-token", CANCEL).await;
     assert_eq!(status(&refused), 401);
+    // Negative assertion: a refused cancel must leave the call running, so give
+    // it a window in which it could wrongly take effect.
     tokio::time::sleep(Duration::from_millis(150)).await;
     assert_eq!(
         f.server.inflight_count(),
@@ -196,13 +200,16 @@ async fn connections_past_the_bound_are_refused_not_queued() {
     // Occupy the only slot with a connection that never finishes its request.
     let mut hog = TcpStream::connect(f.addr).await.unwrap();
     hog.write_all(b"POST / HTTP/1.1\r\n").await.unwrap();
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    let refused = post(
-        f.addr,
-        &f.token,
-        r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#,
+    // Poll until the server has counted the hog: a ping is refused only once
+    // the slot is taken.
+    let ping = r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#;
+    common::wait_until(
+        "the hogged slot to refuse a second connection",
+        Duration::from_secs(5),
+        || async { status(&post(f.addr, &f.token, ping).await) == 503 },
     )
     .await;
+    let refused = post(f.addr, &f.token, ping).await;
     assert_eq!(status(&refused), 503, "{refused}");
     drop(hog);
 }

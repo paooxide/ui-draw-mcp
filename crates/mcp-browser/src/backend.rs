@@ -4849,10 +4849,11 @@ impl Drop for CdpBackend {
     }
 }
 
-/// The temp profile directory this process would create for `port`.
+/// The temp profile directory this process creates for its `seq`-th launch.
 ///
-/// Keyed on the pid as well as the port so two concurrent servers never share
-/// a profile, and so ownership is decidable: only a directory matching this
+/// Keyed on the pid as well as a per-process launch counter (the port is not
+/// known until Chrome has started) so two concurrent servers never share a
+/// profile, and so ownership is decidable: only a directory matching this
 /// shape, for *our* pid, was created by us and may be deleted.
 fn own_profile_dir(seq: u64) -> std::path::PathBuf {
     std::env::temp_dir().join(format!("agentctl-cdp-{}-{seq}", std::process::id()))

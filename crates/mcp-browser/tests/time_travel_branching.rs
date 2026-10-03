@@ -2,6 +2,8 @@
 //! Task 4.1: Ephemeral Browser Context Forking & Speculative Branching
 //! Task 4.2: Instant State Checkpointing & Rollback ($T_{-1}$)
 
+mod common;
+
 use mcp_browser::{BrowserBackend, CdpBackend, NavPolicy, CHROME_BINS};
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -15,12 +17,12 @@ fn have_chrome() -> bool {
     !skip_live() && CHROME_BINS.iter().any(|p| std::path::Path::new(p).exists())
 }
 
-async fn tab(port: u64) -> Option<(CdpBackend, String)> {
+async fn tab() -> Option<(CdpBackend, String)> {
     if !have_chrome() {
         return None;
     }
     let b = CdpBackend::new(NavPolicy::new(&[], true));
-    b.connect(None, Some(json!({ "headless": true, "port": port })))
+    b.connect(None, Some(json!({ "headless": true, "port": 0 })))
         .await
         .ok()?;
     let tabs = b.tabs(1, "list", None, None).await.ok()?;
@@ -70,7 +72,7 @@ async fn eval_js(b: &CdpBackend, target: &str, expr: &str) -> Value {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_speculative_branch_isolation_and_commit() {
-    let Some((b, parent_tab)) = tab(9450).await else {
+    let Some((b, parent_tab)) = tab().await else {
         return;
     };
 
@@ -91,7 +93,17 @@ async fn test_speculative_branch_isolation_and_commit() {
     b.navigate(&parent_tab, "goto", Some(&url))
         .await
         .expect("navigate failed");
-    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+    common::wait_until(
+        "the page script to set its storage",
+        std::time::Duration::from_secs(5),
+        || async {
+            b.eval(&parent_tab, "localStorage.getItem('cart_status')")
+                .await
+                .map(|v| v["result"] == "initial_parent")
+                .unwrap_or(false)
+        },
+    )
+    .await;
 
     // 1. Fork context into speculative branch "attempt_promo"
     let branch_res = b
@@ -160,7 +172,7 @@ async fn test_speculative_branch_isolation_and_commit() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_speculative_branch_discard_and_teardown() {
-    let Some((b, parent_tab)) = tab(9451).await else {
+    let Some((b, parent_tab)) = tab().await else {
         return;
     };
 
@@ -204,7 +216,7 @@ async fn test_speculative_branch_discard_and_teardown() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_concurrent_speculative_branching_5_branches() {
-    let Some((b, parent_tab)) = tab(9452).await else {
+    let Some((b, parent_tab)) = tab().await else {
         return;
     };
 
@@ -263,7 +275,7 @@ async fn test_concurrent_speculative_branching_5_branches() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_instant_checkpoint_save_and_fast_rollback() {
-    let Some((b, target)) = tab(9453).await else {
+    let Some((b, target)) = tab().await else {
         return;
     };
 
@@ -293,7 +305,17 @@ async fn test_instant_checkpoint_save_and_fast_rollback() {
     b.navigate(&target, "goto", Some(&url))
         .await
         .expect("navigate failed");
-    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+    common::wait_until(
+        "the page script to set its storage",
+        std::time::Duration::from_secs(5),
+        || async {
+            b.eval(&target, "localStorage.getItem('user_session')")
+                .await
+                .map(|v| v["result"] == "sess_valid_123")
+                .unwrap_or(false)
+        },
+    )
+    .await;
 
     // 1. Save checkpoint T-1 (Tag: "step_2_filled")
     let save_res = b
@@ -379,7 +401,7 @@ async fn test_instant_checkpoint_save_and_fast_rollback() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_checkpoint_t_minus_1_default_and_delete() {
-    let Some((b, target)) = tab(9454).await else {
+    let Some((b, target)) = tab().await else {
         return;
     };
 

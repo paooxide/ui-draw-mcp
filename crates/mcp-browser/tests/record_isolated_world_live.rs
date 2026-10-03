@@ -5,7 +5,6 @@
 //! recorder's state, while the recorder still sees real clicks and typing.
 //!
 //! Skipped when `AGENTCTL_SKIP_LIVE` is set or no Chrome binary is found.
-//! CDP port 9510.
 
 use std::sync::Arc;
 
@@ -22,12 +21,12 @@ fn have_chrome() -> bool {
     !skip_live() && CHROME_BINS.iter().any(|p| std::path::Path::new(p).exists())
 }
 
-async fn tab(port: u64) -> Option<(Arc<CdpBackend>, String)> {
+async fn tab() -> Option<(Arc<CdpBackend>, String)> {
     if !have_chrome() {
         return None;
     }
     let b = CdpBackend::new(NavPolicy::new(&[], true));
-    b.connect(None, Some(json!({ "headless": true, "port": port })))
+    b.connect(None, Some(json!({ "headless": true, "port": 0 })))
         .await
         .ok()?;
     let tabs = b.tabs(1, "list", None, None).await.ok()?;
@@ -130,7 +129,7 @@ fn selectors(events: &[mcp_browser::RawInteractionEvent]) -> Vec<String> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn page_script_cannot_forge_or_eavesdrop_on_a_recording() {
-    let Some((b, t)) = tab(9510).await else {
+    let Some((b, t)) = tab().await else {
         return;
     };
     let (base, stop) = serve_html(PAGE.to_string()).await;

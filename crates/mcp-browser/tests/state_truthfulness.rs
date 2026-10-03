@@ -3,10 +3,14 @@
 //! profile auto-connect. The failure these guard is a tool reporting success
 //! for work that did not happen, which only a live browser can show.
 //!
-//! Each test owns one CDP port in 9470-9479. Skips (rather than fails) when
-//! `AGENTCTL_SKIP_LIVE=1` or no Chromium binary is installed.
+//! Every launch lets Chrome pick its own CDP port, so the tests can run in
+//! parallel. Skips (rather than fails) when `AGENTCTL_SKIP_LIVE=1` or no
+//! Chromium binary is installed.
+
+mod common;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use mcp_browser::{
     BrowserBackend, BrowserError, BrowserModule, CdpBackend, Locator, NavPolicy, ProfileStore,
@@ -25,16 +29,20 @@ fn have_chrome() -> bool {
     !skip_live() && CHROME_BINS.iter().any(|p| std::path::Path::new(p).exists())
 }
 
-async fn launch(port: u64) -> Option<(CdpBackend, String)> {
+/// Launch a headless Chrome on a port of its own choosing and return the
+/// backend, its first tab and the port Chrome picked.
+async fn launch() -> Option<(CdpBackend, String, u64)> {
     if !have_chrome() {
         return None;
     }
     let b = CdpBackend::new(NavPolicy::new(&[], true));
-    b.connect(None, Some(json!({ "headless": true, "port": port })))
+    let conn = b
+        .connect(None, Some(json!({ "headless": true, "port": 0 })))
         .await
         .ok()?;
+    let port = conn["port"].as_u64()?;
     let target = first_tab(&b, 1).await?;
-    Some((b, target))
+    Some((b, target, port))
 }
 
 async fn first_tab(b: &CdpBackend, browser_id: u32) -> Option<String> {
@@ -55,28 +63,31 @@ async fn serve(routes: Vec<(&'static str, String)>) -> (String, tokio::sync::one
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("addr");
     let (tx, mut rx) = tokio::sync::oneshot::channel::<()>();
+    // Tells every connection task to let go of its socket when the server stops.
+    let (down_tx, down_rx) = tokio::sync::watch::channel(false);
     tokio::spawn(async move {
         loop {
             tokio::select! {
-                _ = &mut rx => break,
+                _ = &mut rx => {
+                    let _ = down_tx.send(true);
+                    break;
+                }
                 res = listener.accept() => {
                     let Ok((mut stream, _)) = res else { continue };
                     // One task per connection: Chrome opens speculative
                     // connections that never send a request, and a serial
                     // read would block the loop (and the shutdown) on them.
                     let routes = routes.clone();
+                    let mut down = down_rx.clone();
                     tokio::spawn(async move {
                         let mut buf = [0u8; 2048];
                         // Idle speculative sockets must not outlive the server, or
-                        // Chrome reuses one and the server is never really "down".
-                        let n = tokio::time::timeout(
-                            std::time::Duration::from_millis(400),
-                            stream.read(&mut buf),
-                        )
-                        .await
-                        .ok()
-                        .and_then(Result::ok)
-                        .unwrap_or(0);
+                        // Chrome reuses one and the server is never really "down":
+                        // they are closed the moment the server stops.
+                        let n = tokio::select! {
+                            _ = down.changed() => 0,
+                            r = stream.read(&mut buf) => r.unwrap_or(0),
+                        };
                         if n == 0 {
                             return;
                         }
@@ -118,14 +129,15 @@ async fn goto(b: &CdpBackend, target: &str, url: &str) {
     b.navigate(target, "goto", Some(url))
         .await
         .expect("navigate failed");
-    for _ in 0..100 {
-        let v = eval_js(b, target, "location.href + '|' + document.readyState").await;
-        if v.as_str() == Some(&format!("{url}|complete")) {
-            return;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
-    panic!("{url} never finished loading");
+    common::wait_until(
+        &format!("{url} to finish loading"),
+        Duration::from_secs(5),
+        || async {
+            let v = eval_js(b, target, "location.href + '|' + document.readyState").await;
+            v.as_str() == Some(&format!("{url}|complete"))
+        },
+    )
+    .await;
 }
 
 /// GET a DevTools HTTP endpoint. Chrome keeps the connection alive and ignores
@@ -198,7 +210,7 @@ fn err_text(e: &BrowserError) -> String {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn branch_commit_moves_url_and_storage_to_parent_and_closes_branch() {
-    let Some((b, parent)) = launch(9470).await else {
+    let Some((b, parent, port)) = launch().await else {
         return;
     };
     let (base, _stop) = serve(vec![("/p1", page("one")), ("/p2", page("two"))]).await;
@@ -247,7 +259,7 @@ async fn branch_commit_moves_url_and_storage_to_parent_and_closes_branch() {
         "cookie not applied: {cookie}"
     );
     assert!(
-        !target_ids(9470).await.contains(&branch_tab),
+        !target_ids(port).await.contains(&branch_tab),
         "branch tab must be closed after commit"
     );
     assert!(b.branch_commit("try_two").await.is_err(), "double commit");
@@ -257,7 +269,7 @@ async fn branch_commit_moves_url_and_storage_to_parent_and_closes_branch() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn branch_discard_closes_the_tab_and_a_failed_commit_stays_active() {
-    let Some((b, parent)) = launch(9471).await else {
+    let Some((b, parent, port)) = launch().await else {
         return;
     };
     let (base, _stop) = serve(vec![("/p1", page("one"))]).await;
@@ -266,11 +278,11 @@ async fn branch_discard_closes_the_tab_and_a_failed_commit_stays_active() {
     // Discard really closes the target.
     let created = b.branch_create(&parent, "doomed").await.unwrap();
     let doomed_tab = created["branch_target_id"].as_str().unwrap().to_string();
-    assert!(target_ids(9471).await.contains(&doomed_tab));
+    assert!(target_ids(port).await.contains(&doomed_tab));
     let discarded = b.branch_discard("doomed").await.expect("discard");
     assert_eq!(discarded["discarded"], json!(true));
     assert!(
-        !target_ids(9471).await.contains(&doomed_tab),
+        !target_ids(port).await.contains(&doomed_tab),
         "discarded branch tab must be gone from the target list"
     );
     assert!(parent_still_open(&b, &parent).await);
@@ -280,13 +292,13 @@ async fn branch_discard_closes_the_tab_and_a_failed_commit_stays_active() {
     // and must leave the branch active so it can still be cleaned up.
     let created = b.branch_create(&parent, "orphan").await.unwrap();
     let orphan_tab = created["branch_target_id"].as_str().unwrap().to_string();
-    close_out_of_band(9471, &orphan_tab).await;
-    for _ in 0..40 {
-        if !target_ids(9471).await.contains(&orphan_tab) {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
+    close_out_of_band(port, &orphan_tab).await;
+    common::wait_until(
+        "the orphaned tab to close",
+        Duration::from_secs(2),
+        || async { !target_ids(port).await.contains(&orphan_tab) },
+    )
+    .await;
     let err = b
         .branch_commit("orphan")
         .await
@@ -308,14 +320,16 @@ async fn branch_cap_is_enforced_and_freed_by_discard() {
         return;
     }
     let b = CdpBackend::new(NavPolicy::new(&[], true)).with_max_branches(2);
-    b.connect(None, Some(json!({ "headless": true, "port": 9472 })))
+    let conn = b
+        .connect(None, Some(json!({ "headless": true, "port": 0 })))
         .await
         .expect("launch");
+    let port = conn["port"].as_u64().expect("connect reports the port");
     let parent = first_tab(&b, 1).await.expect("tab");
 
     b.branch_create(&parent, "a").await.expect("a");
     b.branch_create(&parent, "b").await.expect("b");
-    let before = target_ids(9472).await.len();
+    let before = target_ids(port).await.len();
     let err = b
         .branch_create(&parent, "c")
         .await
@@ -326,7 +340,7 @@ async fn branch_cap_is_enforced_and_freed_by_discard() {
         err_text(&err)
     );
     assert_eq!(
-        target_ids(9472).await.len(),
+        target_ids(port).await.len(),
         before,
         "a refused branch must not open a tab"
     );
@@ -340,7 +354,7 @@ async fn branch_cap_is_enforced_and_freed_by_discard() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn checkpoint_rollback_restores_url_form_state_storage_and_cookies() {
-    let Some((b, tab)) = launch(9473).await else {
+    let Some((b, tab, _)) = launch().await else {
         return;
     };
     let form = page(
@@ -415,8 +429,13 @@ async fn checkpoint_rollback_restores_url_form_state_storage_and_cookies() {
     b.checkpoint_save(&tab, Some("z")).await.expect("save z");
     goto(&b, &tab, &bb).await;
     let _ = gone_stop.send(());
-    tokio::time::sleep(std::time::Duration::from_millis(800)).await;
     let host = gone_base.trim_start_matches("http://").to_string();
+    common::wait_until(
+        "the fixture server to stop accepting",
+        Duration::from_secs(5),
+        || async { TcpStream::connect(host.as_str()).await.is_err() },
+    )
+    .await;
     assert!(
         TcpStream::connect(host.as_str()).await.is_err(),
         "fixture server should be down"
@@ -437,7 +456,7 @@ async fn checkpoint_rollback_restores_url_form_state_storage_and_cookies() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn act_within_scopes_to_the_row_and_never_widens() {
-    let Some((b, tab)) = launch(9474).await else {
+    let Some((b, tab, _)) = launch().await else {
         return;
     };
     let table = page(
@@ -520,7 +539,7 @@ async fn act_within_scopes_to_the_row_and_never_widens() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn htmx_settled_waits_for_requests_and_settle_events() {
-    let Some((b, tab)) = launch(9475).await else {
+    let Some((b, tab, _)) = launch().await else {
         return;
     };
     let fake = page(
@@ -630,7 +649,7 @@ async fn connect_with_profile_restores_storage_on_the_saved_page() {
         .with_profile_store(ProfileStore::new(store_path.clone(), 10));
 
     backend
-        .connect(None, Some(json!({ "headless": true, "port": 9476 })))
+        .connect(None, Some(json!({ "headless": true, "port": 0 })))
         .await
         .expect("launch source browser");
     let src = first_tab(&backend, 1).await.expect("source tab");
@@ -651,7 +670,7 @@ async fn connect_with_profile_restores_storage_on_the_saved_page() {
     let unknown = module
         .call(
             "browser_connect",
-            json!({ "launch": { "headless": true, "port": 9477 }, "profile": "nope" }),
+            json!({ "launch": { "headless": true, "port": 0 }, "profile": "nope" }),
             &call_ctx(),
         )
         .await;
@@ -663,7 +682,7 @@ async fn connect_with_profile_restores_storage_on_the_saved_page() {
     let conn = module
         .call(
             "browser_connect",
-            json!({ "launch": { "headless": true, "port": 9477 }, "profile": "logged_in" }),
+            json!({ "launch": { "headless": true, "port": 0 }, "profile": "logged_in" }),
             &call_ctx(),
         )
         .await;
@@ -685,14 +704,14 @@ async fn connect_with_profile_restores_storage_on_the_saved_page() {
 #[tokio::test]
 async fn dropping_an_attached_backend_closes_its_branches() {
     // The owner launches and keeps the browser alive.
-    let Some((owner, _)) = launch(9478).await else {
+    let Some((owner, _, port)) = launch().await else {
         return;
     };
     let (base, _stop) = serve(vec![("/p", page("p"))]).await;
 
     let attached = CdpBackend::new(NavPolicy::new(&[], true));
     attached
-        .connect(Some(9478), None)
+        .connect(Some(port as u16), None)
         .await
         .expect("attach to the owner's browser");
     let parent = first_tab(&attached, 1).await.expect("tab");
@@ -702,12 +721,12 @@ async fn dropping_an_attached_backend_closes_its_branches() {
         let created = attached.branch_create(&parent, id).await.expect("create");
         branch_tabs.push(created["branch_target_id"].as_str().unwrap().to_string());
     }
-    let open = target_ids(9478).await;
+    let open = target_ids(port).await;
     assert!(branch_tabs.iter().all(|t| open.contains(t)), "{open:?}");
 
     drop(attached);
 
-    let open = target_ids(9478).await;
+    let open = target_ids(port).await;
     assert!(
         branch_tabs.iter().all(|t| !open.contains(t)),
         "branch tabs survived shutdown: {open:?}"
