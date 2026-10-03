@@ -1879,6 +1879,11 @@ impl BrowserBackend for CdpBackend {
             }
             "open" => {
                 let u = url.unwrap_or("about:blank");
+                // Chrome loads the URL as it creates the tab, so the policy
+                // must run first, as it does for `navigate goto`.
+                if let Err(denied) = self.nav.check(u).await {
+                    return Err(BrowserError::PermissionDenied(denied.message()));
+                }
                 let path = format!("/json/new?{u}");
                 // Modern Chrome requires PUT; older builds accept GET.
                 let r = match http_json(host, port, "PUT", &path).await {

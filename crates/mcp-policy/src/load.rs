@@ -102,6 +102,75 @@ fn strip_comment(line: &str) -> &str {
     line
 }
 
+/// Every `section.key` the loader reads. A test checks it against the match
+/// arms below, so it cannot drift.
+const KNOWN_KEYS: &[&str] = &[
+    "browser.allow_private",
+    "browser.allowed_origins",
+    "credentials.allowed_services",
+    "demo.enabled",
+    "demo.speed",
+    "fs.roots",
+    "http.allowed_origins",
+    "http.bind",
+    "http.enabled",
+    "http.token",
+    "input.demo",
+    "input.demo_speed",
+    "input.human_override",
+    "input.human_override_grace_ms",
+    "input.human_override_px",
+    "input.terminal_apps",
+    "invariants.denied_domains",
+    "invariants.protected_paths",
+    "judge.base_url",
+    "judge.destructive_threshold",
+    "judge.enabled",
+    "judge.injection_threshold",
+    "judge.match_threshold",
+    "judge.max_state_bytes",
+    "judge.model",
+    "judge.threshold",
+    "judge.timeout_ms",
+    "memory.max_recipes",
+    "memory.store",
+    "network.allow_private",
+    "network.allowed_hosts",
+    "packages.allow_arbitrary_source",
+    "packages.allowed_sources",
+    "packages.allowlist",
+    "packages.denylist",
+    "policy.access",
+    "policy.allowed_apps",
+    "policy.anonymize",
+    "policy.audit_dir",
+    "policy.audit_signing_key",
+    "policy.categories",
+    "policy.default_role",
+    "policy.demo",
+    "policy.demo_speed",
+    "policy.enable",
+    "policy.invariants.denied_domains",
+    "policy.invariants.protected_paths",
+    "policy.kill_switch_file",
+    "policy.max_consent_prompts",
+    "policy.max_denials",
+    "policy.mode",
+    "policy.role",
+    "terminal.allow_shell",
+    "terminal.allowed_commands",
+    "terminal.allowed_shells",
+    "terminal.max_pty_buffer",
+    "terminal.max_pty_sessions",
+    "vision.default_detail",
+    "vision.detail_balanced_px",
+    "vision.detail_full_px",
+    "vision.detail_low_px",
+    "vision.max_image_bytes",
+    "vision.pixels_per_token",
+    "vision.unchanged_mad",
+];
+
 /// A boolean setting. TOML spells them `true` and `false`; anything else is an
 /// error rather than false, since several settings default to on and a value
 /// read as false would silently turn a safeguard off (`human_override = "yes"`
@@ -213,8 +282,10 @@ impl PolicyConfig {
                 }
                 ("policy.allowed_apps", Val::List(v)) => cfg.allowed_apps = v.clone(),
                 ("browser.allowed_origins", Val::List(v)) => cfg.allowed_origins = v.clone(),
-                ("browser.allow_private", Val::Str(s)) => cfg.browser_allow_private = s == "true",
-                ("judge.enabled", Val::Str(s)) => cfg.judge.enabled = s == "true",
+                ("browser.allow_private", Val::Str(s)) => {
+                    cfg.browser_allow_private = boolean(key, s)?
+                }
+                ("judge.enabled", Val::Str(s)) => cfg.judge.enabled = boolean(key, s)?,
                 ("judge.base_url", Val::Str(s)) => cfg.judge.base_url = s.clone(),
                 ("judge.model", Val::Str(s)) => cfg.judge.model = s.clone(),
                 ("judge.timeout_ms", Val::Int(i)) if *i > 0 => cfg.judge.timeout_ms = *i as u64,
@@ -262,7 +333,7 @@ impl PolicyConfig {
                 ("packages.allowlist", Val::List(v)) => cfg.package_allowlist = v.clone(),
                 ("packages.denylist", Val::List(v)) => cfg.package_denylist = v.clone(),
                 ("packages.allow_arbitrary_source", Val::Str(s)) => {
-                    cfg.allow_arbitrary_source = s == "true"
+                    cfg.allow_arbitrary_source = boolean(key, s)?
                 }
                 ("terminal.max_pty_sessions", Val::Int(i)) if *i >= 0 => {
                     cfg.max_pty_sessions = *i as usize
@@ -302,21 +373,23 @@ impl PolicyConfig {
                 ("vision.unchanged_mad", Val::Int(i)) if *i >= 0 => {
                     cfg.vision_unchanged_mad = *i as f64
                 }
-                ("http.enabled", Val::Str(s)) => cfg.http_enabled = s == "true",
+                ("http.enabled", Val::Str(s)) => cfg.http_enabled = boolean(key, s)?,
                 ("http.bind", Val::Str(s)) => cfg.http_bind = s.clone(),
                 ("http.token", Val::Str(s)) => cfg.http_token = s.clone(),
                 ("http.allowed_origins", Val::List(v)) => cfg.http_allowed_origins = v.clone(),
                 ("memory.store", Val::Str(s)) => cfg.memory_store = PathBuf::from(s),
                 ("memory.max_recipes", Val::Int(i)) if *i >= 0 => cfg.max_recipes = *i as usize,
-                ("input.human_override", Val::Str(s)) => cfg.human_override = s == "true",
+                ("input.human_override", Val::Str(s)) => cfg.human_override = boolean(key, s)?,
                 ("input.human_override_px", Val::Int(i)) if *i > 0 => {
                     cfg.human_override_px = *i as u32
                 }
                 ("input.human_override_grace_ms", Val::Int(i)) if *i >= 0 => {
                     cfg.human_override_grace_ms = *i as u64
                 }
-                ("terminal.allow_shell", Val::Str(s)) => cfg.allow_shell = s == "true",
-                ("network.allow_private", Val::Str(s)) => cfg.allow_private_network = s == "true",
+                ("terminal.allow_shell", Val::Str(s)) => cfg.allow_shell = boolean(key, s)?,
+                ("network.allow_private", Val::Str(s)) => {
+                    cfg.allow_private_network = boolean(key, s)?
+                }
                 ("policy.mode", Val::Str(s)) => {
                     cfg.mode =
                         Mode::parse(s).ok_or_else(|| format!("unknown policy.mode '{s}'"))?;
@@ -483,6 +556,11 @@ impl PolicyConfig {
                 }
                 ("policy.anonymize", _) => {
                     return Err(format!("{key} must be a boolean (true or false)"))
+                }
+                // A setting this loader reads, given a value of the wrong type,
+                // must not be dropped as if it were unknown.
+                (k, _) if KNOWN_KEYS.contains(&k) => {
+                    return Err(format!("{key} has the wrong type for this setting"))
                 }
                 _ => tracing::warn!(key = %key, "ignoring unknown config key"),
             }
@@ -804,5 +882,63 @@ mod tests {
             err.contains("AGENTCTL_DEMO_SPEED") && err.contains("turbo"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn known_keys_lists_every_key_the_loader_matches() {
+        let src = include_str!("load.rs");
+        let start = src.find("for (key, val) in &map {").unwrap();
+        let end = src
+            .find("// A setting this loader reads, given a value")
+            .unwrap();
+        let body = &src[start..end];
+        let mut i = 0;
+        while let Some(q) = body[i..].find('"') {
+            let a = i + q + 1;
+            let Some(len) = body[a..].find('"') else {
+                break;
+            };
+            let lit = &body[a..a + len];
+            // `"roles."` is a prefix match, not a key.
+            let is_key = lit.contains('.')
+                && !lit.ends_with('.')
+                && lit
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c == '_' || c == '.');
+            if is_key {
+                assert!(
+                    KNOWN_KEYS.contains(&lit),
+                    "{lit} is matched but not in KNOWN_KEYS"
+                );
+            }
+            i = a + len + 1;
+        }
+    }
+
+    #[test]
+    fn booleans_are_strict() {
+        for bad in ["yes", "True", "1", "on"] {
+            let err =
+                PolicyConfig::from_toml_str(&format!("[input]\nhuman_override = \"{bad}\"\n"))
+                    .unwrap_err();
+            assert!(err.contains("must be true or false"), "{err}");
+        }
+        let cfg = PolicyConfig::from_toml_str("[input]\nhuman_override = false\n").unwrap();
+        assert!(!cfg.human_override);
+    }
+
+    #[test]
+    fn a_known_key_with_the_wrong_type_is_an_error() {
+        let err = PolicyConfig::from_toml_str("[policy]\nmax_denials = \"5\"\n").unwrap_err();
+        assert!(err.contains("max_denials"), "{err}");
+        // Unknown keys stay tolerated for forward compatibility.
+        assert!(PolicyConfig::from_toml_str("[policy]\nsome_future_key = 1\n").is_ok());
+    }
+
+    #[test]
+    fn an_unknown_role_setting_is_an_error() {
+        let err =
+            PolicyConfig::from_toml_str("[roles.qa2]\ndenied_tool = [\"exec\"]\n").unwrap_err();
+        assert!(err.contains("roles.qa2.denied_tool"), "{err}");
     }
 }

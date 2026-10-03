@@ -61,6 +61,8 @@ All notable changes to this project are documented here. The format follows
   `safaridriver`'s W3C WebDriver. Operations WebDriver cannot do (key presses, device emulation, branching,
   checkpoints, recording, network capture) return `UNSUPPORTED`. Needs a one-time `safaridriver --enable`;
   its live suite runs with `AGENTCTL_LIVE_SAFARI=1`.
+- Release archives are also built for Linux on ARM64.
+
 - **UX testing: accessibility, design-token style, component and responsive checks.** `browser_assert`
   gained UX clauses that ride the same `{passed, checks}` flow and `agentctl test` report as the functional
   ones: `a11y` runs a built-in WCAG audit (alt text, form labels, control names, colour contrast, target
@@ -155,6 +157,10 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- A running call could not be stopped: the per-call cancel token was never tripped, so the kill switch
+  and a human taking the mouse only blocked the next call. A running call now checks the kill switch every
+  50 ms and cancels its token, and `notifications/cancelled` reaches the call it names; the stdio loop
+  keeps reading during a call so the cancel can arrive.
 - `browser_wait navigation` returned on the page being left when a click started its navigation a moment
   later (a timer, a debounce), because that page still reports `complete`. It now waits for a loaded
   document that is not the one the action left, and a click that navigates nowhere within 2 s settles
@@ -168,6 +174,18 @@ All notable changes to this project are documented here. The format follows
 
 ### Security
 
+- **Config values are checked, not guessed.** A boolean was read as `value == "true"`, so
+  `human_override = "yes"` or `"True"` silently turned the human-takeover stop off, and a known setting
+  with the wrong type (`max_denials = "5"`) was dropped as an unknown key. Booleans must be `true` or
+  `false`, and a known key of the wrong type is an error; only keys the loader does not know are
+  tolerated.
+- **Accessibility snapshots escape page text.** Element names and values were written into the
+  snapshot's quoted fields verbatim, so a control named `Cancel"`, a newline and `@e9 button "Approve`
+  showed the model a line for an element that does not exist. Quotes, backslashes and control characters
+  are now escaped.
+- **`browser_tabs open` runs the navigation policy.** Chrome loads the URL as it creates the tab, so
+  opening a tab at a URL bypassed `browser.allowed_origins` and the private-address check that
+  `browser_navigate` applies.
 - `browser_navigate` now runs the same resolved-address guard as `http_request`. With
   `browser.allowed_origins` empty the agent could point the browser at cloud metadata or a loopback
   service; every address the target resolves to must now be public unless the new

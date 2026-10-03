@@ -30,7 +30,37 @@ pub struct Server {
     /// Where mid-call notifications go, when a transport can carry them.
     /// Installed by `serve_stream`; `None` under a transport that cannot.
     notifier: std::sync::Mutex<Option<Arc<dyn mcp_types::Notifier>>>,
+    /// Cancel tokens of calls between admission and completion, so a
+    /// `notifications/cancelled` can find the call it names.
+    inflight: std::sync::Mutex<std::collections::HashMap<u64, Inflight>>,
+    next_call: std::sync::atomic::AtomicU64,
 }
+
+struct Inflight {
+    /// The JSON-RPC id, as its JSON text (`1` and `"1"` are different ids).
+    request_id: Option<String>,
+    token: CancelToken,
+}
+
+/// Removes a call from the in-flight registry however it ends, including a
+/// dropped future.
+struct InflightGuard<'a> {
+    server: &'a Server,
+    key: u64,
+}
+
+impl Drop for InflightGuard<'_> {
+    fn drop(&mut self) {
+        self.server
+            .inflight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.key);
+    }
+}
+
+/// How often a running call checks whether the kill switch has tripped.
+const KILL_POLL: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// Sends notification frames to the transport loop.
 ///
@@ -59,7 +89,41 @@ impl Server {
             max_frame_bytes: DEFAULT_MAX_FRAME_BYTES,
             last_image: std::sync::Mutex::new(None),
             notifier: std::sync::Mutex::new(None),
+            inflight: std::sync::Mutex::new(std::collections::HashMap::new()),
+            next_call: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// Cancel the in-flight call that was made with this JSON-RPC id. Returns
+    /// whether one was found. Cooperative: the engine stops when it next polls
+    /// its token.
+    pub fn cancel_request(&self, request_id: &Value) -> bool {
+        let key = request_id.to_string();
+        let map = self.inflight.lock().unwrap_or_else(|e| e.into_inner());
+        let mut found = false;
+        for call in map.values() {
+            if call.request_id.as_deref() == Some(key.as_str()) {
+                call.token.cancel();
+                found = true;
+            }
+        }
+        found
+    }
+
+    /// Cancel every in-flight call.
+    pub fn cancel_all(&self) {
+        let map = self.inflight.lock().unwrap_or_else(|e| e.into_inner());
+        for call in map.values() {
+            call.token.cancel();
+        }
+    }
+
+    /// How many calls are between admission and completion.
+    pub fn inflight_count(&self) -> usize {
+        self.inflight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len()
     }
 
     /// Cap the size of a single JSON-RPC frame.
@@ -102,6 +166,36 @@ impl Server {
         args: Value,
         progress_token: Option<Value>,
     ) -> Envelope {
+        self.dispatch_call_for(name, args, progress_token, None)
+            .await
+    }
+
+    /// As [`Self::dispatch_call_with`], remembering which JSON-RPC request this
+    /// call answers so `notifications/cancelled` can reach it.
+    async fn dispatch_call_for(
+        &self,
+        name: &str,
+        args: Value,
+        progress_token: Option<Value>,
+        request_id: Option<&Value>,
+    ) -> Envelope {
+        // Registered before the gate, so a cancel that lands while a consent
+        // prompt is open is not lost; removed when this future ends.
+        let cancel = CancelToken::new();
+        let key = self
+            .next_call
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.inflight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                key,
+                Inflight {
+                    request_id: request_id.map(Value::to_string),
+                    token: cancel.clone(),
+                },
+            );
+        let _inflight = InflightGuard { server: self, key };
         // 1. Kill switch first.
         if self.policy.kill_switch_tripped() {
             let mut pre = AuditRecord::pre(&self.session_id, name);
@@ -281,8 +375,16 @@ impl Server {
         }
 
         // 5. Execute (descriptor borrow has ended; `module` is an owned Arc).
+        if cancel.is_cancelled() {
+            return Envelope::fail_with(
+                name,
+                ErrorCode::Timeout,
+                "cancelled by the client before it started",
+                "send the call again if it is still wanted",
+            );
+        }
         let start = now_ms();
-        let mut ctx = CallCtx::new(self.session_id.clone(), CancelToken::new());
+        let mut ctx = CallCtx::new(self.session_id.clone(), cancel.clone());
         if let Some(token) = progress_token {
             let n = self
                 .notifier
@@ -294,7 +396,26 @@ impl Server {
             }
         }
         let de_anonymized_args = self.policy.de_anonymize_args(name, args);
-        let result = module.call(name, de_anonymized_args, &ctx).await;
+        // The engine polls `ctx.cancel`. Nothing else trips it, so while the
+        // call runs we watch the kill switch (the STOP file, or the pointer
+        // watcher's in-process trip) and cancel on its behalf; a client's
+        // `notifications/cancelled` reaches the same token.
+        let result = {
+            let call = module.call(name, de_anonymized_args, &ctx);
+            tokio::pin!(call);
+            let mut tick = tokio::time::interval(KILL_POLL);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    r = &mut call => break r,
+                    _ = tick.tick() => {
+                        if !cancel.is_cancelled() && self.policy.kill_switch_tripped() {
+                            self.cancel_all();
+                        }
+                    }
+                }
+            }
+        };
 
         // 6. Redact the result, then anonymize PII/PHI, then mark its provenance.
         //
@@ -476,8 +597,19 @@ impl Server {
                     .and_then(|m| m.get("progressToken"))
                     .filter(|t| t.is_string() || t.is_i64() || t.is_u64())
                     .cloned();
-                let env = self.dispatch_call_with(name, args, progress_token).await;
+                let env = self
+                    .dispatch_call_for(name, args, progress_token, id.as_ref())
+                    .await;
                 Response::success(id, self.tool_call_result(env))
+            }
+            // A notification: the client no longer wants the answer to an
+            // earlier request. Unknown or finished ids are ignored, as the
+            // spec says they may be.
+            "notifications/cancelled" => {
+                if let Some(rid) = req.params.as_ref().and_then(|p| p.get("requestId")) {
+                    self.cancel_request(rid);
+                }
+                Response::success(id, json!({}))
             }
             "resources/list" => Response::success(id, crate::resources::list()),
             // No templates: every resource here has a fixed URI.
@@ -594,8 +726,18 @@ impl Server {
     {
         use tokio::io::AsyncWriteExt;
 
+        // Frames that arrived while a call was running. Reading continues
+        // during a call so a `notifications/cancelled` can reach it; anything
+        // else waits its turn, so requests are still answered in order.
+        let mut frames = FrameReader::default();
+        let mut queued: std::collections::VecDeque<std::io::Result<Frame>> = Default::default();
+        let mut stream_ended = false;
+
         loop {
-            let frame = read_frame(reader, self.max_frame_bytes).await?;
+            let frame = match queued.pop_front() {
+                Some(f) => f?,
+                None => frames.next(reader, self.max_frame_bytes).await?,
+            };
             let response = match frame {
                 Frame::Eof => return Ok(()),
                 Frame::Line(line) => {
@@ -605,12 +747,32 @@ impl Server {
                     let fut = self.handle_line(&line);
                     tokio::pin!(fut);
                     loop {
+                        // Biased: the call is polled first, so it has registered
+                        // its cancel token before any frame read behind it is
+                        // looked at.
                         tokio::select! {
+                            biased;
                             r = &mut fut => break r,
                             Some(note) = rx.recv() => {
                                 writer.write_all(note.as_bytes()).await?;
                                 writer.write_all(b"\n").await?;
                                 writer.flush().await?;
+                            }
+                            // Bounded, so a client that floods while a call
+                            // runs is made to wait rather than buffered.
+                            next = frames.next(reader, self.max_frame_bytes),
+                                if !stream_ended && queued.len() < MAX_QUEUED_FRAMES =>
+                            {
+                                match next {
+                                    Ok(Frame::Line(l)) if is_cancel_notification(&l) => {
+                                        let _ = self.handle_line(&l).await;
+                                    }
+                                    other => {
+                                        stream_ended =
+                                            matches!(other, Ok(Frame::Eof) | Err(_));
+                                        queued.push_back(other);
+                                    }
+                                }
                             }
                         }
                     }
@@ -650,7 +812,19 @@ enum Frame {
     TooLong(usize),
 }
 
-/// Read one newline-delimited frame, refusing to buffer more than `max` bytes.
+/// Frames held back while a call runs. Past this the reader stops reading
+/// until the call finishes.
+const MAX_QUEUED_FRAMES: usize = 64;
+
+/// Is this line a `notifications/cancelled`? Only that one is acted on while a
+/// call is running; everything else waits for the call to finish.
+fn is_cancel_notification(line: &str) -> bool {
+    serde_json::from_str::<Request>(line.trim())
+        .map(|r| r.id.is_none() && r.method == "notifications/cancelled")
+        .unwrap_or(false)
+}
+
+/// Reads newline-delimited frames, refusing to buffer more than `max` bytes.
 ///
 /// `BufReader::lines()` grows its buffer without bound, so a client that opens
 /// a frame and never closes it can drive the process out of memory *before any
@@ -658,58 +832,70 @@ enum Frame {
 /// Past the cap the remaining bytes are consumed and dropped rather than
 /// accumulated, so memory stays flat and the stream resynchronises at the next
 /// newline instead of the session dying.
-async fn read_frame<R>(reader: &mut R, max: usize) -> std::io::Result<Frame>
-where
-    R: tokio::io::AsyncBufRead + Unpin,
-{
-    use tokio::io::AsyncBufReadExt;
+///
+/// The partial frame lives in the struct, not on the stack, so `next` is safe
+/// to drop mid-frame (a `select!` branch losing the race) and call again.
+#[derive(Default)]
+struct FrameReader {
+    buf: Vec<u8>,
+    /// Non-zero once the cap is passed: total bytes seen, with `buf` released.
+    discarded: usize,
+}
 
-    let mut buf: Vec<u8> = Vec::new();
-    // Non-zero once the cap is passed: total bytes seen, with `buf` released.
-    let mut discarded = 0usize;
+impl FrameReader {
+    async fn next<R>(&mut self, reader: &mut R, max: usize) -> std::io::Result<Frame>
+    where
+        R: tokio::io::AsyncBufRead + Unpin,
+    {
+        use tokio::io::AsyncBufReadExt;
 
-    loop {
-        let (consumed, complete) = {
-            let available = reader.fill_buf().await?;
-            if available.is_empty() {
-                return Ok(match (discarded, buf.is_empty()) {
-                    (0, true) => Frame::Eof,
-                    (0, false) => Frame::Line(String::from_utf8_lossy(&buf).into_owned()),
-                    _ => Frame::TooLong(discarded),
+        loop {
+            let (consumed, complete) = {
+                // The only await point, and `fill_buf` is cancel-safe.
+                let available = reader.fill_buf().await?;
+                if available.is_empty() {
+                    let buf = std::mem::take(&mut self.buf);
+                    let discarded = std::mem::take(&mut self.discarded);
+                    return Ok(match (discarded, buf.is_empty()) {
+                        (0, true) => Frame::Eof,
+                        (0, false) => Frame::Line(String::from_utf8_lossy(&buf).into_owned()),
+                        _ => Frame::TooLong(discarded),
+                    });
+                }
+                match available.iter().position(|b| *b == b'\n') {
+                    Some(at) => {
+                        if self.discarded == 0 {
+                            self.buf.extend_from_slice(&available[..at]);
+                        }
+                        (at + 1, true)
+                    }
+                    None => {
+                        let n = available.len();
+                        if self.discarded == 0 {
+                            self.buf.extend_from_slice(available);
+                        }
+                        (n, false)
+                    }
+                }
+            };
+            reader.consume(consumed);
+
+            if self.discarded > 0 {
+                self.discarded = self.discarded.saturating_add(consumed);
+            } else if self.buf.len() > max {
+                self.discarded = self.buf.len();
+                self.buf = Vec::new();
+            }
+
+            if complete {
+                let buf = std::mem::take(&mut self.buf);
+                let discarded = std::mem::take(&mut self.discarded);
+                return Ok(if discarded > 0 {
+                    Frame::TooLong(discarded)
+                } else {
+                    Frame::Line(String::from_utf8_lossy(&buf).into_owned())
                 });
             }
-            match available.iter().position(|b| *b == b'\n') {
-                Some(at) => {
-                    if discarded == 0 {
-                        buf.extend_from_slice(&available[..at]);
-                    }
-                    (at + 1, true)
-                }
-                None => {
-                    let n = available.len();
-                    if discarded == 0 {
-                        buf.extend_from_slice(available);
-                    }
-                    (n, false)
-                }
-            }
-        };
-        reader.consume(consumed);
-
-        if discarded > 0 {
-            discarded = discarded.saturating_add(consumed);
-        } else if buf.len() > max {
-            discarded = buf.len();
-            buf = Vec::new();
-            buf.shrink_to_fit();
-        }
-
-        if complete {
-            return Ok(if discarded > 0 {
-                Frame::TooLong(discarded)
-            } else {
-                Frame::Line(String::from_utf8_lossy(&buf).into_owned())
-            });
         }
     }
 }

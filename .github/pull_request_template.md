@@ -9,6 +9,7 @@
 - [ ] `AGENTCTL_SKIP_LIVE=1 cargo test --workspace`
 - [ ] New behaviour has a test (pure logic as a free function; OS behaviour against the real OS)
 - [ ] `docs/tools.md` regenerated if any tool descriptor changed
+- [ ] `CHANGELOG.md` updated under `Unreleased` if behaviour changed; `config.example.toml` if an operator can set it
 - [ ] New tool schemas stay in the Gemini-safe subset (no `pattern`/`format`/`additionalProperties`)
 
 ## Security tier touched?
