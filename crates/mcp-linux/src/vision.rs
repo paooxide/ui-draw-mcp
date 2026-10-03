@@ -161,9 +161,11 @@ async fn portal_screenshot() -> Result<Rgb, VisionError> {
         Err(e) => return Err(fail(format!("screenshot portal: {e}"))),
     };
     let uri = shot.uri().clone();
-    let path = uri
-        .to_file_path()
-        .map_err(|_| fail(format!("screenshot portal returned a non-file URI: {uri}")))?;
+    // ashpd 0.13 hands back a bare string wrapper, not a `url::Url`.
+    let path = url::Url::parse(uri.as_str())
+        .ok()
+        .and_then(|u| u.to_file_path().ok())
+        .ok_or_else(|| fail(format!("screenshot portal returned a non-file URI: {uri}")))?;
     let bytes = tokio::fs::read(&path)
         .await
         .map_err(|e| fail(format!("reading {}: {e}", path.display())))?;

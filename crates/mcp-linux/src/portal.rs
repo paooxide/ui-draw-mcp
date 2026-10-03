@@ -17,9 +17,13 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use ashpd::desktop::remote_desktop::{Axis, DeviceType, KeyState, RemoteDesktop};
-use ashpd::desktop::screencast::{CursorMode, Screencast, SourceType};
-use ashpd::desktop::{PersistMode, Session};
+use ashpd::desktop::remote_desktop::{
+    Axis, DeviceType, KeyState, NotifyKeyboardKeysymOptions, NotifyPointerAxisDiscreteOptions,
+    NotifyPointerButtonOptions, NotifyPointerMotionAbsoluteOptions, RemoteDesktop,
+    SelectDevicesOptions, StartOptions,
+};
+use ashpd::desktop::screencast::{CursorMode, Screencast, SelectSourcesOptions, SourceType};
+use ashpd::desktop::{CreateSessionOptions, PersistMode, Session};
 use enumflags2::BitFlags;
 use futures_util::future::BoxFuture;
 use futures_util::FutureExt;
@@ -104,8 +108,8 @@ pub fn button_code(name: Option<&str>) -> Result<i32, InputError> {
 }
 
 struct Live {
-    proxy: RemoteDesktop<'static>,
-    session: Session<'static, RemoteDesktop<'static>>,
+    proxy: RemoteDesktop,
+    session: Session<RemoteDesktop>,
     streams: Vec<StreamGeom>,
 }
 
@@ -232,7 +236,7 @@ impl Portal {
             ))
         })?;
         let session = proxy
-            .create_session()
+            .create_session(CreateSessionOptions::default())
             .await
             .map_err(|e| failed("create session", e))?;
         // A restore token only helps when we are asking to persist; with a
@@ -245,9 +249,10 @@ impl Portal {
         proxy
             .select_devices(
                 &session,
-                DeviceType::Keyboard | DeviceType::Pointer,
-                token.as_deref(),
-                persist,
+                SelectDevicesOptions::default()
+                    .set_devices(DeviceType::Keyboard | DeviceType::Pointer)
+                    .set_restore_token(token.as_deref())
+                    .set_persist_mode(persist),
             )
             .await
             .map_err(|e| failed("select devices", e))?
@@ -259,24 +264,28 @@ impl Portal {
             .map_err(|e| failed("screencast", e))?;
         cast.select_sources(
             &session,
-            CursorMode::Hidden,
-            BitFlags::from(SourceType::Monitor),
-            true,
-            token.as_deref(),
-            persist,
+            SelectSourcesOptions::default()
+                .set_cursor_mode(CursorMode::Hidden)
+                .set_sources(BitFlags::from(SourceType::Monitor))
+                .set_multiple(true)
+                .set_restore_token(token.as_deref())
+                .set_persist_mode(persist),
         )
         .await
         .map_err(|e| failed("select sources", e))?
         .response()
         .map_err(|e| failed("select sources", e))?;
-        let started = tokio::time::timeout(APPROVAL_TIMEOUT, proxy.start(&session, None))
-            .await
-            .map_err(|_| {
-                InputError::PermissionDenied(
-                    "nobody answered the remote-desktop approval dialog within two minutes".into(),
-                )
-            })?
-            .map_err(|e| failed("start", e))?;
+        let started = tokio::time::timeout(
+            APPROVAL_TIMEOUT,
+            proxy.start(&session, None, StartOptions::default()),
+        )
+        .await
+        .map_err(|_| {
+            InputError::PermissionDenied(
+                "nobody answered the remote-desktop approval dialog within two minutes".into(),
+            )
+        })?
+        .map_err(|e| failed("start", e))?;
         let devices = match started.response() {
             Ok(d) => d,
             Err(ashpd::Error::Response(r)) => {
@@ -301,7 +310,6 @@ impl Portal {
         }
         let streams: Vec<StreamGeom> = devices
             .streams()
-            .unwrap_or(&[])
             .iter()
             .map(|s| {
                 let (x, y) = s.position().unwrap_or((0, 0));
@@ -334,8 +342,8 @@ impl Portal {
     async fn with<T, F>(&self, f: F) -> Result<T, InputError>
     where
         F: for<'a> FnOnce(
-            &'a RemoteDesktop<'static>,
-            &'a Session<'static, RemoteDesktop<'static>>,
+            &'a RemoteDesktop,
+            &'a Session<RemoteDesktop>,
             &'a [StreamGeom],
         ) -> BoxFuture<'a, Result<T, ashpd::Error>>,
     {
@@ -379,7 +387,16 @@ impl Portal {
             KeyState::Released
         };
         self.with(move |p, s, _| {
-            async move { p.notify_keyboard_keysym(s, sym.raw() as i32, state).await }.boxed()
+            async move {
+                p.notify_keyboard_keysym(
+                    s,
+                    sym.raw() as i32,
+                    state,
+                    NotifyKeyboardKeysymOptions::default(),
+                )
+                .await
+            }
+            .boxed()
         })
         .await
     }
@@ -391,7 +408,14 @@ impl Portal {
                 let Some((stream, rx, ry)) = stream_for(streams, x, y) else {
                     return Err(ashpd::Error::NoResponse);
                 };
-                p.notify_pointer_motion_absolute(s, stream.node, rx, ry).await
+                p.notify_pointer_motion_absolute(
+                    s,
+                    stream.node,
+                    rx,
+                    ry,
+                    NotifyPointerMotionAbsoluteOptions::default(),
+                )
+                .await
             }
             .boxed()
         })
@@ -413,7 +437,11 @@ impl Portal {
             KeyState::Released
         };
         self.with(move |p, s, _| {
-            async move { p.notify_pointer_button(s, code, state).await }.boxed()
+            async move {
+                p.notify_pointer_button(s, code, state, NotifyPointerButtonOptions::default())
+                    .await
+            }
+            .boxed()
         })
         .await
     }
@@ -425,7 +453,16 @@ impl Portal {
             Axis::Horizontal
         };
         self.with(move |p, s, _| {
-            async move { p.notify_pointer_axis_discrete(s, axis, steps).await }.boxed()
+            async move {
+                p.notify_pointer_axis_discrete(
+                    s,
+                    axis,
+                    steps,
+                    NotifyPointerAxisDiscreteOptions::default(),
+                )
+                .await
+            }
+            .boxed()
         })
         .await
     }
