@@ -793,10 +793,18 @@ fn safari_return(expr: &str) -> String {
 /// `Runtime.evaluate` does: as a script whose completion value is the result
 /// (so `a(); b` and a plain expression both work), awaiting a returned
 /// promise. Reports `{ok, value}` or `{ok:false, error}`; never throws.
+///
+/// `eval` is probed with a constant before the expression runs: when the probe
+/// throws (a page CSP without `unsafe-eval`, Trusted Types, or a page that broke
+/// `eval`), the reply is `{refused: true}` and nothing of `expr` has run, so the
+/// caller can take the no-`eval` route without running it twice. A refusal is
+/// never inferred from the expression's own error, which page code it calls can
+/// word however it likes.
 fn safari_eval_script(expr: &str) -> String {
     let src = serde_json::to_string(expr).unwrap_or_else(|_| "\"\"".into());
     format!(
         "var done = arguments[arguments.length - 1];\n\
+         try {{ (0, eval)('0'); }} catch(e) {{ done({{ok:false,refused:true,error:String(e)}}); return; }}\n\
          try {{\n\
            Promise.resolve((0, eval)({src})).then(\n\
              function(v){{ done({{ok:true,value:v===undefined?null:v}}); }},\n\
@@ -825,16 +833,6 @@ fn safari_noeval_script(code: &str, expression: bool) -> String {
              function(e){{ done({{ok:false,error:String(e)}}); }});\n\
          }} catch(e) {{ done({{ok:false,error:String(e)}}); }}"
     )
-}
-
-/// Whether an `eval` failure is the page's CSP refusing string evaluation (as
-/// opposed to the user's code throwing), the only case worth a second route.
-/// The refusal happens before any user code runs, so retrying repeats nothing.
-fn is_csp_eval_refusal(msg: &str) -> bool {
-    // WebKit words it "...in the following Content Security Policy directive"
-    // for `unsafe-eval` and "...requires a 'Trusted Type' assignment" under
-    // Trusted Types; both start with "Refused to evaluate".
-    msg.starts_with("EvalError") && msg.contains("Refused to evaluate")
 }
 
 /// Refuse a Safari (WebKit) target for a feature built on CDP, saying so,
@@ -3315,12 +3313,9 @@ impl BrowserBackend for CdpBackend {
                     .session
                     .execute_async(&safari_eval_script(expression), &[])
                     .await?;
-                let refused = env
-                    .get("error")
-                    .and_then(Value::as_str)
-                    .is_some_and(is_csp_eval_refusal);
-                if refused {
-                    // The page's CSP forbids `eval`. The driver's own script
+                if env.get("refused").and_then(Value::as_bool) == Some(true) {
+                    // `eval` itself is refused (the page's CSP forbids it), and
+                    // none of the code has run. The driver's own script
                     // body is not subject to it: try the code as an expression,
                     // and as a function body when it is not one.
                     env = match entry
@@ -5737,13 +5732,12 @@ mod tests {
     }
 
     #[test]
-    fn csp_refusal_is_told_from_user_errors() {
-        let csp = "EvalError: Refused to evaluate a string as JavaScript because 'unsafe-eval' is not an allowed source of script in the following Content Security Policy directive";
-        assert!(is_csp_eval_refusal(csp));
-        assert!(!is_csp_eval_refusal("EvalError: user thing"));
-        assert!(!is_csp_eval_refusal("Error: Refused to evaluate"));
-        let tt = "EvalError: Refused to evaluate a string as JavaScript because this document requires a 'Trusted Type' assignment.";
-        assert!(is_csp_eval_refusal(tt));
+    fn safari_eval_probes_eval_before_running_the_expression() {
+        let s = safari_eval_script("buy()");
+        let probe = s.find("(0, eval)('0')").expect("probe");
+        let run = s.find(r#"(0, eval)("buy()")"#).expect("run");
+        assert!(probe < run, "{s}");
+        assert!(s.contains("refused:true"), "{s}");
     }
 
     #[test]

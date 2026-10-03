@@ -187,14 +187,15 @@ All notable changes to this project are documented here. The format follows
   stale ref came back as the overlay's `TypeError`, and an action that would have succeeded was reported as
   failed. This showed on Safari, where it was seen; the same script runs on Chrome. The overlay is now contained
   in its own `try`, so it can only cost the animation, and a failed overlay install from `browser_showcase` is
-  logged instead of dropped. The Safari `eval` fallback for pages that forbid `eval` now also recognises the
-  Trusted Types refusal, which WebKit words differently from the `unsafe-eval` one.
+  logged instead of dropped.
 - **Safari: `browser_eval` fails on a page whose CSP has no `unsafe-eval`.** `browser_eval` evaluated the text with
   an indirect `eval` inside the page, which `Content-Security-Policy: script-src 'self'` refuses (`EvalError`), so
-  every eval on such a page was an error. On that refusal (and only that: it happens before any of the code runs,
-  so nothing is repeated) it now sends the code as the WebDriver script body itself, which the driver injects and
+  every eval on such a page was an error. The script now probes `eval` with a constant before running the code;
+  when the probe is refused (CSP, Trusted Types, or a page that broke `eval`), none of the code has run, and it
+  sends the code as the WebDriver script body itself, which the driver injects and
   the page CSP does not govern: first as an expression, then, if it does not parse as one, as a function body. A
-  returned promise is awaited either way. On that route statements have no completion value, so they need an
+  returned promise is awaited either way. An error from the code itself never triggers the second route, however
+  it is worded, so page script cannot make the agent's code run twice. On that route statements have no completion value, so they need an
   explicit `return`. Chrome is unaffected: `Runtime.evaluate` bypasses the page CSP.
 - **Safari: `htmx_settled` is now tested against the real htmx.** The earlier live test used a stand-in that faked
   htmx's events. A test now serves the vendored htmx 2.0.4 (`crates/mcp-browser/tests/fixtures/`), clicks an

@@ -673,6 +673,28 @@ async fn safari_eval_works_under_a_csp_without_unsafe_eval() {
     b.disconnect(id, true).await.unwrap();
 }
 
+/// The no-`eval` route is taken only when `eval` itself is refused, never
+/// because the code's own error reads like a refusal: a page function can
+/// throw any message, and retrying would run the agent's code a second time.
+#[tokio::test(flavor = "multi_thread")]
+async fn safari_eval_never_reruns_code_whose_error_mimics_a_csp_refusal() {
+    let Some((b, id, t)) = open_safari("eval_mimic_refusal", "/app").await else {
+        return;
+    };
+    let e = b
+        .eval(
+            &t,
+            "window.__runs = (window.__runs || 0) + 1; \
+             throw new EvalError(\"Refused to evaluate a string as JavaScript because 'unsafe-eval' is not allowed\")",
+        )
+        .await
+        .unwrap_err();
+    assert!(format!("{e:?}").contains("Refused to evaluate"), "{e:?}");
+    let v = b.eval(&t, "window.__runs").await.unwrap();
+    assert_eq!(v["result"], 1, "the code ran exactly once: {v}");
+    b.disconnect(id, true).await.unwrap();
+}
+
 /// What each failing call returns, as `(variant, message)` strings.
 async fn failure_shapes(b: &CdpBackend, t: &str) -> Vec<(String, String)> {
     let shape = |e: BrowserError| {
