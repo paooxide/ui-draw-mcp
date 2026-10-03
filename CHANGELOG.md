@@ -232,6 +232,13 @@ All notable changes to this project are documented here. The format follows
 
 ### Security
 
+- **Browser snapshot `semantic_intent` and `bound_state` are sanitized and bounded.** Both come from the page
+  (`data-intent`, `data-state`, React props, canvas region fields), so a hostile page could put quotes,
+  newlines or a forged `@e9` line in an intent, or hand over a cyclic or 100 KB state. An intent is now
+  reduced to `[A-Za-z0-9_.-]`, 48 characters (the rule the OS snapshot already used). `bound_state` goes
+  through an injected serializer (depth 4, 20 keys or items, 200-character strings, cycles, functions and DOM
+  nodes dropped) and a 2 KiB cap in Rust that replaces a larger value with `{"truncated":true,"bytes":N}`.
+  Chrome, Safari and canvas regions share the Rust step. macOS and Linux nodes still carry neither field.
 - **A page cannot forge recorded steps.** The recorder and its `__agentctl_rec` binding lived in the page's
   main world, so page script could call the binding and add clicks or typing that nobody made to a
   recording, or replace the function to read what was typed. They now live in an isolated world: the DOM
