@@ -450,6 +450,9 @@ pub async fn walk(
                 bounds: f.bounds,
                 node_id: Some(id),
                 children: Vec::new(),
+                // AT-SPI exposes no application-level intent or bound state.
+                semantic_intent: None,
+                bound_state: None,
             };
             let idx = flat.len();
             flat.push(Flat { node, parent });

@@ -376,6 +376,8 @@ mod tests {
             }),
             node_id,
             state: ElementState::default(),
+            semantic_intent: None,
+            bound_state: None,
         }
     }
 

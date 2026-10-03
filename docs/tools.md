@@ -8,7 +8,7 @@ Tiers gate what an agent may call: `read` and `standard` tools are available ins
 enabled category, while a `dangerous` tool additionally has to be named in
 `policy.enable`. Enabling a category never enables its dangerous tools.
 
-**114 tools across 12 categories.**
+**122 tools across 12 categories.**
 
 | Tool | Category | Tier | Summary |
 |---|---|---|---|
@@ -53,21 +53,29 @@ enabled category, while a `dangerous` tool additionally has to be named in
 | [`system_settings`](#system-settings) | desktop | standard | Read or change a desktop setting. |
 | [`browser_act`](#browser-act) | browser | standard | Act on a DOM node: click, type, select, hover, focus, scroll_into_view, submit. |
 | [`browser_assert`](#browser-assert) | browser | read | Settle (optional) then check the page in one call; returns {passed, checks} and errors when it fails. |
+| [`browser_branch`](#browser-branch) | browser | standard | Speculative browser context branching: fork an isolated background context from a tab ('create'), run trials without affecting the visible tab, commit winning state ('commit'), discard failed branches ('discard'), switch focus ('switch'), or list branches ('list'). |
 | [`browser_capture`](#browser-capture) | browser | dangerous | Regression-test capture. |
+| [`browser_challenge`](#browser-challenge) | browser | standard | Mixed-initiative CAPTCHA / 2FA detector and handshake. |
+| [`browser_checkpoint`](#browser-checkpoint) | browser | standard | In-memory state checkpointing and rollback (T-1) for browser tabs. |
 | [`browser_connect`](#browser-connect) | browser | standard | Attach to a Chromium browser started with --remote-debugging-port, or launch a dedicated instance. |
 | [`browser_cookies`](#browser-cookies) | browser | dangerous | Cookie access: get (values redacted), set, or clear. |
 | [`browser_dialog`](#browser-dialog) | browser | standard | Inspect and control how the page's JavaScript dialogs (alert/confirm/prompt/beforeunload) are answered. |
 | [`browser_disconnect`](#browser-disconnect) | browser | standard | Disconnect from a browser. |
 | [`browser_eval`](#browser-eval) | browser | dangerous | Evaluate arbitrary JavaScript in the page context; result is JSON-serialized. |
+| [`browser_extract`](#browser-extract) | browser | read | Extract structured data directly from the page using a CSS/attribute schema (e.g. |
+| [`browser_fill_form`](#browser-fill-form) | browser | standard | Fill multiple form fields (input, select, checkbox, radio) in one call and optionally submit. |
 | [`browser_flow`](#browser-flow) | browser | standard | Save and replay a browser UI test. |
 | [`browser_navigate`](#browser-navigate) | browser | standard | Navigate a tab: goto a url, or go back/forward/reload. |
 | [`browser_network`](#browser-network) | browser | dangerous | Network control. |
+| [`browser_profile`](#browser-profile) | browser | standard | Save, restore, list, or delete browser session profiles (cookies, localStorage, sessionStorage) for instant user or auth state swapping with… |
 | [`browser_query`](#browser-query) | browser | read | Resolve node ref(s) by css selector, xpath, or visible text. |
+| [`browser_record`](#browser-record) | browser | standard | Shadow observation & macro learning mode (Ghost Mode). |
 | [`browser_screenshot`](#browser-screenshot) | browser | read | Capture a PNG of the page (or a single element by ref). |
+| [`browser_showcase`](#browser-showcase) | browser | standard | Configure visual flair for demos, screencasts, and presentations: animated virtual SVG cursor, smooth cubic-bezier gliding, click ripples, a… |
 | [`browser_snapshot`](#browser-snapshot) | browser | read | Flatten a page into interactable node refs (dom/accessibility) or raw text. |
 | [`browser_tabs`](#browser-tabs) | browser | standard | List/open/activate/close tabs (targets) of a connected browser. |
 | [`browser_viewport`](#browser-viewport) | browser | standard | Emulate a viewport for responsive testing: override the page's device metrics (width/height, optionally mobile and a device scale factor). |
-| [`browser_wait`](#browser-wait) | browser | read | Wait for a settle signal: a selector to appear, navigation to complete, or the network to idle. |
+| [`browser_wait`](#browser-wait) | browser | read | Wait for a settle signal: a selector to appear, dom_settled (DOM mutations and animation frames settled for >=150ms), htmx_settled (HTMX req… |
 | [`command_info`](#command-info) | terminal | read | Resolve a command and capture its own --help and --version. |
 | [`exec`](#exec) | terminal | dangerous | Run an allowlisted command. |
 | [`man_page`](#man-page) | terminal | read | A manual page as clean plain text, pager and overstrike formatting removed. |
@@ -678,16 +686,20 @@ Read or change a desktop setting. Settings the platform does not expose return U
 
 `browser_act` · standard tier
 
-Act on a DOM node: click, type, select, hover, focus, scroll_into_view, submit. Target it with 'ref' (from browser_query/snapshot) or, in one call, with 'query' plus 'by' (css/xpath/text) to resolve and act without a separate query.
+Act on a DOM node: click, type, select, hover, focus, scroll_into_view, submit. A page-published canvas region (a canvas-child ref from browser_snapshot) supports only click and hover, sent as real mouse input at the region centre; other actions on it return Unsupported. Target it with 'ref' (from browser_query/snapshot) or, in one call, with 'query' plus optional 'by' (css/xpath/text), 'within' (scoped container), 'text' (substring filter), and 'index'.
 
 | Argument | Type | Required | Description |
 |---|---|---|---|
-| `action` | one of: click, type, select, hover, focus, scroll_into_view, submit | yes |  |
+| `action` | one of: click, type, select, hover, focus, scroll_into_view, submit, press | yes |  |
 | `by` | one of: css, xpath, text |  | how to read 'query' (default css); used when no 'ref' |
+| `index` | integer |  | optional 0-based match index if query matches multiple elements (default 0) |
 | `query` | string |  | selector to resolve and act on in one call, instead of 'ref' |
 | `ref` | string |  | a ref from browser_query/snapshot |
+| `secret` | boolean |  | the value is a secret: keep it out of the audit log and never show it in the showcase typing HUD (password and one-time-code fields are masked automatically) |
 | `target_id` | string | yes |  |
-| `value` | string |  |  |
+| `text` | string |  | optional text substring filter to narrow matches |
+| `value` | string |  | text for type, option for select, or key name for press (Enter, Escape, Tab) |
+| `within` | string |  | optional CSS/XPath root selector to scope query search |
 
 ### browser-assert
 
@@ -711,9 +723,22 @@ Settle (optional) then check the page in one call; returns {passed, checks} and 
 | `url` | string |  | assert the URL contains this |
 | `ux` | object |  | judge-scored review: {dims:[clarity,hierarchy,affordance,consistency], gate:false, min:0.5}; advisory unless gate=true |
 | `visual` | any |  | baseline name, or {name, tolerance, ref}; first run saves the baseline, later runs diff the screenshot within tolerance (default 0.01) |
+| `wait_dom_settled` | boolean |  | settle: wait for DOM mutations to settle first |
 | `wait_network_idle` | boolean |  | settle: wait for network idle first |
 | `wait_selector` | string |  | settle: wait for this selector first |
 | `within` | string |  | scope a11y/style/component checks to this css root (component testing) |
+
+### browser-branch
+
+`browser_branch` · standard tier
+
+Speculative browser context branching: fork an isolated background context from a tab ('create'), run trials without affecting the visible tab, commit winning state ('commit'), discard failed branches ('discard'), switch focus ('switch'), or list branches ('list'). Branches run in a separate browser context and fail with an error if one cannot be created (no silent fallback to the shared context). Commit and discard report an error unless the work was done and the branch tab was really closed. At most 8 branches may be active at once (AGENTCTL_MAX_BRANCHES).
+
+| Argument | Type | Required | Description |
+|---|---|---|---|
+| `action` | one of: create, commit, discard, switch, list | yes |  |
+| `branch_id` | string |  | create/commit/discard/switch: unique branch identifier |
+| `target_id` | string |  | create: parent tab to fork from |
 
 ### browser-capture
 
@@ -728,20 +753,49 @@ Regression-test capture. 'start' installs a page hook (persists across navigatio
 | `only_errors` | boolean |  | read: keep only non-2xx / failed requests |
 | `target_id` | string | yes |  |
 
+### browser-challenge
+
+`browser_challenge` · standard tier
+
+Mixed-initiative CAPTCHA / 2FA detector and handshake. Pauses execution, shows a non-intrusive HUD in the browser informing the user to solve the verification, and auto-resumes in <=50ms upon clearance.
+
+| Argument | Type | Required | Description |
+|---|---|---|---|
+| `action` | one of: detect, wait, hud_show, hud_hide |  | action to perform (default: detect) |
+| `kind` | string |  | optional challenge kind override for hud_show |
+| `target_id` | string | yes |  |
+| `timeout_ms` | integer |  | max wait time for human verification clearance in ms (default: 30000) |
+
+### browser-checkpoint
+
+`browser_checkpoint` · standard tier
+
+In-memory state checkpointing and rollback (T-1) for browser tabs. 'save' captures a deep copy of form state (input values, checks, select indexes, scroll), storage, cookies and URL (not the DOM tree); 'rollback' navigates back if needed, waits for the page to load, restores that state and fails with the reason if any part could not be restored; 'list'/'delete' manage checkpoints. Re-saving a tag makes it the newest ('latest'). File inputs are skipped.
+
+| Argument | Type | Required | Description |
+|---|---|---|---|
+| `action` | one of: save, rollback, list, delete | yes |  |
+| `tag` | string |  | save/rollback/delete: tag name (e.g. 'step_2' or 'latest') |
+| `target_id` | string |  | target tab to checkpoint or restore |
+
 ### browser-connect
 
 `browser_connect` · standard tier
 
-Attach to a Chromium browser started with --remote-debugging-port, or launch a dedicated instance.
+Attach to a Chromium browser started with --remote-debugging-port, or launch a dedicated instance. Optionally auto-restores a saved profile. launch.browser='safari' drives Safari through safaridriver (macOS only, experimental: needs `safaridriver --enable` once, opens a visible window, and has no network interception).
 
 | Argument | Type | Required | Description |
 |---|---|---|---|
 | `attach` | object |  |  |
 | `attach.port` | integer |  |  |
 | `launch` | object |  |  |
+| `launch.browser` | one of: chromium, safari |  | chromium (default) launches an auto-discovered Chrome/Chromium; safari launches experimental Safari via safaridriver (macOS only) |
 | `launch.headless` | boolean |  |  |
 | `launch.port` | integer |  |  |
+| `launch.profile` | string |  | saved profile name to auto-restore upon connecting |
+| `launch.url` | string |  | first page to open; Safari only (Chromium: use browser_navigate); checked against the navigation policy |
 | `launch.user_data_dir` | string |  |  |
+| `profile` | string |  | saved profile name to auto-restore upon connecting |
 
 ### browser-cookies
 
@@ -789,17 +843,42 @@ Evaluate arbitrary JavaScript in the page context; result is JSON-serialized. Ar
 | `expression` | string | yes |  |
 | `target_id` | string | yes |  |
 
+### browser-extract
+
+`browser_extract` · read tier
+
+Extract structured data directly from the page using a CSS/attribute schema (e.g. text values, lists, tables). Offloads extraction parsing from the LLM.
+
+| Argument | Type | Required | Description |
+|---|---|---|---|
+| `schema` | object | yes | Extraction schema mapping field names to rules {selector, attr, regex, multiple, fields} |
+| `target_id` | string | yes |  |
+| `within` | string |  | Optional CSS root selector to scope extraction |
+
+### browser-fill-form
+
+`browser_fill_form` · standard tier
+
+Fill multiple form fields (input, select, checkbox, radio) in one call and optionally submit. Eliminates round-trips for registration or checkout forms.
+
+| Argument | Type | Required | Description |
+|---|---|---|---|
+| `fields` | array&lt;object&gt; | yes | Array of fields: [{ref or selector, value, type, secret}] |
+| `submit` | object |  | Optional submit trigger: {ref or selector} |
+| `target_id` | string | yes |  |
+
 ### browser-flow
 
 `browser_flow` · standard tier
 
-Save and replay a browser UI test. 'save' (name + steps) records a flow; 'run' (name + target_id) replays it deterministically, stopping at the first failing step (set continue_on_error to run all); 'list'/'get'/'delete' manage them. A step is {op: navigate|act|wait|capture|assert, ...} using the same fields as those tools (e.g. {op:'act',by:'text',query:'Login',action:'click'}, {op:'assert',text:'Welcome'}). A green run never needs a model.
+Save and replay a browser UI test. 'save' (name + steps) records a flow; 'run' (name + target_id) replays it deterministically, stopping at the first failing step (set continue_on_error to run all); 'list'/'get'/'delete' manage them. A step is {op: navigate|act|wait|capture|assert, ...} using the same fields as those tools (e.g. {op:'act',by:'text',query:'Login',action:'click'}, {op:'assert',text:'Welcome'}). A secret step never holds its value: use {op:'act',action:'type',query:'#pw',secret:true,secret_ref:'pw'} and pass secrets:{pw:'...'} to 'run'; 'save' refuses a secret step with a literal value. A green run never needs a model.
 
 | Argument | Type | Required | Description |
 |---|---|---|---|
 | `action` | one of: save, run, list, get, delete | yes |  |
 | `continue_on_error` | boolean |  | run: keep going past a failed step |
 | `name` | string |  |  |
+| `secrets` | object |  | run: values for the steps' secret_ref names, e.g. {pw: '...'}; used in memory for this run only, never stored, redacted from the audit log. A missing one fails the run before any step runs |
 | `steps` | array&lt;object&gt; |  | save: the ordered steps |
 | `target_id` | string |  | run: the tab to replay against |
 
@@ -829,6 +908,18 @@ Network control. log: record requests and responses for a bounded window (URLs, 
 | `headers` | object |  | set_headers: the headers. intercept: { block: [url patterns] } |
 | `target_id` | string | yes |  |
 
+### browser-profile
+
+`browser_profile` · standard tier
+
+Save, restore, list, or delete browser session profiles (cookies, localStorage, sessionStorage) for instant user or auth state swapping without re-logging in.
+
+| Argument | Type | Required | Description |
+|---|---|---|---|
+| `action` | one of: save, restore, list, delete | yes |  |
+| `name` | string |  | save/restore/delete: profile name |
+| `target_id` | string |  | save/restore: the tab to snapshot or populate |
+
 ### browser-query
 
 `browser_query` · read tier
@@ -842,6 +933,18 @@ Resolve node ref(s) by css selector, xpath, or visible text.
 | `query` | string | yes |  |
 | `target_id` | string | yes |  |
 
+### browser-record
+
+`browser_record` · standard tier
+
+Shadow observation & macro learning mode (Ghost Mode). Observes human interactions in a tab, across page loads and navigations (a link or form post becomes a wait for the next page, a typed URL or reload a goto), debounces keystrokes and click bursts, strips noise, and synthesizes clean, deterministic browser_flow steps. Secret fields are never recorded: they become steps with a secret_ref, supplied as secrets when the flow runs. Chrome only; while recording, the tab's JavaScript dialogs are answered by the recorder's dialog policy (dismiss by default).
+
+| Argument | Type | Required | Description |
+|---|---|---|---|
+| `action` | one of: start, stop, status |  | recording action (default: status) |
+| `name` | string |  | optional flow name to auto-save to flow store upon stop |
+| `target_id` | string | yes |  |
+
 ### browser-screenshot
 
 `browser_screenshot` · read tier
@@ -853,11 +956,27 @@ Capture a PNG of the page (or a single element by ref).
 | `ref` | string |  |  |
 | `target_id` | string | yes |  |
 
+### browser-showcase
+
+`browser_showcase` · standard tier
+
+Configure visual flair for demos, screencasts, and presentations: animated virtual SVG cursor, smooth cubic-bezier gliding, click ripples, and floating typing HUD.
+
+| Argument | Type | Required | Description |
+|---|---|---|---|
+| `click_ripple` | boolean |  | expand glowing shockwave rings on click |
+| `cursor_style` | one of: glow_arrow, neon_cyan, minimal_dot |  | visual pointer style |
+| `enabled` | boolean |  | enable or disable visual overlays |
+| `glide_ms` | integer |  | custom glide duration in milliseconds |
+| `speed` | one of: cinematic, demo, snappy, off |  | gliding speed preset |
+| `target_id` | string | yes | the tab to configure showcase overlays for |
+| `typing_hud` | boolean |  | display floating action/typing badges next to cursor |
+
 ### browser-snapshot
 
 `browser_snapshot` · read tier
 
-Flatten a page into interactable node refs (dom/accessibility) or raw text. The web equivalent of get_ui_tree.
+Flatten a page into interactable node refs (dom/accessibility) or raw text. The web equivalent of get_ui_tree. A <canvas> gets child nodes (tag canvas-child) only if the page itself publishes its interactive regions via canvas.__agentctl_regions or a data-canvas-regions JSON attribute; any other canvas is an opaque node.
 
 | Argument | Type | Required | Description |
 |---|---|---|---|
@@ -896,10 +1015,14 @@ Emulate a viewport for responsive testing: override the page's device metrics (w
 
 `browser_wait` · read tier
 
-Wait for a settle signal: a selector to appear, navigation to complete, or the network to idle.
+Wait for a settle signal: a selector to appear, dom_settled (DOM mutations and animation frames settled for >=150ms), htmx_settled (HTMX requests and DOM swaps settled; errors if htmx is not present on the page), navigation to complete (after a goto, reload, click, submit or key press in this session it waits for the NEW document, not the one being left; a click that starts no navigation within 2s settles on the loaded page with navigated:false), the network to idle, or verification challenge clearance.
 
 | Argument | Type | Required | Description |
 |---|---|---|---|
+| `challenge_cleared` | boolean |  |  |
+| `condition` | one of: selector, dom_settled, htmx_settled, navigation, network_idle, challenge_cleared |  |  |
+| `dom_settled` | boolean |  |  |
+| `htmx_settled` | boolean |  |  |
 | `navigation` | boolean |  |  |
 | `network_idle` | boolean |  |  |
 | `selector` | string |  |  |

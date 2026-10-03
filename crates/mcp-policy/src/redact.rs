@@ -53,20 +53,47 @@ impl Redactor {
 /// the payload fields are replaced with the length marker. The flag itself is
 /// kept, so the log still shows that a secret was entered, just not what.
 /// Applied only to the logged copy; the real value still reaches the engine.
+///
+/// Applies at every depth, not only the top level: a `browser_flow` call
+/// carries its steps in an array, and a step flagged `secret` holds a password
+/// as surely as a top-level `keyboard_type` does.
 pub fn redact_flagged_payload(v: &mut Value) {
-    let Some(obj) = v.as_object_mut() else {
-        return;
-    };
-    let flagged = obj.get("secret").and_then(Value::as_bool).unwrap_or(false);
-    if !flagged {
-        return;
-    }
-    for key in ["text", "data", "value"] {
-        if let Some(val) = obj.get_mut(key) {
-            if !val.is_null() {
-                *val = Value::String(marker(val));
+    match v {
+        Value::Object(obj) => {
+            if obj.get("secret").and_then(Value::as_bool).unwrap_or(false) {
+                for key in [
+                    "text",
+                    "data",
+                    "value",
+                    "key",
+                    "token",
+                    "api_key",
+                    "secret_key",
+                ] {
+                    if let Some(val) = obj.get_mut(key) {
+                        if !val.is_null() {
+                            *val = Value::String(marker(val));
+                        }
+                    }
+                }
+            }
+            // `browser_flow run` takes its replay-time secrets as a `secrets`
+            // object (name -> value). Its values are secret by construction:
+            // the caller put them there for that reason, and no `secret` flag
+            // sits beside them to key off.
+            if let Some(Value::Object(secrets)) = obj.get_mut("secrets") {
+                for val in secrets.values_mut() {
+                    *val = Value::String(marker(val));
+                }
+            }
+            for child in obj.values_mut() {
+                if child.is_object() || child.is_array() {
+                    redact_flagged_payload(child);
+                }
             }
         }
+        Value::Array(items) => items.iter_mut().for_each(redact_flagged_payload),
+        _ => {}
     }
 }
 
@@ -76,6 +103,60 @@ fn marker(v: &Value) -> String {
         other => other.to_string().len(),
     };
     format!("\u{2039}redacted:len={len}\u{203a}")
+}
+
+#[cfg(test)]
+mod nested_secret_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn flagged_payload_is_redacted_inside_flow_steps() {
+        let mut v = json!({
+            "name": "login",
+            "steps": [
+                { "op": "act", "action": "type", "query": "#user", "value": "alice" },
+                { "op": "act", "action": "type", "query": "#pw", "value": "hunter2", "secret": true }
+            ]
+        });
+        redact_flagged_payload(&mut v);
+        assert_eq!(v["steps"][0]["value"], "alice");
+        assert_eq!(v["steps"][1]["value"], "\u{2039}redacted:len=7\u{203a}");
+        assert_eq!(v["steps"][1]["secret"], true);
+    }
+
+    #[test]
+    fn flow_run_secrets_object_is_redacted_by_value_and_keeps_its_names() {
+        let mut v = json!({
+            "action": "run",
+            "name": "login",
+            "target_id": "T1",
+            "secrets": { "pw": "hunter2", "otp": "123456" }
+        });
+        redact_flagged_payload(&mut v);
+        assert_eq!(v["secrets"]["pw"], "\u{2039}redacted:len=7\u{203a}");
+        assert_eq!(v["secrets"]["otp"], "\u{2039}redacted:len=6\u{203a}");
+        // Only the values: the names say which secrets were supplied.
+        assert_eq!(v["name"], "login");
+        assert_eq!(v["action"], "run");
+        assert!(!v.to_string().contains("hunter2"));
+        assert!(!v.to_string().contains("123456"));
+
+        // Any depth, and a non-string value is redacted too.
+        let mut v = json!({ "calls": [{ "args": { "secrets": { "n": 4242, "pw": "x" } } }] });
+        redact_flagged_payload(&mut v);
+        assert!(!v.to_string().contains("4242"));
+        assert_eq!(
+            v["calls"][0]["args"]["secrets"]["pw"],
+            "\u{2039}redacted:len=1\u{203a}"
+        );
+
+        // A `secrets` that is not an object (or an unrelated key) is left alone.
+        let mut v = json!({ "secrets": "plain", "secret": false, "other": { "secrets_count": 2 } });
+        redact_flagged_payload(&mut v);
+        assert_eq!(v["secrets"], "plain");
+        assert_eq!(v["other"]["secrets_count"], 2);
+    }
 }
 
 #[cfg(test)]

@@ -37,6 +37,8 @@ pub struct EngineConfig {
     pub max_recipes: usize,
     pub autonomous: bool,
     pub bypass: bool,
+    pub demo: bool,
+    pub demo_speed: String,
     // The vision engine only exists where there is a capture backend.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     pub vision: mcp_vision::VisionConfig,
@@ -64,6 +66,8 @@ impl From<&PolicyConfig> for EngineConfig {
             max_recipes: c.max_recipes,
             autonomous: matches!(c.mode, Mode::Autonomous),
             bypass: c.access == Some(mcp_policy::Access::Bypass),
+            demo: c.demo,
+            demo_speed: c.demo_speed.clone(),
             #[cfg(any(target_os = "macos", target_os = "linux"))]
             vision: vision_config(c),
         }
@@ -90,6 +94,15 @@ pub fn vision_config(c: &PolicyConfig) -> mcp_vision::VisionConfig {
         pixels_per_token: c.vision_pixels_per_token,
         max_image_bytes: c.vision_max_image_bytes,
     }
+}
+
+/// The one place the configured `demo_speed` becomes a preset.
+///
+/// Config loading already refuses a name `GlidePreset::from_speed` does not
+/// know, so the fallback to `Demo` is only reachable by a caller that skipped
+/// loading (`--demo-speed` on the command line, until that path validates).
+pub(crate) fn demo_glide_preset(speed: &str) -> mcp_input::GlidePreset {
+    mcp_input::GlidePreset::from_speed(speed).unwrap_or(mcp_input::GlidePreset::Demo)
 }
 
 /// Wire every engine the config enables.
@@ -154,7 +167,9 @@ pub fn build_stack(cfg: &PolicyConfig) -> (Vec<Arc<dyn ToolModule>>, Wiring) {
     // default: with no roots/commands/hosts/services configured it refuses
     // everything rather than falling open.
     {
-        use mcp_browser::{BrowserModule, CdpBackend, FlowStore, NavPolicy, VisualStore};
+        use mcp_browser::{
+            BrowserModule, CdpBackend, FlowStore, NavPolicy, ProfileStore, VisualStore,
+        };
         use mcp_fs::{default_denied, FsModule, Jail};
         use mcp_memory::{MemoryModule, Store as MemoryStore};
         use mcp_net::{NetModule, NetPolicy};
@@ -164,21 +179,45 @@ pub fn build_stack(cfg: &PolicyConfig) -> (Vec<Arc<dyn ToolModule>>, Wiring) {
         use mcp_sec::SecModule;
         use mcp_sys::SysModule;
 
-        modules.push(Arc::new(
-            BrowserModule::new(Arc::new(CdpBackend::new(NavPolicy::new(
+        let showcase = if engines.demo {
+            let speed = match demo_glide_preset(&engines.demo_speed) {
+                mcp_input::GlidePreset::Cinematic => mcp_browser::ShowcaseSpeed::Cinematic,
+                mcp_input::GlidePreset::Demo => mcp_browser::ShowcaseSpeed::Demo,
+                mcp_input::GlidePreset::Snappy => mcp_browser::ShowcaseSpeed::Snappy,
+                mcp_input::GlidePreset::Instant => mcp_browser::ShowcaseSpeed::Off,
+            };
+            mcp_browser::ShowcaseConfig {
+                speed,
+                ..Default::default()
+            }
+        } else {
+            mcp_browser::ShowcaseConfig::default()
+        };
+
+        let browser_backend = Arc::new(
+            CdpBackend::new(NavPolicy::new(
                 &engines.allowed_origins,
                 engines.browser_allow_private,
-            ))))
-            .with_flow_store(FlowStore::new(
-                state_dir(cfg).join("browser_flows.json"),
-                200,
-                200,
             ))
-            .with_visual_store(VisualStore::new(
-                state_dir(cfg).join("browser_baselines.json"),
-                500,
-            ))
-            .with_judge(judge.clone()),
+            .with_showcase(showcase.clone()),
+        );
+        modules.push(Arc::new(
+            BrowserModule::new(browser_backend.clone())
+                .with_showcase(showcase)
+                .with_flow_store(FlowStore::new(
+                    state_dir(cfg).join("browser_flows.json"),
+                    200,
+                    200,
+                ))
+                .with_profile_store(ProfileStore::new(
+                    state_dir(cfg).join("browser_profiles.json"),
+                    50,
+                ))
+                .with_visual_store(VisualStore::new(
+                    state_dir(cfg).join("browser_baselines.json"),
+                    500,
+                ))
+                .with_judge(judge.clone()),
         ));
 
         let jail = Jail::new(engines.fs_roots.clone(), default_denied());
@@ -277,9 +316,13 @@ pub fn build_stack(cfg: &PolicyConfig) -> (Vec<Arc<dyn ToolModule>>, Wiring) {
             arena.clone(),
         ));
         let activity = mcp_input::Activity::new();
-        let input = InputModule::new(backend.clone(), arena, input_policy)
+        let glide_preset = demo_glide_preset(&engines.demo_speed);
+        let mut input = InputModule::new(backend.clone(), arena, input_policy)
             .with_verifier(verifier)
             .with_activity(activity.clone());
+        if engines.demo {
+            input = input.with_glide(glide_preset.into());
+        }
         let vision = VisionModule::new(backend.clone(), engines.vision);
         let window = WindowModule::new(backend.clone(), backend.clone(), allowed_apps)
             .with_judge(judge.clone());
@@ -333,9 +376,13 @@ pub fn build_stack(cfg: &PolicyConfig) -> (Vec<Arc<dyn ToolModule>>, Wiring) {
             arena.clone(),
         ));
         let activity = mcp_input::Activity::new();
-        let input = InputModule::new(backend.clone(), arena, input_policy)
+        let glide_preset = demo_glide_preset(&engines.demo_speed);
+        let mut input = InputModule::new(backend.clone(), arena, input_policy)
             .with_verifier(verifier)
             .with_activity(activity.clone());
+        if engines.demo {
+            input = input.with_glide(glide_preset.into());
+        }
         let vision = VisionModule::new(backend.clone(), engines.vision);
         let window = WindowModule::new(backend.clone(), backend.clone(), allowed_apps)
             .with_judge(judge.clone());
@@ -353,4 +400,25 @@ pub fn build_stack(cfg: &PolicyConfig) -> (Vec<Arc<dyn ToolModule>>, Wiring) {
         wiring.desktop = Some(desktop_backend);
     }
     (modules, wiring)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `mcp-policy` validates `demo_speed` against its own list because it
+    /// cannot depend on the engine; every name it lets through must map to the
+    /// preset of the same meaning, never fall through to the default.
+    #[test]
+    fn every_speed_config_accepts_is_known_to_the_glide_engine() {
+        for name in mcp_policy::DEMO_SPEEDS {
+            let preset = mcp_input::GlidePreset::from_speed(name)
+                .unwrap_or_else(|| panic!("config accepts '{name}' but the engine does not"));
+            if name != "off" {
+                assert_eq!(preset.as_str(), name);
+            }
+            assert_eq!(demo_glide_preset(name), preset);
+        }
+        assert_eq!(demo_glide_preset("off"), mcp_input::GlidePreset::Instant);
+    }
 }

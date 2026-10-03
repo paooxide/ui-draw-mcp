@@ -30,6 +30,37 @@ All notable changes to this project are documented here. The format follows
 - **Compound native forms and extraction.** `ui_fill_form` sets text fields, checkboxes, switches and
   pop-ups in one call and can submit and check the result; `ui_extract` reads a native table, form or list
   into JSON.
+- **Demo mode** (`policy.demo`, `--demo`, `--demo-speed cinematic|demo|snappy|instant`), for screencasts:
+  the pointer glides along an eased curve, and browser pages show a pointer, click ripples and a typing
+  label that masks secret fields. Off by default. A glide stops at the next waypoint when a human takes the
+  mouse or the call is cancelled.
+- **Browser forms, extraction and profiles.** `browser_fill_form` fills many fields and optionally submits
+  in one call; `browser_extract` reads schema-shaped records from a page; `browser_profile` saves and
+  restores cookies and storage, and `browser_connect` can start from a profile. `browser_wait` gains
+  `dom_settled`, and `browser_assert` can wait for it first.
+- **Branches and checkpoints.** `browser_branch` tries a path in a separate browser context seeded with the
+  page's cookies and storage, then commits it to the visible tab or discards it (at most 8 at once,
+  `AGENTCTL_MAX_BRANCHES`; their tabs are closed on discard and at shutdown). `browser_checkpoint` saves
+  and rolls back URL, form fields, storage and cookies, and names any field it could not restore.
+- **Scoped acting and htmx.** `browser_act` can resolve its target inside a CSS or XPath container, filter
+  by text and pick by index; a container that matches nothing is an error. `browser_act` also gains
+  `press` (Enter, Escape, Tab as real key events) and `secret`. `browser_wait htmx_settled` follows
+  htmx's request and settle events.
+- **Shadow DOM and canvas regions.** Snapshots descend into open shadow roots. A canvas that publishes its
+  interactive regions (`__agentctl_regions` or `data-canvas-regions`) gets child nodes that are clicked
+  with real mouse input; other canvases stay opaque.
+- **Challenge handshake.** `browser_challenge` detects a CAPTCHA or one-time-code prompt, shows an overlay
+  and waits for a person to clear it. It never tries to solve one.
+- **Recording.** `browser_record` (and `agentctl record`, which launches its own browser unless given
+  `--attach <port>`) captures clicks, typing, key presses and navigations into a `browser_flow` that
+  replays. Password, PIN, one-time-code, card, token and API-key fields are recorded as a named
+  `secret_ref`; their values are supplied at replay time (`browser_flow run` `secrets`, or
+  `AGENTCTL_SECRET_<REF>` for `agentctl test`) and never stored or logged. While a recording runs, the
+  tab's JavaScript dialogs are answered by its dialog policy.
+- **Safari, experimental.** `browser_connect` takes `launch.browser = "safari"` and drives Safari through
+  `safaridriver`'s W3C WebDriver. Operations WebDriver cannot do (key presses, device emulation, branching,
+  checkpoints, recording, network capture) return `UNSUPPORTED`. Needs a one-time `safaridriver --enable`;
+  its live suite runs with `AGENTCTL_LIVE_SAFARI=1`.
 - **UX testing: accessibility, design-token style, component and responsive checks.** `browser_assert`
   gained UX clauses that ride the same `{passed, checks}` flow and `agentctl test` report as the functional
   ones: `a11y` runs a built-in WCAG audit (alt text, form labels, control names, colour contrast, target
@@ -59,7 +90,7 @@ All notable changes to this project are documented here. The format follows
   run can be watched) and stays headless in CI, with `--headed`/`--headless` to force either way.
 - **The browser engine can launch any installed Chromium-family browser and always stops the tree it
   started.** Launch discovery now covers Chrome, Chromium, Edge and Brave across native, snap and flatpak
-  locations (the engine speaks CDP, so Firefox and Safari remain unsupported). Each launch takes its own
+  locations (the engine speaks CDP, so Firefox remains unsupported; Safari is experimental, below). Each launch takes its own
   free port rather
   than a fixed one, so back-to-back launches never collide. A launched browser is stopped with a CDP
   `Browser.close`, the only thing that reaps a sandboxed (flatpak/snap) browser's whole process tree,
@@ -124,6 +155,12 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- `browser_wait navigation` returned on the page being left when a click started its navigation a moment
+  later (a timer, a debounce), because that page still reports `complete`. It now waits for a loaded
+  document that is not the one the action left, and a click that navigates nowhere within 2 s settles
+  with `navigated: false`.
+- The CDP client could lose half a WebSocket frame when a read was cancelled by a timeout, corrupting the
+  rest of the stream. Reads are now buffered and cancel-safe.
 - `pty_spawn` with no `shell` picked the first allowed shell whether or not it existed, so on a machine
   without `/bin/zsh` every default spawn failed. It now prefers `$SHELL` when allowed and present, then
   the first allowed shell that exists, and names every candidate when none does.

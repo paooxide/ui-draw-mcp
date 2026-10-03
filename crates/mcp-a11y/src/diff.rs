@@ -255,6 +255,8 @@ mod tests {
             bounds: None,
             node_id: Some(1),
             state: ElementState::default(),
+            semantic_intent: None,
+            bound_state: None,
         }
     }
 

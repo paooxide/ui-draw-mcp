@@ -177,12 +177,30 @@ impl Builder<'_> {
             let t = truncate_value(v, self.cfg.value_truncate, self.cfg.terminal_app);
             s.push_str(&format!(" value=\"{t}\""));
         }
+        if let Some(intent) = node.semantic_intent.as_deref().and_then(intent_token) {
+            s.push_str(&format!(" intent={intent}"));
+        }
         for flag in flags(node) {
             s.push(' ');
             s.push_str(flag);
         }
         s
     }
+}
+
+/// Longest semantic intent shown in a snapshot.
+const INTENT_MAX: usize = 48;
+
+/// A semantic intent as a bare identifier (`add_to_cart`), or nothing. It is
+/// derived from page attributes, so anything outside `[A-Za-z0-9_.-]` is
+/// dropped rather than escaped: an intent is a label, not text to quote.
+fn intent_token(raw: &str) -> Option<String> {
+    let t: String = raw
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
+        .take(INTENT_MAX)
+        .collect();
+    (!t.is_empty()).then_some(t)
 }
 
 fn flags(node: &UiNode) -> Vec<&'static str> {
@@ -231,6 +249,8 @@ fn element_info(node: &UiNode, cfg: &FlattenConfig) -> ElementInfo {
             checked: node.checked,
             expanded: node.expanded,
         },
+        semantic_intent: node.semantic_intent.clone(),
+        bound_state: node.bound_state.clone(),
     }
 }
 
@@ -442,5 +462,47 @@ mod tests {
         let f = flatten(&root_with(vec![deep]), None, None, "s1", &cfg);
         assert!(f.text.contains("+1 children]"));
         assert!(!f.text.contains("\"deep\""));
+    }
+
+    #[test]
+    fn flattens_semantic_intent_and_bound_state() {
+        let node = UiNode {
+            role: "button".into(),
+            name: Some("Checkout".into()),
+            semantic_intent: Some("checkout_order".into()),
+            bound_state: Some(serde_json::json!({ "total": 49.99 })),
+            ..Default::default()
+        };
+        let f = flatten(
+            &root_with(vec![node]),
+            None,
+            None,
+            "s1",
+            &FlattenConfig::default(),
+        );
+        assert!(f
+            .text
+            .contains("@e1 button \"Checkout\" intent=checkout_order"));
+        let el = f
+            .snapshot
+            .elements
+            .get("@e1")
+            .expect("must have element @e1");
+        assert_eq!(el.semantic_intent.as_deref(), Some("checkout_order"));
+        assert_eq!(
+            el.bound_state
+                .as_ref()
+                .and_then(|v| v.get("total"))
+                .and_then(|t| t.as_f64()),
+            Some(49.99)
+        );
+    }
+
+    #[test]
+    fn intent_is_a_capped_identifier() {
+        assert_eq!(intent_token("add_to_cart"), Some("add_to_cart".into()));
+        assert_eq!(intent_token("<script>"), Some("script".into()));
+        assert_eq!(intent_token("\"\n"), None);
+        assert_eq!(intent_token(&"a".repeat(500)).unwrap().len(), INTENT_MAX);
     }
 }

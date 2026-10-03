@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>E-Commerce SPA Cart</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; padding: 24px; background: #fafafa; }
+    .card { background: white; border: 1px solid #e1e4e8; border-radius: 8px; padding: 20px; max-width: 480px; box-shadow: 0 2px 8px rgba(0,0,0,0.05); }
+    .item { display: flex; justify-content: space-between; padding: 8px 0; border-bottom: 1px solid #f0f0f0; }
+    .total { font-size: 18px; font-weight: bold; margin-top: 16px; display: flex; justify-content: space-between; }
+    button.primary { background: #0070f3; color: white; border: none; padding: 12px 20px; border-radius: 6px; font-size: 16px; cursor: pointer; width: 100%; margin-top: 16px; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h2>Shopping Cart</h2>
+    <div id="cartItems">
+      <div class="item"><span>Ergonomic Keyboard</span><span>$49.99</span></div>
+      <div class="item"><span>USB-C Hub</span><span>$29.99</span></div>
+      <div class="item"><span>Mousepad</span><span>$9.99</span></div>
+    </div>
+    <div class="total">
+      <span>Total:</span>
+      <span id="cartTotal">$89.97</span>
+    </div>
+
+    <!-- Web Component with Shadow DOM -->
+    <order-summary-widget id="orderWidget"></order-summary-widget>
+
+    <button
+      id="btnCheckout"
+      class="primary"
+      data-intent="checkout_order"
+      data-state='{"count":3,"total":89.97}'
+      aria-label="Proceed to Checkout"
+    >
+      Checkout ($89.97)
+    </button>
+  </div>
+
+  <script>
+    // Simulate Zustand / Redux global reactive store
+    window.useStore = {
+      getState: () => ({
+        count: 3,
+        total: 89.97,
+        currency: 'USD',
+        items: [
+          { name: 'Ergonomic Keyboard', price: 49.99 },
+          { name: 'USB-C Hub', price: 29.99 },
+          { name: 'Mousepad', price: 9.99 }
+        ]
+      })
+    };
+    window.useCartStore = window.useStore;
+
+    // Custom Web Component with Open Shadow Root
+    class OrderSummaryWidget extends HTMLElement {
+      connectedCallback() {
+        const shadow = this.attachShadow({ mode: 'open' });
+        shadow.innerHTML = `
+          <style>
+            .shadow-box { margin-top: 12px; padding: 8px; background: #eef2ff; border-radius: 4px; }
+            .btn-promo { background: #4f46e5; color: white; border: none; padding: 6px 12px; border-radius: 4px; cursor: pointer; }
+          </style>
+          <div class="shadow-box">
+            <span>Special discount available: 10% off</span>
+            <button id="shadowApplyPromo" class="btn-promo" data-intent="apply_discount">Apply Discount</button>
+          </div>
+        `;
+        shadow.getElementById('shadowApplyPromo').addEventListener('click', () => {
+          this.setAttribute('data-applied', 'true');
+        });
+      }
+    }
+    customElements.define('order-summary-widget', OrderSummaryWidget);
+
+    document.getElementById('btnCheckout').addEventListener('click', () => {
+      document.body.setAttribute('data-checked-out', 'true');
+    });
+  </script>
+</body>
+</html>

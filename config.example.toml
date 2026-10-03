@@ -72,11 +72,31 @@ anonymize = false
 # (the file must be mode 0600), and verify with --pubkey <the printed key>.
 # audit_signing_key = "/Users/you/.agentctl/audit_signing.key"
 
+# Demo mode, for screencasts. The pointer glides along an eased curve instead
+# of jumping, and browser pages get a visible pointer, click ripples and a
+# typing overlay (secret fields masked). It slows every pointer action and
+# adds elements to pages, so leave it off for real work and in CI.
+# --demo / --demo-speed and AGENTCTL_DEMO / AGENTCTL_DEMO_SPEED override these.
+demo = false
+# cinematic (350 ms), demo (200 ms), snappy (100 ms), or instant (alias: off).
+# Anything else here, or in AGENTCTL_DEMO_SPEED, is a startup error.
+demo_speed = "demo"
+
 # Role profiles narrow what a session may call; they never widen it. Built in:
 # readonly (read tier only), qa (browser, vision, window, system, input; no
 # browser_eval), operator (dangerous tools always ask), admin (no extra limits).
 # Pick one for this server, or define your own below.
 # role = "qa"
+
+# Paths and domains refused in any tool's arguments before the gate, whatever
+# `access` says. This is a check on argument text: it sees "/etc/shadow" inside
+# a command and resolves symlinks, but not a relative path, a shell glob or
+# what a host name resolves to. The filesystem jail, the command allowlist and
+# the SSRF guard remain the real limits. Defaults cover /etc/shadow,
+# /etc/sudoers, /etc/pam.d, /System and master.passwd.
+# [invariants]
+# protected_paths = ["/etc/shadow", "/etc/sudoers", "/Users/you/.ssh"]
+# denied_domains = ["pastebin.com", "transfer.sh"]
 
 # A custom role, selected with role = "support" above.
 # [roles.support]

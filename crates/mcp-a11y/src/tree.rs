@@ -39,6 +39,10 @@ pub struct UiNode {
     pub expanded: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bounds: Option<Bounds>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_intent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bound_state: Option<serde_json::Value>,
     /// Backend token to re-locate the native element for actions (input tools).
     /// Scoped to the current snapshot; never persisted to memory/disk.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -102,6 +106,10 @@ pub fn is_interactive_role(role: &str) -> bool {
         // must be pressed to open before its items exist.
         "listitem",
         "menu",
+        // Hybrid Canvas and WebGL interactive targets
+        "canvas",
+        "canvas-child",
+        "canvas-element",
     ];
     let norm = normalize_role(role);
     INTERACTIVE.contains(&norm.as_str())

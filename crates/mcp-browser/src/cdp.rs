@@ -188,6 +188,12 @@ pub struct CdpConn {
     rng: u64,
     dialog_policy: DialogPolicy,
     dialogs: Vec<Value>,
+    /// Bytes read from the socket that do not yet make a whole frame.
+    rbuf: Vec<u8>,
+    /// Fragments of a message whose final frame has not arrived.
+    partial: Vec<u8>,
+    keep_events: bool,
+    kept: Vec<Value>,
 }
 
 impl CdpConn {
@@ -252,6 +258,10 @@ impl CdpConn {
             rng: seed,
             dialog_policy: DialogPolicy::default(),
             dialogs: Vec::new(),
+            rbuf: Vec::new(),
+            partial: Vec::new(),
+            keep_events: false,
+            kept: Vec::new(),
         })
     }
 
@@ -271,7 +281,7 @@ impl CdpConn {
     /// DevTools session, so a session attaching afterwards gets "No dialog is
     /// showing" and the tab stays wedged. The reply is fire-and-forget — its
     /// response is drained by the caller's loop like any other event.
-    async fn answer_dialog(&mut self, params: &Value) -> Result<(), BrowserError> {
+    pub(crate) async fn answer_dialog(&mut self, params: &Value) -> Result<(), BrowserError> {
         let (accept, text) = match &self.dialog_policy {
             DialogPolicy::Dismiss => (false, None),
             DialogPolicy::Accept(t) => (true, t.clone()),
@@ -343,42 +353,32 @@ impl CdpConn {
 
     /// Read one frame: `(fin, opcode, unmasked_payload)`. Server→client frames
     /// are never masked.
+    ///
+    /// Cancel-safe: bytes read from the socket are kept in `rbuf` until a whole
+    /// frame is there, so dropping this future (a `select!` that went another
+    /// way, a `timeout`) never loses part of a frame and desynchronises the
+    /// stream.
     async fn read_frame(&mut self) -> Result<(bool, u8, Vec<u8>), BrowserError> {
-        let mut h = [0u8; 2];
-        self.stream.read_exact(&mut h).await.map_err(io_fail)?;
-        let fin = h[0] & 0x80 != 0;
-        let opcode = h[0] & 0x0F;
-        let masked = h[1] & 0x80 != 0;
-        let mut len = (h[1] & 0x7F) as u64;
-        if len == 126 {
-            let mut e = [0u8; 2];
-            self.stream.read_exact(&mut e).await.map_err(io_fail)?;
-            len = u16::from_be_bytes(e) as u64;
-        } else if len == 127 {
-            let mut e = [0u8; 8];
-            self.stream.read_exact(&mut e).await.map_err(io_fail)?;
-            len = u64::from_be_bytes(e);
-        }
-        let mut mask = [0u8; 4];
-        if masked {
-            self.stream.read_exact(&mut mask).await.map_err(io_fail)?;
-        }
-        let mut payload = vec![0u8; len as usize];
-        self.stream
-            .read_exact(&mut payload)
-            .await
-            .map_err(io_fail)?;
-        if masked {
-            for (i, b) in payload.iter_mut().enumerate() {
-                *b ^= mask[i % 4];
+        loop {
+            if let Some((frame, used)) = parse_frame(&self.rbuf)? {
+                self.rbuf.drain(..used);
+                return Ok(frame);
+            }
+            let n = self
+                .stream
+                .read_buf(&mut self.rbuf)
+                .await
+                .map_err(io_fail)?;
+            if n == 0 {
+                return Err(BrowserError::Failed("websocket closed by browser".into()));
             }
         }
-        Ok((fin, opcode, payload))
     }
 
     /// Read one full CDP message (reassembling fragments, answering pings).
-    async fn read_message(&mut self) -> Result<Value, BrowserError> {
-        let mut buf: Vec<u8> = Vec::new();
+    /// Cancel-safe, like [`Self::read_frame`]: fragments already received wait
+    /// in `partial` for the next call.
+    pub(crate) async fn read_message(&mut self) -> Result<Value, BrowserError> {
         loop {
             let (fin, opcode, payload) = self.read_frame().await?;
             match opcode {
@@ -390,12 +390,23 @@ impl CdpConn {
                 0x8 => return Err(BrowserError::Failed("websocket closed by browser".into())),
                 _ => {}
             }
-            buf.extend_from_slice(&payload);
+            self.partial.extend_from_slice(&payload);
             if fin {
                 break;
             }
         }
+        let buf = std::mem::take(&mut self.partial);
         serde_json::from_slice(&buf).map_err(|e| BrowserError::Failed(format!("bad cdp json: {e}")))
+    }
+
+    /// Keep (rather than drop) the events that arrive while a command waits
+    /// for its reply, up to a cap; collect them with [`Self::take_events`].
+    pub(crate) fn keep_events(&mut self, on: bool) {
+        self.keep_events = on;
+    }
+
+    pub(crate) fn take_events(&mut self) -> Vec<Value> {
+        std::mem::take(&mut self.kept)
     }
 
     /// Collect events for a bounded window, keeping only `methods`.
@@ -460,8 +471,73 @@ impl CdpConn {
                 return Ok(v.get("result").cloned().unwrap_or_else(|| json!({})));
             }
             // otherwise an event or a stale id — keep reading.
+            if self.keep_events && v.get("method").is_some() && self.kept.len() < MAX_KEPT_EVENTS {
+                self.kept.push(v);
+            }
         }
     }
+}
+
+/// Most events held back while a command waits (see [`CdpConn::keep_events`]).
+const MAX_KEPT_EVENTS: usize = 10_000;
+
+/// Largest WebSocket frame accepted. CDP replies (a screenshot, a DOM dump)
+/// are megabytes; a length beyond this is a corrupt or hostile peer, not a
+/// reply to wait for.
+const MAX_FRAME: u64 = 256 * 1024 * 1024;
+
+/// A frame parsed from the front of `buf`, and how many bytes it used; `None`
+/// when `buf` does not hold a whole frame yet.
+type ParsedFrame = ((bool, u8, Vec<u8>), usize);
+
+fn parse_frame(buf: &[u8]) -> Result<Option<ParsedFrame>, BrowserError> {
+    if buf.len() < 2 {
+        return Ok(None);
+    }
+    let fin = buf[0] & 0x80 != 0;
+    let opcode = buf[0] & 0x0F;
+    let masked = buf[1] & 0x80 != 0;
+    let mut len = (buf[1] & 0x7F) as u64;
+    let mut at = 2usize;
+    if len == 126 {
+        if buf.len() < at + 2 {
+            return Ok(None);
+        }
+        len = u16::from_be_bytes([buf[at], buf[at + 1]]) as u64;
+        at += 2;
+    } else if len == 127 {
+        if buf.len() < at + 8 {
+            return Ok(None);
+        }
+        let mut e = [0u8; 8];
+        e.copy_from_slice(&buf[at..at + 8]);
+        len = u64::from_be_bytes(e);
+        at += 8;
+    }
+    if len > MAX_FRAME {
+        return Err(BrowserError::Failed(format!(
+            "websocket frame of {len} bytes exceeds the {MAX_FRAME} byte limit"
+        )));
+    }
+    let mut mask = [0u8; 4];
+    if masked {
+        if buf.len() < at + 4 {
+            return Ok(None);
+        }
+        mask.copy_from_slice(&buf[at..at + 4]);
+        at += 4;
+    }
+    let len = len as usize;
+    if buf.len() < at + len {
+        return Ok(None);
+    }
+    let mut payload = buf[at..at + len].to_vec();
+    if masked {
+        for (i, b) in payload.iter_mut().enumerate() {
+            *b ^= mask[i % 4];
+        }
+    }
+    Ok(Some(((fin, opcode, payload), at + len)))
 }
 
 #[cfg(test)]
@@ -485,6 +561,46 @@ mod tests {
         );
         assert_eq!(parse_status(b"HTTP/1.1 200 OK\r\n").unwrap(), 200);
         assert!(parse_status(b"garbage").is_err());
+    }
+
+    #[test]
+    fn frames_parse_only_when_whole_and_never_lose_bytes() {
+        // Unmasked text frame "hi", then the first byte of a second frame.
+        let mut buf = vec![0x81, 0x02, b'h', b'i', 0x81];
+        let ((fin, op, payload), used) = parse_frame(&buf).unwrap().unwrap();
+        assert!(fin);
+        assert_eq!(op, 1);
+        assert_eq!(payload, b"hi");
+        assert_eq!(used, 4);
+        buf.drain(..used);
+        // One byte is not a frame; the byte stays for the next read.
+        assert!(parse_frame(&buf).unwrap().is_none());
+        buf.extend_from_slice(&[0x03, b'a', b'b']);
+        assert!(parse_frame(&buf).unwrap().is_none(), "payload still short");
+        buf.push(b'c');
+        let ((_, _, payload), used) = parse_frame(&buf).unwrap().unwrap();
+        assert_eq!(payload, b"abc");
+        assert_eq!(used, buf.len());
+
+        // 16-bit and 64-bit lengths, and a masked frame.
+        let mut f = vec![0x82, 126, 0x01, 0x00];
+        f.extend(vec![7u8; 256]);
+        let ((_, op, payload), used) = parse_frame(&f).unwrap().unwrap();
+        assert_eq!((op, payload.len(), used), (2, 256, 260));
+        let mut f = vec![0x81, 127];
+        f.extend_from_slice(&3u64.to_be_bytes());
+        f.extend_from_slice(b"xyz");
+        assert_eq!(parse_frame(&f).unwrap().unwrap().0 .2, b"xyz");
+        let mask = [1u8, 2, 3, 4];
+        let mut f = vec![0x81, 0x80 | 4];
+        f.extend_from_slice(&mask);
+        f.extend(b"abcd".iter().enumerate().map(|(i, b)| b ^ mask[i % 4]));
+        assert_eq!(parse_frame(&f).unwrap().unwrap().0 .2, b"abcd");
+
+        // A length beyond the cap is an error, not an allocation.
+        let mut f = vec![0x81, 127];
+        f.extend_from_slice(&u64::MAX.to_be_bytes());
+        assert!(parse_frame(&f).is_err());
     }
 
     #[test]

@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -16,7 +17,9 @@ pub struct BrowserModule {
     backend: Arc<dyn BrowserBackend>,
     flows: Option<crate::flow::FlowStore>,
     baselines: Option<crate::visual::VisualStore>,
+    profiles: Option<crate::profile::ProfileStore>,
     judge: Option<Arc<mcp_judge::Judge>>,
+    showcase: std::sync::Mutex<crate::showcase::ShowcaseConfig>,
 }
 
 impl BrowserModule {
@@ -25,7 +28,9 @@ impl BrowserModule {
             backend,
             flows: None,
             baselines: None,
+            profiles: None,
             judge: None,
+            showcase: std::sync::Mutex::new(crate::showcase::ShowcaseConfig::default()),
         }
     }
 
@@ -41,9 +46,24 @@ impl BrowserModule {
         self
     }
 
+    /// Enable `browser_profile` (save/restore session states) backed by a JSON file.
+    pub fn with_profile_store(mut self, store: crate::profile::ProfileStore) -> Self {
+        self.profiles = Some(store);
+        self
+    }
+
     /// Enable the `ux` assert clause (judge-scored heuristic review; advisory).
     pub fn with_judge(mut self, judge: Arc<mcp_judge::Judge>) -> Self {
         self.judge = Some(judge);
+        self
+    }
+
+    /// Enable showcase mode (animated SVG pointer, gliding, ripples, typing HUD).
+    pub fn with_showcase(self, config: crate::showcase::ShowcaseConfig) -> Self {
+        *self
+            .showcase
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = config;
         self
     }
 }
@@ -156,10 +176,165 @@ impl BrowserModule {
             .and_then(Value::as_u64)
             .map(|p| p as u16);
         let launch = args.get("launch").cloned();
-        result(
-            "browser_connect",
-            self.backend.connect(attach_port, launch).await,
-        )
+        let profile_name = launch
+            .as_ref()
+            .and_then(|l| l.get("profile"))
+            .and_then(Value::as_str)
+            .or_else(|| str_arg(args, "profile"))
+            .map(|s| s.to_string());
+
+        // Resolve the profile *before* connecting: an unknown name must fail
+        // without launching (and leaking) a browser, and it must fail loudly
+        // rather than connect without the session the caller asked for.
+        let profile = match profile_name {
+            None => None,
+            Some(ref pname) => {
+                let Some(ref store) = self.profiles else {
+                    return Envelope::fail(
+                        "browser_connect",
+                        ErrorCode::InvalidArgs,
+                        format!(
+                            "profile '{pname}' requested but browser profiles are not enabled \
+                             (no profile store configured)"
+                        ),
+                    );
+                };
+                match store.get(pname) {
+                    Ok(Some(p)) => Some(p),
+                    Ok(None) => {
+                        return Envelope::fail(
+                            "browser_connect",
+                            ErrorCode::NotFound,
+                            format!("profile '{pname}' not found"),
+                        )
+                    }
+                    Err(crate::profile::ProfileError::Io(m)) => {
+                        return Envelope::fail("browser_connect", ErrorCode::ActionFailed, m)
+                    }
+                    Err(crate::profile::ProfileError::Invalid(m)) => {
+                        return Envelope::fail("browser_connect", ErrorCode::InvalidArgs, m)
+                    }
+                }
+            }
+        };
+
+        let res = self.backend.connect(attach_port, launch).await;
+        match res {
+            Ok(mut val) => {
+                if let Some(prof) = profile {
+                    let browser_id =
+                        val.get("browser_id").and_then(Value::as_u64).unwrap_or(1) as u32;
+                    let outcome = self.restore_profile_onto_first_tab(browser_id, &prof).await;
+                    if let Some(map) = val.as_object_mut() {
+                        match outcome {
+                            Ok(()) => {
+                                map.insert("profile_restored".into(), json!(prof.name));
+                            }
+                            Err(msg) => {
+                                // The browser is connected, so this is not a
+                                // failed call; but it must not claim success.
+                                map.insert("profile_restored".into(), json!(false));
+                                map.insert("profile_restore_error".into(), json!(msg));
+                            }
+                        }
+                    }
+                }
+                Envelope::ok("browser_connect", val)
+            }
+            Err(e) => browser_err("browser_connect", e),
+        }
+    }
+
+    /// Put a saved profile onto the first tab of a freshly connected browser.
+    ///
+    /// Order matters: cookies and web storage are scoped to an origin, and a
+    /// new tab is `about:blank`, where storage writes throw. So go to the
+    /// profile's saved URL first, wait for that document to finish loading,
+    /// and only then restore. Returns the reason on any failure.
+    async fn restore_profile_onto_first_tab(
+        &self,
+        browser_id: u32,
+        prof: &crate::profile::Profile,
+    ) -> Result<(), String> {
+        let tabs = self
+            .backend
+            .tabs(browser_id, "list", None, None)
+            .await
+            .map_err(|e| format!("could not list tabs: {}", browser_err_msg(&e)))?;
+        let first = tabs
+            .get("tabs")
+            .and_then(Value::as_array)
+            .and_then(|a| a.first())
+            .ok_or_else(|| "browser has no tab to restore the profile onto".to_string())?;
+        let target_id = first
+            .get("target_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "first tab has no target_id".to_string())?;
+        let before = first.get("url").and_then(Value::as_str).unwrap_or("");
+
+        let dest = prof
+            .url
+            .as_deref()
+            .filter(|u| !u.is_empty() && *u != "about:blank");
+        if let Some(dest) = dest {
+            self.backend
+                .navigate(target_id, "goto", Some(dest))
+                .await
+                .map_err(|e| format!("could not open {dest}: {}", browser_err_msg(&e)))?;
+            self.wait_page_loaded(target_id, before, dest).await?;
+        }
+
+        let state = json!({
+            "cookies": prof.cookies,
+            "localStorage": prof.local_storage,
+            "sessionStorage": prof.session_storage,
+        });
+        let res = self
+            .backend
+            .profile_restore(target_id, &state)
+            .await
+            .map_err(|e| format!("restore failed: {}", browser_err_msg(&e)))?;
+        if res.get("ok").and_then(Value::as_bool) == Some(false) {
+            let why = res
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("storage restore failed");
+            let hint = if dest.is_none() {
+                " (the profile has no saved URL, so web storage has no page to live on)"
+            } else {
+                ""
+            };
+            return Err(format!("restore failed: {why}{hint}"));
+        }
+        Ok(())
+    }
+
+    /// Block until `target` shows a finished document other than `before`
+    /// (the pre-navigation URL), or is already at `dest`. Polls the page: the
+    /// old document still reports `complete` for a moment after navigating.
+    async fn wait_page_loaded(&self, target: &str, before: &str, dest: &str) -> Result<(), String> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            if let Ok(v) = self
+                .backend
+                .eval(target, "location.href + '|' + document.readyState")
+                .await
+            {
+                let probe = v.get("result").and_then(Value::as_str).unwrap_or("");
+                if let Some((href, state)) = probe.rsplit_once('|') {
+                    let moved = href != before
+                        || href == dest
+                        || before.trim_end_matches('/') == dest.trim_end_matches('/');
+                    if state == "complete" && moved && href != "about:blank" {
+                        return Ok(());
+                    }
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(format!("{dest} did not finish loading within 15s"));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
     }
 
     async fn disconnect(&self, args: &Value) -> Envelope {
@@ -254,22 +429,321 @@ impl BrowserModule {
             crate::backend::Locator::Selector {
                 by: str_arg(args, "by").unwrap_or("css"),
                 query: q,
+                within: str_arg(args, "within"),
+                text: str_arg(args, "text"),
+                index: args
+                    .get("index")
+                    .and_then(Value::as_u64)
+                    .map(|n| n as usize),
             }
         } else {
             return Envelope::fail_with(
                 "browser_act",
                 ErrorCode::InvalidArgs,
-                "need 'ref' (from browser_query/snapshot) or 'query' (with optional 'by')",
+                "need 'ref' (from browser_query/snapshot) or 'query' (with optional 'by', 'within', 'text', 'index')",
                 "pass ref, or query plus by=css|xpath|text",
             );
         };
         let action = str_arg(args, "action").unwrap_or("click");
+        let secret = args.get("secret").and_then(Value::as_bool) == Some(true);
         result(
             "browser_act",
             self.backend
-                .act(target, locator, action, str_arg(args, "value"))
+                .act_masked(target, locator, action, str_arg(args, "value"), secret)
                 .await,
         )
+    }
+
+    async fn fill_form(&self, args: &Value) -> Envelope {
+        let tool = "browser_fill_form";
+        let target = match require(args, "target_id", tool) {
+            Ok(t) => t,
+            Err(e) => return e,
+        };
+        let Some(fields) = args.get("fields").and_then(Value::as_array) else {
+            return Envelope::fail(tool, ErrorCode::InvalidArgs, "missing 'fields' array");
+        };
+        if fields.is_empty() {
+            return Envelope::fail(
+                tool,
+                ErrorCode::InvalidArgs,
+                "'fields' array must not be empty",
+            );
+        }
+        let submit = args.get("submit");
+        result(
+            tool,
+            self.backend
+                .fill_form(target, &Value::Array(fields.clone()), submit)
+                .await,
+        )
+    }
+
+    async fn extract(&self, args: &Value) -> Envelope {
+        let tool = "browser_extract";
+        let target = match require(args, "target_id", tool) {
+            Ok(t) => t,
+            Err(e) => return e,
+        };
+        let Some(schema) = args.get("schema") else {
+            return Envelope::fail(tool, ErrorCode::InvalidArgs, "missing 'schema' object");
+        };
+        let within = str_arg(args, "within");
+        result(tool, self.backend.extract(target, schema, within).await)
+    }
+
+    async fn profile(&self, args: &Value) -> Envelope {
+        let tool = "browser_profile";
+        let Some(store) = self.profiles.as_ref() else {
+            return Envelope::fail_with(
+                tool,
+                ErrorCode::UnsupportedOs,
+                "browser_profile is not enabled (no profile store configured)",
+                "run agentctl with a state dir so profiles can be saved",
+            );
+        };
+        let action = str_arg(args, "action").unwrap_or("list");
+        match action {
+            "save" => {
+                let target = match require(args, "target_id", tool) {
+                    Ok(t) => t,
+                    Err(e) => return e,
+                };
+                let Some(name) = str_arg(args, "name") else {
+                    return Envelope::fail(tool, ErrorCode::InvalidArgs, "save needs 'name'");
+                };
+                let state = match self.backend.profile_state(target).await {
+                    Ok(s) => s,
+                    Err(e) => return browser_err(tool, e),
+                };
+                let cookies = state
+                    .get("cookies")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                let ls = state.get("localStorage").cloned().unwrap_or(json!({}));
+                let ss = state.get("sessionStorage").cloned().unwrap_or(json!({}));
+                let url = state
+                    .get("url")
+                    .and_then(Value::as_str)
+                    .map(|s| s.to_string());
+                match store.save(name, cookies, ls, ss, url, now_ms()) {
+                    Ok(p) => Envelope::ok(
+                        tool,
+                        json!({
+                            "saved": true,
+                            "name": p.name,
+                            "cookies_count": p.cookies.len(),
+                            "local_storage_keys": p.local_storage.as_object().map(|o| o.len()).unwrap_or(0),
+                            "session_storage_keys": p.session_storage.as_object().map(|o| o.len()).unwrap_or(0),
+                            "url": p.url,
+                        }),
+                    ),
+                    Err(crate::profile::ProfileError::Invalid(m)) => {
+                        Envelope::fail(tool, ErrorCode::InvalidArgs, m)
+                    }
+                    Err(crate::profile::ProfileError::Io(m)) => {
+                        Envelope::fail(tool, ErrorCode::ActionFailed, m)
+                    }
+                }
+            }
+            "restore" => {
+                let target = match require(args, "target_id", tool) {
+                    Ok(t) => t,
+                    Err(e) => return e,
+                };
+                let Some(name) = str_arg(args, "name") else {
+                    return Envelope::fail(tool, ErrorCode::InvalidArgs, "restore needs 'name'");
+                };
+                let profile = match store.get(name) {
+                    Ok(Some(p)) => p,
+                    Ok(None) => {
+                        return Envelope::fail(
+                            tool,
+                            ErrorCode::NotFound,
+                            format!("profile '{name}' not found"),
+                        )
+                    }
+                    Err(crate::profile::ProfileError::Io(m)) => {
+                        return Envelope::fail(tool, ErrorCode::ActionFailed, m)
+                    }
+                    Err(crate::profile::ProfileError::Invalid(m)) => {
+                        return Envelope::fail(tool, ErrorCode::InvalidArgs, m)
+                    }
+                };
+                let state = json!({
+                    "cookies": profile.cookies,
+                    "localStorage": profile.local_storage,
+                    "sessionStorage": profile.session_storage,
+                });
+                match self.backend.profile_restore(target, &state).await {
+                    Ok(res) if res.get("ok").and_then(Value::as_bool) == Some(false) => {
+                        // The backend reports a failed storage write inside an
+                        // otherwise successful reply; do not call that restored.
+                        Envelope::fail(
+                            tool,
+                            ErrorCode::ActionFailed,
+                            format!(
+                                "restore of '{name}' failed: {}",
+                                res.get("error")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("storage restore failed")
+                            ),
+                        )
+                    }
+                    Ok(mut res) => {
+                        if let Some(map) = res.as_object_mut() {
+                            map.insert("restored".into(), json!(true));
+                            map.insert("name".into(), json!(name));
+                            Envelope::ok(tool, res)
+                        } else {
+                            Envelope::ok(
+                                tool,
+                                json!({ "ok": true, "name": name, "restored": true, "detail": res }),
+                            )
+                        }
+                    }
+                    Err(e) => browser_err(tool, e),
+                }
+            }
+            "list" => match store.list() {
+                Ok(ps) => {
+                    let rows: Vec<Value> = ps
+                        .iter()
+                        .map(|p| {
+                            json!({
+                                "name": p.name,
+                                "cookies_count": p.cookies_count,
+                                "local_storage_count": p.local_storage_count,
+                                "url": p.url,
+                                "updated_ms": p.updated_ms,
+                            })
+                        })
+                        .collect();
+                    Envelope::ok(tool, json!({ "profiles": rows, "count": rows.len() }))
+                }
+                Err(crate::profile::ProfileError::Io(m)) => {
+                    Envelope::fail(tool, ErrorCode::ActionFailed, m)
+                }
+                Err(crate::profile::ProfileError::Invalid(m)) => {
+                    Envelope::fail(tool, ErrorCode::InvalidArgs, m)
+                }
+            },
+            "delete" => {
+                let Some(name) = str_arg(args, "name") else {
+                    return Envelope::fail(tool, ErrorCode::InvalidArgs, "delete needs 'name'");
+                };
+                match store.delete(name) {
+                    Ok(true) => Envelope::ok(tool, json!({ "deleted": true, "name": name })),
+                    Ok(false) => Envelope::fail(
+                        tool,
+                        ErrorCode::NotFound,
+                        format!("profile '{name}' not found"),
+                    ),
+                    Err(crate::profile::ProfileError::Io(m)) => {
+                        Envelope::fail(tool, ErrorCode::ActionFailed, m)
+                    }
+                    Err(crate::profile::ProfileError::Invalid(m)) => {
+                        Envelope::fail(tool, ErrorCode::InvalidArgs, m)
+                    }
+                }
+            }
+            other => Envelope::fail(
+                tool,
+                ErrorCode::InvalidArgs,
+                format!("unknown action '{other}' (use save|restore|list|delete)"),
+            ),
+        }
+    }
+
+    async fn branch(&self, args: &Value) -> Envelope {
+        let tool = "browser_branch";
+        let action = str_arg(args, "action").unwrap_or("list");
+        match action {
+            "create" => {
+                let target = match require(args, "target_id", tool) {
+                    Ok(t) => t,
+                    Err(e) => return e,
+                };
+                let branch_id = match require(args, "branch_id", tool) {
+                    Ok(b) => b,
+                    Err(e) => return e,
+                };
+                result(tool, self.backend.branch_create(target, branch_id).await)
+            }
+            "commit" => {
+                let branch_id = match require(args, "branch_id", tool) {
+                    Ok(b) => b,
+                    Err(e) => return e,
+                };
+                result(tool, self.backend.branch_commit(branch_id).await)
+            }
+            "discard" => {
+                let branch_id = match require(args, "branch_id", tool) {
+                    Ok(b) => b,
+                    Err(e) => return e,
+                };
+                result(tool, self.backend.branch_discard(branch_id).await)
+            }
+            "switch" => {
+                let branch_id = match require(args, "branch_id", tool) {
+                    Ok(b) => b,
+                    Err(e) => return e,
+                };
+                result(tool, self.backend.branch_switch(branch_id).await)
+            }
+            "list" => {
+                let target = str_arg(args, "target_id");
+                result(tool, self.backend.branch_list(target).await)
+            }
+            other => Envelope::fail(
+                tool,
+                ErrorCode::InvalidArgs,
+                format!(
+                    "unknown branch action '{other}'; use create, commit, discard, switch, or list"
+                ),
+            ),
+        }
+    }
+
+    async fn checkpoint(&self, args: &Value) -> Envelope {
+        let tool = "browser_checkpoint";
+        let action = str_arg(args, "action").unwrap_or("save");
+        match action {
+            "save" => {
+                let target = match require(args, "target_id", tool) {
+                    Ok(t) => t,
+                    Err(e) => return e,
+                };
+                let tag = str_arg(args, "tag");
+                result(tool, self.backend.checkpoint_save(target, tag).await)
+            }
+            "rollback" => {
+                let target = match require(args, "target_id", tool) {
+                    Ok(t) => t,
+                    Err(e) => return e,
+                };
+                let tag = str_arg(args, "tag");
+                result(tool, self.backend.checkpoint_rollback(target, tag).await)
+            }
+            "list" => {
+                let target = str_arg(args, "target_id");
+                result(tool, self.backend.checkpoint_list(target).await)
+            }
+            "delete" => {
+                let target = match require(args, "target_id", tool) {
+                    Ok(t) => t,
+                    Err(e) => return e,
+                };
+                let tag = str_arg(args, "tag");
+                result(tool, self.backend.checkpoint_delete(target, tag).await)
+            }
+            other => Envelope::fail(
+                tool,
+                ErrorCode::InvalidArgs,
+                format!("unknown checkpoint action '{other}'; use save, rollback, list, or delete"),
+            ),
+        }
     }
 
     async fn wait(&self, args: &Value) -> Envelope {
@@ -281,24 +755,218 @@ impl BrowserModule {
             .get("timeout_ms")
             .and_then(Value::as_u64)
             .unwrap_or(10_000);
-        // exactly one of selector | navigation | network_idle
+        // exactly one of selector | dom_settled | navigation | network_idle
         let (cond, arg) = if let Some(sel) = str_arg(args, "selector") {
             ("selector", Some(sel))
-        } else if args.get("navigation").is_some() {
+        } else if args.get("dom_settled").and_then(Value::as_bool) == Some(true)
+            || str_arg(args, "condition") == Some("dom_settled")
+        {
+            ("dom_settled", None)
+        } else if args.get("htmx_settled").and_then(Value::as_bool) == Some(true)
+            || str_arg(args, "condition") == Some("htmx_settled")
+        {
+            ("htmx_settled", None)
+        } else if args.get("navigation").is_some()
+            || str_arg(args, "condition") == Some("navigation")
+        {
             ("navigation", None)
-        } else if args.get("network_idle").is_some() {
+        } else if args.get("network_idle").and_then(Value::as_bool) == Some(true)
+            || str_arg(args, "condition") == Some("network_idle")
+        {
             ("network_idle", None)
+        } else if args.get("challenge_cleared").and_then(Value::as_bool) == Some(true)
+            || str_arg(args, "condition") == Some("challenge_cleared")
+            || str_arg(args, "condition") == Some("challenge")
+        {
+            ("challenge_cleared", None)
         } else {
             return Envelope::fail(
                 "browser_wait",
                 ErrorCode::InvalidArgs,
-                "provide one of 'selector', 'navigation', or 'network_idle'",
+                "provide one of 'selector', 'dom_settled', 'htmx_settled', 'navigation', 'network_idle', or 'challenge_cleared'",
             );
         };
         result(
             "browser_wait",
             self.backend.wait(target, cond, arg, timeout_ms).await,
         )
+    }
+
+    async fn challenge(&self, args: &Value) -> Envelope {
+        let tool = "browser_challenge";
+        let target = match require(args, "target_id", tool) {
+            Ok(t) => t,
+            Err(e) => return e,
+        };
+        let action = str_arg(args, "action").unwrap_or("detect");
+        let timeout_ms = args
+            .get("timeout_ms")
+            .and_then(Value::as_u64)
+            .unwrap_or(30_000);
+
+        match action {
+            "detect" | "status" => {
+                match crate::challenge::ChallengeManager::detect(self.backend.as_ref(), target)
+                    .await
+                {
+                    Ok(st) => Envelope::ok(tool, json!(st)),
+                    Err(e) => browser_err(tool, e),
+                }
+            }
+            "wait" | "clear" => {
+                match crate::challenge::ChallengeManager::wait_for_clearance(
+                    self.backend.as_ref(),
+                    target,
+                    timeout_ms,
+                )
+                .await
+                {
+                    Ok(v) => Envelope::ok(tool, v),
+                    Err(e) => browser_err(tool, e),
+                }
+            }
+            "hud_show" => {
+                let kind_str = str_arg(args, "kind").unwrap_or("unknown");
+                let kind = crate::challenge::ChallengeKind::from_name(kind_str);
+                match crate::challenge::ChallengeManager::inject_hud(
+                    self.backend.as_ref(),
+                    target,
+                    &kind,
+                )
+                .await
+                {
+                    Ok(()) => Envelope::ok(tool, json!({ "hud": "visible", "kind": kind_str })),
+                    Err(e) => browser_err(tool, e),
+                }
+            }
+            "hud_hide" => {
+                match crate::challenge::ChallengeManager::remove_hud(self.backend.as_ref(), target)
+                    .await
+                {
+                    Ok(()) => Envelope::ok(tool, json!({ "hud": "removed" })),
+                    Err(e) => browser_err(tool, e),
+                }
+            }
+            other => Envelope::fail(
+                tool,
+                ErrorCode::InvalidArgs,
+                format!(
+                    "unknown challenge action '{other}'; use detect, wait, hud_show, or hud_hide"
+                ),
+            ),
+        }
+    }
+
+    async fn record(&self, args: &Value) -> Envelope {
+        let tool = "browser_record";
+        let target = match require(args, "target_id", tool) {
+            Ok(t) => t,
+            Err(e) => return e,
+        };
+        let action = str_arg(args, "action").unwrap_or("status");
+        match action {
+            "start" => {
+                match crate::record::RecordManager::start(self.backend.as_ref(), target).await {
+                    Ok(v) => Envelope::ok(tool, v),
+                    Err(e) => browser_err(tool, e),
+                }
+            }
+            "status" => {
+                match crate::record::RecordManager::status(self.backend.as_ref(), target).await {
+                    Ok(v) => Envelope::ok(tool, v),
+                    Err(e) => browser_err(tool, e),
+                }
+            }
+            "stop" => {
+                if let Some(name) = str_arg(args, "name") {
+                    let Some(store) = self.flows.as_ref() else {
+                        return Envelope::fail_with(
+                            tool,
+                            ErrorCode::UnsupportedOs,
+                            "browser_record auto-save is not enabled (no flow store configured)",
+                            "run agentctl with a state dir so flows can be saved",
+                        );
+                    };
+                    match crate::record::RecordManager::stop_and_save(
+                        self.backend.as_ref(),
+                        store,
+                        target,
+                        name,
+                    )
+                    .await
+                    {
+                        Ok(f) => Envelope::ok(
+                            tool,
+                            json!({ "saved": true, "name": f.name, "steps": f.steps.len(), "flow": f }),
+                        ),
+                        Err(e) => flow_err(tool, e),
+                    }
+                } else {
+                    match crate::record::RecordManager::stop(self.backend.as_ref(), target).await {
+                        Ok(steps) => Envelope::ok(
+                            tool,
+                            json!({ "recording": false, "steps": steps, "count": steps.len() }),
+                        ),
+                        Err(e) => browser_err(tool, e),
+                    }
+                }
+            }
+            other => Envelope::fail(
+                tool,
+                ErrorCode::InvalidArgs,
+                format!("unknown record action '{other}'; use start, stop, or status"),
+            ),
+        }
+    }
+
+    async fn showcase(&self, args: &Value) -> Envelope {
+        let tool = "browser_showcase";
+        let target = match require(args, "target_id", tool) {
+            Ok(t) => t,
+            Err(e) => return e,
+        };
+        let mut cfg = self
+            .showcase
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(en) = args.get("enabled").and_then(Value::as_bool) {
+            cfg.enabled = en;
+            if en && matches!(cfg.speed, crate::showcase::ShowcaseSpeed::Off) {
+                cfg.speed = crate::showcase::ShowcaseSpeed::Demo;
+            }
+        }
+        if let Some(spd) = str_arg(args, "speed") {
+            if let Some(s) = crate::showcase::ShowcaseSpeed::parse(spd) {
+                cfg.speed = s;
+                cfg.enabled = !matches!(s, crate::showcase::ShowcaseSpeed::Off);
+            } else {
+                return Envelope::fail(
+                    tool,
+                    ErrorCode::InvalidArgs,
+                    "speed must be cinematic, demo, snappy, or off",
+                );
+            }
+        }
+        if let Some(r) = args.get("click_ripple").and_then(Value::as_bool) {
+            cfg.click_ripple = r;
+        }
+        if let Some(h) = args.get("typing_hud").and_then(Value::as_bool) {
+            cfg.typing_hud = h;
+        }
+        if let Some(style) = str_arg(args, "cursor_style") {
+            if let Some(cs) = crate::showcase::CursorStyle::parse(style) {
+                cfg.cursor_style = cs;
+            }
+        }
+        if let Some(dur) = args.get("glide_ms").and_then(Value::as_u64) {
+            cfg.custom_glide_ms = Some(dur);
+        }
+        *self
+            .showcase
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = cfg.clone();
+        result(tool, self.backend.showcase(target, Some(cfg)).await)
     }
 
     async fn screenshot(&self, args: &Value) -> Envelope {
@@ -728,7 +1396,24 @@ impl BrowserModule {
                     .get("continue_on_error")
                     .and_then(Value::as_bool)
                     .unwrap_or(false);
-                self.replay(tool, target, &flow, cont).await
+                let secrets = match parse_secrets(args.get("secrets")) {
+                    Ok(s) => s,
+                    Err(m) => return Envelope::fail(tool, ErrorCode::InvalidArgs, m),
+                };
+                // Fail before any step runs: a login that types the username
+                // and then stops for want of a password has already changed
+                // the page.
+                let missing = crate::flow::missing_secret_refs(&flow.steps, &secrets);
+                if !missing.is_empty() {
+                    let first = crate::flow::missing_msg(&missing[0]);
+                    let msg = if missing.len() > 1 {
+                        format!("{first}; also missing: {}", missing[1..].join(", "))
+                    } else {
+                        first
+                    };
+                    return Envelope::fail(tool, ErrorCode::InvalidArgs, msg);
+                }
+                self.replay(tool, target, &flow, cont, &secrets).await
             }
             other => Envelope::fail(
                 tool,
@@ -746,11 +1431,16 @@ impl BrowserModule {
         target: &str,
         flow: &crate::flow::Flow,
         cont: bool,
+        secrets: &BTreeMap<String, String>,
     ) -> Envelope {
         let mut results = Vec::new();
         let mut passed = true;
         for (i, step) in flow.steps.iter().enumerate() {
-            let (ok, detail) = self.run_step(target, step).await;
+            let (ok, detail) = match crate::flow::resolve_step_secrets(step, secrets) {
+                // The resolved copy lives for this step only.
+                Ok(resolved) => self.run_step(target, &resolved).await,
+                Err(m) => (false, json!(m)),
+            };
             results.push(json!({ "i": i, "op": step.get("op"), "ok": ok, "detail": detail }));
             if !ok {
                 passed = false;
@@ -794,22 +1484,40 @@ impl BrowserModule {
                     .await
             }
             "act" => {
+                // An older recording holds a placeholder in place of the
+                // value: refuse loudly rather than type it.
+                if str_arg(step, "value") == Some(crate::flow::SECRET_PLACEHOLDER) {
+                    return (
+                        false,
+                        json!("act step holds a secret placeholder from an older recording: its value was never stored. Re-record it, or replace the step's value with \"secret_ref\": \"<name>\" and pass secrets:{\"<name>\": \"...\"} when running the flow"),
+                    );
+                }
                 let locator = if let Some(r) = str_arg(step, "ref") {
                     crate::backend::Locator::Ref(r)
                 } else if let Some(q) = str_arg(step, "query") {
                     crate::backend::Locator::Selector {
                         by: str_arg(step, "by").unwrap_or("css"),
                         query: q,
+                        within: str_arg(step, "within"),
+                        text: str_arg(step, "text"),
+                        index: step
+                            .get("index")
+                            .and_then(Value::as_u64)
+                            .map(|n| n as usize),
                     }
                 } else {
-                    return (false, json!("act step needs 'ref' or 'query'"));
+                    return (false, json!("act step needs 'ref' or 'query' (with optional 'by', 'within', 'text', 'index')"));
                 };
+                // A secret value (substituted from `secrets` for this step) is
+                // masked in anything that would display it, like `browser_act`.
+                let secret = step.get("secret").and_then(Value::as_bool) == Some(true);
                 self.backend
-                    .act(
+                    .act_masked(
                         target,
                         locator,
                         str_arg(step, "action").unwrap_or("click"),
                         str_arg(step, "value"),
+                        secret,
                     )
                     .await
             }
@@ -822,9 +1530,31 @@ impl BrowserModule {
                     .set_viewport(target, width, height, mobile, scale)
                     .await
             }
+            "fill_form" => {
+                let Some(fields) = step.get("fields") else {
+                    return (false, json!("fill_form step needs 'fields'"));
+                };
+                self.backend
+                    .fill_form(target, fields, step.get("submit"))
+                    .await
+            }
+            "extract" => {
+                let Some(schema) = step.get("schema") else {
+                    return (false, json!("extract step needs 'schema'"));
+                };
+                self.backend
+                    .extract(target, schema, str_arg(step, "within"))
+                    .await
+            }
             "wait" => {
                 let (cond, arg) = if let Some(sel) = str_arg(step, "selector") {
                     ("selector", Some(sel))
+                } else if step.get("dom_settled").is_some() {
+                    ("dom_settled", None)
+                } else if step.get("htmx_settled").is_some()
+                    || str_arg(step, "condition") == Some("htmx_settled")
+                {
+                    ("htmx_settled", None)
                 } else if step.get("navigation").is_some() {
                     ("navigation", None)
                 } else {
@@ -856,6 +1586,27 @@ impl BrowserModule {
             Err(e) => (false, json!(browser_err_msg(&e))),
         }
     }
+}
+
+/// The `secrets` argument of a flow run: an object of string values. A wrong
+/// shape is refused without echoing any value.
+fn parse_secrets(v: Option<&Value>) -> Result<BTreeMap<String, String>, String> {
+    let Some(v) = v.filter(|v| !v.is_null()) else {
+        return Ok(BTreeMap::new());
+    };
+    let Some(obj) = v.as_object() else {
+        return Err("'secrets' must be an object of name: value strings".into());
+    };
+    let mut out = BTreeMap::new();
+    for (k, val) in obj {
+        match val.as_str() {
+            Some(s) => {
+                out.insert(k.clone(), s.to_string());
+            }
+            None => return Err(format!("secret '{k}' must be a string")),
+        }
+    }
+    Ok(out)
 }
 
 fn now_ms() -> u128 {
@@ -891,15 +1642,19 @@ impl ToolModule for BrowserModule {
                 "browser_connect",
                 Category::Browser,
                 Tier::Standard,
-                "Attach to a Chromium browser started with --remote-debugging-port, or launch a dedicated instance.",
+                "Attach to a Chromium browser started with --remote-debugging-port, or launch a dedicated instance. Optionally auto-restores a saved profile. launch.browser='safari' drives Safari through safaridriver (macOS only, experimental: needs `safaridriver --enable` once, opens a visible window, and has no network interception).",
                 obj(
                     json!({
                         "attach": { "type": "object", "properties": { "port": { "type": "integer" } } },
                         "launch": { "type": "object", "properties": {
+                            "browser": { "type": "string", "enum": ["chromium", "safari"], "description": "chromium (default) launches an auto-discovered Chrome/Chromium; safari launches experimental Safari via safaridriver (macOS only)" },
+                            "url": { "type": "string", "description": "first page to open; Safari only (Chromium: use browser_navigate); checked against the navigation policy" },
                             "port": { "type": "integer" },
                             "headless": { "type": "boolean" },
-                            "user_data_dir": { "type": "string" }
-                        } }
+                            "user_data_dir": { "type": "string" },
+                            "profile": { "type": "string", "description": "saved profile name to auto-restore upon connecting" }
+                        } },
+                        "profile": { "type": "string", "description": "saved profile name to auto-restore upon connecting" }
                     }),
                     json!([]),
                 ),
@@ -950,7 +1705,9 @@ impl ToolModule for BrowserModule {
                 "browser_snapshot",
                 Category::Browser,
                 Tier::Read,
-                "Flatten a page into interactable node refs (dom/accessibility) or raw text. The web equivalent of get_ui_tree.",
+                "Flatten a page into interactable node refs (dom/accessibility) or raw text. The web equivalent of get_ui_tree. \
+                 A <canvas> gets child nodes (tag canvas-child) only if the page itself publishes its interactive regions \
+                 via canvas.__agentctl_regions or a data-canvas-regions JSON attribute; any other canvas is an opaque node.",
                 obj(
                     json!({
                         "target_id": { "type": "string" },
@@ -980,36 +1737,173 @@ impl ToolModule for BrowserModule {
                 Category::Browser,
                 Tier::Standard,
                 "Act on a DOM node: click, type, select, hover, focus, scroll_into_view, submit. \
+                 A page-published canvas region (a canvas-child ref from browser_snapshot) supports only click and hover, \
+                 sent as real mouse input at the region centre; other actions on it return Unsupported. \
                  Target it with 'ref' (from browser_query/snapshot) or, in one call, with \
-                 'query' plus 'by' (css/xpath/text) to resolve and act without a separate query.",
+                 'query' plus optional 'by' (css/xpath/text), 'within' (scoped container), 'text' (substring filter), and 'index'.",
                 obj(
                     json!({
                         "target_id": { "type": "string" },
                         "ref": { "type": "string", "description": "a ref from browser_query/snapshot" },
                         "by": { "type": "string", "enum": ["css", "xpath", "text"], "description": "how to read 'query' (default css); used when no 'ref'" },
                         "query": { "type": "string", "description": "selector to resolve and act on in one call, instead of 'ref'" },
-                        "action": { "type": "string", "enum": ["click", "type", "select", "hover", "focus", "scroll_into_view", "submit"] },
-                        "value": { "type": "string" }
+                        "within": { "type": "string", "description": "optional CSS/XPath root selector to scope query search" },
+                        "text": { "type": "string", "description": "optional text substring filter to narrow matches" },
+                        "index": { "type": "integer", "description": "optional 0-based match index if query matches multiple elements (default 0)" },
+                        "action": { "type": "string", "enum": ["click", "type", "select", "hover", "focus", "scroll_into_view", "submit", "press"] },
+                        "value": { "type": "string", "description": "text for type, option for select, or key name for press (Enter, Escape, Tab)" },
+                        "secret": { "type": "boolean", "description": "the value is a secret: keep it out of the audit log and never show it in the showcase typing HUD (password and one-time-code fields are masked automatically)" }
                     }),
                     json!(["target_id", "action"]),
+                ),
+            ).untrusted_output(),
+            ToolDescriptor::new(
+                "browser_fill_form",
+                Category::Browser,
+                Tier::Standard,
+                "Fill multiple form fields (input, select, checkbox, radio) in one call and \
+                 optionally submit. Eliminates round-trips for registration or checkout forms.",
+                obj(
+                    json!({
+                        "target_id": { "type": "string" },
+                        "fields": {
+                            "type": "array",
+                            "items": { "type": "object" },
+                            "description": "Array of fields: [{ref or selector, value, type, secret}]"
+                        },
+                        "submit": {
+                            "type": "object",
+                            "description": "Optional submit trigger: {ref or selector}"
+                        }
+                    }),
+                    json!(["target_id", "fields"]),
+                ),
+            ),
+            ToolDescriptor::new(
+                "browser_extract",
+                Category::Browser,
+                Tier::Read,
+                "Extract structured data directly from the page using a CSS/attribute schema \
+                 (e.g. text values, lists, tables). Offloads extraction parsing from the LLM.",
+                obj(
+                    json!({
+                        "target_id": { "type": "string" },
+                        "schema": {
+                            "type": "object",
+                            "description": "Extraction schema mapping field names to rules {selector, attr, regex, multiple, fields}"
+                        },
+                        "within": {
+                            "type": "string",
+                            "description": "Optional CSS root selector to scope extraction"
+                        }
+                    }),
+                    json!(["target_id", "schema"]),
+                ),
+            ).untrusted_output(),
+            ToolDescriptor::new(
+                "browser_profile",
+                Category::Browser,
+                Tier::Standard,
+                "Save, restore, list, or delete browser session profiles (cookies, localStorage, \
+                 sessionStorage) for instant user or auth state swapping without re-logging in.",
+                obj(
+                    json!({
+                        "action": { "type": "string", "enum": ["save", "restore", "list", "delete"] },
+                        "target_id": { "type": "string", "description": "save/restore: the tab to snapshot or populate" },
+                        "name": { "type": "string", "description": "save/restore/delete: profile name" }
+                    }),
+                    json!(["action"]),
+                ),
+            ).untrusted_output(),
+            ToolDescriptor::new(
+                "browser_branch",
+                Category::Browser,
+                Tier::Standard,
+                "Speculative browser context branching: fork an isolated background context from a \
+                 tab ('create'), run trials without affecting the visible tab, commit winning state \
+                 ('commit'), discard failed branches ('discard'), switch focus ('switch'), or list branches ('list'). \
+                 Branches run in a separate browser context and fail with an error if one cannot be created \
+                 (no silent fallback to the shared context). Commit and discard report an error unless the \
+                 work was done and the branch tab was really closed. At most 8 branches may be active at once \
+                 (AGENTCTL_MAX_BRANCHES).",
+                obj(
+                    json!({
+                        "action": { "type": "string", "enum": ["create", "commit", "discard", "switch", "list"] },
+                        "target_id": { "type": "string", "description": "create: parent tab to fork from" },
+                        "branch_id": { "type": "string", "description": "create/commit/discard/switch: unique branch identifier" }
+                    }),
+                    json!(["action"]),
+                ),
+            ).untrusted_output(),
+            ToolDescriptor::new(
+                "browser_checkpoint",
+                Category::Browser,
+                Tier::Standard,
+                "In-memory state checkpointing and rollback (T-1) for browser tabs. 'save' captures \
+                 a deep copy of form state (input values, checks, select indexes, scroll), storage, \
+                 cookies and URL (not the DOM tree); 'rollback' navigates back if needed, waits for \
+                 the page to load, restores that state and fails with the reason if any part could \
+                 not be restored; 'list'/'delete' manage checkpoints. Re-saving a tag makes it the \
+                 newest ('latest'). File inputs are skipped.",
+                obj(
+                    json!({
+                        "action": { "type": "string", "enum": ["save", "rollback", "list", "delete"] },
+                        "target_id": { "type": "string", "description": "target tab to checkpoint or restore" },
+                        "tag": { "type": "string", "description": "save/rollback/delete: tag name (e.g. 'step_2' or 'latest')" }
+                    }),
+                    json!(["action"]),
                 ),
             ).untrusted_output(),
             ToolDescriptor::new(
                 "browser_wait",
                 Category::Browser,
                 Tier::Read,
-                "Wait for a settle signal: a selector to appear, navigation to complete, or the network to idle.",
+                "Wait for a settle signal: a selector to appear, dom_settled (DOM mutations and \
+                 animation frames settled for >=150ms), htmx_settled (HTMX requests and DOM swaps settled; errors if htmx is not present on the page), navigation to complete (after a goto, reload, click, submit or key press in this session it waits for the NEW document, not the one being left; a click that starts no navigation within 2s settles on the loaded page with navigated:false), the network to idle, or verification challenge clearance.",
                 obj(
                     json!({
                         "target_id": { "type": "string" },
                         "selector": { "type": "string" },
+                        "dom_settled": { "type": "boolean" },
+                        "htmx_settled": { "type": "boolean" },
                         "navigation": { "type": "boolean" },
                         "network_idle": { "type": "boolean" },
+                        "challenge_cleared": { "type": "boolean" },
+                        "condition": { "type": "string", "enum": ["selector", "dom_settled", "htmx_settled", "navigation", "network_idle", "challenge_cleared"] },
                         "timeout_ms": { "type": "integer" }
                     }),
                     json!(["target_id"]),
                 ),
             ).untrusted_output(),
+            ToolDescriptor::new(
+                "browser_challenge",
+                Category::Browser,
+                Tier::Standard,
+                "Mixed-initiative CAPTCHA / 2FA detector and handshake. Pauses execution, shows a non-intrusive HUD in the browser informing the user to solve the verification, and auto-resumes in <=50ms upon clearance.",
+                obj(
+                    json!({
+                        "target_id": { "type": "string" },
+                        "action": { "type": "string", "enum": ["detect", "wait", "hud_show", "hud_hide"], "description": "action to perform (default: detect)" },
+                        "timeout_ms": { "type": "integer", "description": "max wait time for human verification clearance in ms (default: 30000)" },
+                        "kind": { "type": "string", "description": "optional challenge kind override for hud_show" }
+                    }),
+                    json!(["target_id"]),
+                ),
+            ),
+            ToolDescriptor::new(
+                "browser_record",
+                Category::Browser,
+                Tier::Standard,
+                "Shadow observation & macro learning mode (Ghost Mode). Observes human interactions in a tab, across page loads and navigations (a link or form post becomes a wait for the next page, a typed URL or reload a goto), debounces keystrokes and click bursts, strips noise, and synthesizes clean, deterministic browser_flow steps. Secret fields are never recorded: they become steps with a secret_ref, supplied as secrets when the flow runs. Chrome only; while recording, the tab's JavaScript dialogs are answered by the recorder's dialog policy (dismiss by default).",
+                obj(
+                    json!({
+                        "target_id": { "type": "string" },
+                        "action": { "type": "string", "enum": ["start", "stop", "status"], "description": "recording action (default: status)" },
+                        "name": { "type": "string", "description": "optional flow name to auto-save to flow store upon stop" }
+                    }),
+                    json!(["target_id"]),
+                ),
+            ),
             ToolDescriptor::new(
                 "browser_screenshot",
                 Category::Browser,
@@ -1159,6 +2053,7 @@ impl ToolModule for BrowserModule {
                         "visual": { "description": "baseline name, or {name, tolerance, ref}; first run saves the baseline, later runs diff the screenshot within tolerance (default 0.01)" },
                         "ux": { "type": "object", "description": "judge-scored review: {dims:[clarity,hierarchy,affordance,consistency], gate:false, min:0.5}; advisory unless gate=true" },
                         "wait_selector": { "type": "string", "description": "settle: wait for this selector first" },
+                        "wait_dom_settled": { "type": "boolean", "description": "settle: wait for DOM mutations to settle first" },
                         "wait_network_idle": { "type": "boolean", "description": "settle: wait for network idle first" },
                         "timeout_ms": { "type": "integer", "description": "settle timeout (default 8000)" }
                     }),
@@ -1174,18 +2069,40 @@ impl ToolModule for BrowserModule {
                  step (set continue_on_error to run all); 'list'/'get'/'delete' manage them. A \
                  step is {op: navigate|act|wait|capture|assert, ...} using the same fields as \
                  those tools (e.g. {op:'act',by:'text',query:'Login',action:'click'}, \
-                 {op:'assert',text:'Welcome'}). A green run never needs a model.",
+                 {op:'assert',text:'Welcome'}). A secret step never holds its value: use \
+                 {op:'act',action:'type',query:'#pw',secret:true,secret_ref:'pw'} and pass \
+                 secrets:{pw:'...'} to 'run'; 'save' refuses a secret step with a literal value. \
+                 A green run never needs a model.",
                 obj(
                     json!({
                         "action": { "type": "string", "enum": ["save", "run", "list", "get", "delete"] },
                         "name": { "type": "string" },
                         "target_id": { "type": "string", "description": "run: the tab to replay against" },
                         "steps": { "type": "array", "items": { "type": "object" }, "description": "save: the ordered steps" },
-                        "continue_on_error": { "type": "boolean", "description": "run: keep going past a failed step" }
+                        "continue_on_error": { "type": "boolean", "description": "run: keep going past a failed step" },
+                        "secrets": { "type": "object", "description": "run: values for the steps' secret_ref names, e.g. {pw: '...'}; used in memory for this run only, never stored, redacted from the audit log. A missing one fails the run before any step runs" }
                     }),
                     json!(["action"]),
                 ),
             ).untrusted_output(),
+            ToolDescriptor::new(
+                "browser_showcase",
+                Category::Browser,
+                Tier::Standard,
+                "Configure visual flair for demos, screencasts, and presentations: animated virtual SVG cursor, smooth cubic-bezier gliding, click ripples, and floating typing HUD.",
+                obj(
+                    json!({
+                        "target_id": { "type": "string", "description": "the tab to configure showcase overlays for" },
+                        "enabled": { "type": "boolean", "description": "enable or disable visual overlays" },
+                        "speed": { "type": "string", "enum": ["cinematic", "demo", "snappy", "off"], "description": "gliding speed preset" },
+                        "click_ripple": { "type": "boolean", "description": "expand glowing shockwave rings on click" },
+                        "typing_hud": { "type": "boolean", "description": "display floating action/typing badges next to cursor" },
+                        "cursor_style": { "type": "string", "enum": ["glow_arrow", "neon_cyan", "minimal_dot"], "description": "visual pointer style" },
+                        "glide_ms": { "type": "integer", "description": "custom glide duration in milliseconds" }
+                    }),
+                    json!(["target_id"]),
+                ),
+            ).idempotent(true),
         ]
     }
 
@@ -1217,7 +2134,13 @@ impl ToolModule for BrowserModule {
             "browser_snapshot" => self.snapshot(&args).await,
             "browser_query" => self.query(&args).await,
             "browser_act" => self.act(&args).await,
+            "browser_fill_form" => self.fill_form(&args).await,
+            "browser_extract" => self.extract(&args).await,
+            "browser_profile" => self.profile(&args).await,
             "browser_wait" => self.wait(&args).await,
+            "browser_challenge" => self.challenge(&args).await,
+            "browser_record" => self.record(&args).await,
+            "browser_showcase" => self.showcase(&args).await,
             "browser_screenshot" => self.screenshot(&args).await,
             "browser_viewport" => self.viewport(&args).await,
             "browser_eval" => self.eval(&args).await,
@@ -1227,6 +2150,8 @@ impl ToolModule for BrowserModule {
             "browser_capture" => self.capture(&args).await,
             "browser_assert" => self.assert(&args).await,
             "browser_flow" => self.flow(&args).await,
+            "browser_branch" => self.branch(&args).await,
+            "browser_checkpoint" => self.checkpoint(&args).await,
             other => Envelope::fail(other, ErrorCode::InvalidArgs, "unknown tool"),
         }
     }
@@ -1245,12 +2170,21 @@ mod act_tests {
         acts: Mutex<Vec<String>>,
         captures: Mutex<Vec<String>>,
         viewports: Mutex<Vec<String>>,
+        forms: Mutex<Vec<Value>>,
+        extracts: Mutex<Vec<Value>>,
+        profiles: Mutex<Vec<String>>,
+        /// `navigate` / `profile_restore` calls, in the order they happened.
+        order: Mutex<Vec<String>>,
+        connects: std::sync::atomic::AtomicUsize,
+        fail_restore: std::sync::atomic::AtomicBool,
     }
 
     #[async_trait]
     impl BrowserBackend for Recorder {
         async fn connect(&self, _p: Option<u16>, _l: Option<Value>) -> Result<Value, BrowserError> {
-            Err(BrowserError::Failed("n/a".into()))
+            self.connects
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(json!({ "browser_id": 1 }))
         }
         async fn disconnect(&self, _b: u32, _k: bool) -> Result<Value, BrowserError> {
             Err(BrowserError::Failed("n/a".into()))
@@ -1262,7 +2196,9 @@ mod act_tests {
             _t: Option<&str>,
             _u: Option<&str>,
         ) -> Result<Value, BrowserError> {
-            Err(BrowserError::Failed("n/a".into()))
+            Ok(json!({
+                "tabs": [{"target_id": "T", "url": "about:blank"}]
+            }))
         }
         async fn navigate(
             &self,
@@ -1270,6 +2206,7 @@ mod act_tests {
             a: &str,
             _u: Option<&str>,
         ) -> Result<Value, BrowserError> {
+            self.order.lock().unwrap().push(format!("navigate:{a}"));
             Ok(json!({ "ok": true, "action": a }))
         }
         async fn snapshot(
@@ -1298,7 +2235,25 @@ mod act_tests {
         ) -> Result<Value, BrowserError> {
             let desc = match locator {
                 Locator::Ref(r) => format!("ref:{r}"),
-                Locator::Selector { by, query } => format!("sel:{by}:{query}"),
+                Locator::Selector {
+                    by,
+                    query,
+                    within,
+                    text,
+                    index,
+                } => {
+                    let mut s = format!("sel:{by}:{query}");
+                    if let Some(w) = within {
+                        s.push_str(&format!(":within={w}"));
+                    }
+                    if let Some(t) = text {
+                        s.push_str(&format!(":text={t}"));
+                    }
+                    if let Some(i) = index {
+                        s.push_str(&format!(":index={i}"));
+                    }
+                    s
+                }
             };
             self.acts.lock().unwrap().push(desc);
             Ok(json!({ "ok": true, "action": action }))
@@ -1316,7 +2271,8 @@ mod act_tests {
             Err(BrowserError::Failed("n/a".into()))
         }
         async fn eval(&self, _t: &str, _e: &str) -> Result<Value, BrowserError> {
-            Err(BrowserError::Failed("n/a".into()))
+            // Only the page-load probe is ever evaluated by the tool layer.
+            Ok(json!({ "result": "https://example.com/app|complete" }))
         }
         async fn network(
             &self,
@@ -1362,6 +2318,69 @@ mod act_tests {
                 .push(format!("{w}x{h} mobile={m} scale={s}"));
             Ok(json!({ "width": w, "height": h, "mobile": m }))
         }
+        async fn fill_form(
+            &self,
+            _t: &str,
+            fields: &Value,
+            submit: Option<&Value>,
+        ) -> Result<Value, BrowserError> {
+            self.forms.lock().unwrap().push(fields.clone());
+            let count = fields.as_array().map(|a| a.len()).unwrap_or(0);
+            Ok(json!({ "filled": count, "submitted": submit.is_some() }))
+        }
+        async fn extract(
+            &self,
+            _t: &str,
+            schema: &Value,
+            within: Option<&str>,
+        ) -> Result<Value, BrowserError> {
+            self.extracts.lock().unwrap().push(schema.clone());
+            Ok(json!({
+                "data": { "extracted": true },
+                "within": within
+            }))
+        }
+        async fn profile_state(&self, _t: &str) -> Result<Value, BrowserError> {
+            self.profiles.lock().unwrap().push("state".into());
+            Ok(json!({
+                "url": "https://example.com/app",
+                "cookies": [{"name": "sid", "value": "xyz"}],
+                "local_storage": {"token": "abc"},
+                "session_storage": {}
+            }))
+        }
+        async fn profile_restore(&self, _t: &str, state: &Value) -> Result<Value, BrowserError> {
+            self.profiles.lock().unwrap().push("restore".into());
+            self.order.lock().unwrap().push("restore".into());
+            if self.fail_restore.load(std::sync::atomic::Ordering::SeqCst) {
+                return Ok(json!({ "ok": false, "error": "SecurityError: storage denied" }));
+            }
+            let cookies = state
+                .get("cookies")
+                .and_then(Value::as_array)
+                .map(|a| a.len())
+                .unwrap_or(0);
+            Ok(json!({
+                "restored_cookies": cookies,
+                "local_storage_keys": 1,
+                "session_storage_keys": 0
+            }))
+        }
+        async fn showcase(
+            &self,
+            target: &str,
+            config: Option<crate::showcase::ShowcaseConfig>,
+        ) -> Result<Value, BrowserError> {
+            let cfg = config.unwrap_or_default();
+            Ok(json!({
+                "target_id": target,
+                "enabled": cfg.enabled,
+                "speed": cfg.speed.as_str(),
+                "glide_ms": cfg.glide_ms(),
+                "click_ripple": cfg.click_ripple,
+                "typing_hud": cfg.typing_hud
+            }))
+        }
     }
 
     fn module() -> (BrowserModule, Arc<Recorder>) {
@@ -1378,6 +2397,25 @@ mod act_tests {
         ));
         let _ = std::fs::remove_file(&p);
         BrowserModule::new(Arc::new(Recorder::default())).with_flow_store(FlowStore::new(p, 50, 50))
+    }
+
+    fn module_with_profiles_and_rec(tag: &str) -> (BrowserModule, Arc<Recorder>) {
+        use crate::profile::ProfileStore;
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "agentctl-profiletool-{tag}-{}.json",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&p);
+        let rec = Arc::new(Recorder::default());
+        (
+            BrowserModule::new(rec.clone()).with_profile_store(ProfileStore::new(p, 50)),
+            rec,
+        )
+    }
+
+    fn module_with_profiles(tag: &str) -> BrowserModule {
+        module_with_profiles_and_rec(tag).0
     }
 
     #[tokio::test]
@@ -1409,6 +2447,50 @@ mod act_tests {
             .await;
         assert!(e.ok, "{e:?}");
         assert_eq!(rec.acts.lock().unwrap()[0], "sel:css:#save");
+    }
+
+    #[tokio::test]
+    async fn a_query_with_scoping_forwards_within_text_and_index() {
+        let (m, rec) = module();
+        let e = m
+            .act(&json!({
+                "target_id": "T",
+                "query": "button",
+                "by": "css",
+                "within": ".table-row",
+                "text": "Submit",
+                "index": 2,
+                "action": "click"
+            }))
+            .await;
+        assert!(e.ok, "{e:?}");
+        assert_eq!(
+            rec.acts.lock().unwrap()[0],
+            "sel:css:button:within=.table-row:text=Submit:index=2"
+        );
+    }
+
+    #[tokio::test]
+    async fn flow_replays_act_step_with_compound_scoping() {
+        let (m, rec) = module();
+        let (ok, _) = m
+            .run_step(
+                "T",
+                &json!({
+                    "op": "act",
+                    "query": "button.emr-btn",
+                    "within": "table tbody tr:first-child",
+                    "text": "Dispense",
+                    "index": 0,
+                    "action": "click"
+                }),
+            )
+            .await;
+        assert!(ok);
+        assert_eq!(
+            rec.acts.lock().unwrap()[0],
+            "sel:css:button.emr-btn:within=table tbody tr:first-child:text=Dispense:index=0"
+        );
     }
 
     #[tokio::test]
@@ -1532,5 +2614,541 @@ mod act_tests {
         let (m, _) = module();
         let e = m.flow(&json!({"action":"list"})).await;
         assert!(!e.ok, "no store configured means the tool is unavailable");
+    }
+
+    #[tokio::test]
+    async fn fill_form_batches_fields_and_reports_count() {
+        let (m, rec) = module();
+        let e = m
+            .fill_form(&json!({
+                "target_id": "T",
+                "fields": [
+                    { "selector": "#username", "value": "alice" },
+                    { "selector": "#password", "value": "secret" }
+                ],
+                "submit": { "selector": "#login-btn" }
+            }))
+            .await;
+        assert!(e.ok, "{e:?}");
+        assert_eq!(rec.forms.lock().unwrap().len(), 1);
+        let d = e.data.unwrap();
+        assert_eq!(d["filled"], 2);
+        assert_eq!(d["submitted"], true);
+    }
+
+    #[tokio::test]
+    async fn fill_form_without_fields_fails_invalid_args() {
+        let (m, _) = module();
+        let e = m.fill_form(&json!({ "target_id": "T" })).await;
+        assert!(!e.ok);
+        assert_eq!(e.error.unwrap().code, ErrorCode::InvalidArgs);
+    }
+
+    #[tokio::test]
+    async fn extract_evaluates_schema() {
+        let (m, rec) = module();
+        let e = m
+            .extract(&json!({
+                "target_id": "T",
+                "schema": { "title": "h1" },
+                "within": ".content"
+            }))
+            .await;
+        assert!(e.ok, "{e:?}");
+        assert_eq!(rec.extracts.lock().unwrap().len(), 1);
+        let d = e.data.unwrap();
+        assert_eq!(d["data"]["extracted"], true);
+        assert_eq!(d["within"], ".content");
+    }
+
+    #[tokio::test]
+    async fn wait_accepts_network_idle() {
+        let (m, _) = module();
+        for args in [
+            json!({ "target_id": "T", "network_idle": true }),
+            json!({ "target_id": "T", "condition": "network_idle" }),
+        ] {
+            let e = m.wait(&args).await;
+            assert!(e.ok, "{e:?}");
+            assert_eq!(e.data.unwrap()["condition"], "network_idle");
+        }
+    }
+
+    #[tokio::test]
+    async fn wait_supports_dom_settled() {
+        let (m, _) = module();
+        let e = m
+            .wait(&json!({
+                "target_id": "T",
+                "dom_settled": true,
+                "timeout_ms": 3000
+            }))
+            .await;
+        assert!(e.ok, "{e:?}");
+        let d = e.data.unwrap();
+        assert_eq!(d["condition"], "dom_settled");
+    }
+
+    #[tokio::test]
+    async fn wait_supports_htmx_settled() {
+        let (m, _) = module();
+        let e = m
+            .wait(&json!({
+                "target_id": "T",
+                "htmx_settled": true,
+                "timeout_ms": 3000
+            }))
+            .await;
+        assert!(e.ok, "{e:?}");
+        let d = e.data.unwrap();
+        assert_eq!(d["condition"], "htmx_settled");
+
+        let e2 = m
+            .wait(&json!({
+                "target_id": "T",
+                "condition": "htmx_settled"
+            }))
+            .await;
+        assert!(e2.ok, "{e2:?}");
+        assert_eq!(e2.data.unwrap()["condition"], "htmx_settled");
+    }
+
+    #[tokio::test]
+    async fn connect_auto_restores_named_profile() {
+        let (m, rec) = module_with_profiles_and_rec("autoload");
+        let save_res = m
+            .profile(&json!({
+                "action": "save",
+                "name": "qa_saved_session",
+                "target_id": "T"
+            }))
+            .await;
+        assert!(save_res.ok, "{save_res:?}");
+
+        let conn_res = m
+            .connect(&json!({
+                "profile": "qa_saved_session"
+            }))
+            .await;
+        assert!(conn_res.ok, "{conn_res:?}");
+        let data = conn_res.data.unwrap();
+        assert_eq!(data["profile_restored"], "qa_saved_session");
+        assert!(rec
+            .profiles
+            .lock()
+            .unwrap()
+            .contains(&"restore".to_string()));
+    }
+
+    #[tokio::test]
+    async fn connect_navigates_to_the_profile_url_before_restoring() {
+        let (m, rec) = module_with_profiles_and_rec("order");
+        let save = m
+            .profile(&json!({ "action": "save", "name": "ordered", "target_id": "T" }))
+            .await;
+        assert!(save.ok, "{save:?}");
+        rec.order.lock().unwrap().clear();
+        let conn = m.connect(&json!({ "profile": "ordered" })).await;
+        assert!(conn.ok, "{conn:?}");
+        assert_eq!(conn.data.unwrap()["profile_restored"], "ordered");
+        // Storage writes throw on about:blank, so the page must come first.
+        assert_eq!(
+            *rec.order.lock().unwrap(),
+            vec!["navigate:goto".to_string(), "restore".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_with_unknown_profile_errors_and_does_not_connect() {
+        let (m, rec) = module_with_profiles_and_rec("unknown");
+        let conn = m.connect(&json!({ "profile": "no_such_profile" })).await;
+        assert!(!conn.ok, "{conn:?}");
+        assert_eq!(conn.error.as_ref().unwrap().code, ErrorCode::NotFound);
+        assert!(conn
+            .error
+            .as_ref()
+            .unwrap()
+            .message
+            .contains("no_such_profile"));
+        assert_eq!(rec.connects.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn connect_with_profile_but_no_store_errors() {
+        let (m, rec) = module();
+        let conn = m.connect(&json!({ "profile": "x" })).await;
+        assert!(!conn.ok, "{conn:?}");
+        assert_eq!(rec.connects.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn connect_reports_a_failed_restore_instead_of_claiming_it() {
+        let (m, rec) = module_with_profiles_and_rec("restore_fail");
+        let save = m
+            .profile(&json!({ "action": "save", "name": "bad", "target_id": "T" }))
+            .await;
+        assert!(save.ok, "{save:?}");
+        rec.fail_restore
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let conn = m.connect(&json!({ "profile": "bad" })).await;
+        assert!(conn.ok, "{conn:?}");
+        let data = conn.data.unwrap();
+        assert_eq!(data["profile_restored"], json!(false));
+        assert!(data["profile_restore_error"]
+            .as_str()
+            .unwrap()
+            .contains("storage denied"));
+        // The explicit restore action must not say "restored" either.
+        let r = m
+            .profile(&json!({ "action": "restore", "target_id": "T", "name": "bad" }))
+            .await;
+        assert!(!r.ok, "{r:?}");
+    }
+
+    #[tokio::test]
+    async fn connect_auto_restores_named_profile_under_launch() {
+        let (m, rec) = module_with_profiles_and_rec("autoload_launch");
+        let save_res = m
+            .profile(&json!({
+                "action": "save",
+                "name": "qa_launch_session",
+                "target_id": "T"
+            }))
+            .await;
+        assert!(save_res.ok, "{save_res:?}");
+
+        let conn_res = m
+            .connect(&json!({
+                "launch": {
+                    "headless": true,
+                    "profile": "qa_launch_session"
+                }
+            }))
+            .await;
+        assert!(conn_res.ok, "{conn_res:?}");
+        let data = conn_res.data.unwrap();
+        assert_eq!(data["profile_restored"], "qa_launch_session");
+        assert!(rec
+            .profiles
+            .lock()
+            .unwrap()
+            .contains(&"restore".to_string()));
+    }
+
+    #[tokio::test]
+    async fn profile_save_list_restore_delete_flow() {
+        let m = module_with_profiles("full_flow");
+        let save = m
+            .profile(&json!({
+                "action": "save",
+                "name": "login_session",
+                "target_id": "T"
+            }))
+            .await;
+        assert!(save.ok, "{save:?}");
+        let d = save.data.unwrap();
+        assert_eq!(d["saved"], true);
+        assert_eq!(d["name"], "login_session");
+
+        let list = m.profile(&json!({ "action": "list" })).await;
+        assert!(list.ok, "{list:?}");
+        let list_data = list.data.unwrap();
+        let arr = list_data["profiles"].as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["name"], "login_session");
+
+        let restore = m
+            .profile(&json!({
+                "action": "restore",
+                "name": "login_session",
+                "target_id": "T"
+            }))
+            .await;
+        assert!(restore.ok, "{restore:?}");
+        let restore_data = restore.data.unwrap();
+        assert_eq!(restore_data["restored"], true);
+        assert_eq!(restore_data["restored_cookies"], 1);
+
+        let del = m
+            .profile(&json!({
+                "action": "delete",
+                "name": "login_session"
+            }))
+            .await;
+        assert!(del.ok, "{del:?}");
+        assert_eq!(del.data.unwrap()["deleted"], true);
+
+        let list_after = m.profile(&json!({ "action": "list" })).await;
+        assert!(list_after.ok);
+        assert_eq!(
+            list_after.data.unwrap()["profiles"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn profile_is_disabled_without_a_store() {
+        let (m, _) = module();
+        let e = m.profile(&json!({ "action": "list" })).await;
+        assert!(!e.ok);
+        assert_eq!(e.error.unwrap().code, ErrorCode::UnsupportedOs);
+    }
+
+    #[tokio::test]
+    async fn flow_replays_fill_form_and_extract_steps() {
+        let m = module_with_flows("forms_and_extract");
+        let save = m
+            .flow(&json!({
+                "action": "save",
+                "name": "pipeline",
+                "steps": [
+                    { "op": "navigate", "url": "https://x" },
+                    { "op": "fill_form", "fields": [{ "selector": "#email", "value": "a@b.com" }] },
+                    { "op": "wait", "dom_settled": true },
+                    { "op": "extract", "schema": { "name": ".profile-name" } },
+                    { "op": "assert", "_pass": true }
+                ]
+            }))
+            .await;
+        assert!(save.ok, "{save:?}");
+        let run = m
+            .flow(&json!({ "action": "run", "name": "pipeline", "target_id": "T" }))
+            .await;
+        assert!(run.ok, "{run:?}");
+        let d = run.data.unwrap();
+        assert_eq!(d["passed"], true);
+        assert_eq!(d["ran"], 5);
+    }
+
+    #[tokio::test]
+    async fn profile_restore_nonexistent_returns_not_found() {
+        let m = module_with_profiles("notfound");
+        let res = m
+            .profile(&json!({
+                "action": "restore",
+                "name": "ghost_session",
+                "target_id": "T"
+            }))
+            .await;
+        assert!(!res.ok);
+        assert_eq!(res.error.unwrap().code, ErrorCode::NotFound);
+    }
+
+    #[tokio::test]
+    async fn profile_save_missing_name_fails() {
+        let m = module_with_profiles("noname");
+        let res = m
+            .profile(&json!({
+                "action": "save",
+                "target_id": "T"
+            }))
+            .await;
+        assert!(!res.ok);
+        assert_eq!(res.error.unwrap().code, ErrorCode::InvalidArgs);
+    }
+
+    #[tokio::test]
+    async fn profile_invalid_name_fails() {
+        let m = module_with_profiles("badname");
+        let res = m
+            .profile(&json!({
+                "action": "save",
+                "name": "../escape",
+                "target_id": "T"
+            }))
+            .await;
+        assert!(!res.ok);
+        assert_eq!(res.error.unwrap().code, ErrorCode::InvalidArgs);
+    }
+
+    #[tokio::test]
+    async fn extract_without_schema_fails() {
+        let (m, _) = module();
+        let res = m.extract(&json!({ "target_id": "T" })).await;
+        assert!(!res.ok);
+        assert_eq!(res.error.unwrap().code, ErrorCode::InvalidArgs);
+    }
+
+    #[tokio::test]
+    async fn fill_form_with_empty_fields_array_fails() {
+        let (m, _) = module();
+        let res = m
+            .fill_form(&json!({ "target_id": "T", "fields": [] }))
+            .await;
+        assert!(!res.ok);
+        assert_eq!(res.error.unwrap().code, ErrorCode::InvalidArgs);
+    }
+
+    #[tokio::test]
+    async fn assert_with_wait_dom_settled_flag() {
+        let (m, _) = module();
+        let res = m
+            .assert(&json!({
+                "target_id": "T",
+                "wait_dom_settled": true,
+                "_pass": true
+            }))
+            .await;
+        assert!(res.ok, "{res:?}");
+        assert_eq!(res.data.unwrap()["passed"], true);
+    }
+
+    #[tokio::test]
+    async fn profile_delete_nonexistent_returns_not_found() {
+        let m = module_with_profiles("del_notfound");
+        let res = m
+            .profile(&json!({
+                "action": "delete",
+                "name": "ghost_profile"
+            }))
+            .await;
+        assert!(!res.ok);
+        assert_eq!(res.error.unwrap().code, ErrorCode::NotFound);
+    }
+
+    #[tokio::test]
+    async fn profile_delete_missing_name_fails() {
+        let m = module_with_profiles("del_noname");
+        let res = m
+            .profile(&json!({
+                "action": "delete"
+            }))
+            .await;
+        assert!(!res.ok);
+        assert_eq!(res.error.unwrap().code, ErrorCode::InvalidArgs);
+    }
+
+    #[tokio::test]
+    async fn profile_restore_missing_name_fails() {
+        let m = module_with_profiles("restore_noname");
+        let res = m
+            .profile(&json!({
+                "action": "restore",
+                "target_id": "T"
+            }))
+            .await;
+        assert!(!res.ok);
+        assert_eq!(res.error.unwrap().code, ErrorCode::InvalidArgs);
+    }
+
+    #[tokio::test]
+    async fn profile_unknown_action_fails() {
+        let m = module_with_profiles("unknown_act");
+        let res = m
+            .profile(&json!({
+                "action": "wipe_everything"
+            }))
+            .await;
+        assert!(!res.ok);
+        assert_eq!(res.error.unwrap().code, ErrorCode::InvalidArgs);
+    }
+
+    #[tokio::test]
+    async fn fill_form_with_non_array_fields_fails() {
+        let (m, _) = module();
+        let res = m
+            .fill_form(&json!({
+                "target_id": "T",
+                "fields": "not-an-array"
+            }))
+            .await;
+        assert!(!res.ok);
+        assert_eq!(res.error.unwrap().code, ErrorCode::InvalidArgs);
+    }
+
+    #[tokio::test]
+    async fn wait_without_condition_fails() {
+        let (m, _) = module();
+        let res = m.wait(&json!({ "target_id": "T" })).await;
+        assert!(!res.ok);
+        assert_eq!(res.error.unwrap().code, ErrorCode::InvalidArgs);
+    }
+
+    #[tokio::test]
+    async fn branch_create_missing_args_fails() {
+        let (m, _) = module();
+        let res = m.branch(&json!({ "action": "create" })).await;
+        assert!(!res.ok);
+        assert_eq!(res.error.unwrap().code, ErrorCode::InvalidArgs);
+
+        let res = m
+            .branch(&json!({ "action": "create", "target_id": "T" }))
+            .await;
+        assert!(!res.ok);
+        assert_eq!(res.error.unwrap().code, ErrorCode::InvalidArgs);
+    }
+
+    #[tokio::test]
+    async fn branch_unknown_action_fails() {
+        let (m, _) = module();
+        let res = m.branch(&json!({ "action": "warp_speed" })).await;
+        assert!(!res.ok);
+        assert_eq!(res.error.unwrap().code, ErrorCode::InvalidArgs);
+    }
+
+    #[tokio::test]
+    async fn checkpoint_save_missing_target_fails() {
+        let (m, _) = module();
+        let res = m.checkpoint(&json!({ "action": "save" })).await;
+        assert!(!res.ok);
+        assert_eq!(res.error.unwrap().code, ErrorCode::InvalidArgs);
+    }
+
+    #[tokio::test]
+    async fn checkpoint_unknown_action_fails() {
+        let (m, _) = module();
+        let res = m.checkpoint(&json!({ "action": "quantum_leap" })).await;
+        assert!(!res.ok);
+        assert_eq!(res.error.unwrap().code, ErrorCode::InvalidArgs);
+    }
+
+    #[tokio::test]
+    async fn test_browser_showcase_toggle_and_config() {
+        let (m, _) = module();
+        let res = m
+            .showcase(&json!({
+                "target_id": "T",
+                "enabled": true,
+                "speed": "cinematic",
+                "click_ripple": true,
+                "typing_hud": true,
+                "cursor_style": "glow_arrow"
+            }))
+            .await;
+        assert!(res.ok, "{res:?}");
+        let data = res.data.unwrap();
+        assert_eq!(data["enabled"], true);
+        assert_eq!(data["speed"], "cinematic");
+        assert_eq!(data["glide_ms"], 350);
+        assert_eq!(data["click_ripple"], true);
+        assert_eq!(data["typing_hud"], true);
+    }
+
+    #[tokio::test]
+    async fn test_browser_showcase_presets() {
+        let (m, _) = module();
+        let res = m
+            .showcase(&json!({
+                "target_id": "T",
+                "speed": "snappy"
+            }))
+            .await;
+        assert!(res.ok);
+        let data = res.data.unwrap();
+        assert_eq!(data["speed"], "snappy");
+        assert_eq!(data["glide_ms"], 120);
+
+        // Unknown speed returns invalid args
+        let res = m
+            .showcase(&json!({
+                "target_id": "T",
+                "speed": "supersonic"
+            }))
+            .await;
+        assert!(!res.ok);
+        assert_eq!(res.error.unwrap().code, ErrorCode::InvalidArgs);
     }
 }

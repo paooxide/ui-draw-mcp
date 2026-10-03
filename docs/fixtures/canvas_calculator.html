@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Canvas Calculator</title>
+  <style>
+    body { font-family: sans-serif; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; margin: 0; background: #f0f2f5; }
+    canvas { border: 2px solid #333; border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.15); background: #222; cursor: pointer; }
+  </style>
+</head>
+<body>
+  <h2>HTML5 Canvas Calculator</h2>
+  <canvas id="calcCanvas" width="300" height="400"></canvas>
+  <script>
+    const canvas = document.getElementById('calcCanvas');
+    const ctx = canvas.getContext('2d');
+
+    let displayValue = '0';
+    let storedValue = null;
+    let currentOp = null;
+    let waitingForOperand = false;
+
+    const buttons = [
+      { id: '7', label: '7', x: 20, y: 100, w: 55, h: 55, role: 'button', intent: 'calc_num_7' },
+      { id: '8', label: '8', x: 85, y: 100, w: 55, h: 55, role: 'button', intent: 'calc_num_8' },
+      { id: '9', label: '9', x: 150, y: 100, w: 55, h: 55, role: 'button', intent: 'calc_num_9' },
+      { id: '/', label: '/', x: 215, y: 100, w: 55, h: 55, role: 'button', intent: 'calc_op_div' },
+
+      { id: '4', label: '4', x: 20, y: 165, w: 55, h: 55, role: 'button', intent: 'calc_num_4' },
+      { id: '5', label: '5', x: 85, y: 165, w: 55, h: 55, role: 'button', intent: 'calc_num_5' },
+      { id: '6', label: '6', x: 150, y: 165, w: 55, h: 55, role: 'button', intent: 'calc_num_6' },
+      { id: '*', label: '*', x: 215, y: 165, w: 55, h: 55, role: 'button', intent: 'calc_op_mul' },
+
+      { id: '1', label: '1', x: 20, y: 230, w: 55, h: 55, role: 'button', intent: 'calc_num_1' },
+      { id: '2', label: '2', x: 85, y: 230, w: 55, h: 55, role: 'button', intent: 'calc_num_2' },
+      { id: '3', label: '3', x: 150, y: 230, w: 55, h: 55, role: 'button', intent: 'calc_num_3' },
+      { id: '-', label: '-', x: 215, y: 230, w: 55, h: 55, role: 'button', intent: 'calc_op_sub' },
+
+      { id: 'C', label: 'C', x: 20, y: 295, w: 55, h: 55, role: 'button', intent: 'calc_clear' },
+      { id: '0', label: '0', x: 85, y: 295, w: 55, h: 55, role: 'button', intent: 'calc_num_0' },
+      { id: '=', label: '=', x: 150, y: 295, w: 55, h: 55, role: 'button', intent: 'calc_eval' },
+      { id: '+', label: '+', x: 215, y: 295, w: 55, h: 55, role: 'button', intent: 'calc_op_add' },
+    ];
+
+    function draw() {
+      // Background
+      ctx.fillStyle = '#1e1e1e';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+      // Display Area
+      ctx.fillStyle = '#0f0f0f';
+      ctx.fillRect(20, 20, 260, 60);
+      ctx.strokeStyle = '#444';
+      ctx.strokeRect(20, 20, 260, 60);
+
+      // Display Text
+      ctx.fillStyle = '#00ffcc';
+      ctx.font = '32px monospace';
+      ctx.textAlign = 'right';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(displayValue, 265, 50);
+
+      // Buttons
+      for (const btn of buttons) {
+        ctx.fillStyle = (btn.id === '=' || btn.id === '+') ? '#ff9500' : '#3a3a3c';
+        ctx.beginPath();
+        ctx.roundRect ? ctx.roundRect(btn.x, btn.y, btn.w, btn.h, 8) : ctx.rect(btn.x, btn.y, btn.w, btn.h);
+        ctx.fill();
+
+        ctx.fillStyle = '#ffffff';
+        ctx.font = '22px sans-serif';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(btn.label, btn.x + btn.w / 2, btn.y + btn.h / 2);
+      }
+    }
+
+    function handleInput(btnKey) {
+      if (btnKey >= '0' && btnKey <= '9') {
+        if (waitingForOperand) {
+          displayValue = btnKey;
+          waitingForOperand = false;
+        } else {
+          displayValue = displayValue === '0' ? btnKey : displayValue + btnKey;
+        }
+      } else if (btnKey === 'C') {
+        displayValue = '0';
+        storedValue = null;
+        currentOp = null;
+        waitingForOperand = false;
+      } else if (['+', '-', '*', '/'].includes(btnKey)) {
+        storedValue = parseFloat(displayValue);
+        currentOp = btnKey;
+        waitingForOperand = true;
+      } else if (btnKey === '=') {
+        if (currentOp && storedValue !== null) {
+          const val = parseFloat(displayValue);
+          let res = storedValue;
+          if (currentOp === '+') res += val;
+          else if (currentOp === '-') res -= val;
+          else if (currentOp === '*') res *= val;
+          else if (currentOp === '/') res = val !== 0 ? res / val : 'ERR';
+          displayValue = String(res);
+          storedValue = null;
+          currentOp = null;
+          waitingForOperand = true;
+        }
+      }
+      canvas.setAttribute('data-display-value', displayValue);
+      draw();
+    }
+
+    // Attach agentctl regions for perception
+    canvas.__agentctl_regions = buttons;
+    canvas.setAttribute('data-canvas-regions', JSON.stringify(buttons));
+    canvas.setAttribute('data-display-value', displayValue);
+
+    // Mouse event dispatcher for clicks
+    canvas.addEventListener('click', (e) => {
+      const rect = canvas.getBoundingClientRect();
+      const clickX = e.clientX - rect.left;
+      const clickY = e.clientY - rect.top;
+      for (const btn of buttons) {
+        if (clickX >= btn.x && clickX <= btn.x + btn.w && clickY >= btn.y && clickY <= btn.y + btn.h) {
+          handleInput(btn.id);
+          break;
+        }
+      }
+    });
+
+    draw();
+  </script>
+</body>
+</html>

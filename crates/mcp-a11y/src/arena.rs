@@ -40,6 +40,10 @@ pub struct ElementInfo {
     /// Toggles and flags, compared when diffing snapshots.
     #[serde(default)]
     pub state: ElementState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_intent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bound_state: Option<serde_json::Value>,
 }
 
 /// One captured snapshot: an id, the app/window it came from, and the `@eN` ->
@@ -165,6 +169,8 @@ mod tests {
             bounds: None,
             node_id: None,
             state: ElementState::default(),
+            semantic_intent: None,
+            bound_state: None,
         }
     }
 

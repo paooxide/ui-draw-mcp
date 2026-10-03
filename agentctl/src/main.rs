@@ -15,12 +15,39 @@ async fn main() -> std::io::Result<()> {
     init_tracing();
 
     let args: Vec<String> = std::env::args().collect();
-    let cmd = args.get(1).map(String::as_str).unwrap_or("serve");
-
     let force_http = args.iter().any(|a| a == "--http");
+
+    let mut cmd = None;
+    let mut i = 1;
+    while i < args.len() {
+        let a = &args[i];
+        if a == "--role" || a == "--demo-speed" {
+            i += 2;
+            continue;
+        }
+        if a.starts_with("--") || a == "-h" {
+            i += 1;
+            continue;
+        }
+        cmd = Some(a.as_str());
+        break;
+    }
+    let cmd = cmd.unwrap_or_else(|| {
+        if args.iter().any(|a| a == "--help" || a == "-h") {
+            "help"
+        } else if args.iter().any(|a| a == "--version" || a == "-V") {
+            "version"
+        } else {
+            "serve"
+        }
+    });
 
     match cmd {
         "serve" => serve(force_http).await,
+        "version" => {
+            println!("agentctl {}", env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
         "doctor" => {
             doctor();
             Ok(())
@@ -31,13 +58,14 @@ async fn main() -> std::io::Result<()> {
         }
         "bridge" => bridge(&args).await,
         "test" => test_cmd(&args).await,
+        "record" => record_cmd(&args).await,
         "transcript" => transcript_cmd(&args),
         "audit" => audit_cmd(&args),
         "config" if args.iter().any(|a| a == "print") => {
             config_print();
             Ok(())
         }
-        "help" | "--help" | "-h" => {
+        "help" => {
             print_help();
             Ok(())
         }
@@ -332,6 +360,26 @@ fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
         .map(String::as_str)
 }
 
+/// The port after `--attach`: `Ok(None)` when the flag is absent, an error
+/// when its value is not a port. Silently ignoring a bad value would launch a
+/// different browser than the one the operator named.
+fn attach_port_arg(args: &[String]) -> Result<Option<u16>, String> {
+    if !has(args, "--attach") {
+        return Ok(None);
+    }
+    match flag(args, "--attach").map(str::parse::<u16>) {
+        Some(Ok(port)) => Ok(Some(port)),
+        _ => Err("--attach needs a port number, e.g. --attach 9222".into()),
+    }
+}
+
+fn parse_attach_port(cmd: &str, args: &[String]) -> Option<u16> {
+    attach_port_arg(args).unwrap_or_else(|e| {
+        eprintln!("agentctl {cmd}: {e}");
+        std::process::exit(2);
+    })
+}
+
 fn has(args: &[String], name: &str) -> bool {
     args.iter().any(|a| a == name)
 }
@@ -396,6 +444,10 @@ async fn test_cmd(args: &[String]) -> std::io::Result<()> {
     use mcp_types::{CallCtx, CancelToken, ToolModule};
     use std::time::Instant;
 
+    if has(args, "--help") || has(args, "-h") {
+        print_test_help();
+        return Ok(());
+    }
     let cfg = config_or_exit();
     let dir = state_dir(&cfg);
     let strict = has(args, "--strict");
@@ -405,17 +457,40 @@ async fn test_cmd(args: &[String]) -> std::io::Result<()> {
     // headed/headless). With no `--attach`, the runner launches a throwaway
     // browser and, unless overridden, shows a window when a display is present
     // so you can watch the run, and stays headless in CI where there is none.
-    let attach_port = flag(args, "--attach").and_then(|s| s.parse::<u16>().ok());
+    let attach_port = parse_attach_port("test", args);
     let headless = resolve_launch_headless(args);
 
-    let backend = Arc::new(CdpBackend::new(NavPolicy::new(
-        &cfg.allowed_origins,
-        cfg.browser_allow_private,
-    )));
+    let showcase = if cfg.demo {
+        let speed = match cfg.demo_speed.to_ascii_lowercase().as_str() {
+            "cinematic" => mcp_browser::ShowcaseSpeed::Cinematic,
+            "snappy" => mcp_browser::ShowcaseSpeed::Snappy,
+            "off" | "instant" => mcp_browser::ShowcaseSpeed::Off,
+            _ => mcp_browser::ShowcaseSpeed::Demo,
+        };
+        mcp_browser::ShowcaseConfig {
+            speed,
+            ..Default::default()
+        }
+    } else {
+        mcp_browser::ShowcaseConfig::default()
+    };
+
+    let backend = Arc::new(
+        CdpBackend::new(NavPolicy::new(
+            &cfg.allowed_origins,
+            cfg.browser_allow_private,
+        ))
+        .with_showcase(showcase.clone()),
+    );
     // The judge powers the `ux` assert clause; a disabled judge just skips it.
     let judge = mcp_policy::mcp_judge::Judge::from_config(cfg.judge.clone(), &dir);
     let module = BrowserModule::new(backend)
+        .with_showcase(showcase)
         .with_flow_store(FlowStore::new(dir.join("browser_flows.json"), 200, 200))
+        .with_profile_store(mcp_browser::ProfileStore::new(
+            dir.join("browser_profiles.json"),
+            50,
+        ))
         .with_visual_store(mcp_browser::VisualStore::new(
             dir.join("browser_baselines.json"),
             500,
@@ -528,10 +603,12 @@ async fn test_cmd(args: &[String]) -> std::io::Result<()> {
                 &ctx,
             )
             .await;
+        // Replay-time secrets come from the environment, never from the flow.
+        let secrets = flow_secrets_from_env(&module, &ctx, name).await;
         let run = module
             .call(
                 "browser_flow",
-                json!({ "action": "run", "name": name, "target_id": target }),
+                json!({ "action": "run", "name": name, "target_id": target, "secrets": secrets }),
                 &ctx,
             )
             .await;
@@ -580,6 +657,87 @@ async fn test_cmd(args: &[String]) -> std::io::Result<()> {
     }
     let bad = failed > 0 || (strict && issue_flows > 0);
     std::process::exit(if bad { 1 } else { 0 });
+}
+
+/// The environment variable that supplies the secret a flow step names with
+/// `secret_ref`: `AGENTCTL_SECRET_` plus the ref uppercased, every character
+/// outside `A-Z0-9` replaced by `_` (so ref `pw` is `AGENTCTL_SECRET_PW` and
+/// `card-cvv` is `AGENTCTL_SECRET_CARD_CVV`).
+fn secret_env_name(secret_ref: &str) -> String {
+    let tail: String = secret_ref
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    format!("AGENTCTL_SECRET_{tail}")
+}
+
+/// The `secrets` object for a run: each ref in `refs` that `lookup` knows (by
+/// its environment variable name). A ref with no value is left out, so the run
+/// fails up front naming it, rather than typing an empty string.
+fn secrets_for_refs(
+    refs: &[String],
+    lookup: impl Fn(&str) -> Option<String>,
+) -> serde_json::Map<String, Value> {
+    refs.iter()
+        .filter_map(|r| {
+            lookup(&secret_env_name(r))
+                .filter(|v| !v.is_empty())
+                .map(|v| (r.clone(), Value::String(v)))
+        })
+        .collect()
+}
+
+/// Read the flow's `secret_ref`s and resolve them from `AGENTCTL_SECRET_<REF>`.
+async fn flow_secrets_from_env(
+    module: &mcp_browser::BrowserModule,
+    ctx: &mcp_types::CallCtx,
+    name: &str,
+) -> Value {
+    use mcp_types::ToolModule;
+    let got = module
+        .call(
+            "browser_flow",
+            json!({ "action": "get", "name": name }),
+            ctx,
+        )
+        .await;
+    let steps: Vec<Value> = got
+        .data
+        .as_ref()
+        .and_then(|d| d.get("steps"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let refs = mcp_browser::flow::secret_refs(&steps);
+    Value::Object(secrets_for_refs(&refs, |k| std::env::var(k).ok()))
+}
+
+fn print_test_help() {
+    println!(
+        "agentctl test — replay saved browser_flow UI tests\n\
+         \n\
+         USAGE:\n\
+         \x20   agentctl test [FLOW...] [--attach <port>] [--headed|--headless] [--json <file>] [--strict]\n\
+         \n\
+         With no FLOW names every saved flow runs. With no --attach it launches a throwaway\n\
+         browser and stops it afterwards.\n\
+         \n\
+         SECRETS:\n\
+         \x20   A recorded flow never stores a password, code or key. A step that needs one names it\n\
+         \x20   with \"secret_ref\" (the recorder uses the field's id or name, e.g. \"pw\"), and the value\n\
+         \x20   is read from the environment variable AGENTCTL_SECRET_<REF>: the ref uppercased, with\n\
+         \x20   anything outside A-Z and 0-9 turned into '_'.\n\
+         \n\
+         \x20       AGENTCTL_SECRET_PW='correct horse' agentctl test login\n\
+         \n\
+         \x20   A flow whose secret is not set fails before any step runs, naming the ref.\n"
+    );
 }
 
 /// Whether a launched test browser should be headless. Explicit flags win;
@@ -683,7 +841,13 @@ fn build_flow_report(name: &str, run: &mcp_types::Envelope, cap: &mcp_types::Env
                 .collect()
         })
         .unwrap_or_default();
-    json!({
+    // A run refused before any step (a missing secret, a bad argument) has no
+    // failing step; its error is the whole explanation.
+    let error = match (&failing, run.ok, &run.error) {
+        (Value::Null, false, Some(e)) => json!(e.message),
+        _ => Value::Null,
+    };
+    let mut row = json!({
         "name": name,
         "passed": run.ok,
         "ran": rd.get("ran").cloned().unwrap_or(json!(0)),
@@ -692,7 +856,11 @@ fn build_flow_report(name: &str, run: &mcp_types::Envelope, cap: &mcp_types::Env
         "failed_requests": failed_requests,
         "ux_checks": ux_checks,
         "steps": steps,
-    })
+    });
+    if !error.is_null() {
+        row["error"] = error;
+    }
+    row
 }
 
 /// Print the human report; return (passed, failed, flows-with-issues).
@@ -797,6 +965,184 @@ fn print_report(reports: &[Value], strict: bool) -> (usize, usize, usize) {
     };
     println!("\n{passed} passed, {failed} failed{extra}");
     (passed, failed, issue_flows)
+}
+
+/// `agentctl record --name <flow_name>` — Shadow observation and macro learning mode ("Ghost Mode").
+/// Observes human interactions in a tab, debounces keystrokes and rapid click bursts,
+/// strips noise, and synthesizes clean, deterministic `browser_flow` definitions.
+async fn record_cmd(args: &[String]) -> std::io::Result<()> {
+    use mcp_browser::{BrowserModule, CdpBackend, FlowStore, NavPolicy};
+    use mcp_types::{CallCtx, CancelToken, ToolModule};
+
+    let cfg = config_or_exit();
+    let dir = state_dir(&cfg);
+    let name = flag(args, "--name").unwrap_or_else(|| {
+        eprintln!(
+            "agentctl record: missing --name <flow_name>\n  \
+             Usage: agentctl record --name <flow_name> [--attach <port>] [--target <target_id>]\n  \
+             Without --attach it launches its own throwaway browser."
+        );
+        std::process::exit(2);
+    });
+    let attach_port = parse_attach_port("record", args);
+    let target_id_arg = flag(args, "--target");
+
+    let backend = Arc::new(CdpBackend::new(NavPolicy::new(
+        &cfg.allowed_origins,
+        cfg.browser_allow_private,
+    )));
+    let flow_store = FlowStore::new(dir.join("browser_flows.json"), 200, 200);
+    let module = BrowserModule::new(backend).with_flow_store(flow_store);
+    let ctx = CallCtx::new(new_session_id(), CancelToken::new());
+
+    // Attach only when asked to: a browser with remote debugging on is often
+    // the operator's everyday one, and recording into it would put every tab
+    // they have open in reach of the recorder. The default is a throwaway
+    // headed browser with its own temporary profile.
+    let launched = attach_port.is_none();
+    let conn = if let Some(port) = attach_port {
+        module
+            .call(
+                "browser_connect",
+                json!({ "attach": { "port": port } }),
+                &ctx,
+            )
+            .await
+    } else {
+        println!("Launching a throwaway headed browser for recording...");
+        module
+            .call(
+                "browser_connect",
+                json!({ "launch": { "headless": false } }),
+                &ctx,
+            )
+            .await
+    };
+
+    if !conn.ok {
+        eprintln!("agentctl record: could not connect or launch browser.");
+        if let Some(e) = conn.error {
+            eprintln!("  {}", e.message);
+        }
+        std::process::exit(2);
+    }
+
+    let browser_id = conn
+        .data
+        .as_ref()
+        .and_then(|d| d.get("browser_id"))
+        .and_then(Value::as_u64)
+        .unwrap_or(1);
+
+    // List tabs to find target
+    let tabs_res = module
+        .call(
+            "browser_tabs",
+            json!({ "browser_id": browser_id, "action": "list" }),
+            &ctx,
+        )
+        .await;
+    let tabs = tabs_res
+        .data
+        .as_ref()
+        .and_then(|d| d.get("tabs"))
+        .and_then(Value::as_array);
+
+    let target_id = if let Some(tid) = target_id_arg {
+        tid.to_string()
+    } else if let Some(first_tab) = tabs.and_then(|t| t.first()) {
+        first_tab
+            .get("target_id")
+            .and_then(Value::as_str)
+            .unwrap_or("T")
+            .to_string()
+    } else {
+        eprintln!("agentctl record: no active tabs found in browser session.");
+        stop_launched_browser(&module, &ctx, browser_id, launched).await;
+        std::process::exit(2);
+    };
+
+    println!("\n=======================================================");
+    println!("  🔴 agentctl Ghost Mode — Observation Active");
+    println!("  Target Tab: {target_id}");
+    println!("  Flow Name : {name}");
+    println!("=======================================================");
+    println!("Perform your actions in the browser window.");
+    println!("Keystrokes will be debounced and clicks filtered into clean Flow steps.");
+    println!("Press [ENTER] in this terminal when finished to compile the macro...\n");
+
+    let start_res = module
+        .call(
+            "browser_record",
+            json!({ "target_id": target_id, "action": "start" }),
+            &ctx,
+        )
+        .await;
+
+    if !start_res.ok {
+        eprintln!(
+            "agentctl record: failed to start recording: {:?}",
+            start_res.error
+        );
+        stop_launched_browser(&module, &ctx, browser_id, launched).await;
+        std::process::exit(2);
+    }
+
+    // Wait for ENTER
+    let mut line = String::new();
+    let _ = std::io::stdin().read_line(&mut line);
+
+    println!("Compiling macro and synthesizing deterministic Flow steps...");
+    let stop_res = module
+        .call(
+            "browser_record",
+            json!({ "target_id": target_id, "action": "stop", "name": name }),
+            &ctx,
+        )
+        .await;
+
+    if !stop_res.ok {
+        eprintln!(
+            "agentctl record: failed to compile macro: {:?}",
+            stop_res.error
+        );
+        std::process::exit(2);
+    }
+
+    stop_launched_browser(&module, &ctx, browser_id, launched).await;
+
+    let data = stop_res.data.unwrap_or(Value::Null);
+    let step_count = data.get("steps").and_then(Value::as_u64).unwrap_or(0);
+    println!("\n✅ Successfully synthesized and saved macro '{name}'!");
+    println!("   Steps recorded: {step_count}");
+    println!(
+        "   Saved store   : {}",
+        dir.join("browser_flows.json").display()
+    );
+    println!("\nYou can replay this test anytime with:");
+    println!("   agentctl test {name}\n");
+
+    Ok(())
+}
+
+/// Stop a browser this command launched; an attached one is someone else's
+/// and is left running.
+async fn stop_launched_browser(
+    module: &mcp_browser::BrowserModule,
+    ctx: &mcp_types::CallCtx,
+    browser_id: u64,
+    launched: bool,
+) {
+    use mcp_types::ToolModule;
+    if launched {
+        let _ = module
+            .call(
+                "browser_disconnect",
+                json!({ "browser_id": browser_id, "kill": true }),
+                ctx,
+            )
+            .await;
+    }
 }
 
 /// Rebuild a transcript from an audit log — how a session driven by a client
@@ -1340,7 +1686,7 @@ fn print_help() {
         "agentctl {} — MCP server for GUI/desktop control\n\
          \n\
          USAGE:\n\
-         \x20   agentctl [COMMAND]\n\
+         \x20   agentctl [COMMAND] [OPTIONS]\n\
          \n\
          COMMANDS:\n\
          \x20   serve            Serve MCP over stdio (default)\n\
@@ -1349,9 +1695,20 @@ fn print_help() {
          \x20   config print     Print the effective configuration\n\
          \x20   tools            Print the tool reference (--all, --json)\n\
          \x20   bridge           Drive this server with Gemini (--task, --list-models, --prune)\n\
-         \x20   test             Replay saved browser_flow UI tests (--attach, --headed/--headless, --json, --strict)\n\
+         \x20   test             Replay saved browser_flow UI tests (--attach, --headed/--headless, --json, --strict; secrets via AGENTCTL_SECRET_<REF>, see `test --help`)\n\
+         \x20   record           Record human browser interactions into a deterministic flow (--name <flow>, --attach <port>)\n\
          \x20   transcript       Rebuild a session record from an audit log\n\
-         \x20   help             Show this help\n",
+         \x20   audit            Verify or export cryptographic audit logs (SOC2/HIPAA)\n\
+         \x20   help             Show this help\n\
+         \n\
+         OPTIONS:\n\
+         \x20   --role <ROLE>         Set active RBAC role profile (readonly, qa, operator, admin)\n\
+         \x20   --no-anonymize        Disable outbound/inbound PII/PHI tokenization\n\
+         \x20   --no-pii              Alias for --no-anonymize\n\
+         \x20   --anonymize           Explicitly enable PII/PHI tokenization (default: enabled)\n\
+         \x20   --demo                Enable visual flair showcase mode (cursor glide, ripple animations, HUD)\n\
+         \x20   --demo-speed <SPEED>  Set demo speed preset: cinematic, demo, snappy, instant/off\n\
+         \x20   --http                Serve over HTTP instead of stdio\n",
         env!("CARGO_PKG_VERSION")
     );
 }
@@ -1402,6 +1759,53 @@ mod test_cmd_tests {
         assert!(!resolve_launch_headless(&s(&[
             "agentctl", "test", "--headed"
         ])));
+    }
+
+    #[test]
+    fn a_run_refused_before_any_step_reports_why() {
+        let run = mcp_types::Envelope::fail(
+            "browser_flow",
+            mcp_types::ErrorCode::InvalidArgs,
+            "secret 'pw' was not supplied",
+        );
+        let r = build_flow_report("login", &run, &env_ok(json!({})));
+        assert_eq!(r["passed"], false);
+        assert_eq!(r["error"], "secret 'pw' was not supplied");
+    }
+
+    #[test]
+    fn test_secrets_come_from_agentctl_secret_env_vars() {
+        assert_eq!(secret_env_name("pw"), "AGENTCTL_SECRET_PW");
+        assert_eq!(secret_env_name("card-cvv"), "AGENTCTL_SECRET_CARD_CVV");
+        assert_eq!(secret_env_name("api_key2"), "AGENTCTL_SECRET_API_KEY2");
+
+        let refs = vec!["pw".to_string(), "otp".to_string(), "empty".to_string()];
+        let env = |k: &str| match k {
+            "AGENTCTL_SECRET_PW" => Some("hunter2".to_string()),
+            "AGENTCTL_SECRET_EMPTY" => Some(String::new()),
+            _ => None,
+        };
+        let s = secrets_for_refs(&refs, env);
+        // Set -> supplied; unset or empty -> left out, so the run names it.
+        assert_eq!(s.len(), 1);
+        assert_eq!(s["pw"], "hunter2");
+    }
+
+    #[test]
+    fn record_attaches_only_to_an_explicit_port() {
+        // No flag: no attach, so `agentctl record` launches its own browser
+        // instead of reaching for whatever listens on 9222.
+        assert_eq!(
+            attach_port_arg(&s(&["agentctl", "record", "--name", "x"])),
+            Ok(None)
+        );
+        assert_eq!(
+            attach_port_arg(&s(&["agentctl", "record", "--attach", "9222"])),
+            Ok(Some(9222))
+        );
+        // A bad or missing value is an error, never a silent fallback.
+        assert!(attach_port_arg(&s(&["agentctl", "record", "--attach", "abc"])).is_err());
+        assert!(attach_port_arg(&s(&["agentctl", "record", "--attach"])).is_err());
     }
 
     #[test]
