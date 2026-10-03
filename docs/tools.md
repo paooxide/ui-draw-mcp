@@ -24,7 +24,7 @@ enabled category, while a `dangerous` tool additionally has to be named in
 | [`clipboard_write`](#clipboard-write) | input | standard | Write the clipboard. |
 | [`drag_drop`](#drag-drop) | input | standard | Press-move-release drag from one point/ref to another. |
 | [`hover`](#hover) | input | standard | Move the pointer over an element ref or point (reveals tooltips/hover menus). |
-| [`input_showcase`](#input-showcase) | input | standard | Configure smooth Bezier mouse gliding and visual flair for demos, screencasts, and presentations. |
+| [`input_showcase`](#input-showcase) | input | standard | Glide the real mouse pointer along a smooth Bezier curve to each point instead of jumping there, for demos, screencasts and presentations. |
 | [`keyboard_shortcut`](#keyboard-shortcut) | input | standard | Press a key or chord, e.g. |
 | [`keyboard_type`](#keyboard-type) | input | standard | Type Unicode text into the focused window. |
 | [`mouse_action`](#mouse-action) | input | standard | Coordinate pointer action (screen control). |
@@ -51,7 +51,7 @@ enabled category, while a `dangerous` tool additionally has to be named in
 | [`power_control`](#power-control) | desktop | dangerous | Sleep, log out, restart or shut down. |
 | [`speak`](#speak) | desktop | standard | Speak text through the speakers. |
 | [`system_settings`](#system-settings) | desktop | standard | Read or change a desktop setting. |
-| [`browser_act`](#browser-act) | browser | standard | Act on a DOM node: click, type, select, hover, focus, scroll_into_view, submit. |
+| [`browser_act`](#browser-act) | browser | standard | Act on a DOM node: click, type, select, hover, focus, scroll_into_view, submit, press (value Enter, Escape or Tab, sent as a real key event to the focused node; Chrome only). |
 | [`browser_assert`](#browser-assert) | browser | read | Settle (optional) then check the page in one call; returns {passed, checks} and errors when it fails. |
 | [`browser_branch`](#browser-branch) | browser | standard | Speculative browser context branching: fork an isolated background context from a tab ('create'), run trials without affecting the visible tab, commit winning state ('commit'), discard failed branches ('discard'), switch focus ('switch'), or list branches ('list'). |
 | [`browser_capture`](#browser-capture) | browser | dangerous | Regression-test capture. |
@@ -61,7 +61,7 @@ enabled category, while a `dangerous` tool additionally has to be named in
 | [`browser_cookies`](#browser-cookies) | browser | dangerous | Cookie access: get (values redacted), set, or clear. |
 | [`browser_dialog`](#browser-dialog) | browser | standard | Inspect and control how the page's JavaScript dialogs (alert/confirm/prompt/beforeunload) are answered. |
 | [`browser_disconnect`](#browser-disconnect) | browser | standard | Disconnect from a browser. |
-| [`browser_eval`](#browser-eval) | browser | dangerous | Evaluate arbitrary JavaScript in the page context; result is JSON-serialized. |
+| [`browser_eval`](#browser-eval) | browser | dangerous | Evaluate arbitrary JavaScript in the page context. |
 | [`browser_extract`](#browser-extract) | browser | read | Extract structured data directly from the page using a CSS/attribute schema (e.g. |
 | [`browser_fill_form`](#browser-fill-form) | browser | standard | Fill multiple form fields (input, select, checkbox, radio) in one call and optionally submit. |
 | [`browser_flow`](#browser-flow) | browser | standard | Save and replay a browser UI test. |
@@ -71,7 +71,7 @@ enabled category, while a `dangerous` tool additionally has to be named in
 | [`browser_query`](#browser-query) | browser | read | Resolve node ref(s) by css selector, xpath, or visible text. |
 | [`browser_record`](#browser-record) | browser | standard | Shadow observation & macro learning mode (Ghost Mode). |
 | [`browser_screenshot`](#browser-screenshot) | browser | read | Capture a PNG of the page (or a single element by ref). |
-| [`browser_showcase`](#browser-showcase) | browser | standard | Configure visual flair for demos, screencasts, and presentations: animated virtual SVG cursor, smooth cubic-bezier gliding, click ripples, a… |
+| [`browser_showcase`](#browser-showcase) | browser | standard | Configure visual flair for demos, screencasts, and presentations: animated virtual SVG cursor, smooth cubic-bezier gliding, click ripples, and floating typing HUD, drawn inside the tab on Chrome and Safari. |
 | [`browser_snapshot`](#browser-snapshot) | browser | read | Flatten a page into interactable node refs (dom/accessibility) or raw text. |
 | [`browser_tabs`](#browser-tabs) | browser | standard | List/open/activate/close tabs (targets) of a connected browser. |
 | [`browser_viewport`](#browser-viewport) | browser | standard | Emulate a viewport for responsive testing: override the page's device metrics (width/height, optionally mobile and a device scale factor). |
@@ -311,7 +311,7 @@ Move the pointer over an element ref or point (reveals tooltips/hover menus). Su
 
 `input_showcase` · standard tier
 
-Configure smooth Bezier mouse gliding and visual flair for demos, screencasts, and presentations.
+Glide the real mouse pointer along a smooth Bezier curve to each point instead of jumping there, for demos, screencasts and presentations. It only moves the system cursor: no click ripples, typing HUD or styled cursor are drawn on the desktop (browser_showcase draws those inside a browser tab).
 
 | Argument | Type | Required | Description |
 |---|---|---|---|
@@ -686,7 +686,7 @@ Read or change a desktop setting. Settings the platform does not expose return U
 
 `browser_act` · standard tier
 
-Act on a DOM node: click, type, select, hover, focus, scroll_into_view, submit. A page-published canvas region (a canvas-child ref from browser_snapshot) supports only click and hover, sent as real mouse input at the region centre; other actions on it return Unsupported. Target it with 'ref' (from browser_query/snapshot) or, in one call, with 'query' plus optional 'by' (css/xpath/text), 'within' (scoped container), 'text' (substring filter), and 'index'.
+Act on a DOM node: click, type, select, hover, focus, scroll_into_view, submit, press (value Enter, Escape or Tab, sent as a real key event to the focused node; Chrome only). A page-published canvas region (a canvas-child ref from browser_snapshot) supports only click and hover, sent as real mouse input at the region centre; other actions on it return Unsupported. Target it with 'ref' (from browser_query/snapshot) or, in one call, with 'query' plus optional 'by' (css/xpath/text), 'within' (scoped container), 'text' (substring filter), and 'index'.
 
 | Argument | Type | Required | Description |
 |---|---|---|---|
@@ -732,7 +732,7 @@ Settle (optional) then check the page in one call; returns {passed, checks} and 
 
 `browser_branch` · standard tier
 
-Speculative browser context branching: fork an isolated background context from a tab ('create'), run trials without affecting the visible tab, commit winning state ('commit'), discard failed branches ('discard'), switch focus ('switch'), or list branches ('list'). Branches run in a separate browser context and fail with an error if one cannot be created (no silent fallback to the shared context). Commit and discard report an error unless the work was done and the branch tab was really closed. At most 8 branches may be active at once (AGENTCTL_MAX_BRANCHES).
+Speculative browser context branching: fork an isolated background context from a tab ('create'), run trials without affecting the visible tab, commit winning state ('commit'), discard failed branches ('discard'), switch focus ('switch'), or list branches ('list'). Branches run in a separate browser context and fail with an error if one cannot be created (no silent fallback to the shared context). Commit and discard report an error unless the work was done and the branch tab was really closed. At most 8 branches may be active at once (AGENTCTL_MAX_BRANCHES). Chrome only: a Safari tab returns Unsupported.
 
 | Argument | Type | Required | Description |
 |---|---|---|---|
@@ -770,7 +770,7 @@ Mixed-initiative CAPTCHA / 2FA detector and handshake. Pauses execution, shows a
 
 `browser_checkpoint` · standard tier
 
-In-memory state checkpointing and rollback (T-1) for browser tabs. 'save' captures a deep copy of form state (input values, checks, select indexes, scroll), storage, cookies and URL (not the DOM tree); 'rollback' navigates back if needed (loading the page from the network with Chrome's HTTP cache bypassed, so a server that is down is an error, not a stale cached page; the result says cache_bypassed), waits for the page to load, restores that state and fails with the reason if any part could not be restored; 'list'/'delete' manage checkpoints. Re-saving a tag makes it the newest ('latest'). File inputs are skipped.
+In-memory state checkpointing and rollback (T-1) for browser tabs. 'save' captures a deep copy of form state (input values, checks, select indexes, scroll), storage, cookies and URL (not the DOM tree); 'rollback' navigates back if needed (loading the page from the network with Chrome's HTTP cache bypassed, so a server that is down is an error, not a stale cached page; the result says cache_bypassed), waits for the page to load, restores that state and fails with the reason if any part could not be restored; 'list'/'delete' manage checkpoints. Re-saving a tag makes it the newest ('latest'). File inputs are skipped. Chrome only: a Safari tab returns Unsupported.
 
 | Argument | Type | Required | Description |
 |---|---|---|---|
@@ -782,7 +782,7 @@ In-memory state checkpointing and rollback (T-1) for browser tabs. 'save' captur
 
 `browser_connect` · standard tier
 
-Attach to a Chromium browser started with --remote-debugging-port, or launch a dedicated instance. Optionally auto-restores a saved profile. launch.browser='safari' drives Safari through safaridriver (macOS only, experimental: needs `safaridriver --enable` once, opens a visible window, and has no network interception).
+Attach to a Chromium browser started with --remote-debugging-port, or launch a dedicated instance. Optionally auto-restores a saved profile. launch.browser='safari' drives Safari through safaridriver (macOS only, experimental: needs `safaridriver --enable` once, and a Safari that was already open when automation was enabled must be quit first; opens a visible window). On Safari, browser_network, browser_dialog, browser_viewport, browser_record, browser_branch, browser_checkpoint and browser_act 'press' return Unsupported.
 
 | Argument | Type | Required | Description |
 |---|---|---|---|
@@ -836,7 +836,7 @@ Disconnect from a browser. With kill=true, also stop a browser this session laun
 
 `browser_eval` · dangerous tier
 
-Evaluate arbitrary JavaScript in the page context; result is JSON-serialized. Arbitrary code execution.
+Evaluate arbitrary JavaScript in the page context. The result is the value of the last statement (a returned promise is awaited), JSON-serialized. Arbitrary code execution. On Safari, a page whose CSP forbids eval gets the code run without eval: an expression works as usual, but statements need an explicit `return` to produce a result.
 
 | Argument | Type | Required | Description |
 |---|---|---|---|
@@ -937,7 +937,7 @@ Resolve node ref(s) by css selector, xpath, or visible text.
 
 `browser_record` · standard tier
 
-Shadow observation & macro learning mode (Ghost Mode). Observes human interactions in a tab, across page loads and navigations (a link or form post becomes a wait for the next page, a typed URL or reload a goto), debounces keystrokes and click bursts, strips noise, and synthesizes clean, deterministic browser_flow steps. Secret fields are never recorded: they become steps with a secret_ref, supplied as secrets when the flow runs. Chrome only. JavaScript dialogs raised while recording are answered as 'dialogs' says: by the person at a visible window by default (the recording keeps the answer as a dialog step the flow replays before the action that raised it; a prompt's typed text is not kept), by the recorder in a headless browser (dismiss unless browser_dialog says accept).
+Shadow observation & macro learning mode (Ghost Mode). Observes interactions in a tab (a person's, and the agent's own browser_act and browser_fill_form actions; events the page's own script fakes, such as el.click() or dispatchEvent, are ignored), across page loads and navigations (a link or form post becomes a wait for the next page, a typed URL or reload a goto), debounces keystrokes and click bursts, strips noise, and synthesizes clean, deterministic browser_flow steps. Secret fields are never recorded: they become steps with a secret_ref, supplied as secrets when the flow runs. Chrome only. JavaScript dialogs raised while recording are answered as 'dialogs' says: by the person at a visible window by default (the recording keeps the answer as a dialog step the flow replays before the action that raised it; a prompt's typed text is not kept), by the recorder in a headless browser (dismiss unless browser_dialog says accept).
 
 | Argument | Type | Required | Description |
 |---|---|---|---|
@@ -961,7 +961,7 @@ Capture a PNG of the page (or a single element by ref).
 
 `browser_showcase` · standard tier
 
-Configure visual flair for demos, screencasts, and presentations: animated virtual SVG cursor, smooth cubic-bezier gliding, click ripples, and floating typing HUD.
+Configure visual flair for demos, screencasts, and presentations: animated virtual SVG cursor, smooth cubic-bezier gliding, click ripples, and floating typing HUD, drawn inside the tab on Chrome and Safari. Decoration only: it never changes an action's result or error, and the typing HUD masks secrets and password/one-time-code fields.
 
 | Argument | Type | Required | Description |
 |---|---|---|---|

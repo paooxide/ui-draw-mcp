@@ -1729,7 +1729,7 @@ impl ToolModule for BrowserModule {
                 "browser_connect",
                 Category::Browser,
                 Tier::Standard,
-                "Attach to a Chromium browser started with --remote-debugging-port, or launch a dedicated instance. Optionally auto-restores a saved profile. launch.browser='safari' drives Safari through safaridriver (macOS only, experimental: needs `safaridriver --enable` once, opens a visible window, and has no network interception).",
+                "Attach to a Chromium browser started with --remote-debugging-port, or launch a dedicated instance. Optionally auto-restores a saved profile. launch.browser='safari' drives Safari through safaridriver (macOS only, experimental: needs `safaridriver --enable` once, and a Safari that was already open when automation was enabled must be quit first; opens a visible window). On Safari, browser_network, browser_dialog, browser_viewport, browser_record, browser_branch, browser_checkpoint and browser_act 'press' return Unsupported.",
                 obj(
                     json!({
                         "attach": { "type": "object", "properties": { "port": { "type": "integer" } } },
@@ -1823,7 +1823,8 @@ impl ToolModule for BrowserModule {
                 "browser_act",
                 Category::Browser,
                 Tier::Standard,
-                "Act on a DOM node: click, type, select, hover, focus, scroll_into_view, submit. \
+                "Act on a DOM node: click, type, select, hover, focus, scroll_into_view, submit, press \
+                 (value Enter, Escape or Tab, sent as a real key event to the focused node; Chrome only). \
                  A page-published canvas region (a canvas-child ref from browser_snapshot) supports only click and hover, \
                  sent as real mouse input at the region centre; other actions on it return Unsupported. \
                  Target it with 'ref' (from browser_query/snapshot) or, in one call, with \
@@ -1912,7 +1913,7 @@ impl ToolModule for BrowserModule {
                  Branches run in a separate browser context and fail with an error if one cannot be created \
                  (no silent fallback to the shared context). Commit and discard report an error unless the \
                  work was done and the branch tab was really closed. At most 8 branches may be active at once \
-                 (AGENTCTL_MAX_BRANCHES).",
+                 (AGENTCTL_MAX_BRANCHES). Chrome only: a Safari tab returns Unsupported.",
                 obj(
                     json!({
                         "action": { "type": "string", "enum": ["create", "commit", "discard", "switch", "list"] },
@@ -1933,7 +1934,7 @@ impl ToolModule for BrowserModule {
                  down is an error, not a stale cached page; the result says cache_bypassed), waits \
                  for the page to load, restores that state and fails with the reason if any part \
                  could not be restored; 'list'/'delete' manage checkpoints. Re-saving a tag makes it the \
-                 newest ('latest'). File inputs are skipped.",
+                 newest ('latest'). File inputs are skipped. Chrome only: a Safari tab returns Unsupported.",
                 obj(
                     json!({
                         "action": { "type": "string", "enum": ["save", "rollback", "list", "delete"] },
@@ -1984,7 +1985,7 @@ impl ToolModule for BrowserModule {
                 "browser_record",
                 Category::Browser,
                 Tier::Standard,
-                "Shadow observation & macro learning mode (Ghost Mode). Observes human interactions in a tab, across page loads and navigations (a link or form post becomes a wait for the next page, a typed URL or reload a goto), debounces keystrokes and click bursts, strips noise, and synthesizes clean, deterministic browser_flow steps. Secret fields are never recorded: they become steps with a secret_ref, supplied as secrets when the flow runs. Chrome only. JavaScript dialogs raised while recording are answered as 'dialogs' says: by the person at a visible window by default (the recording keeps the answer as a dialog step the flow replays before the action that raised it; a prompt's typed text is not kept), by the recorder in a headless browser (dismiss unless browser_dialog says accept).",
+                "Shadow observation & macro learning mode (Ghost Mode). Observes interactions in a tab (a person's, and the agent's own browser_act and browser_fill_form actions; events the page's own script fakes, such as el.click() or dispatchEvent, are ignored), across page loads and navigations (a link or form post becomes a wait for the next page, a typed URL or reload a goto), debounces keystrokes and click bursts, strips noise, and synthesizes clean, deterministic browser_flow steps. Secret fields are never recorded: they become steps with a secret_ref, supplied as secrets when the flow runs. Chrome only. JavaScript dialogs raised while recording are answered as 'dialogs' says: by the person at a visible window by default (the recording keeps the answer as a dialog step the flow replays before the action that raised it; a prompt's typed text is not kept), by the recorder in a headless browser (dismiss unless browser_dialog says accept).",
                 obj(
                     json!({
                         "target_id": { "type": "string" },
@@ -2030,7 +2031,7 @@ impl ToolModule for BrowserModule {
                 "browser_eval",
                 Category::Browser,
                 Tier::Dangerous,
-                "Evaluate arbitrary JavaScript in the page context; result is JSON-serialized. Arbitrary code execution.",
+                "Evaluate arbitrary JavaScript in the page context. The result is the value of the last statement (a returned promise is awaited), JSON-serialized. Arbitrary code execution. On Safari, a page whose CSP forbids eval gets the code run without eval: an expression works as usual, but statements need an explicit `return` to produce a result.",
                 obj(
                     json!({
                         "target_id": { "type": "string" },
@@ -2180,7 +2181,7 @@ impl ToolModule for BrowserModule {
                 "browser_showcase",
                 Category::Browser,
                 Tier::Standard,
-                "Configure visual flair for demos, screencasts, and presentations: animated virtual SVG cursor, smooth cubic-bezier gliding, click ripples, and floating typing HUD.",
+                "Configure visual flair for demos, screencasts, and presentations: animated virtual SVG cursor, smooth cubic-bezier gliding, click ripples, and floating typing HUD, drawn inside the tab on Chrome and Safari. Decoration only: it never changes an action's result or error, and the typing HUD masks secrets and password/one-time-code fields.",
                 obj(
                     json!({
                         "target_id": { "type": "string", "description": "the tab to configure showcase overlays for" },

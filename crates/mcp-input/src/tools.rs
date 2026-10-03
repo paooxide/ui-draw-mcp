@@ -1132,7 +1132,7 @@ impl ToolModule for InputModule {
                 "input_showcase",
                 Category::Input,
                 Tier::Standard,
-                "Configure smooth Bezier mouse gliding and visual flair for demos, screencasts, and presentations.",
+                "Glide the real mouse pointer along a smooth Bezier curve to each point instead of jumping there, for demos, screencasts and presentations. It only moves the system cursor: no click ripples, typing HUD or styled cursor are drawn on the desktop (browser_showcase draws those inside a browser tab).",
                 json!({"type":"object","properties":{
                     "enabled":{"type":"boolean","description":"enable or disable smooth gliding"},
                     "speed":{"type":"string","enum":["cinematic","demo","snappy","instant","off"],"description":"speed preset (cinematic: 350ms, demo: 200ms, snappy: 100ms, instant: 0ms)"},

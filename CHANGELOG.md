@@ -323,6 +323,12 @@ All notable changes to this project are documented here. The format follows
 - The SSRF guard moved from `mcp-net` into its own dependency-free crate, `mcp-ssrf`, so the browser
   engine can share it without one engine depending on another. `mcp-net` re-exports it unchanged.
 - Driving a local development server through the browser now needs `browser.allow_private = true`.
+- Tool descriptions say what a model needs to plan with: `browser_connect` lists what returns `UNSUPPORTED`
+  on Safari (and that a Safari open before automation was enabled must be quit), `browser_act` lists `press`,
+  `browser_eval` states its result semantics and the Safari `return` rule under a CSP, `browser_record` says the
+  agent's own actions are recorded and page-faked events are not, `browser_branch`/`browser_checkpoint` say
+  Chrome only, `browser_showcase` says it is decoration that never changes a result, and `input_showcase` no
+  longer promises desktop overlays it does not draw.
 
 ## [0.1.0] - 2026-09-03
 
