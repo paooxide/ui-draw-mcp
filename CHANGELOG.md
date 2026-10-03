@@ -21,6 +21,12 @@ All notable changes to this project are documented here. The format follows
   `agentctl audit keygen` creates a signing key for `policy.audit_signing_key`; `agentctl audit verify
   --pubkey` fails unless the log was signed by that key, and without one reports the log as
   self-consistent only. `agentctl audit export` writes a SOC2-style report or a HIPAA access-event CSV/JSON.
+- **Role profiles and argument invariants.** `policy.role` (built in: `readonly`, `qa`, `operator`,
+  `admin`, or one defined under `[roles.<name>]`) narrows the visible tools by category, tier or name,
+  can require consent, and can lower the denial budget; a role never widens anything. `[invariants]`
+  refuses protected paths and denied domains anywhere in a call's arguments before the gate, including
+  inside command lines, in `file:` URLs and through symlinks. It is a check on argument text, not
+  containment; relative paths, shell expansion, encoding and DNS are documented as out of reach.
 - **UX testing: accessibility, design-token style, component and responsive checks.** `browser_assert`
   gained UX clauses that ride the same `{passed, checks}` flow and `agentctl test` report as the functional
   ones: `a11y` runs a built-in WCAG audit (alt text, form labels, control names, colour contrast, target

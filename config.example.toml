@@ -72,6 +72,20 @@ anonymize = false
 # (the file must be mode 0600), and verify with --pubkey <the printed key>.
 # audit_signing_key = "/Users/you/.agentctl/audit_signing.key"
 
+# Role profiles narrow what a session may call; they never widen it. Built in:
+# readonly (read tier only), qa (browser, vision, window, system, input; no
+# browser_eval), operator (dangerous tools always ask), admin (no extra limits).
+# Pick one for this server, or define your own below.
+# role = "qa"
+
+# A custom role, selected with role = "support" above.
+# [roles.support]
+# description = "Reads and browses; may not touch the terminal or files"
+# allowed_categories = ["browser", "vision", "window", "system"]
+# denied_tools = ["browser_eval", "browser_cookies"]
+# require_consent_for = ["standard"]   # tiers or tool names
+# max_denials = 3                      # can only tighten policy.max_denials
+
 [input]
 # Stop when a human takes over the mouse.
 #

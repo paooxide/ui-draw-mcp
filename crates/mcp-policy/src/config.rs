@@ -216,6 +216,25 @@ pub struct PolicyConfig {
     /// Off by default: it rewrites every result, including IP addresses and
     /// phone-like numbers in network and system output.
     pub anonymize: bool,
+    /// Active RBAC role profile name for this session (e.g. "readonly", "qa", "operator", "admin").
+    pub active_role: Option<String>,
+    /// Configured role definitions, mapping role name to RoleProfile.
+    pub roles: std::collections::HashMap<String, crate::role::RoleProfile>,
+    /// Protected paths and denied domains checked before the gate (see
+    /// [`crate::role::HardInvariants`] for what they can and cannot see).
+    pub invariants: crate::role::HardInvariants,
+}
+
+impl PolicyConfig {
+    /// Retrieve a role profile by name, checking custom configured roles and built-ins.
+    pub fn get_role(&self, name: &str) -> Option<crate::role::RoleProfile> {
+        crate::role::resolve_role_profile(name, &self.roles)
+    }
+
+    /// Retrieve the currently active role profile, if one is configured.
+    pub fn active_role_profile(&self) -> Option<crate::role::RoleProfile> {
+        self.active_role.as_deref().and_then(|r| self.get_role(r))
+    }
 }
 
 impl Default for PolicyConfig {
@@ -227,6 +246,9 @@ impl Default for PolicyConfig {
             mode: Mode::Interactive,
             access: None,
             anonymize: false,
+            active_role: None,
+            roles: std::collections::HashMap::new(),
+            invariants: crate::role::HardInvariants::default(),
             allowed_apps: ["Terminal", "Finder", "TextEdit"]
                 .iter()
                 .map(|s| s.to_string())

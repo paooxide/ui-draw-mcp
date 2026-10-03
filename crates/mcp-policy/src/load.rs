@@ -39,7 +39,11 @@ fn parse(text: &str) -> Result<HashMap<String, Val>, String> {
         let lineno = n + 1;
         if let Some(inner) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
             let name = inner.trim();
-            if name.is_empty() || !name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+            if name.is_empty()
+                || !name
+                    .chars()
+                    .all(|c| c.is_alphanumeric() || c == '_' || c == '.')
+            {
                 return Err(format!("line {lineno}: bad section header '{line}'"));
             }
             section = name.to_ascii_lowercase();
@@ -305,6 +309,103 @@ impl PolicyConfig {
                 ("policy.audit_dir", Val::Str(s)) => cfg.audit_dir = PathBuf::from(s),
                 ("policy.audit_signing_key", Val::Str(s)) => {
                     cfg.audit_signing_key = Some(PathBuf::from(s))
+                }
+                ("policy.default_role" | "policy.role", Val::Str(s)) => {
+                    cfg.active_role = Some(s.clone());
+                }
+                (
+                    "invariants.protected_paths" | "policy.invariants.protected_paths",
+                    Val::List(v),
+                ) => {
+                    cfg.invariants.protected_paths = v.iter().map(PathBuf::from).collect();
+                }
+                (
+                    "invariants.denied_domains" | "policy.invariants.denied_domains",
+                    Val::List(v),
+                ) => {
+                    cfg.invariants.denied_domains = v.clone();
+                }
+                (k, val) if k.starts_with("roles.") => {
+                    let parts: Vec<&str> = k.split('.').collect();
+                    if parts.len() == 3 {
+                        let role_name = parts[1];
+                        let prop = parts[2];
+                        let role = cfg
+                            .roles
+                            .entry(role_name.to_string())
+                            .or_insert_with(|| crate::role::RoleProfile::new(role_name));
+
+                        match (prop, val) {
+                            ("description", Val::Str(s)) => role.description = s.clone(),
+                            ("allowed_categories", Val::List(v)) => {
+                                let mut cats = Vec::new();
+                                for slug in v {
+                                    cats.push(Category::from_slug(slug).ok_or_else(|| {
+                                        format!("unknown category '{slug}' in {k}")
+                                    })?);
+                                }
+                                role.allowed_categories = Some(cats);
+                            }
+                            ("denied_categories", Val::List(v)) => {
+                                let mut cats = Vec::new();
+                                for slug in v {
+                                    cats.push(Category::from_slug(slug).ok_or_else(|| {
+                                        format!("unknown category '{slug}' in {k}")
+                                    })?);
+                                }
+                                role.denied_categories = cats;
+                            }
+                            ("allowed_tiers", Val::List(v)) => {
+                                let mut tiers = Vec::new();
+                                for t in v {
+                                    match t.to_ascii_lowercase().as_str() {
+                                        "read" => tiers.push(mcp_types::Tier::Read),
+                                        "standard" => tiers.push(mcp_types::Tier::Standard),
+                                        "dangerous" => tiers.push(mcp_types::Tier::Dangerous),
+                                        other => {
+                                            return Err(format!("unknown tier '{other}' in {k}"))
+                                        }
+                                    }
+                                }
+                                role.allowed_tiers = Some(tiers);
+                            }
+                            ("allowed_tools", Val::List(v)) => role.allowed_tools = Some(v.clone()),
+                            ("denied_tools", Val::List(v)) => role.denied_tools = v.clone(),
+                            (
+                                "require_consent_for"
+                                | "require_consent_for_tiers"
+                                | "require_consent_tiers",
+                                Val::List(v),
+                            ) => {
+                                let mut tiers = Vec::new();
+                                let mut tools = Vec::new();
+                                for item in v {
+                                    match item.to_ascii_lowercase().as_str() {
+                                        "read" => tiers.push(mcp_types::Tier::Read),
+                                        "standard" => tiers.push(mcp_types::Tier::Standard),
+                                        "dangerous" => tiers.push(mcp_types::Tier::Dangerous),
+                                        _ => tools.push(item.clone()),
+                                    }
+                                }
+                                if !tiers.is_empty() {
+                                    role.require_consent_for_tiers = tiers;
+                                }
+                                if !tools.is_empty() {
+                                    role.require_consent_for_tools = tools;
+                                }
+                            }
+                            (
+                                "require_consent_for_tools" | "require_consent_tools",
+                                Val::List(v),
+                            ) => role.require_consent_for_tools = v.clone(),
+                            ("max_denials", Val::Int(i)) if *i >= 0 => {
+                                role.max_denials = Some(*i as usize)
+                            }
+                            // A misspelt or mistyped role setting would leave the
+                            // role looser than its author meant.
+                            _ => return Err(format!("{k}: unknown role setting or wrong type")),
+                        }
+                    }
                 }
                 // Unknown keys are tolerated for forward-compatibility, but a
                 // *known* key with the wrong type is a hard error.

@@ -20,6 +20,7 @@ mod judged;
 mod killswitch;
 mod load;
 mod redact;
+mod role;
 
 pub use anonymize::{
     is_luhn_credit_card, is_token_sink, is_valid_ssn, EntityType, SessionAnonymizer, MAX_ENTITIES,
@@ -46,6 +47,10 @@ pub use judged::{judged_destructive, second_opinion_on_content, Destructive};
 pub use killswitch::KillSwitch;
 pub use mcp_judge;
 pub use redact::{redact_flagged_payload, Redactor};
+pub use role::{
+    check_arguments_invariants, default_protected_paths, is_domain_denied, is_path_protected,
+    resolve_role_profile, HardInvariants, RoleProfile,
+};
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 pub use consent::DialogConsent;

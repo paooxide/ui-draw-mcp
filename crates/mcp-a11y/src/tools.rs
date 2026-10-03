@@ -418,6 +418,35 @@ impl ToolModule for A11yModule {
                     "required": ["ref"]
                 }),
             ).untrusted_output(),
+            ToolDescriptor::new(
+                "ui_extract",
+                Category::Vision,
+                Tier::Read,
+                "Extract structured data (tables, forms, lists, or custom schemas) directly \
+                 from native accessibility trees into JSON without parsing raw text dumps.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "app": { "type": "string", "description": "target application name" },
+                        "root": { "type": "string", "description": "drill into this container ref (@eN)" },
+                        "surface": {
+                            "type": "string",
+                            "enum": ["window", "focused", "menu", "menubar", "sheet", "popover", "alert"],
+                            "description": "which UI surface to observe"
+                        },
+                        "mode": {
+                            "type": "string",
+                            "enum": ["table", "form", "list", "schema"],
+                            "description": "extraction mode (table, form, list, schema)"
+                        },
+                        "schema": {
+                            "type": "object",
+                            "description": "custom extraction schema (field -> { role, name, property })"
+                        }
+                    },
+                    "required": []
+                }),
+            ).untrusted_output(),
         ]
     }
 

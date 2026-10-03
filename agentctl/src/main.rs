@@ -92,7 +92,8 @@ fn build_config() -> Result<PolicyConfig, String> {
         cfg.categories.push(Category::System);
         cfg.categories.push(Category::Browser);
     }
-    // Command-line flag overrides for PII/PHI anonymization
+    // Command-line flag overrides for PII/PHI anonymization and active role
+    let mut role_cli: Option<String> = None;
     let raw_args: Vec<String> = std::env::args().collect();
     let mut i = 0;
     while i < raw_args.len() {
@@ -101,9 +102,34 @@ fn build_config() -> Result<PolicyConfig, String> {
             cfg.anonymize = false;
         } else if arg == "--anonymize" {
             cfg.anonymize = true;
+        } else if arg == "--role" && i + 1 < raw_args.len() {
+            role_cli = Some(raw_args[i + 1].clone());
+            i += 1;
+        } else if let Some(stripped) = arg.strip_prefix("--role=") {
+            role_cli = Some(stripped.to_string());
         }
         i += 1;
     }
+
+    // Role precedence: CLI flag > AGENTCTL_ROLE env var > config default_role
+    if let Some(r) = role_cli {
+        cfg.active_role = Some(r);
+    } else if let Ok(env_r) = std::env::var("AGENTCTL_ROLE") {
+        let trimmed = env_r.trim();
+        if !trimmed.is_empty() {
+            cfg.active_role = Some(trimmed.to_string());
+        }
+    }
+
+    // Validate active role if specified (fail-closed)
+    if let Some(ref role_name) = cfg.active_role {
+        if cfg.get_role(role_name).is_none() {
+            return Err(format!(
+                "unknown role '{role_name}'. Available built-in roles: readonly (or auditor), qa (or tester), operator, admin; or define custom roles in config.toml under [roles.<name>]"
+            ));
+        }
+    }
+
     Ok(cfg)
 }
 
@@ -276,6 +302,9 @@ fn tools(args: &[String]) {
         .collect();
     if !all {
         descriptors.retain(|d| cfg.categories.contains(&d.category));
+        if let Some(role) = cfg.active_role_profile() {
+            descriptors.retain(|d| role.allows_tool(d));
+        }
     }
     if as_json {
         println!("{}", tools_doc::render_json(&descriptors));
@@ -1110,6 +1139,20 @@ fn doctor() {
         ),
         None => println!("  access profile:  none (granular categories/enable)"),
     }
+    println!(
+        "  active role:     {} (RBAC profile)",
+        cfg.active_role
+            .as_deref()
+            .unwrap_or("none (full config defaults)")
+    );
+    if let Some(role) = cfg.active_role_profile() {
+        println!("  role details:    {} — {}", role.name, role.description);
+    }
+    println!(
+        "  hard invariants: {} protected path(s), {} denied domain(s)",
+        cfg.invariants.protected_paths.len(),
+        cfg.invariants.denied_domains.len()
+    );
     println!("  enabled cats:    {}", slugs(&cfg));
     print_judge(&cfg);
     println!(
@@ -1260,11 +1303,17 @@ fn config_print() {
     println!("enable = {:?}", cfg.enable);
     println!("mode = {}", cfg.mode.as_str());
     println!("anonymize = {}", cfg.anonymize);
+    if let Some(r) = &cfg.active_role {
+        println!("active_role = {:?}", r);
+    }
     println!("allowed_apps = {:?}", cfg.allowed_apps);
     println!("max_denials = {}", cfg.max_denials);
     println!("max_consent_prompts = {}", cfg.max_consent_prompts);
     println!("kill_switch_file = {:?}", cfg.kill_switch_file);
     println!("audit_dir = {:?}", cfg.audit_dir);
+    println!("\n[invariants]");
+    println!("protected_paths = {:?}", cfg.invariants.protected_paths);
+    println!("denied_domains = {:?}", cfg.invariants.denied_domains);
 }
 
 fn slugs(cfg: &PolicyConfig) -> String {

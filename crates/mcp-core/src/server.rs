@@ -105,6 +105,7 @@ impl Server {
         // 1. Kill switch first.
         if self.policy.kill_switch_tripped() {
             let mut pre = AuditRecord::pre(&self.session_id, name);
+            pre.role = self.policy.active_role().map(String::from);
             pre.decision = Some("kill_switch".into());
             self.policy.audit(&pre);
             let why = self.policy.kill_switch_reason();
@@ -122,6 +123,7 @@ impl Server {
         // 2. Look up the tool.
         let Some((module, descriptor)) = self.registry.find(name) else {
             let mut pre = AuditRecord::pre(&self.session_id, name);
+            pre.role = self.policy.active_role().map(String::from);
             pre.decision = Some("unknown_tool".into());
             self.policy.audit(&pre);
             return Envelope::fail_with(
@@ -145,6 +147,46 @@ impl Server {
             );
         }
 
+        // 3b. Hard Policy Invariants (protected system paths and denied domains).
+        // Checked before the gate, so `access = "bypass"` does not skip them.
+        // A heuristic over argument text; see `HardInvariants`.
+        if let Err(reason) = self.policy.check_invariants(name, &args) {
+            let mut pre = AuditRecord::pre(&self.session_id, name);
+            pre.role = self.policy.active_role().map(String::from);
+            pre.tier = Some(tier);
+            let mut redacted_args = args.clone();
+            self.policy.redact(&mut redacted_args);
+            mcp_policy::redact_flagged_payload(&mut redacted_args);
+            self.policy.anonymize(&mut redacted_args);
+            pre.args_redacted = Some(redacted_args);
+            pre.decision = Some(format!("deny (invariant violation: {reason})"));
+            self.policy.audit(&pre);
+            self.policy.record_denial();
+            return Envelope::fail(
+                name,
+                ErrorCode::PolicyDenied,
+                format!("hard invariant violation: {reason}"),
+            );
+        }
+
+        // 3c. Synthetic PII tokens resolve only into local input fields. A
+        //     token headed anywhere else (a URL, a command, a file) would carry
+        //     the plaintext off the machine once de-tokenized, so the call is
+        //     refused here, whatever the access profile.
+        if let Err(reason) = self.policy.check_token_sink(name, &args) {
+            let mut pre = AuditRecord::pre(&self.session_id, name);
+            pre.role = self.policy.active_role().map(String::from);
+            pre.tier = Some(tier);
+            let mut redacted_args = args.clone();
+            self.policy.redact(&mut redacted_args);
+            mcp_policy::redact_flagged_payload(&mut redacted_args);
+            pre.args_redacted = Some(redacted_args);
+            pre.decision = Some("deny (pii token outside input sink)".into());
+            self.policy.audit(&pre);
+            self.policy.record_denial();
+            return Envelope::fail(name, ErrorCode::PolicyDenied, reason);
+        }
+
         // 4. Gate (category -> tier). An engine may additionally flag *this*
         //    invocation as risky (e.g. a destructive command), which upgrades an
         //    otherwise-allowed call to needing human approval.
@@ -152,6 +194,7 @@ impl Server {
 
         // Pre-audit with redacted args.
         let mut pre = AuditRecord::pre(&self.session_id, name);
+        pre.role = self.policy.active_role().map(String::from);
         pre.tier = Some(tier.clone());
         let mut redacted_args = args.clone();
         self.policy.redact(&mut redacted_args);
@@ -285,6 +328,7 @@ impl Server {
 
         // 7. Post-audit.
         let mut post = AuditRecord::post(&self.session_id, name);
+        post.role = self.policy.active_role().map(String::from);
         post.ok = Some(result.ok);
         post.error_code = result.error.as_ref().map(|e| enum_str(&e.code));
         post.latency_ms = Some(now_ms().saturating_sub(start));
@@ -295,11 +339,11 @@ impl Server {
 
     // ---- protocol -----------------------------------------------------------
 
-    /// Descriptors visible to the agent = those in an enabled category.
+    /// Descriptors visible to the agent = those permitted by enabled category and active role.
     fn visible_descriptors(&self) -> Vec<Value> {
         self.registry
             .descriptors()
-            .filter(|d| self.policy.is_category_enabled(d.category))
+            .filter(|d| self.policy.allows_tool(d))
             .map(|d| {
                 json!({
                     "name": d.name,
@@ -325,6 +369,7 @@ impl Server {
             return Err((-32002, "kill switch engaged".into()));
         }
         let mut rec = AuditRecord::pre(&self.session_id, "resources/read");
+        rec.role = self.policy.active_role().map(String::from);
         rec.decision = Some("resource".into());
         rec.args_redacted = Some(json!({ "uri": uri }));
         self.policy.audit(&rec);

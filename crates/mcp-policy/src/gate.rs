@@ -19,9 +19,23 @@ pub struct Policy {
     anonymizer: std::sync::Mutex<crate::SessionAnonymizer>,
 }
 
+/// The stricter of two denial budgets, where 0 means no limit.
+fn tighter_budget(a: usize, b: usize) -> usize {
+    match (a, b) {
+        (0, x) | (x, 0) => x,
+        (x, y) => x.min(y),
+    }
+}
+
 impl Policy {
     pub fn new(config: PolicyConfig, audit: AuditSink, redactor: Redactor) -> Self {
-        let budget = DenialBudget::new(config.max_denials);
+        // A role may tighten the operator's denial budget, never loosen or
+        // disable it (0 means no limit).
+        let effective_max_denials = match config.active_role_profile().and_then(|r| r.max_denials) {
+            Some(role) => tighter_budget(config.max_denials, role),
+            None => config.max_denials,
+        };
+        let budget = DenialBudget::new(effective_max_denials);
         let config_max_prompts = config.max_consent_prompts;
         let kill = KillSwitch::new(config.kill_switch_file.clone());
         let prompts = crate::PromptBudget::new(config_max_prompts);
@@ -105,6 +119,19 @@ impl Policy {
         self.config.categories.contains(&category)
     }
 
+    /// Check whether a tool descriptor is permitted under the active policy and role.
+    pub fn allows_tool(&self, desc: &ToolDescriptor) -> bool {
+        if !self.is_category_enabled(desc.category) {
+            return false;
+        }
+        if let Some(role) = self.config.active_role_profile() {
+            if !role.allows_tool(desc) {
+                return false;
+            }
+        }
+        true
+    }
+
     /// Stop everything, and say why.
     ///
     /// Used by the pointer watcher when a human takes over the mouse. Audited
@@ -136,6 +163,25 @@ impl Policy {
                 reason: format!("category '{}' is not enabled", desc.category.slug()),
             };
         }
+
+        // Active role / RBAC profile check
+        if let Some(role) = self.config.active_role_profile() {
+            if let Err(reason) = role.check_permission(desc) {
+                return Decision::Deny {
+                    code: ErrorCode::PolicyDenied,
+                    reason,
+                };
+            }
+            if role.requires_consent(desc) {
+                return Decision::NeedConsent {
+                    prompt: format!(
+                        "run tool '{}' (required by role '{}')",
+                        desc.name, role.name
+                    ),
+                };
+            }
+        }
+
         match desc.tier {
             Tier::Read | Tier::Standard => Decision::Allow,
             Tier::Dangerous => match self.config.access {
@@ -153,7 +199,8 @@ impl Policy {
                         Decision::Deny {
                             code: ErrorCode::PolicyDenied,
                             reason: format!(
-                                "dangerous tool '{}' is not enabled (add it to policy.enable,                                  or set policy.access = \"ask\")",
+                                "dangerous tool '{}' is not enabled (add it to policy.enable, \
+                                 or set policy.access = \"ask\")",
                                 desc.name
                             ),
                         }
@@ -161,6 +208,16 @@ impl Policy {
                 }
             },
         }
+    }
+
+    /// Check hard invariants (e.g. protected system paths, denied domains) against tool arguments.
+    pub fn check_invariants(&self, _tool: &str, args: &Value) -> Result<(), String> {
+        crate::role::check_arguments_invariants(args, &self.config.invariants)
+    }
+
+    /// The active role profile name, if one is configured for this session.
+    pub fn active_role(&self) -> Option<&str> {
+        self.config.active_role.as_deref()
     }
 
     /// In autonomous mode there is no consent channel, so `NeedConsent` collapses

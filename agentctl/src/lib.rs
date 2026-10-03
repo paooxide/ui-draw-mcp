@@ -63,6 +63,11 @@ pub fn build_server_with(
 ) -> Result<(Server, Arc<Policy>, engines::Wiring), String> {
     let (modules, wiring) = build_stack(&cfg);
     let registry = Registry::build(modules)?;
+    let audit = if let Some(r) = &cfg.active_role {
+        audit.with_role(r)
+    } else {
+        audit
+    };
     let mut policy = Policy::new(cfg, audit, Redactor::empty()).with_consent(consent);
     if let Some(judge) = wiring.judge.clone() {
         policy = policy.with_judge(judge);

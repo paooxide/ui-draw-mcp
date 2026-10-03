@@ -8,7 +8,7 @@ Tiers gate what an agent may call: `read` and `standard` tools are available ins
 enabled category, while a `dangerous` tool additionally has to be named in
 `policy.enable`. Enabling a category never enables its dangerous tools.
 
-**111 tools across 12 categories.**
+**112 tools across 12 categories.**
 
 | Tool | Category | Tier | Summary |
 |---|---|---|---|
@@ -19,6 +19,7 @@ enabled category, while a `dangerous` tool additionally has to be named in
 | [`get_ui_tree`](#get-ui-tree) | vision | read | Observe the UI. |
 | [`list_displays`](#list-displays) | vision | read | List displays (monitors) with geometry, scale, and which is primary. |
 | [`ocr_region`](#ocr-region) | vision | read | Read text off the screen, with a box for each line in screen coordinates. |
+| [`ui_extract`](#ui-extract) | vision | read | Extract structured data (tables, forms, lists, or custom schemas) directly from native accessibility trees into JSON without parsing raw tex… |
 | [`clipboard_read`](#clipboard-read) | input | standard | Read the clipboard. |
 | [`clipboard_write`](#clipboard-write) | input | standard | Write the clipboard. |
 | [`drag_drop`](#drag-drop) | input | standard | Press-move-release drag from one point/ref to another. |
@@ -229,6 +230,20 @@ Read text off the screen, with a box for each line in screen coordinates. The fa
 | `region.x` | number |  |  |
 | `region.y` | number |  |  |
 | `window_id` | integer |  | read one window (id from list_windows) |
+
+### ui-extract
+
+`ui_extract` · read tier
+
+Extract structured data (tables, forms, lists, or custom schemas) directly from native accessibility trees into JSON without parsing raw text dumps.
+
+| Argument | Type | Required | Description |
+|---|---|---|---|
+| `app` | string |  | target application name |
+| `mode` | one of: table, form, list, schema |  | extraction mode (table, form, list, schema) |
+| `root` | string |  | drill into this container ref (@eN) |
+| `schema` | object |  | custom extraction schema (field -> { role, name, property }) |
+| `surface` | one of: window, focused, menu, menubar, sheet, popover, alert |  | which UI surface to observe |
 
 ## input
 
