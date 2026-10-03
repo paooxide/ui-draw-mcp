@@ -13,8 +13,13 @@
 //!   `127.0.0.1` — this is the DNS-rebinding class of attack, and it is why a
 //!   local port is not the same thing as a private one. A real MCP client sends
 //!   no `Origin` header at all, so refusing every unlisted one costs nothing.
-//! * **Bounded everything.** Header block, body, and read time all have caps; a
-//!   half-open connection cannot hold resources indefinitely.
+//! * **Bounded everything.** Header block, body, read time and the number of
+//!   connections served at once all have caps; a half-open connection cannot
+//!   hold resources indefinitely.
+//! * **Concurrent, and checked per request.** Connections are served in
+//!   parallel so a `notifications/cancelled` POST can reach a `tools/call`
+//!   POST that is still running. Every connection runs the full origin, token
+//!   and size checks itself; nothing carries over from another connection.
 //!
 //! The wire format is the JSON subset of MCP's Streamable HTTP transport: POST
 //! a single JSON-RPC message, get a single JSON-RPC message back (or `202` for
@@ -54,8 +59,14 @@ pub struct HttpConfig {
     pub allowed_origins: Vec<String>,
     /// Largest request body accepted.
     pub max_body_bytes: usize,
-    /// How long one request may take to arrive.
+    /// How long one request may take to arrive. Bounds reading only; a tool
+    /// call that has been accepted runs for as long as it needs.
     pub read_timeout: Duration,
+    /// Most connections served at once. Connections are served concurrently so
+    /// a `notifications/cancelled` can arrive while another request's call is
+    /// still running; past this bound a new connection is refused with 503
+    /// rather than queued.
+    pub max_connections: usize,
 }
 
 impl Default for HttpConfig {
@@ -66,6 +77,7 @@ impl Default for HttpConfig {
             allowed_origins: Vec::new(),
             max_body_bytes: 8 * 1024 * 1024,
             read_timeout: Duration::from_secs(30),
+            max_connections: 64,
         }
     }
 }
@@ -118,6 +130,12 @@ impl HttpTransport {
                 ),
             ));
         }
+        if cfg.max_connections == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "max_connections must be at least 1",
+            ));
+        }
         if cfg.token.len() < 16 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -140,7 +158,14 @@ impl HttpTransport {
     /// One request per connection: `Connection: close` keeps the state machine
     /// small, and a local control plane has no throughput problem that
     /// keep-alive would solve.
+    ///
+    /// Each connection is its own task, up to `max_connections`, and each runs
+    /// the full origin/auth/size checks itself: nothing is inherited from an
+    /// earlier connection. Concurrency is what lets a `notifications/cancelled`
+    /// POST reach a `tools/call` POST that is still running.
     pub async fn serve(self, server: Arc<Server>) -> io::Result<()> {
+        let slots = Arc::new(tokio::sync::Semaphore::new(self.cfg.max_connections));
+        let refusals = Arc::new(tokio::sync::Semaphore::new(MAX_REFUSALS));
         loop {
             let (stream, peer) = match self.listener.accept().await {
                 Ok(x) => x,
@@ -148,15 +173,44 @@ impl HttpTransport {
                 Err(e) if is_transient(&e) => continue,
                 Err(e) => return Err(e),
             };
+            // Checked before any byte is read, so an unauthenticated flood
+            // costs a refused socket, not a served connection. The refusal is
+            // itself bounded: past `MAX_REFUSALS` the socket is just dropped,
+            // so a flood cannot turn refusals into unbounded tasks.
+            let Ok(permit) = slots.clone().try_acquire_owned() else {
+                tracing::warn!(%peer, "http connection refused: at max_connections");
+                if let Ok(refusal) = refusals.clone().try_acquire_owned() {
+                    tokio::spawn(async move {
+                        let _refusal = refusal;
+                        refuse(stream).await;
+                    });
+                }
+                continue;
+            };
             let server = server.clone();
             let cfg = self.cfg.clone();
             tokio::spawn(async move {
+                let _permit = permit;
                 if let Err(e) = handle_connection(stream, &server, &cfg).await {
                     tracing::debug!(%peer, error = %e, "http connection ended");
                 }
             });
         }
     }
+}
+
+/// Most 503 refusals being written at once.
+const MAX_REFUSALS: usize = 16;
+
+/// Tell a client the server is full, then drain so the 503 is not lost to an
+/// RST. Bounded by the same limits as any other refusal.
+async fn refuse(mut stream: TcpStream) {
+    let text = status_response(503, "too many concurrent connections");
+    let ok = tokio::time::timeout(DRAIN_IDLE, stream.write_all(text.as_bytes())).await;
+    if matches!(ok, Ok(Ok(()))) {
+        drain(&mut stream, Drain::UntilIdle).await;
+    }
+    let _ = stream.shutdown().await;
 }
 
 fn is_transient(e: &io::Error) -> bool {
@@ -219,9 +273,23 @@ async fn handle_connection(
     server: &Server,
     cfg: &HttpConfig,
 ) -> io::Result<()> {
-    let outcome = tokio::time::timeout(cfg.read_timeout, serve_one(&mut stream, server, cfg)).await;
+    // The timeout covers *receiving* the request only. A tool call may
+    // legitimately run longer, and dropping it at the read deadline would
+    // abandon a half-finished action.
+    let outcome = tokio::time::timeout(cfg.read_timeout, read_request(&mut stream, cfg)).await;
     let reply = match outcome {
-        Ok(Ok(reply)) => reply,
+        Ok(Ok(Request::Body(text))) => {
+            // The same dispatch path stdio uses — the transport authenticates,
+            // it does not get its own copy of the protocol or its own way past
+            // the gate.
+            match server.handle_line(&text).await {
+                Some(response) => Reply::done(json_response(200, &response)),
+                // A notification has no reply, and neither does a request the
+                // client cancelled. 202 says "accepted, nothing to return".
+                None => Reply::done(status_response(202, "accepted")),
+            }
+        }
+        Ok(Ok(Request::Refused(reply))) => reply,
         Ok(Err(e)) => return Err(e),
         Err(_) => Reply::done(status_response(408, "request timed out")),
     };
@@ -253,8 +321,26 @@ async fn drain(stream: &mut TcpStream, what: Drain) {
     }
 }
 
-/// Read and answer exactly one request. Returns the full response text.
-async fn serve_one(stream: &mut TcpStream, server: &Server, cfg: &HttpConfig) -> io::Result<Reply> {
+/// What reading one request produced.
+enum Request {
+    /// A request that passed every check; its body is ready to dispatch.
+    Body(String),
+    /// Refused before dispatch; the reply says why.
+    Refused(Reply),
+}
+
+/// Read one request and run every check on it, without dispatching.
+async fn read_request(stream: &mut TcpStream, cfg: &HttpConfig) -> io::Result<Request> {
+    read_request_inner(stream, cfg).await.map(|r| match r {
+        Ok(text) => Request::Body(text),
+        Err(reply) => Request::Refused(reply),
+    })
+}
+
+async fn read_request_inner(
+    stream: &mut TcpStream,
+    cfg: &HttpConfig,
+) -> io::Result<Result<String, Reply>> {
     // ---- headers -----------------------------------------------------------
     let mut buf: Vec<u8> = Vec::with_capacity(1024);
     let head_end = loop {
@@ -262,64 +348,64 @@ async fn serve_one(stream: &mut TcpStream, server: &Server, cfg: &HttpConfig) ->
             break at;
         }
         if buf.len() > MAX_HEADER_BYTES {
-            return Ok(Reply {
+            return Ok(Err(Reply {
                 text: status_response(431, "header block too large"),
                 drain: Drain::UntilIdle,
-            });
+            }));
         }
         let mut chunk = [0u8; 1024];
         let n = stream.read(&mut chunk).await?;
         if n == 0 {
             // Client hung up before finishing the header block.
-            return Ok(Reply::done(status_response(400, "incomplete request")));
+            return Ok(Err(Reply::done(status_response(400, "incomplete request"))));
         }
         buf.extend_from_slice(&chunk[..n]);
     };
 
     let Some(parsed) = parse_head(&buf[..head_end]) else {
-        return Ok(Reply::done(status_response(400, "malformed request")));
+        return Ok(Err(Reply::done(status_response(400, "malformed request"))));
     };
 
     // ---- checks, cheapest and most conclusive first -------------------------
     if parsed.chunked {
         // Chunked framing buys nothing for single-message JSON-RPC and is a
         // classic request-smuggling surface. Refuse rather than implement.
-        return Ok(Reply {
+        return Ok(Err(Reply {
             text: status_response(
                 411,
                 "chunked encoding is not supported; send Content-Length",
             ),
             drain: Drain::UntilIdle,
-        });
+        }));
     }
     if parsed.method != "POST" {
         // GET would be the SSE stream in the full spec; we do not implement it,
         // so say so instead of leaving the client waiting on a stream.
-        return Ok(Reply {
+        return Ok(Err(Reply {
             text: status_response(
                 405,
                 "only POST is supported (this transport does not implement SSE)",
             ),
             drain: unread_body(&parsed, &buf, head_end),
-        });
+        }));
     }
     if parsed.path != "/" && parsed.path != "/mcp" {
-        return Ok(Reply {
+        return Ok(Err(Reply {
             text: status_response(404, "not found"),
             drain: unread_body(&parsed, &buf, head_end),
-        });
+        }));
     }
     // Origin before auth: a browser-mounted request should be refused on the
     // grounds that it is a browser, not told whether its token guess was right.
     if let Some(origin) = &parsed.origin {
         if !cfg.allowed_origins.iter().any(|a| a == origin) {
-            return Ok(Reply {
+            return Ok(Err(Reply {
                 text: status_response(
                     403,
                     "origin not allowed; a browser must not drive this endpoint",
                 ),
                 drain: unread_body(&parsed, &buf, head_end),
-            });
+            }));
         }
     }
     let presented = parsed
@@ -328,22 +414,22 @@ async fn serve_one(stream: &mut TcpStream, server: &Server, cfg: &HttpConfig) ->
         .and_then(|v| v.strip_prefix("Bearer "))
         .unwrap_or("");
     if !constant_time_eq(presented.as_bytes(), cfg.token.as_bytes()) {
-        return Ok(Reply {
+        return Ok(Err(Reply {
             text: unauthorized(),
             drain: unread_body(&parsed, &buf, head_end),
-        });
+        }));
     }
     let Some(len) = parsed.content_length else {
-        return Ok(Reply {
+        return Ok(Err(Reply {
             text: status_response(411, "Content-Length required"),
             drain: Drain::UntilIdle,
-        });
+        }));
     };
     if len > cfg.max_body_bytes {
-        return Ok(Reply {
+        return Ok(Err(Reply {
             text: status_response(413, "request body too large"),
             drain: unread_body(&parsed, &buf, head_end),
-        });
+        }));
     }
 
     // ---- body --------------------------------------------------------------
@@ -353,22 +439,15 @@ async fn serve_one(stream: &mut TcpStream, server: &Server, cfg: &HttpConfig) ->
         let mut chunk = vec![0u8; (len - body.len()).min(64 * 1024)];
         let n = stream.read(&mut chunk).await?;
         if n == 0 {
-            return Ok(Reply::done(status_response(
+            return Ok(Err(Reply::done(status_response(
                 400,
                 "request body shorter than Content-Length",
-            )));
+            ))));
         }
         body.extend_from_slice(&chunk[..n]);
     }
 
-    let text = String::from_utf8_lossy(&body).into_owned();
-    // The same dispatch path stdio uses — the transport authenticates, it does
-    // not get its own copy of the protocol or its own way past the gate.
-    match server.handle_line(&text).await {
-        Some(response) => Ok(Reply::done(json_response(200, &response))),
-        // A notification has no reply. 202 says "accepted, nothing to return".
-        None => Ok(Reply::done(status_response(202, "accepted"))),
-    }
+    Ok(Ok(String::from_utf8_lossy(&body).into_owned()))
 }
 
 /// How much of the declared body has not been read yet.
@@ -445,6 +524,7 @@ fn reason(code: u16) -> &'static str {
         411 => "Length Required",
         413 => "Payload Too Large",
         431 => "Request Header Fields Too Large",
+        503 => "Service Unavailable",
         _ => "Error",
     }
 }

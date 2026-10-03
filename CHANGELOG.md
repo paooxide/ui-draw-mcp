@@ -180,6 +180,11 @@ All notable changes to this project are documented here. The format follows
   without `/bin/zsh` every default spawn failed. It now prefers `$SHELL` when allowed and present, then
   the first allowed shell that exists, and names every candidate when none does.
 - The `docs/tools.md` check now runs on both CI legs, since both build every engine.
+- The HTTP transport could not be relied on to deliver `notifications/cancelled`, and it dropped a call
+  that outlived the read timeout. Connections are now served concurrently, up to `max_connections` (64;
+  the next one gets a 503 rather than queueing), each with the full origin, token and size checks, so a
+  cancel POST reaches a `tools/call` POST that is still running. The 30 s read timeout now bounds only
+  receiving the request, not the tool call.
 
 ### Security
 

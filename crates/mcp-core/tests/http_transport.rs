@@ -68,6 +68,7 @@ async fn start(allowed_origins: Vec<String>, max_body_bytes: usize) -> Fixture {
         allowed_origins,
         max_body_bytes,
         read_timeout: Duration::from_secs(5),
+        max_connections: 64,
     })
     .await
     .expect("must bind on loopback");
