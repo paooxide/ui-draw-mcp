@@ -207,6 +207,11 @@ pub struct PolicyConfig {
     /// Browser origins allowed to call the endpoint. Empty = any request
     /// carrying an `Origin` header is refused.
     pub http_allowed_origins: Vec<String>,
+    /// Replace PII/PHI in tool results with synthetic tokens (`<SSN_1>`) before
+    /// the model sees them, and restore them only inside local input tools.
+    /// Off by default: it rewrites every result, including IP addresses and
+    /// phone-like numbers in network and system output.
+    pub anonymize: bool,
 }
 
 impl Default for PolicyConfig {
@@ -217,6 +222,7 @@ impl Default for PolicyConfig {
             enable: Vec::new(),
             mode: Mode::Interactive,
             access: None,
+            anonymize: false,
             allowed_apps: ["Terminal", "Finder", "TextEdit"]
                 .iter()
                 .map(|s| s.to_string())
@@ -334,6 +340,7 @@ impl PolicyConfig {
                 "enable": self.enable,
                 "mode": self.mode.as_str(),
                 "access": self.access.map(|a| a.as_str()),
+                "anonymize": self.anonymize,
                 "allowed_apps": self.allowed_apps,
                 "max_denials": self.max_denials,
                 "max_consent_prompts": self.max_consent_prompts,

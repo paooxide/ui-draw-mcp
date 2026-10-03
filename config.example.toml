@@ -51,6 +51,19 @@ max_denials = 5
 # GUI apps the agent may launch or drive.
 allowed_apps = ["TextEdit", "Finder"]
 
+# PII/PHI tokenizer. When on, tool results reach the model with names you
+# registered, SSNs, Luhn-valid card numbers, emails, phone numbers, MRNs, IPv4
+# addresses and API keys replaced by tokens such as <SSN_1>. The plaintext is
+# restored only when the model types a token into a local field
+# (keyboard_type, set_value, ui_fill_form, browser_fill_form, browser_act); a
+# token in any other tool's arguments (a URL, a command, a file) is refused,
+# because restoring it there would send the real value off the machine.
+# It does not stop the model typing a token into a field on a page it chose,
+# or into a terminal. Off by default: it also rewrites IP addresses and
+# phone-like numbers in network and system output. AGENTCTL_ANONYMIZE=1 or 0
+# overrides this.
+anonymize = false
+
 [input]
 # Stop when a human takes over the mouse.
 #

@@ -78,6 +78,18 @@ fn strip_comment(line: &str) -> &str {
     line
 }
 
+/// A boolean setting. TOML spells them `true` and `false`; anything else is an
+/// error rather than false, since several settings default to on and a value
+/// read as false would silently turn a safeguard off (`human_override = "yes"`
+/// used to disable the human-takeover stop).
+fn boolean(key: &str, s: &str) -> Result<bool, String> {
+    match s {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        other => Err(format!("{key} must be true or false, not '{other}'")),
+    }
+}
+
 fn parse_value(s: &str) -> Result<Val, String> {
     if let Some(inner) = s.strip_prefix('[') {
         let inner = inner
@@ -169,6 +181,7 @@ impl PolicyConfig {
                     cfg.categories = cats;
                 }
                 ("policy.enable", Val::List(v)) => cfg.enable = v.clone(),
+                ("policy.anonymize", Val::Str(s)) => cfg.anonymize = boolean(key, s)?,
                 ("policy.access", Val::Str(a)) => {
                     cfg.access = Some(crate::Access::parse(a).ok_or_else(|| {
                         format!("unknown policy.access '{a}' (expected ask, auto, or bypass)")
@@ -334,6 +347,9 @@ impl PolicyConfig {
                 ("policy.access", _) => {
                     return Err(format!("{key} must be a string (ask, auto, or bypass)"))
                 }
+                ("policy.anonymize", _) => {
+                    return Err(format!("{key} must be a boolean (true or false)"))
+                }
                 _ => tracing::warn!(key = %key, "ignoring unknown config key"),
             }
         }
@@ -359,11 +375,31 @@ impl PolicyConfig {
     }
 
     pub fn load_from(path: &Path) -> Result<PolicyConfig, String> {
-        match std::fs::read_to_string(path) {
-            Ok(text) => Self::from_toml_str(&text).map_err(|e| format!("{}: {e}", path.display())),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(PolicyConfig::default()),
-            Err(e) => Err(format!("{}: {e}", path.display())),
+        let mut cfg = match std::fs::read_to_string(path) {
+            Ok(text) => {
+                Self::from_toml_str(&text).map_err(|e| format!("{}: {e}", path.display()))?
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => PolicyConfig::default(),
+            Err(e) => return Err(format!("{}: {e}", path.display())),
+        };
+
+        if let Ok(v) = std::env::var("AGENTCTL_ANONYMIZE") {
+            match v.to_ascii_lowercase().as_str() {
+                "0" | "false" | "off" | "no" => cfg.anonymize = false,
+                "1" | "true" | "on" | "yes" => cfg.anonymize = true,
+                _ => {
+                    return Err(format!(
+                        "invalid AGENTCTL_ANONYMIZE value '{v}' (expected true/false)"
+                    ))
+                }
+            }
+        } else if std::env::var_os("AGENTCTL_NO_ANONYMIZE").is_some()
+            || std::env::var_os("AGENTCTL_NO_PII").is_some()
+        {
+            cfg.anonymize = false;
         }
+
+        Ok(cfg)
     }
 }
 

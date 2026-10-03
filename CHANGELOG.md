@@ -8,6 +8,14 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- **PII tokenizer, opt-in** (`policy.anonymize`, `AGENTCTL_ANONYMIZE`). Tool results reach the model with
+  personal data replaced by stable tokens (`<SSN_1>`, `<EMAIL_2>`): registered names, SSA-valid SSNs,
+  Luhn-checked card numbers, phone numbers, emails, MRNs, IPv4 addresses and common API key formats. The
+  audit log keeps the tokens. Plaintext is restored only when a token is typed into a local field
+  (`keyboard_type`, `set_value`, `ui_fill_form`, `browser_fill_form`, `browser_act`); a token in any other
+  tool's arguments is refused before the gate, so it cannot be sent off the machine in a URL, command or
+  file. Typing a token into a field on a page the model chose still delivers it; that gap is pinned in
+  `documented_known_bypasses`. Off by default, because it rewrites every result.
 - **UX testing: accessibility, design-token style, component and responsive checks.** `browser_assert`
   gained UX clauses that ride the same `{passed, checks}` flow and `agentctl test` report as the functional
   ones: `a11y` runs a built-in WCAG audit (alt text, form labels, control names, colour contrast, target

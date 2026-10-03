@@ -6,6 +6,7 @@
 //! `mcp-core`. It gates on descriptor *metadata* (category/tier/name), not on
 //! concrete engine types, so it cannot be bypassed or circularly coupled.
 
+mod anonymize;
 mod audit;
 mod budget;
 mod config;
@@ -19,6 +20,10 @@ mod killswitch;
 mod load;
 mod redact;
 
+pub use anonymize::{
+    is_luhn_credit_card, is_token_sink, is_valid_ssn, EntityType, SessionAnonymizer, MAX_ENTITIES,
+    TOKEN_SINK_TOOLS,
+};
 pub use audit::{now_ms, AuditRecord, AuditSink};
 pub use budget::DenialBudget;
 pub use config::{all_categories, default_agentctl_dir, Access, Mode, PolicyConfig};

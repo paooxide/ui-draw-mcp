@@ -16,6 +16,7 @@ pub struct Policy {
     consent: std::sync::Arc<dyn crate::ConsentProvider>,
     prompts: crate::PromptBudget,
     judge: Option<std::sync::Arc<mcp_judge::Judge>>,
+    anonymizer: std::sync::Mutex<crate::SessionAnonymizer>,
 }
 
 impl Policy {
@@ -24,6 +25,7 @@ impl Policy {
         let config_max_prompts = config.max_consent_prompts;
         let kill = KillSwitch::new(config.kill_switch_file.clone());
         let prompts = crate::PromptBudget::new(config_max_prompts);
+        let anonymize_enabled = config.anonymize;
         Policy {
             config,
             budget,
@@ -33,6 +35,9 @@ impl Policy {
             consent: std::sync::Arc::new(crate::NoConsent),
             prompts,
             judge: None,
+            anonymizer: std::sync::Mutex::new(
+                crate::SessionAnonymizer::new().with_enabled(anonymize_enabled),
+            ),
         }
     }
 
@@ -234,6 +239,86 @@ impl Policy {
             self.redactor.redact_value(data);
         }
         env
+    }
+
+    /// Register an entity (e.g. patient name, user name) for session tokenization.
+    pub fn register_entity(&self, entity: &str, entity_type: crate::EntityType) {
+        if let Ok(mut anon) = self.anonymizer.lock() {
+            anon.register(entity, entity_type);
+        }
+    }
+
+    /// Anonymize all sensitive PII/PHI in a JSON value in place.
+    pub fn anonymize(&self, value: &mut Value) {
+        if let Ok(mut anon) = self.anonymizer.lock() {
+            anon.anonymize_value(value);
+        }
+    }
+
+    /// Anonymize an outgoing envelope's data.
+    pub fn anonymize_envelope(&self, mut env: Envelope) -> Envelope {
+        if let Some(data) = env.data.as_mut() {
+            if let Ok(mut anon) = self.anonymizer.lock() {
+                anon.anonymize_value(data);
+            }
+        }
+        env
+    }
+
+    /// Refuse a call that would carry an issued token to a tool outside
+    /// [`crate::TOKEN_SINK_TOOLS`]. Runs before the gate, so the refusal is the
+    /// same whatever the access profile.
+    pub fn check_token_sink(&self, tool: &str, args: &Value) -> Result<(), String> {
+        if crate::is_token_sink(tool) {
+            return Ok(());
+        }
+        let tokens = match self.anonymizer.lock() {
+            Ok(anon) => anon.known_tokens_in(args),
+            Err(e) => e.into_inner().known_tokens_in(args),
+        };
+        if tokens.is_empty() {
+            return Ok(());
+        }
+        Err(format!(
+            "{} stands for redacted personal data and cannot be passed to '{tool}'; \
+             tokens are resolved only when typed into a local field ({})",
+            tokens.join(", "),
+            crate::TOKEN_SINK_TOOLS.join(", ")
+        ))
+    }
+
+    /// Restore synthetic tokens to plaintext in the arguments of a sink tool.
+    /// Every other tool gets its arguments unchanged: a token reaching one has
+    /// already been refused by [`Self::check_token_sink`], and this keeps the
+    /// two in agreement if a caller forgets to check.
+    pub fn de_anonymize_args(&self, tool: &str, mut args: Value) -> Value {
+        if !crate::is_token_sink(tool) {
+            return args;
+        }
+        if let Ok(anon) = self.anonymizer.lock() {
+            anon.de_anonymize_value(&mut args);
+        }
+        args
+    }
+
+    /// Check whether PII/PHI anonymization is enabled for this session.
+    pub fn is_anonymize_enabled(&self) -> bool {
+        self.anonymizer
+            .lock()
+            .map(|a| a.is_enabled())
+            .unwrap_or(false)
+    }
+
+    /// Dynamically enable or disable PII/PHI anonymization for this session.
+    pub fn set_anonymize_enabled(&self, enabled: bool) {
+        if let Ok(mut anon) = self.anonymizer.lock() {
+            anon.set_enabled(enabled);
+        }
+    }
+
+    /// Access the underlying session anonymizer mutex.
+    pub fn anonymizer(&self) -> &std::sync::Mutex<crate::SessionAnonymizer> {
+        &self.anonymizer
     }
 
     pub fn audit(&self, record: &AuditRecord) {

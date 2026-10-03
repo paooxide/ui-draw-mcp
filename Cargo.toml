@@ -50,6 +50,11 @@ tokio = { version = "1", features = [
     "time",
 ] }
 toml = "0.8"
+regex = "1"
+sha2 = "0.10"
+ed25519-dalek = { version = "2.1", default-features = false, features = ["std", "rand_core"] }
+rand = "0.8"
+hex = "0.4"
 
 # --- SSD-conscious build profiles ---------------------------------------------
 # Skip debuginfo entirely: it is usually the majority of target/ size and we have

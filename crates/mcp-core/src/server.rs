@@ -159,6 +159,7 @@ impl Server {
         // its payload in the append-only audit; the engine still gets the real
         // `args`, only this logged copy is redacted.
         mcp_policy::redact_flagged_payload(&mut redacted_args);
+        self.policy.anonymize(&mut redacted_args);
         pre.args_redacted = Some(redacted_args.clone());
 
         // 4a. Rehearsal. Reads still run — an agent cannot plan without
@@ -249,13 +250,15 @@ impl Server {
                 ctx = ctx.with_progress(token, n);
             }
         }
-        let result = module.call(name, args, &ctx).await;
+        let de_anonymized_args = self.policy.de_anonymize_args(name, args);
+        let result = module.call(name, de_anonymized_args, &ctx).await;
 
-        // 6. Redact the result, then mark its provenance.
+        // 6. Redact the result, then anonymize PII/PHI, then mark its provenance.
         //
         //    Order matters: redaction first, so the injection scan never reads
         //    a secret, and the markers it adds are never themselves scanned.
         let result = self.policy.redact_envelope(result);
+        let result = self.policy.anonymize_envelope(result);
         let result = if untrusted_output {
             // The pattern scan first, then the judge's second opinion, which
             // can add the flag but never remove it.

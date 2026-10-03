@@ -91,6 +91,18 @@ fn build_config() -> Result<PolicyConfig, String> {
         cfg.categories.push(Category::System);
         cfg.categories.push(Category::Browser);
     }
+    // Command-line flag overrides for PII/PHI anonymization
+    let raw_args: Vec<String> = std::env::args().collect();
+    let mut i = 0;
+    while i < raw_args.len() {
+        let arg = &raw_args[i];
+        if arg == "--no-anonymize" || arg == "--no-pii" {
+            cfg.anonymize = false;
+        } else if arg == "--anonymize" {
+            cfg.anonymize = true;
+        }
+        i += 1;
+    }
     Ok(cfg)
 }
 
@@ -964,6 +976,7 @@ fn config_print() {
     println!("categories = [{}]", slugs(&cfg));
     println!("enable = {:?}", cfg.enable);
     println!("mode = {}", cfg.mode.as_str());
+    println!("anonymize = {}", cfg.anonymize);
     println!("allowed_apps = {:?}", cfg.allowed_apps);
     println!("max_denials = {}", cfg.max_denials);
     println!("max_consent_prompts = {}", cfg.max_consent_prompts);

@@ -298,7 +298,7 @@ mod tests {
         if d["exists"] == json!(true) {
             assert_eq!(d["value"], json!(REDACTED));
         }
-        assert!(d.to_string().find("password").is_none());
+        assert!(!d.to_string().contains("password"));
     }
 
     /// Against the real Secret Service: store, confirm, and take it out
