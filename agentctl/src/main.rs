@@ -32,7 +32,8 @@ async fn main() -> std::io::Result<()> {
         "bridge" => bridge(&args).await,
         "test" => test_cmd(&args).await,
         "transcript" => transcript_cmd(&args),
-        "config" if args.get(2).map(String::as_str) == Some("print") => {
+        "audit" => audit_cmd(&args),
+        "config" if args.iter().any(|a| a == "print") => {
             config_print();
             Ok(())
         }
@@ -120,7 +121,17 @@ fn config_or_exit() -> PolicyConfig {
 async fn serve(force_http: bool) -> std::io::Result<()> {
     let cfg = config_or_exit();
     let session_id = new_session_id();
-    let audit = AuditSink::file(cfg.audit_dir.clone(), &session_id)?;
+    let signing_key = cfg.audit_signing_key.as_deref().map(|p| {
+        mcp_policy::load_signing_key(p).unwrap_or_else(|e| {
+            eprintln!("agentctl: refusing to start — {e}");
+            eprintln!(
+                "    create one with: agentctl audit keygen --out {}",
+                p.display()
+            );
+            std::process::exit(2);
+        })
+    });
+    let audit = AuditSink::file_with_key(cfg.audit_dir.clone(), &session_id, signing_key)?;
     let http = (force_http || cfg.http_enabled).then(|| http_config(&cfg));
     let override_cfg = mcp_input::OverrideConfig {
         enabled: cfg.human_override,
@@ -778,6 +789,278 @@ fn transcript_cmd(args: &[String]) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Audit flags that take a value, whose value must not be mistaken for the
+/// positional `<file_or_session>`.
+const AUDIT_VALUE_FLAGS: &[&str] = &["--format", "-f", "--out", "-o", "--pubkey", "--pubkey-file"];
+
+fn find_positional_after(args: &[String], after_index: usize) -> Option<&str> {
+    let mut i = after_index;
+    while let Some(a) = args.get(i) {
+        if AUDIT_VALUE_FLAGS.contains(&a.as_str()) {
+            i += 2;
+            continue;
+        }
+        if !a.starts_with('-') {
+            return Some(a.as_str());
+        }
+        i += 1;
+    }
+    None
+}
+
+/// The verifier's trusted signer, from `--pubkey <hex>` or `--pubkey-file
+/// <path>`. Exits on a malformed key rather than silently verifying unpinned.
+fn pinned_key(args: &[String], cmd: &str) -> Option<mcp_policy::AuditVerifyingKey> {
+    let hex = match (flag(args, "--pubkey"), flag(args, "--pubkey-file")) {
+        (Some(h), _) => h.to_string(),
+        (None, Some(path)) => std::fs::read_to_string(path).unwrap_or_else(|e| {
+            eprintln!("agentctl audit {cmd}: {path}: {e}");
+            std::process::exit(2);
+        }),
+        (None, None) => return None,
+    };
+    match mcp_policy::verifying_key_from_hex(&hex) {
+        Ok(k) => Some(k),
+        Err(e) => {
+            eprintln!("agentctl audit {cmd}: {e}");
+            std::process::exit(2);
+        }
+    }
+}
+
+fn audit_keygen(args: &[String]) -> std::io::Result<()> {
+    let cfg = config_or_exit();
+    let out = flag(args, "--out")
+        .map(std::path::PathBuf::from)
+        .or_else(|| cfg.audit_signing_key.clone())
+        .unwrap_or_else(|| state_dir(&cfg).join("audit_signing.key"));
+    match mcp_policy::generate_signing_key_file(&out) {
+        Ok(pubkey) => {
+            println!("wrote audit signing key: {} (mode 0600)", out.display());
+            println!("public key:              {pubkey}");
+            println!();
+            println!("Point the server at it in config.toml:");
+            println!("    [policy]");
+            println!("    audit_signing_key = {:?}", out.display().to_string());
+            println!("Keep the public key somewhere the agent cannot write, and verify with:");
+            println!("    agentctl audit verify <session> --pubkey {pubkey}");
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("agentctl audit keygen: {e}");
+            std::process::exit(2);
+        }
+    }
+}
+
+fn audit_cmd(args: &[String]) -> std::io::Result<()> {
+    let subcmd = find_positional_after(args, 2);
+
+    match subcmd {
+        Some("verify") => audit_verify(args),
+        Some("export") => audit_export(args),
+        Some("keygen") => audit_keygen(args),
+        Some("help") | None => {
+            print_audit_help();
+            if subcmd.is_none() && !has(args, "--help") && !has(args, "-h") {
+                std::process::exit(2);
+            }
+            Ok(())
+        }
+        Some(other) => {
+            eprintln!("agentctl audit: unknown subcommand '{other}'\n");
+            print_audit_help();
+            std::process::exit(2);
+        }
+    }
+}
+
+fn audit_verify(args: &[String]) -> std::io::Result<()> {
+    let cfg = config_or_exit();
+    let as_json = has(args, "--json");
+    let target = find_positional_after(args, 3);
+
+    let Some(target) = target else {
+        eprintln!(
+            "agentctl audit verify: <file_or_session> is required.\n\n\
+             \x20   agentctl audit verify ~/.agentctl/audit/<session>.jsonl\n\
+             \x20   agentctl audit verify <session-id>"
+        );
+        std::process::exit(2);
+    };
+
+    let path = resolve_audit_path(target, &cfg.audit_dir);
+    if !path.exists() {
+        eprintln!("agentctl audit verify: file not found: {}", path.display());
+        std::process::exit(2);
+    }
+
+    let pinned = pinned_key(args, "verify");
+    let report = match mcp_policy::verify_audit_file_pinned(&path, pinned.as_ref()) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("agentctl audit verify: failed to read or parse audit file: {e}");
+            std::process::exit(2);
+        }
+    };
+
+    if as_json {
+        let out = serde_json::to_string_pretty(&report).unwrap_or_default();
+        println!("{out}");
+    } else {
+        println!("agentctl audit verify: {}", path.display());
+        println!(
+            "  session:       {}",
+            if report.session_id.is_empty() {
+                "unknown"
+            } else {
+                &report.session_id
+            }
+        );
+        println!("  records:       {}", report.total_records);
+        println!("  public key:    {}", report.public_key);
+        println!("  root hash:     {}", report.root_hash);
+        println!("  leaf hash:     {}", report.leaf_hash);
+        if report.valid && report.key_pinned {
+            println!("\n  ✓ VERIFIED: chain and signatures intact, signed by the pinned key");
+        } else if report.valid {
+            println!("\n  ~ SELF-CONSISTENT: chain and signatures intact, but the signer was not pinned.");
+            println!(
+                "    Anyone able to rewrite this file could re-sign it with a fresh key and it"
+            );
+            println!(
+                "    would look the same. Pass --pubkey <hex> (from `agentctl audit keygen`) to"
+            );
+            println!("    check it was signed by your key.");
+        } else {
+            println!("\n  ✗ FAILED: Audit ledger integrity compromised!");
+            if let Some(err) = &report.error {
+                println!("    -> Sequence: {}", err.seq);
+                println!("    -> Reason:   {}", err.reason);
+            }
+        }
+    }
+
+    if !report.valid {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+fn audit_export(args: &[String]) -> std::io::Result<()> {
+    let cfg = config_or_exit();
+    let target = find_positional_after(args, 3);
+
+    let Some(target) = target else {
+        eprintln!(
+            "agentctl audit export: <file_or_session> is required.\n\n\
+             \x20   agentctl audit export ~/.agentctl/audit/<session>.jsonl --format soc2\n\
+             \x20   agentctl audit export <session-id> --format csv --out audit.csv"
+        );
+        std::process::exit(2);
+    };
+
+    let path = resolve_audit_path(target, &cfg.audit_dir);
+    if !path.exists() {
+        eprintln!("agentctl audit export: file not found: {}", path.display());
+        std::process::exit(2);
+    }
+
+    let raw = std::fs::read_to_string(&path)?;
+    let records = match mcp_policy::parse_audit_records(&raw) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("agentctl audit export: failed to parse audit log: {e}");
+            std::process::exit(2);
+        }
+    };
+
+    let pinned = pinned_key(args, "export");
+    let verification = mcp_policy::verify_audit_records_pinned(&records, pinned.as_ref());
+    if !verification.valid {
+        eprintln!(
+            "warning: audit ledger verification failed! Exporting with tampering annotations."
+        );
+    }
+
+    let format_str = flag(args, "--format")
+        .or_else(|| flag(args, "-f"))
+        .unwrap_or("soc2");
+
+    let output_text = match format_str {
+        "soc2" | "markdown" | "md" => {
+            mcp_policy::ComplianceExporter::to_soc2_report(&verification, &records)
+        }
+        "soc2-json" | "soc2_json" => {
+            let val = mcp_policy::ComplianceExporter::to_soc2_json(&verification, &records);
+            serde_json::to_string_pretty(&val).unwrap_or_default() + "\n"
+        }
+        "csv" | "hipaa" | "hipaa-csv" | "hipaa_csv" => {
+            mcp_policy::ComplianceExporter::to_hipaa_csv(&records) + "\n"
+        }
+        "hipaa-json" | "hipaa_json" | "json" => {
+            let val = mcp_policy::ComplianceExporter::to_hipaa_json(&records);
+            serde_json::to_string_pretty(&val).unwrap_or_default() + "\n"
+        }
+        other => {
+            eprintln!(
+                "agentctl audit export: unsupported format '{other}'. Choose from: soc2, soc2-json, csv, hipaa-json"
+            );
+            std::process::exit(2);
+        }
+    };
+
+    if let Some(out_path) = flag(args, "--out").or_else(|| flag(args, "-o")) {
+        std::fs::write(out_path, &output_text)?;
+        eprintln!("wrote {out_path} ({} bytes)", output_text.len());
+    } else {
+        print!("{output_text}");
+    }
+
+    Ok(())
+}
+
+fn resolve_audit_path(target: &str, audit_dir: &std::path::Path) -> std::path::PathBuf {
+    let p = std::path::Path::new(target);
+    if p.exists() {
+        return p.to_path_buf();
+    }
+    let in_dir = audit_dir.join(target);
+    if in_dir.exists() {
+        return in_dir;
+    }
+    let with_ext = audit_dir.join(format!("{target}.jsonl"));
+    if with_ext.exists() {
+        return with_ext;
+    }
+    p.to_path_buf()
+}
+
+fn print_audit_help() {
+    println!(
+        "agentctl audit — Cryptographic audit log verification and compliance export\n\
+         \n\
+         USAGE:\n\
+         \x20   agentctl audit keygen [--out <file>]\n\
+         \x20   agentctl audit verify <file_or_session> [--pubkey <hex> | --pubkey-file <file>] [--json]\n\
+         \x20   agentctl audit export <file_or_session> [--pubkey <hex>] [--format <fmt>] [--out <file>]\n\
+         \n\
+         SUBCOMMANDS:\n\
+         \x20   keygen   Create an audit signing key (0600) and print its public key\n\
+         \x20   verify   Verify SHA-256 hash chains and Ed25519 signatures of an audit log\n\
+         \x20   export   Export compliance bundles (SOC2 Markdown, HIPAA CSV/JSON)\n\
+         \n\
+         Without --pubkey a valid log is only self-consistent: the signer is read from\n\
+         the log itself. Pin the key printed by `keygen` to attribute a log to this host.\n\
+         \n\
+         FORMATS:\n\
+         \x20   soc2        SOC2 & HIPAA Operational Audit Report in Markdown (default)\n\
+         \x20   soc2-json   Structured SOC2 JSON bundle including cryptographic verification\n\
+         \x20   csv         RFC 4180 compliant CSV audit trail (HIPAA § 164.312(b))\n\
+         \x20   hipaa-json  HIPAA Access Events array in JSON\n"
+    );
+}
+
 fn doctor() {
     let cfg = config_or_exit();
     println!("agentctl doctor");
@@ -1158,5 +1441,37 @@ mod test_cmd_tests {
         );
         let (passed, failed, issues) = print_report(&[clean_pass, pass_with_issue, fail], false);
         assert_eq!((passed, failed, issues), (2, 1, 1));
+    }
+
+    #[test]
+    fn test_find_positional_after() {
+        let args = s(&["agentctl", "audit", "verify", "--json", "session-123"]);
+        assert_eq!(find_positional_after(&args, 2), Some("verify"));
+        assert_eq!(find_positional_after(&args, 3), Some("session-123"));
+    }
+
+    #[test]
+    fn test_resolve_audit_path() {
+        let dir = std::env::temp_dir().join(format!("agentctl_test_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let target_file = dir.join("sess-abc.jsonl");
+        std::fs::write(&target_file, "{}").unwrap();
+
+        // 1. Direct path
+        assert_eq!(
+            resolve_audit_path(target_file.to_str().unwrap(), &dir),
+            target_file
+        );
+        // 2. Filename in audit dir
+        assert_eq!(resolve_audit_path("sess-abc.jsonl", &dir), target_file);
+        // 3. Session ID without extension in audit dir
+        assert_eq!(resolve_audit_path("sess-abc", &dir), target_file);
+        // 4. Non-existent returns path as given
+        assert_eq!(
+            resolve_audit_path("nonexistent", &dir),
+            std::path::PathBuf::from("nonexistent")
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

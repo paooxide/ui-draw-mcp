@@ -303,6 +303,9 @@ impl PolicyConfig {
                 }
                 ("policy.kill_switch_file", Val::Str(s)) => cfg.kill_switch_file = PathBuf::from(s),
                 ("policy.audit_dir", Val::Str(s)) => cfg.audit_dir = PathBuf::from(s),
+                ("policy.audit_signing_key", Val::Str(s)) => {
+                    cfg.audit_signing_key = Some(PathBuf::from(s))
+                }
                 // Unknown keys are tolerated for forward-compatibility, but a
                 // *known* key with the wrong type is a hard error.
                 (
@@ -338,9 +341,13 @@ impl PolicyConfig {
                     return Err(format!("{key} must be a string"))
                 }
                 ("memory.store", _) => return Err(format!("{key} must be a string")),
-                ("policy.mode" | "policy.kill_switch_file" | "policy.audit_dir", _) => {
-                    return Err(format!("{key} must be a string"))
-                }
+                (
+                    "policy.mode"
+                    | "policy.kill_switch_file"
+                    | "policy.audit_dir"
+                    | "policy.audit_signing_key",
+                    _,
+                ) => return Err(format!("{key} must be a string")),
                 ("policy.max_denials" | "policy.max_consent_prompts", _) => {
                     return Err(format!("{key} must be a non-negative integer"))
                 }

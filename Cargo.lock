@@ -35,6 +35,7 @@ dependencies = [
  "mcp-window",
  "serde",
  "serde_json",
+ "tempfile",
  "test-support",
  "tokio",
  "tracing",

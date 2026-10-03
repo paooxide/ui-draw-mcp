@@ -144,6 +144,10 @@ pub struct PolicyConfig {
     pub kill_switch_file: PathBuf,
     /// Directory for `<session>.jsonl` audit logs.
     pub audit_dir: PathBuf,
+    /// File holding the Ed25519 seed that signs audit logs (`agentctl audit
+    /// keygen`). Unset, each session signs with a throwaway key, and a log can
+    /// only be checked for self-consistency, not attributed to this operator.
+    pub audit_signing_key: Option<PathBuf>,
     /// Directories the filesystem engine may touch. Empty = it refuses all.
     pub fs_roots: Vec<PathBuf>,
     /// Binaries `exec` may run. Empty = it runs nothing.
@@ -234,6 +238,7 @@ impl Default for PolicyConfig {
             max_consent_prompts: 20,
             kill_switch_file: base.join("STOP"),
             audit_dir: base.join("audit"),
+            audit_signing_key: None,
             // Every commodity engine defaults to *closed*: no roots, no
             // runnable binaries, no reachable hosts, no keychain services.
             // An operator opts in explicitly via config.toml.
@@ -346,6 +351,7 @@ impl PolicyConfig {
                 "max_consent_prompts": self.max_consent_prompts,
                 "kill_switch_file": self.kill_switch_file.display().to_string(),
                 "audit_dir": self.audit_dir.display().to_string(),
+                "audit_signing_key": self.audit_signing_key.as_ref().map(|p| p.display().to_string()),
             },
             "input": {
                 "terminal_apps": self.terminal_apps,

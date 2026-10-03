@@ -55,6 +55,7 @@ serde_json.workspace = true
 async-trait.workspace = true
 
 [dev-dependencies]
+tempfile = "3"
 test-support = { path = "../crates/test-support" }
 mcp-browser = { path = "../crates/mcp-browser" }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
@@ -79,4 +80,5 @@ mcp-vision = { path = "../crates/mcp-vision" }
 mcp-linux = { path = "../crates/mcp-linux" }
 mcp-window = { path = "../crates/mcp-window" }
 mcp-vision = { path = "../crates/mcp-vision" }
+
 

@@ -16,6 +16,11 @@ All notable changes to this project are documented here. The format follows
   tool's arguments is refused before the gate, so it cannot be sent off the machine in a URL, command or
   file. Typing a token into a field on a page the model chose still delivers it; that gap is pinned in
   `documented_known_bypasses`. Off by default, because it rewrites every result.
+- **Signed audit logs and compliance export.** Each audit record carries a sequence number, the previous
+  record's hash and an Ed25519 signature, so deletion, reordering or editing breaks the chain.
+  `agentctl audit keygen` creates a signing key for `policy.audit_signing_key`; `agentctl audit verify
+  --pubkey` fails unless the log was signed by that key, and without one reports the log as
+  self-consistent only. `agentctl audit export` writes a SOC2-style report or a HIPAA access-event CSV/JSON.
 - **UX testing: accessibility, design-token style, component and responsive checks.** `browser_assert`
   gained UX clauses that ride the same `{passed, checks}` flow and `agentctl test` report as the functional
   ones: `a11y` runs a built-in WCAG audit (alt text, form labels, control names, colour contrast, target

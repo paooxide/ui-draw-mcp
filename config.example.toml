@@ -64,6 +64,14 @@ allowed_apps = ["TextEdit", "Finder"]
 # overrides this.
 anonymize = false
 
+# Audit log signing. Every tool call is appended to ~/.agentctl/audit as a
+# SHA-256 hash chain signed with Ed25519. Unset, each session signs with a
+# throwaway key and records that key in the log, so `agentctl audit verify`
+# can only say the log is self-consistent: anyone able to rewrite the file can
+# re-sign it. Create a key once with `agentctl audit keygen`, point this at it
+# (the file must be mode 0600), and verify with --pubkey <the printed key>.
+# audit_signing_key = "/Users/you/.agentctl/audit_signing.key"
+
 [input]
 # Stop when a human takes over the mouse.
 #

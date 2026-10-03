@@ -9,6 +9,7 @@
 mod anonymize;
 mod audit;
 mod budget;
+mod compliance;
 mod config;
 mod consent;
 mod decision;
@@ -24,11 +25,21 @@ pub use anonymize::{
     is_luhn_credit_card, is_token_sink, is_valid_ssn, EntityType, SessionAnonymizer, MAX_ENTITIES,
     TOKEN_SINK_TOOLS,
 };
-pub use audit::{now_ms, AuditRecord, AuditSink};
+pub use audit::{
+    canonical_json, compute_record_hash, generate_signing_key_file, load_signing_key, now_ms,
+    parse_audit_records, verify_audit_file, verify_audit_file_pinned, verify_audit_log,
+    verify_audit_records, verify_audit_records_pinned, verifying_key_from_hex, AuditRecord,
+    AuditSink, AuditTamperError, AuditVerificationReport, GENESIS_PREV_HASH,
+};
 pub use budget::DenialBudget;
+pub use compliance::{
+    extract_ephi_tokens, format_utc_timestamp, ComplianceExporter, HipaaAccessEvent,
+};
 pub use config::{all_categories, default_agentctl_dir, Access, Mode, PolicyConfig};
 pub use decision::Decision;
 pub use destructive::{default_destructive_patterns, is_destructive};
+/// The Ed25519 public key type a verifier pins an audit log to.
+pub use ed25519_dalek::VerifyingKey as AuditVerifyingKey;
 pub use gate::Policy;
 pub use injection::{flag_untrusted, suspicious_instructions};
 pub use judged::{judged_destructive, second_opinion_on_content, Destructive};
