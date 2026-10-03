@@ -407,6 +407,10 @@ impl MacroSynthesizer {
 /// run once in the current page; see [`RecordManager::start`]. It reports each
 /// event through the `__agentctl_rec` binding. Top frame only: a selector
 /// inside an iframe would not resolve when the flow replays.
+///
+/// It runs in an isolated world, and the binding exists only there: the DOM
+/// is shared, so the listeners see the person's clicks and typing, but page
+/// script has no way to call the binding or read `window.__agentctl_recorder`.
 pub const JS_RECORDER_INSTALL: &str = r#"(function() {
   try { if (window.self !== window.top) return { installed: false, url: '' }; } catch (e) { return { installed: false, url: '' }; }
   // True for the page the recording began on; a document created later is a

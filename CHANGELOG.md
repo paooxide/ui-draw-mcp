@@ -207,6 +207,12 @@ All notable changes to this project are documented here. The format follows
 
 ### Security
 
+- **A page cannot forge recorded steps.** The recorder and its `__agentctl_rec` binding lived in the page's
+  main world, so page script could call the binding and add clicks or typing that nobody made to a
+  recording, or replace the function to read what was typed. They now live in an isolated world: the DOM
+  is shared, so the recorder still sees real clicks and typing, but the binding exists only there and the
+  page cannot reach it or the recorder's state. Page script can still dispatch synthetic DOM events, which
+  the recorder sees like the agent's own `browser_act` clicks.
 - **Config values are checked, not guessed.** A boolean was read as `value == "true"`, so
   `human_override = "yes"` or `"True"` silently turned the human-takeover stop off, and a known setting
   with the wrong type (`max_denials = "5"`) was dropped as an unknown key. Booleans must be `true` or

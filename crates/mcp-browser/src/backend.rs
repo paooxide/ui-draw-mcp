@@ -142,8 +142,10 @@ pub trait BrowserBackend: Send + Sync {
     /// `current_document_script` is run once in the page as it is now, and
     /// returns an object with the page's `url`. Both report events by calling
     /// the page function `binding(jsonString)`, which the backend delivers to
-    /// the Rust side as they happen. Needs a persistent session, so only the
-    /// CDP engine supports it.
+    /// the Rust side as they happen. Both run in an isolated world of the tab
+    /// (shared DOM, separate JavaScript globals), and the binding exists only
+    /// there, so page script can neither call it nor reach the recorder's
+    /// state. Needs a persistent session, so only the CDP engine supports it.
     async fn observe_start(
         &self,
         target: &str,
@@ -417,6 +419,40 @@ struct Observer {
     task: tokio::task::JoinHandle<()>,
 }
 
+/// Name of the isolated world the recorder and its binding live in. Isolated
+/// worlds share the DOM (listeners see the user's clicks and typing) but have
+/// their own JavaScript globals, so page script cannot call the binding or
+/// touch the recorder's state.
+const RECORDER_WORLD: &str = "agentctl_recorder";
+
+/// Keep the set of execution contexts that belong to the recorder's world
+/// current from `Runtime.executionContext*` events, so the teardown can run in
+/// the very context the recorder lives in.
+fn track_world(v: &Value, worlds: &mut std::collections::HashSet<i64>) {
+    let params = v.get("params");
+    match v.get("method").and_then(Value::as_str) {
+        Some("Runtime.executionContextCreated") => {
+            let ctx = params.and_then(|p| p.get("context"));
+            let named = ctx.and_then(|c| c.get("name")).and_then(Value::as_str);
+            if named == Some(RECORDER_WORLD) {
+                if let Some(id) = ctx.and_then(|c| c.get("id")).and_then(Value::as_i64) {
+                    worlds.insert(id);
+                }
+            }
+        }
+        Some("Runtime.executionContextDestroyed") => {
+            if let Some(id) = params
+                .and_then(|p| p.get("executionContextId"))
+                .and_then(Value::as_i64)
+            {
+                worlds.remove(&id);
+            }
+        }
+        Some("Runtime.executionContextsCleared") => worlds.clear(),
+        _ => {}
+    }
+}
+
 /// What the session task reports when it has torn down.
 struct ObserverDone {
     /// The new-document script was unregistered.
@@ -425,22 +461,26 @@ struct ObserverDone {
     dialogs: Vec<Value>,
 }
 
+/// What the session task tracks about the tab it watches.
+struct Watch {
+    binding: String,
+    events: std::sync::Arc<Mutex<Vec<Value>>>,
+    started: std::time::Instant,
+    /// Execution contexts of the recorder's isolated world.
+    worlds: std::collections::HashSet<i64>,
+}
+
 /// One message from a watched page: a dialog it raised is answered (attaching
 /// with the Page domain, which registering a new-document script requires,
 /// makes this session the one Chrome asks), anything else may be an event.
-async fn observe_message(
-    c: &mut CdpConn,
-    v: &Value,
-    binding: &str,
-    events: &Mutex<Vec<Value>>,
-    started: std::time::Instant,
-) {
+async fn observe_message(c: &mut CdpConn, v: &Value, w: &mut Watch) {
+    track_world(v, &mut w.worlds);
     if v.get("method").and_then(Value::as_str) == Some("Page.javascriptDialogOpening") {
         let params = v.get("params").cloned().unwrap_or_else(|| json!({}));
         let _ = c.answer_dialog(&params).await;
         return;
     }
-    record_observed(v, binding, events, started);
+    record_observed(v, &w.binding, &w.events, w.started);
 }
 
 /// Keep a `binding(jsonString)` call from the page as an event, stamped with
@@ -486,15 +526,17 @@ fn record_observed(
 /// stop request never loses part of a message.
 async fn observe_session(
     mut c: CdpConn,
-    binding: String,
-    events: std::sync::Arc<Mutex<Vec<Value>>>,
-    started: std::time::Instant,
+    mut w: Watch,
     script_id: Option<String>,
+    early: Vec<Value>,
     mut stop_rx: tokio::sync::oneshot::Receiver<(
         String,
         tokio::sync::oneshot::Sender<ObserverDone>,
     )>,
 ) {
+    for v in early {
+        observe_message(&mut c, &v, &mut w).await;
+    }
     let (teardown, reply) = loop {
         tokio::select! {
             req = &mut stop_rx => match req {
@@ -503,27 +545,30 @@ async fn observe_session(
                 Err(_) => return,
             },
             msg = c.read_message() => match msg {
-                Ok(v) => observe_message(&mut c, &v, &binding, &events, started).await,
+                Ok(v) => observe_message(&mut c, &v, &mut w).await,
                 // The tab or browser went away; what was captured stays.
                 Err(_) => return,
             },
         }
     };
     c.keep_events(true);
-    let _ = c
-        .call(
-            "Runtime.evaluate",
-            json!({ "expression": teardown, "returnByValue": true }),
-        )
-        .await;
+    // The recorder lives in its isolated world(s), not the page's main world.
+    for id in w.worlds.clone() {
+        let _ = c
+            .call(
+                "Runtime.evaluate",
+                json!({ "expression": teardown, "contextId": id, "returnByValue": true }),
+            )
+            .await;
+    }
     for v in c.take_events() {
-        observe_message(&mut c, &v, &binding, &events, started).await;
+        observe_message(&mut c, &v, &mut w).await;
     }
     // Calls made just before the teardown may still be on their way.
     while let Ok(Ok(v)) =
         tokio::time::timeout(tokio::time::Duration::from_millis(150), c.read_message()).await
     {
-        observe_message(&mut c, &v, &binding, &events, started).await;
+        observe_message(&mut c, &v, &mut w).await;
     }
     let script_removed = match script_id {
         Some(id) => c
@@ -2807,30 +2852,61 @@ impl BrowserBackend for CdpBackend {
         // them with the tab's dialog policy (dismiss unless set otherwise).
         // `observe_stop` lists the ones it answered.
         c.set_dialog_policy(self.dialog_policy(target));
+        c.keep_events(true);
         c.call("Runtime.enable", json!({})).await?;
-        c.call("Runtime.addBinding", json!({ "name": binding }))
-            .await?;
+        // The binding exists only in the recorder's isolated world, never in
+        // the page's main world, so a page cannot forge recorded steps.
+        c.call(
+            "Runtime.addBinding",
+            json!({ "name": binding, "executionContextName": RECORDER_WORLD }),
+        )
+        .await?;
         c.call("Page.enable", json!({})).await?;
         let added = c
             .call(
                 "Page.addScriptToEvaluateOnNewDocument",
-                json!({ "source": new_document_script }),
+                json!({ "source": new_document_script, "worldName": RECORDER_WORLD }),
             )
             .await?;
         let script_id = added
             .get("identifier")
             .and_then(Value::as_str)
             .map(String::from);
+        // The page that is already loaded gets the recorder in the same world:
+        // create (or reuse) it in the top frame and run the script there.
+        let tree = c.call("Page.getFrameTree", json!({})).await?;
+        let frame_id = tree
+            .get("frameTree")
+            .and_then(|t| t.get("frame"))
+            .and_then(|f| f.get("id"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| BrowserError::Failed("recorder install: no top frame".into()))?
+            .to_string();
+        let world = c
+            .call(
+                "Page.createIsolatedWorld",
+                json!({ "frameId": frame_id, "worldName": RECORDER_WORLD }),
+            )
+            .await?;
+        let context_id = world
+            .get("executionContextId")
+            .and_then(Value::as_i64)
+            .ok_or_else(|| BrowserError::Failed("recorder install: no isolated world".into()))?;
         let r = c
             .call(
                 "Runtime.evaluate",
                 json!({
                     "expression": current_document_script,
+                    "contextId": context_id,
                     "returnByValue": true,
                     "awaitPromise": true
                 }),
             )
             .await?;
+        let mut worlds = std::collections::HashSet::new();
+        worlds.insert(context_id);
+        let early = c.take_events();
+        c.keep_events(false);
         if let Some(exc) = r.get("exceptionDetails") {
             let text = exc
                 .get("exception")
@@ -2854,14 +2930,13 @@ impl BrowserBackend for CdpBackend {
         let events = std::sync::Arc::new(Mutex::new(Vec::new()));
         let started = std::time::Instant::now();
         let (stop, stop_rx) = tokio::sync::oneshot::channel();
-        let task = tokio::spawn(observe_session(
-            c,
-            binding.to_string(),
-            events.clone(),
+        let watch = Watch {
+            binding: binding.to_string(),
+            events: events.clone(),
             started,
-            script_id,
-            stop_rx,
-        ));
+            worlds,
+        };
+        let task = tokio::spawn(observe_session(c, watch, script_id, early, stop_rx));
         self.observers.lock().map_err(|_| poisoned())?.insert(
             target.to_string(),
             Observer {
