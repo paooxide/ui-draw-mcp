@@ -189,6 +189,11 @@ All notable changes to this project are documented here. The format follows
   the receiver should not respond, so neither transport now writes a reply for it (HTTP returns an empty
   `202`); the audit post-record is still written, including for a call cancelled before it started. A call
   stopped by the kill switch is still answered, since the client is still waiting.
+- Human takeover detection was silently off on every Linux session. `pointer_position` always answered
+  `None`, and the watcher said so only at info level. On X11 it now reads the pointer through `xdotool`
+  and the watcher runs. Where that is impossible (Wayland, including XWayland, which only sees the
+  pointer over X11 windows; no `DISPLAY`; no `xdotool`) it logs at warn level at startup, and `agentctl
+  doctor` shows `human takeover` with the reason. Not tested on a live X11 session.
 
 ### Security
 

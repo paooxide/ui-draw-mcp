@@ -170,6 +170,23 @@ pub async fn doctor(state_dir: &Path) -> Doctor {
         fix: "",
     });
 
+    // Human takeover needs a global pointer query. X11 has one; Wayland does
+    // not, and without it moving the mouse will not stop the agent.
+    match crate::pointer::support() {
+        crate::pointer::PointerSupport::X11 { xdotool } => d.checks.push(Check {
+            name: "human takeover",
+            ok: true,
+            detail: format!("pointer readable through {xdotool}"),
+            fix: "",
+        }),
+        crate::pointer::PointerSupport::Unavailable(why) => d.checks.push(Check {
+            name: "human takeover",
+            ok: false,
+            detail: format!("detection is OFF: {why}"),
+            fix: "moving the mouse will not stop the agent here; the STOP file still does",
+        }),
+    }
+
     let consent = which("zenity").or_else(|| which("notify-send"));
     d.checks.push(Check {
         name: "consent dialog",

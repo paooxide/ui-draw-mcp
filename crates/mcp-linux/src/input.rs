@@ -498,11 +498,23 @@ impl InputBackend for LinuxBackend {
         "linux"
     }
 
-    /// Wayland gives a client no way to ask where the pointer is. `None` is
-    /// never treated as evidence of anything, so the override watcher stays
-    /// quiet rather than guessing.
+    /// On X11 the server answers `QueryPointer` (through `xdotool`). Wayland
+    /// gives a client no way to ask, and `None` is never treated as evidence
+    /// of anything, so the override watcher stays quiet rather than guessing.
     async fn pointer_position(&self) -> Result<Option<(f64, f64)>, InputError> {
-        Ok(None)
+        match crate::pointer::support() {
+            crate::pointer::PointerSupport::X11 { xdotool } => crate::pointer::query(xdotool)
+                .await
+                .map_err(InputError::Failed),
+            crate::pointer::PointerSupport::Unavailable(_) => Ok(None),
+        }
+    }
+
+    fn pointer_unavailable_reason(&self) -> Option<String> {
+        match crate::pointer::support() {
+            crate::pointer::PointerSupport::X11 { .. } => None,
+            crate::pointer::PointerSupport::Unavailable(why) => Some(why.clone()),
+        }
     }
 
     fn recent_pointer_sets(&self) -> Vec<SetPoint> {

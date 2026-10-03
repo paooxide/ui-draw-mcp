@@ -206,6 +206,13 @@ pub trait InputBackend: Send + Sync {
         Ok(None)
     }
 
+    /// Why [`Self::pointer_position`] cannot answer, when this backend knows
+    /// up front. `None` means it can, or does not know. Lets the watcher say
+    /// *why* human-takeover detection is off instead of just that it is.
+    fn pointer_unavailable_reason(&self) -> Option<String> {
+        None
+    }
+
     /// Pointer positions this backend recently *set*, newest last.
     ///
     /// The watcher compares where the pointer is against where the server put

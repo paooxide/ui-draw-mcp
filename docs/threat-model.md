@@ -179,11 +179,16 @@ sensor must never be treated as evidence of interference. It also cannot help
 when nobody is at the machine, which is exactly when an autonomous agent runs.
 The STOP file remains the control that always works.
 
-**On Linux the override has no sensor at all.**
-Wayland gives a client no way to read the pointer's position, so `pointer_position` answers `None`, which
-the watcher treats as no evidence rather than as interference. Reaching for the mouse does not stop the
-agent on Linux. The STOP file, the consent dialog and the portal grant (revocable from the desktop's
-settings) are the controls.
+**On Linux the override works on X11 only.**
+An X11 session can be asked where the pointer is, through `xdotool getmouselocation`, so the watcher runs
+there (it needs `xdotool` installed). Wayland gives a client no way to read the pointer's position, and
+XWayland is no substitute: it reports the pointer only while it is over an X11 window and holds the last
+value afterwards, which would trip the kill switch on nothing. On Wayland `pointer_position` answers
+`None`, which the watcher treats as no evidence rather than as interference, so reaching for the mouse
+does not stop the agent. That is logged at warn level when the server starts and shown by `agentctl
+doctor` as `human takeover: MISSING`. The STOP file, the consent dialog and the portal grant (revocable
+from the desktop's settings) are the controls. On X11 with several monitors the pointer's root
+coordinates may not match the portal's per-monitor coordinates; this has not been tested.
 
 **The portal grant is a file.**
 The remote-desktop approval is remembered as a restore token under `~/.agentctl/bin/`, mode 0600. Any

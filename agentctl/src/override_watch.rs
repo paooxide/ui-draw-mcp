@@ -24,6 +24,17 @@ pub fn spawn(
         tracing::debug!("human override is disabled");
         return;
     }
+    // Known up front on some backends (Wayland): say so now, at warn level,
+    // rather than at the first call. A person relying on moving the mouse to
+    // stop the agent must be told that it will not work.
+    if let Some(why) = input.pointer_unavailable_reason() {
+        tracing::warn!(
+            reason = %why,
+            "human takeover detection is OFF: moving the mouse will not stop the agent; \
+             use the STOP file instead"
+        );
+        return;
+    }
     tokio::spawn(async move {
         let mut detector = Detector::new();
         let mut interval =
@@ -53,9 +64,10 @@ pub fn spawn(
             if !probed {
                 probed = true;
                 if observed.is_none() {
-                    tracing::info!(
-                        "human override: this backend cannot read the pointer, so the \
-                         watcher would never have anything to compare against; disabled"
+                    tracing::warn!(
+                        "human takeover detection is OFF: this backend could not read the \
+                         pointer, so there is nothing to compare against; moving the mouse \
+                         will not stop the agent"
                     );
                     return;
                 }

@@ -38,6 +38,10 @@ mod input;
 mod keys;
 #[cfg(target_os = "linux")]
 mod launch;
+// Pure logic, so it is also compiled for tests on other hosts.
+#[cfg(any(target_os = "linux", test))]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+mod pointer;
 #[cfg(target_os = "linux")]
 mod portal;
 #[cfg(target_os = "linux")]
