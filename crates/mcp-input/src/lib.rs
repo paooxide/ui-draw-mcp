@@ -5,6 +5,7 @@
 //! the destructive-input gate and coordinate clamp.
 
 mod backend;
+pub mod glide;
 mod human_override;
 mod postcondition;
 mod tools;
@@ -13,6 +14,7 @@ pub use backend::{
     valid_combo, valid_modifier, ClipData, ClipFormat, InputBackend, InputError, MouseKind,
     ScrollDir, SemanticAction,
 };
+pub use glide::{bezier_interpolate, execute_glide, GlideConfig, GlidePreset};
 pub use human_override::{Activity, ActivityGuard, Detector, OverrideConfig, SetPoint, Verdict};
 pub use postcondition::Verifier;
 pub use tools::{InputModule, InputPolicy};

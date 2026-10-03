@@ -349,6 +349,47 @@ impl A11yModule {
             json!({ "ref": reff, "property": property, "value": value }),
         )
     }
+
+    async fn ui_extract(&self, args: &Value) -> Envelope {
+        let tool = "ui_extract";
+        let req = SnapshotRequest {
+            app: str_arg(args, "app"),
+            skeleton: false,
+            root_ref: str_arg(args, "root"),
+            max_depth: None,
+            surface: str_arg(args, "surface"),
+        };
+
+        let raw = match self.backend.snapshot(&req).await {
+            Ok(r) => r,
+            Err(e) => return backend_err(tool, e),
+        };
+
+        let sid = self.next_snapshot_id();
+        let cfg = FlattenConfig {
+            max_chars: usize::MAX,
+            skeleton: false,
+            terminal_app: raw.terminal_app,
+            ..FlattenConfig::default()
+        };
+        let f = flatten(
+            &raw.root,
+            raw.app.as_deref(),
+            raw.window.as_deref(),
+            &sid,
+            &cfg,
+        );
+        {
+            let mut arena = self.arena.lock().unwrap_or_else(|e| e.into_inner());
+            arena.install(f.snapshot);
+        }
+
+        let mode = str_arg(args, "mode");
+        let schema = args.get("schema");
+        let extracted = crate::extract::extract_data(&raw.root, mode.as_deref(), schema);
+
+        Envelope::ok(tool, extracted)
+    }
 }
 
 #[async_trait]
@@ -455,6 +496,7 @@ impl ToolModule for A11yModule {
             "get_ui_tree" => self.get_ui_tree(&args).await,
             "find_elements" => self.find_elements(&args).await,
             "get_element" => self.get_element(&args),
+            "ui_extract" => self.ui_extract(&args).await,
             other => Envelope::fail(other, ErrorCode::InvalidArgs, "unknown tool"),
         }
     }

@@ -223,6 +223,11 @@ pub struct PolicyConfig {
     /// Protected paths and denied domains checked before the gate (see
     /// [`crate::role::HardInvariants`] for what they can and cannot see).
     pub invariants: crate::role::HardInvariants,
+    /// Visual flair / showcase demo mode for screencasts, presentations, and marketing.
+    /// Enables Bezier cursor gliding on desktop, SVG pointer + ripple shockwaves + HUD in browser.
+    pub demo: bool,
+    /// Demo speed preset ("cinematic", "demo", "snappy", "instant" / "off").
+    pub demo_speed: String,
 }
 
 impl PolicyConfig {
@@ -299,6 +304,8 @@ impl Default for PolicyConfig {
             http_bind: "127.0.0.1:8765".to_string(),
             http_token: String::new(),
             http_allowed_origins: Vec::new(),
+            demo: false,
+            demo_speed: "demo".to_string(),
         }
     }
 }
@@ -425,6 +432,10 @@ impl PolicyConfig {
                 } else {
                     format!("‹redacted:len={}›", self.http_token.len())
                 },
+            },
+            "demo": {
+                "enabled": self.demo,
+                "speed": &self.demo_speed,
             },
         })
     }

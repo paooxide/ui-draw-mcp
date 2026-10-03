@@ -57,4 +57,4 @@ pub use consent::DialogConsent;
 pub use consent::{
     applescript_escape, ConsentOutcome, ConsentProvider, ConsentRequest, NoConsent, PromptBudget,
 };
-pub use load::config_path;
+pub use load::{config_path, DEMO_SPEEDS};

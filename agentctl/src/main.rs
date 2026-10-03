@@ -102,6 +102,17 @@ fn build_config() -> Result<PolicyConfig, String> {
             cfg.anonymize = false;
         } else if arg == "--anonymize" {
             cfg.anonymize = true;
+        } else if arg == "--demo" {
+            cfg.demo = true;
+        } else if arg == "--no-demo" {
+            cfg.demo = false;
+        } else if arg == "--demo-speed" && i + 1 < raw_args.len() {
+            cfg.demo_speed = raw_args[i + 1].clone();
+            cfg.demo = true;
+            i += 1;
+        } else if let Some(stripped) = arg.strip_prefix("--demo-speed=") {
+            cfg.demo_speed = stripped.to_string();
+            cfg.demo = true;
         } else if arg == "--role" && i + 1 < raw_args.len() {
             role_cli = Some(raw_args[i + 1].clone());
             i += 1;
@@ -594,7 +605,7 @@ fn display_present() -> bool {
 /// Flow names passed positionally, skipping flags and the values of the flags
 /// that take one.
 fn positional_flows(args: &[String]) -> Vec<String> {
-    let value_flags = ["--attach", "--json", "--config"];
+    let value_flags = ["--attach", "--json", "--config", "--demo-speed", "--role"];
     let mut out = Vec::new();
     let mut i = 2; // args[0]=bin, args[1]="test"
     while i < args.len() {
@@ -1362,6 +1373,9 @@ mod test_cmd_tests {
             "--attach",
             "9333",
             "checkout",
+            "--demo",
+            "--demo-speed",
+            "cinematic",
             "--strict",
             "--json",
             "/tmp/r.json",

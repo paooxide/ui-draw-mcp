@@ -8,7 +8,7 @@ Tiers gate what an agent may call: `read` and `standard` tools are available ins
 enabled category, while a `dangerous` tool additionally has to be named in
 `policy.enable`. Enabling a category never enables its dangerous tools.
 
-**112 tools across 12 categories.**
+**114 tools across 12 categories.**
 
 | Tool | Category | Tier | Summary |
 |---|---|---|---|
@@ -24,12 +24,14 @@ enabled category, while a `dangerous` tool additionally has to be named in
 | [`clipboard_write`](#clipboard-write) | input | standard | Write the clipboard. |
 | [`drag_drop`](#drag-drop) | input | standard | Press-move-release drag from one point/ref to another. |
 | [`hover`](#hover) | input | standard | Move the pointer over an element ref or point (reveals tooltips/hover menus). |
+| [`input_showcase`](#input-showcase) | input | standard | Configure smooth Bezier mouse gliding and visual flair for demos, screencasts, and presentations. |
 | [`keyboard_shortcut`](#keyboard-shortcut) | input | standard | Press a key or chord, e.g. |
 | [`keyboard_type`](#keyboard-type) | input | standard | Type Unicode text into the focused window. |
 | [`mouse_action`](#mouse-action) | input | standard | Coordinate pointer action (screen control). |
 | [`scroll`](#scroll) | input | standard | Scroll at an element ref or a point. |
 | [`set_value`](#set-value) | input | standard | Set the value of a text element by ref (accessibility SetValue). |
 | [`ui_action`](#ui-action) | input | standard | Perform a semantic action on an element by ref (accessibility action, no cursor). |
+| [`ui_fill_form`](#ui-fill-form) | input | standard | Fill multiple native UI fields (text fields, checkboxes, switches, popups, radios) in one call, and optionally submit and verify postconditions. |
 | [`close_app`](#close-app) | window | standard | Quit an application by name. |
 | [`control_window`](#control-window) | window | standard | Focus/move/resize/minimize/maximize/restore/close a window. |
 | [`focus_app`](#focus-app) | window | standard | Pin this session to an application: bring it forward and make every later get_ui_tree/action target it instead of whatever happens to be frontmost. |
@@ -286,13 +288,28 @@ Press-move-release drag from one point/ref to another. The pointer travels in 's
 
 `hover` · standard tier
 
-Move the pointer over an element ref or point (reveals tooltips/hover menus).
+Move the pointer over an element ref or point (reveals tooltips/hover menus). Supports smooth gliding via 'glide' or 'speed'.
 
 | Argument | Type | Required | Description |
 |---|---|---|---|
+| `duration_ms` | integer |  | custom gliding duration in milliseconds, 0-2000 |
+| `glide` | boolean |  | smooth Bezier gliding to target coordinates |
 | `ref` | string |  |  |
+| `speed` | one of: cinematic, demo, snappy, instant |  | gliding speed preset |
 | `x` | number |  |  |
 | `y` | number |  |  |
+
+### input-showcase
+
+`input_showcase` · standard tier
+
+Configure smooth Bezier mouse gliding and visual flair for demos, screencasts, and presentations.
+
+| Argument | Type | Required | Description |
+|---|---|---|---|
+| `duration_ms` | integer |  | custom duration in milliseconds, 0-2000 |
+| `enabled` | boolean |  | enable or disable smooth gliding |
+| `speed` | one of: cinematic, demo, snappy, instant, off |  | speed preset (cinematic: 350ms, demo: 200ms, snappy: 100ms, instant: 0ms) |
 
 ### keyboard-shortcut
 
@@ -338,11 +355,12 @@ Type Unicode text into the focused window. If 'ref' is given, focus it          
 
 `mouse_action` · standard tier
 
-Coordinate pointer action (screen control). 'modifiers' holds keys down for the click, e.g. ["cmd"] to open in a new tab or ["shift"] to extend a selection.
+Coordinate pointer action (screen control). 'modifiers' holds keys down for the click, e.g. ["cmd"] to open in a new tab or ["shift"] to extend a selection. Set 'glide: true' or 'speed' to smoothly glide the pointer along a Bezier curve for demos.
 
 | Argument | Type | Required | Description |
 |---|---|---|---|
 | `button` | string |  | left\|right\|middle |
+| `duration_ms` | integer |  | custom gliding duration in milliseconds, 0-2000 |
 | `expect` | object |  | optional: wait for this to become true after the action, and return what changed |
 | `expect.app` | string |  | which application to observe |
 | `expect.element` | string |  | synonym for text |
@@ -352,7 +370,9 @@ Coordinate pointer action (screen control). 'modifiers' holds keys down for the 
 | `expect.text` | string |  | wait until this text appears in the UI |
 | `expect.timeout_ms` | integer |  | give up after this long (max 30000) |
 | `expect.window` | string |  | wait until a window with this title exists |
+| `glide` | boolean |  | smooth Bezier gliding to target coordinates |
 | `modifiers` | array&lt;one of: cmd, shift, opt, alt, ctrl, fn&gt; |  |  |
+| `speed` | one of: cinematic, demo, snappy, instant |  | gliding speed preset |
 | `type` | one of: move, click, double, triple, right_click, down, up | yes |  |
 | `x` | number | yes |  |
 | `y` | number | yes |  |
@@ -412,6 +432,29 @@ Perform a semantic action on an element by ref (accessibility action, no cursor)
 | `expect.window` | string |  | wait until a window with this title exists |
 | `option` | string |  | option label for select |
 | `ref` | string | yes | element ref @eN |
+
+### ui-fill-form
+
+`ui_fill_form` · standard tier
+
+Fill multiple native UI fields (text fields, checkboxes, switches, popups, radios) in one call, and optionally submit and verify postconditions. Target fields by element ref (@eN) or name/label.
+
+| Argument | Type | Required | Description |
+|---|---|---|---|
+| `expect` | object |  | optional: wait for this to become true after the action, and return what changed |
+| `expect.app` | string |  | which application to observe |
+| `expect.element` | string |  | synonym for text |
+| `expect.focused` | string |  | wait until an element matching this text has focus |
+| `expect.gone` | string |  | wait until this text is no longer present |
+| `expect.judge` | string |  | wait until this plain-language claim about the UI is judged true (needs the judge enabled); the probability is reported |
+| `expect.text` | string |  | wait until this text appears in the UI |
+| `expect.timeout_ms` | integer |  | give up after this long (max 30000) |
+| `expect.window` | string |  | wait until a window with this title exists |
+| `fields` | array&lt;object&gt; | yes | list of fields to set or toggle |
+| `submit` | object |  | optional submission button to click after filling fields |
+| `submit.action` | one of: click, toggle |  |  |
+| `submit.name` | string |  | submit button name to match if ref is omitted |
+| `submit.ref` | string |  | submit button ref @eN |
 
 ## window
 

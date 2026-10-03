@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -70,9 +70,9 @@ pub struct LinuxBackend {
     pub(crate) portal: Portal,
     /// Where downloaded OCR models and the portal restore token live.
     pub(crate) helper_dir: PathBuf,
-    /// Set when something asks in-flight work to stop. Checked between the
-    /// steps of a drag.
-    pub(crate) cancel: AtomicBool,
+    /// Counts requests to stop in-flight work. Compared with the value a call
+    /// started at, between the steps of a drag or keystrokes; never reset.
+    pub(crate) takeovers: AtomicU64,
     pub(crate) ocr: OnceCell<Arc<crate::vision::Ocr>>,
 }
 
@@ -90,7 +90,7 @@ impl LinuxBackend {
             state: Mutex::new(State::default()),
             portal: Portal::new(helper_dir.clone()),
             helper_dir,
-            cancel: AtomicBool::new(false),
+            takeovers: AtomicU64::new(0),
             ocr: OnceCell::new(),
         }
     }

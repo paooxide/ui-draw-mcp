@@ -27,6 +27,9 @@ All notable changes to this project are documented here. The format follows
   refuses protected paths and denied domains anywhere in a call's arguments before the gate, including
   inside command lines, in `file:` URLs and through symlinks. It is a check on argument text, not
   containment; relative paths, shell expansion, encoding and DNS are documented as out of reach.
+- **Compound native forms and extraction.** `ui_fill_form` sets text fields, checkboxes, switches and
+  pop-ups in one call and can submit and check the result; `ui_extract` reads a native table, form or list
+  into JSON.
 - **UX testing: accessibility, design-token style, component and responsive checks.** `browser_assert`
   gained UX clauses that ride the same `{passed, checks}` flow and `agentctl test` report as the functional
   ones: `a11y` runs a built-in WCAG audit (alt text, form labels, control names, colour contrast, target

@@ -171,6 +171,10 @@ pub trait InputBackend: Send + Sync {
     async fn hover(&self, x: f64, y: f64) -> Result<(), InputError>;
     /// Press at `from`, travel to `to` in `steps` intermediate moves, release.
     ///
+    /// `since_takeover` is [`InputBackend::takeover_generation`] as read when
+    /// the call started; the drag aborts (releasing the button) if it has
+    /// moved on by any step.
+    ///
     /// The steps are not decoration: a press followed by a single jump is what
     /// a teleport looks like, and drag targets that track motion — Finder
     /// drags, sliders, canvases, reorderable lists — ignore it.
@@ -180,6 +184,7 @@ pub trait InputBackend: Send + Sync {
         to: (f64, f64),
         modifiers: &[String],
         steps: u32,
+        since_takeover: u64,
     ) -> Result<(), InputError>;
     async fn clipboard_read(&self, format: ClipFormat) -> Result<ClipData, InputError>;
     /// The application that will receive synthetic input *right now*.
@@ -212,6 +217,20 @@ pub trait InputBackend: Send + Sync {
     /// Abandon anything in flight — a drag mid-path, for instance, which would
     /// otherwise keep the button held while the human moves the mouse.
     fn cancel_pending(&self) {}
+
+    /// How many times [`InputBackend::cancel_pending`] has been called, ever.
+    ///
+    /// A counter rather than a flag: a flag has to be cleared before the next
+    /// motion, and whoever clears it also clears a takeover that landed after
+    /// the call was admitted but before its first move. With a counter every
+    /// motion reads the value when its *call starts* and stops if it changes;
+    /// nothing is ever reset, so no takeover can be lost.
+    ///
+    /// A backend with no cancel support returns 0 forever, which leaves its
+    /// motions uninterruptible.
+    fn takeover_generation(&self) -> u64 {
+        0
+    }
 }
 
 /// Modifier names accepted by pointer actions, matching `keyboard_shortcut`'s

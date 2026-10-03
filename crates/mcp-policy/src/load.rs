@@ -28,6 +28,26 @@ enum Val {
 }
 
 /// Parse the supported TOML subset into `section.key -> value`.
+/// The speeds `demo_speed` accepts. `mcp-input`'s `GlidePreset::from_speed`
+/// must accept every one; `agentctl` tests that, because this crate cannot
+/// depend on the engine.
+pub const DEMO_SPEEDS: [&str; 5] = ["cinematic", "demo", "snappy", "instant", "off"];
+
+/// A demo speed this build knows, normalised to lower case. An unknown name
+/// used to fall back to `demo` silently, so `demo_speed = "slow"` ran at the
+/// wrong speed and nothing said so.
+fn validate_demo_speed(source: &str, value: &str) -> Result<String, String> {
+    let v = value.trim().to_ascii_lowercase();
+    if DEMO_SPEEDS.contains(&v.as_str()) {
+        Ok(v)
+    } else {
+        Err(format!(
+            "unknown {source} '{value}' (expected one of: {})",
+            DEMO_SPEEDS.join(", ")
+        ))
+    }
+}
+
 fn parse(text: &str) -> Result<HashMap<String, Val>, String> {
     let mut out = HashMap::new();
     let mut section = String::new();
@@ -313,6 +333,12 @@ impl PolicyConfig {
                 ("policy.default_role" | "policy.role", Val::Str(s)) => {
                     cfg.active_role = Some(s.clone());
                 }
+                ("policy.demo" | "input.demo" | "demo.enabled", Val::Str(s)) => {
+                    cfg.demo = boolean(key, s)?;
+                }
+                ("policy.demo_speed" | "input.demo_speed" | "demo.speed", Val::Str(s)) => {
+                    cfg.demo_speed = validate_demo_speed("demo_speed", s)?;
+                }
                 (
                     "invariants.protected_paths" | "policy.invariants.protected_paths",
                     Val::List(v),
@@ -505,6 +531,21 @@ impl PolicyConfig {
             || std::env::var_os("AGENTCTL_NO_PII").is_some()
         {
             cfg.anonymize = false;
+        }
+
+        if let Ok(v) = std::env::var("AGENTCTL_DEMO") {
+            match v.to_ascii_lowercase().as_str() {
+                "0" | "false" | "off" | "no" => cfg.demo = false,
+                "1" | "true" | "on" | "yes" => cfg.demo = true,
+                _ => {
+                    return Err(format!(
+                        "invalid AGENTCTL_DEMO value '{v}' (expected true/false)"
+                    ))
+                }
+            }
+        }
+        if let Ok(v) = std::env::var("AGENTCTL_DEMO_SPEED") {
+            cfg.demo_speed = validate_demo_speed("AGENTCTL_DEMO_SPEED", &v)?;
         }
 
         Ok(cfg)
@@ -708,5 +749,60 @@ mod tests {
     fn missing_file_yields_defaults() {
         let cfg = PolicyConfig::load_from(Path::new("/nonexistent/agentctl/config.toml")).unwrap();
         assert_eq!(cfg.allowed_apps, PolicyConfig::default().allowed_apps);
+    }
+
+    #[test]
+    fn parses_demo_settings_and_presets() {
+        let toml = r#"
+        [policy]
+        demo = "true"
+        demo_speed = "cinematic"
+        "#;
+        let cfg = PolicyConfig::from_toml_str(toml).expect("parses");
+        assert!(cfg.demo);
+        assert_eq!(cfg.demo_speed, "cinematic");
+
+        let toml_input = r#"
+        [input]
+        demo = "true"
+        demo_speed = "snappy"
+        "#;
+        let cfg_input = PolicyConfig::from_toml_str(toml_input).expect("parses");
+        assert!(cfg_input.demo);
+        assert_eq!(cfg_input.demo_speed, "snappy");
+    }
+
+    #[test]
+    fn an_unknown_demo_speed_is_a_config_error_under_every_spelling() {
+        for key in [
+            "[policy]\ndemo_speed",
+            "[input]\ndemo_speed",
+            "[demo]\nspeed",
+        ] {
+            let bad = format!("{key} = \"slow\"\n");
+            let err = PolicyConfig::from_toml_str(&bad).unwrap_err();
+            assert!(err.contains("slow") && err.contains("cinematic"), "{err}");
+        }
+        for ok in DEMO_SPEEDS {
+            let cfg =
+                PolicyConfig::from_toml_str(&format!("[policy]\ndemo_speed = \"{ok}\"\n")).unwrap();
+            assert_eq!(cfg.demo_speed, ok);
+        }
+        // Case and padding are forgiven and normalised.
+        let cfg = PolicyConfig::from_toml_str("[policy]\ndemo_speed = \" Snappy \"\n").unwrap();
+        assert_eq!(cfg.demo_speed, "snappy");
+    }
+
+    #[test]
+    fn the_demo_speed_environment_variable_is_validated_too() {
+        assert_eq!(
+            validate_demo_speed("AGENTCTL_DEMO_SPEED", "OFF").as_deref(),
+            Ok("off")
+        );
+        let err = validate_demo_speed("AGENTCTL_DEMO_SPEED", "turbo").unwrap_err();
+        assert!(
+            err.contains("AGENTCTL_DEMO_SPEED") && err.contains("turbo"),
+            "{err}"
+        );
     }
 }

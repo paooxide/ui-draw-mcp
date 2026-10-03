@@ -317,6 +317,7 @@ impl InputBackend for LinuxBackend {
         // Open the portal (and answer its dialog) before settling focus: the
         // dialog steals focus, so confirming the target first would be stale
         // by the time the first key is sent.
+        let since = self.takeover_generation();
         self.portal.ensure_ready().await?;
         self.ensure_target_active().await?;
         tracing::debug!(
@@ -325,7 +326,7 @@ impl InputBackend for LinuxBackend {
             "typing into the target"
         );
         for sym in keys::keysyms_for_text(text) {
-            if self.cancel.load(Ordering::SeqCst) {
+            if self.takeover_generation() != since {
                 return Err(InputError::Failed("typing aborted".into()));
             }
             self.tap(sym).await?;
@@ -420,9 +421,9 @@ impl InputBackend for LinuxBackend {
         to: (f64, f64),
         modifiers: &[String],
         steps: u32,
+        since_takeover: u64,
     ) -> Result<(), InputError> {
         let mods = keys::pointer_modifiers(modifiers).map_err(InputError::Failed)?;
-        self.cancel.store(false, Ordering::SeqCst);
         self.portal.pointer_abs(from.0, from.1).await?;
         self.note_pointer(from.0, from.1);
         sleep(Duration::from_millis(20)).await;
@@ -432,7 +433,7 @@ impl InputBackend for LinuxBackend {
         let steps = steps.clamp(1, 200);
         let mut last = from;
         for i in 1..=steps {
-            if self.cancel.load(Ordering::SeqCst) {
+            if self.takeover_generation() != since_takeover {
                 let _ = self.portal.button(0x110, false).await;
                 let _ = self.press_modifiers(&mods, false).await;
                 return Err(InputError::Failed(
@@ -509,7 +510,11 @@ impl InputBackend for LinuxBackend {
     }
 
     fn cancel_pending(&self) {
-        self.cancel.store(true, Ordering::SeqCst);
+        self.takeovers.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn takeover_generation(&self) -> u64 {
+        self.takeovers.load(Ordering::SeqCst)
     }
 }
 

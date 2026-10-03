@@ -358,10 +358,11 @@ pub struct MacosBackend {
     /// here: a backend must not depend on the policy crate to find out where
     /// the agentctl state directory is.
     pub(crate) helper_dir: std::path::PathBuf,
-    /// Set when something asks in-flight work to stop — the human-override
-    /// watcher, for instance. Checked between the steps of a drag, which would
-    /// otherwise keep the button held while the person moves the mouse.
-    cancel: std::sync::atomic::AtomicBool,
+    /// Counts requests to stop in-flight work — the human-override watcher
+    /// raises it. A drag compares it with the value its call started at,
+    /// between steps; it would otherwise keep the button held while the person
+    /// moves the mouse. Never reset: see `InputBackend::takeover_generation`.
+    takeovers: std::sync::atomic::AtomicU64,
 }
 
 impl Default for MacosBackend {
@@ -374,7 +375,7 @@ impl MacosBackend {
     pub fn new() -> Self {
         MacosBackend {
             state: Mutex::new(State::default()),
-            cancel: std::sync::atomic::AtomicBool::new(false),
+            takeovers: std::sync::atomic::AtomicU64::new(0),
             helper_dir: default_helper_dir(),
         }
     }
@@ -713,7 +714,11 @@ impl InputBackend for MacosBackend {
         crate::event::recent_sets()
     }
     fn cancel_pending(&self) {
-        self.cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.takeovers
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+    fn takeover_generation(&self) -> u64 {
+        self.takeovers.load(std::sync::atomic::Ordering::SeqCst)
     }
     async fn hover(&self, x: f64, y: f64) -> Result<(), InputError> {
         crate::event::hover(x, y)
@@ -724,10 +729,9 @@ impl InputBackend for MacosBackend {
         to: (f64, f64),
         modifiers: &[String],
         steps: u32,
+        since_takeover: u64,
     ) -> Result<(), InputError> {
-        use std::sync::atomic::Ordering;
         use tokio::time::{sleep, Duration};
-        self.cancel.store(false, Ordering::SeqCst);
         crate::event::drag_begin(from, modifiers)?;
         // Let the press register before motion starts; a drag that begins in
         // the same instant reads as a click to most targets.
@@ -737,7 +741,7 @@ impl InputBackend for MacosBackend {
             // A cancelled drag must release the button where it is. Returning
             // with it still held would leave the human dragging a selection
             // around with their own mouse.
-            if self.cancel.load(Ordering::SeqCst) {
+            if self.takeover_generation() != since_takeover {
                 let _ = crate::event::drag_end(last, modifiers);
                 return Err(InputError::Failed(
                     "drag aborted: a human took over the pointer".into(),
