@@ -712,3 +712,56 @@ async fn ocr_reads_a_window_and_returns_clickable_coordinates() {
 
     let _ = c.call("close_app", json!({ "app": "TextEdit" })).await;
 }
+
+/// One keyboard event carries at most 20 UTF-16 code units, so a long string
+/// has to go out in pieces. This types 200 characters and reads every one of
+/// them back out of TextEdit's accessibility tree: a cut at the first 20 would
+/// leave the tail missing while `keyboard_type` still reported the full count.
+///
+/// Gated on `AGENTCTL_LIVE_GUI=1`; it takes over the keyboard.
+#[tokio::test(flavor = "multi_thread")]
+async fn two_hundred_characters_typed_into_textedit_arrive_whole() {
+    if !ready() {
+        return;
+    }
+    let nonce = format!("agentctl-{}-", mcp_policy::now_ms());
+    let digits: String = (0..)
+        .map(|i| char::from(b'0' + (i % 10) as u8))
+        .take(200)
+        .collect();
+    let text = format!("{nonce}{}", &digits[..200 - nonce.len()]);
+    assert_eq!(text.chars().count(), 200);
+
+    let c = client("live-long-text");
+    c.initialize().await;
+    c.ok("launch", json!({ "app": "TextEdit" })).await;
+    if !settle_on(&c, "TextEdit").await {
+        return;
+    }
+    // A scratch document, so nothing lands in one the developer had open.
+    if !guarded_key(&c, "TextEdit", "cmd+n").await {
+        return;
+    }
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    if !guarded_type(&c, "TextEdit", &text).await {
+        return;
+    }
+
+    let settled = c
+        .call(
+            "wait_for",
+            json!({ "app": "TextEdit", "text": &text, "timeout_ms": 8000 }),
+        )
+        .await;
+    let tree = c.ok("get_ui_tree", json!({ "app": "TextEdit" })).await;
+    let seen = tree["text"].as_str().unwrap_or_default();
+    assert!(
+        settled.ok && seen.contains(&text),
+        "all 200 characters must arrive; tree was:\n{seen}"
+    );
+
+    // Leave nothing behind: close the scratch document without saving.
+    let _ = guarded_key(&c, "TextEdit", "cmd+w").await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let _ = guarded_key(&c, "TextEdit", "cmd+d").await; // "Delete" in the save sheet
+}

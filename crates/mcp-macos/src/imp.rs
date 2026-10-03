@@ -688,7 +688,27 @@ impl InputBackend for MacosBackend {
 
     async fn type_text(&self, text: &str) -> Result<(), InputError> {
         unsafe { self.ensure_target_frontmost()? };
-        crate::event::type_text(text)
+        use tokio::time::{sleep, Duration};
+        // Read when the call starts, so a takeover that lands at any point
+        // after admission is seen. One event carries at most 20 UTF-16 units,
+        // so the text goes out in pieces, and a human reaching for the
+        // keyboard or mouse stops it between them rather than after the lot.
+        let since = self.takeover_generation();
+        let total = text.chars().count();
+        let mut typed = 0;
+        for chunk in crate::chunk::chunks(text) {
+            if self.takeover_generation() != since {
+                return Err(InputError::Failed(format!(
+                    "typing aborted after {typed} of {total} characters: a human took over"
+                )));
+            }
+            crate::event::type_chunk(chunk)?;
+            typed += chunk.chars().count();
+            // Let the target drain its queue; a burst of events is dropped by
+            // some apps, and this is the window in which a takeover can land.
+            sleep(Duration::from_millis(3)).await;
+        }
+        Ok(())
     }
     async fn key_combo(&self, combo: &str) -> Result<(), InputError> {
         unsafe { self.ensure_target_frontmost()? };

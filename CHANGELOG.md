@@ -194,6 +194,12 @@ All notable changes to this project are documented here. The format follows
   and the watcher runs. Where that is impossible (Wayland, including XWayland, which only sees the
   pointer over X11 windows; no `DISPLAY`; no `xdotool`) it logs at warn level at startup, and `agentctl
   doctor` shows `human takeover` with the reason. Not tested on a live X11 session.
+- On macOS, `keyboard_type` posted a whole string on one key event, and Apple documents that only the first
+  20 UTF-16 code units of a string set on one event are used, so long text could be cut while the call
+  reported the full count. Text now goes out in events of at most 20 units, never splitting a surrogate
+  pair and, as far as a block-based table of combining marks, joiners, skin tones and flags allows, never
+  a grapheme cluster. A takeover between pieces stops the typing and says how much was typed. The 200
+  character live test is written but has not been run.
 
 ### Security
 

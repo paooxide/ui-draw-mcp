@@ -113,11 +113,16 @@ fn source() -> Result<CGEventSource, InputError> {
         .map_err(|_| InputError::Failed("could not create CGEventSource".into()))
 }
 
-/// Type Unicode text by attaching it to a synthetic keystroke.
-pub fn type_text(text: &str) -> Result<(), InputError> {
+/// Type one chunk of Unicode text by attaching it to a synthetic keystroke.
+///
+/// `chunk` must be at most [`crate::chunk::MAX_UNITS`] UTF-16 code units: Apple
+/// documents that only the first 20 of a string set on one event are used, so
+/// anything longer is cut silently. [`crate::chunk::chunks`] produces the
+/// pieces; the caller posts them in order.
+pub fn type_chunk(chunk: &str) -> Result<(), InputError> {
     let src = source()?;
     let down = CGEvent::new_keyboard_event(src.clone(), 0, true).map_err(|_| fail("key down"))?;
-    down.set_string(text);
+    down.set_string(chunk);
     // Typed text carries no modifiers, and *not setting* the flags is not the
     // same as setting them to empty: an event built from the HID state source
     // inherits whatever the system believes is currently held. With Command
@@ -127,7 +132,7 @@ pub fn type_text(text: &str) -> Result<(), InputError> {
     down.set_flags(CGEventFlags::empty());
     down.post(CGEventTapLocation::HID);
     let up = CGEvent::new_keyboard_event(src, 0, false).map_err(|_| fail("key up"))?;
-    up.set_string(text);
+    up.set_string(chunk);
     up.set_flags(CGEventFlags::empty());
     up.post(CGEventTapLocation::HID);
     Ok(())

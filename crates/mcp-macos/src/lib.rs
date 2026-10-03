@@ -10,6 +10,10 @@
 //! implemented here (returns `UNSUPPORTED_OS`); semantic actions (AXPress,
 //! set-value, focus) are real. On non-macOS targets this crate is empty.
 
+// Pure logic, so it is also compiled for tests on other hosts.
+#[cfg(any(target_os = "macos", test))]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+mod chunk;
 #[cfg(target_os = "macos")]
 mod event;
 #[cfg(target_os = "macos")]
