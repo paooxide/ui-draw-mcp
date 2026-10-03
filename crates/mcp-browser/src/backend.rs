@@ -770,6 +770,17 @@ struct NavPending {
     certain: bool,
 }
 
+/// The showcase overlay script, made safe to splice into an action's script.
+/// The overlay is decoration and runs in the page's own world, which can make
+/// it throw (Trusted Types forbid its `innerHTML`, a page can lack a `head`).
+/// Spliced bare, that throw rejects the action's whole async function: the
+/// action's real error is replaced by the overlay's, and an action that would
+/// have succeeded is reported as failed. Contained here, it only costs the
+/// animation (the calls that use it are guarded the same way).
+fn showcase_guarded(engine: &str) -> String {
+    format!("try {{ {engine} }} catch (e) {{}}")
+}
+
 /// `return <expr>;` for `execute/sync`. The expression is trimmed first: a
 /// `return` followed by a newline returns `undefined` (automatic semicolon
 /// insertion) and never runs the expression, which a constant that begins with
@@ -820,7 +831,10 @@ fn safari_noeval_script(code: &str, expression: bool) -> String {
 /// opposed to the user's code throwing), the only case worth a second route.
 /// The refusal happens before any user code runs, so retrying repeats nothing.
 fn is_csp_eval_refusal(msg: &str) -> bool {
-    msg.starts_with("EvalError") && msg.contains("Content Security Policy")
+    // WebKit words it "...in the following Content Security Policy directive"
+    // for `unsafe-eval` and "...requires a 'Trusted Type' assignment" under
+    // Trusted Types; both start with "Refused to evaluate".
+    msg.starts_with("EvalError") && msg.contains("Refused to evaluate")
 }
 
 /// Refuse a Safari (WebKit) target for a feature built on CDP, saying so,
@@ -2819,7 +2833,7 @@ impl BrowserBackend for CdpBackend {
             let click_ripple = showcase_cfg.click_ripple;
             let typing_hud = showcase_cfg.typing_hud;
             (
-                crate::showcase::JS_SHOWCASE_ENGINE,
+                showcase_guarded(crate::showcase::JS_SHOWCASE_ENGINE),
                 format!(
                     r#"
   try {{
@@ -2834,7 +2848,7 @@ impl BrowserBackend for CdpBackend {
                 ),
             )
         } else {
-            ("", String::new())
+            (String::new(), String::new())
         };
 
         // A click, submit or key press may start a navigation. Mark the
@@ -4097,7 +4111,7 @@ impl BrowserBackend for CdpBackend {
         let (showcase_init, showcase_field, showcase_submit) = if showcase_cfg.enabled {
             let glide_ms = showcase_cfg.glide_ms();
             (
-                crate::showcase::JS_SHOWCASE_ENGINE,
+                showcase_guarded(crate::showcase::JS_SHOWCASE_ENGINE),
                 format!(
                     r#"
       try {{
@@ -4124,7 +4138,7 @@ impl BrowserBackend for CdpBackend {
                 ),
             )
         } else {
-            ("", String::new(), String::new())
+            (String::new(), String::new(), String::new())
         };
 
         let expr = JS_FILL_FORM
@@ -4133,7 +4147,7 @@ impl BrowserBackend for CdpBackend {
                 "{JS_ARM}",
                 &JS_ARM.replace("__ISO__", if iso.is_some() { "true" } else { "false" }),
             )
-            .replace("{JS_SHOWCASE_INIT}", showcase_init)
+            .replace("{JS_SHOWCASE_INIT}", &showcase_init)
             .replace("{JS_SHOWCASE_FIELD}", &showcase_field)
             .replace("{JS_SHOWCASE_SUBMIT}", &showcase_submit)
             .replace("__FIELDS__", &fields_json)
@@ -4996,13 +5010,18 @@ impl BrowserBackend for CdpBackend {
             );
             if is_safari {
                 if let Ok(entry) = self.get_safari_session(target) {
-                    let _ = entry
+                    if let Err(e) = entry
                         .session
                         .execute_sync(&safari_return(&init_script), &[])
-                        .await;
+                        .await
+                    {
+                        tracing::warn!("showcase overlay could not be installed: {}", err_msg(&e));
+                    }
                 }
             } else if let Ok(mut c) = self.conn(target).await {
-                let _ = Self::eval_value(&mut c, &init_script).await;
+                if let Err(e) = Self::eval_value(&mut c, &init_script).await {
+                    tracing::warn!("showcase overlay could not be installed: {}", err_msg(&e));
+                }
             }
         }
         Ok(cfg.to_json())
@@ -5722,7 +5741,9 @@ mod tests {
         let csp = "EvalError: Refused to evaluate a string as JavaScript because 'unsafe-eval' is not an allowed source of script in the following Content Security Policy directive";
         assert!(is_csp_eval_refusal(csp));
         assert!(!is_csp_eval_refusal("EvalError: user thing"));
-        assert!(!is_csp_eval_refusal("Error: Content Security Policy"));
+        assert!(!is_csp_eval_refusal("Error: Refused to evaluate"));
+        let tt = "EvalError: Refused to evaluate a string as JavaScript because this document requires a 'Trusted Type' assignment.";
+        assert!(is_csp_eval_refusal(tt));
     }
 
     #[test]

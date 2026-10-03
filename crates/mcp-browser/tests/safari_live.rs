@@ -11,7 +11,8 @@
 //! driver is started.
 
 use mcp_browser::{
-    is_safari_available, BrowserBackend, BrowserError, CdpBackend, DialogPolicy, Locator, NavPolicy,
+    is_safari_available, showcase::ShowcaseConfig, BrowserBackend, BrowserError, CdpBackend,
+    DialogPolicy, Locator, NavPolicy,
 };
 use serde_json::json;
 use std::io::{Read, Write};
@@ -297,6 +298,14 @@ const ROUTES: &[Route] = &[
         ..route(
             "/csp",
             "<!doctype html><title>csp</title><div id=\"o\">csp page</div>",
+        )
+    },
+    // Trusted Types make the overlay's `innerHTML` assignment throw.
+    Route {
+        headers: "Content-Security-Policy: require-trusted-types-for 'script'\r\n",
+        ..route(
+            "/tt",
+            "<!doctype html><title>tt</title><button id=\"btn\" onclick=\"this.textContent='clicked'\">go</button><div id=\"sub\">x</div>",
         )
     },
     Route {
@@ -660,6 +669,88 @@ async fn safari_eval_works_under_a_csp_without_unsafe_eval() {
     // A real error is still an error, not swallowed by the fallback.
     let e = b.eval(&t, "throw new Error('boom')").await.unwrap_err();
     assert!(format!("{e:?}").contains("boom"), "{e:?}");
+
+    b.disconnect(id, true).await.unwrap();
+}
+
+/// What each failing call returns, as `(variant, message)` strings.
+async fn failure_shapes(b: &CdpBackend, t: &str) -> Vec<(String, String)> {
+    let shape = |e: BrowserError| {
+        let s = format!("{e:?}");
+        let (kind, rest) = s.split_once('(').unwrap();
+        (kind.to_string(), rest.to_string())
+    };
+    let mut out = Vec::new();
+    // Nothing matches; a selector that does not parse; a stale ref; submit on
+    // an element with no form; an unknown action; and a form field that is not there.
+    for (loc, action) in [
+        (sel("#does-not-exist"), "click"),
+        (sel("###"), "click"),
+        (Locator::Ref("//*[@id=\"gone\"]"), "click"),
+        (sel("#sub"), "submit"),
+        (sel("#name"), "frobnicate"),
+    ] {
+        out.push(shape(b.act(t, loc, action, None).await.unwrap_err()));
+    }
+    out.push(shape(
+        b.fill_form(t, &json!([{ "selector": "#nope", "value": "x" }]), None)
+            .await
+            .unwrap_err(),
+    ));
+    out
+}
+
+/// The overlay is decoration: with showcase on, an action that fails must
+/// report exactly the error it reports with showcase off.
+#[tokio::test(flavor = "multi_thread")]
+async fn safari_showcase_does_not_change_engine_errors() {
+    let Some((b, id, t)) = open_safari("showcase_errors", "/app").await else {
+        return;
+    };
+    let off = failure_shapes(&b, &t).await;
+    assert_eq!(off.len(), 6, "{off:?}");
+
+    b.showcase(&t, Some(ShowcaseConfig::snappy()))
+        .await
+        .unwrap();
+    // The overlay really is installed in the page, so this is not the off path.
+    let v = b
+        .eval(&t, "typeof window.__agentctl_showcase")
+        .await
+        .unwrap();
+    assert_eq!(v["result"], "object", "{v}");
+    let on = failure_shapes(&b, &t).await;
+    assert_eq!(on, off);
+
+    // And a good action still succeeds with the overlay in play.
+    let r = b.act(&t, sel(".save"), "click", None).await.unwrap();
+    assert_eq!(r["showcase"], true, "{r}");
+
+    b.disconnect(id, true).await.unwrap();
+}
+
+/// A page can make the overlay's own script throw (Trusted Types forbid its
+/// `innerHTML`). That must never replace the action's real error, nor turn a
+/// good action into a failure.
+#[tokio::test(flavor = "multi_thread")]
+async fn safari_showcase_overlay_failure_neither_masks_nor_fails_an_action() {
+    let Some((b, id, t)) = open_safari("showcase_overlay_throws", "/tt").await else {
+        return;
+    };
+    let off = failure_shapes(&b, &t).await;
+    b.showcase(&t, Some(ShowcaseConfig::snappy()))
+        .await
+        .unwrap();
+    let on = failure_shapes(&b, &t).await;
+    assert_eq!(on, off);
+
+    let r = b.act(&t, sel("#btn"), "click", None).await.unwrap();
+    assert_eq!(r["ok"], true, "{r}");
+    let v = b
+        .eval(&t, "document.getElementById('btn').textContent")
+        .await
+        .unwrap();
+    assert_eq!(v["result"], "clicked");
 
     b.disconnect(id, true).await.unwrap();
 }

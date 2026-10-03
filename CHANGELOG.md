@@ -181,6 +181,14 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- **Showcase overlay errors replaced the real error of `browser_act` and `browser_fill_form`.** The overlay script
+  was spliced bare into the action's async function, so when a page made it throw (Trusted Types forbid its
+  `innerHTML`; a page can also lack a `head`) the whole function rejected: a missing element, a bad selector or a
+  stale ref came back as the overlay's `TypeError`, and an action that would have succeeded was reported as
+  failed. This showed on Safari, where it was seen; the same script runs on Chrome. The overlay is now contained
+  in its own `try`, so it can only cost the animation, and a failed overlay install from `browser_showcase` is
+  logged instead of dropped. The Safari `eval` fallback for pages that forbid `eval` now also recognises the
+  Trusted Types refusal, which WebKit words differently from the `unsafe-eval` one.
 - **Safari: `browser_eval` fails on a page whose CSP has no `unsafe-eval`.** `browser_eval` evaluated the text with
   an indirect `eval` inside the page, which `Content-Security-Policy: script-src 'self'` refuses (`EvalError`), so
   every eval on such a page was an error. On that refusal (and only that: it happens before any of the code runs,

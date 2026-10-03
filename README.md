@@ -175,10 +175,11 @@ Protocol, and it is built for an agent to run regressions and UI tests natively.
 as an experimental second engine through `safaridriver` (`launch.browser: "safari"`; run
 `safaridriver --enable` once, enable Develop > Allow Remote Automation, and restart Safari). Verified live on
 Safari 27: navigation, snapshot, `browser_act` click and type by ref and selector, `within`, `browser_fill_form`,
-`htmx_settled` (against the real htmx 2.x library), `browser_eval` on a page whose CSP forbids `eval`, cookies,
-profile state and restore, capture and screenshots. It has no network interception, dialog policy, key presses, device emulation, recording, branches or checkpoints (each returns `UNSUPPORTED`).
-`browser_capture` arms only the page that is open, not later navigations. Firefox speaks a different protocol and is not
-supported.
+`htmx_settled` (against the real htmx 2.x library), `browser_eval` on a page whose CSP forbids `eval`, action
+errors reported unchanged under `browser_showcase`, cookies, profile state and restore, capture and screenshots. It
+has no network interception, dialog policy, key presses, device emulation, recording, branches or checkpoints (each
+returns `UNSUPPORTED`). `browser_capture` arms only the page that is open, not later navigations. Firefox speaks a
+different protocol and is not supported.
 
 - `browser_act` acts on a `ref` or, in one call, a `by`+`query` selector (no separate `browser_query`).
 - `browser_capture` installs a page hook (persists across navigations) that records fetch/XHR with
