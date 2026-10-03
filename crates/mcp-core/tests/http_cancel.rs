@@ -118,6 +118,16 @@ async fn wait_inflight(server: &Server, n: usize) {
     }
 }
 
+fn post_records(server: &Server) -> usize {
+    server
+        .policy()
+        .audit_sink()
+        .memory_records()
+        .iter()
+        .filter(|r| r["phase"] == "post" && r["tool"] == "spin_wait")
+        .count()
+}
+
 #[tokio::test]
 async fn a_cancel_post_reaches_a_call_running_in_another_post() {
     let f = start(8).await;
@@ -134,8 +144,12 @@ async fn a_cancel_post_reaches_a_call_running_in_another_post() {
         started.elapsed() < Duration::from_secs(3),
         "the call was not cancelled promptly"
     );
-    assert_eq!(status(&first), 200, "{first}");
+    // The client withdrew the request, so it is not answered with a result.
+    assert_eq!(status(&first), 202, "{first}");
+    assert!(!first.contains("\"result\""), "{first}");
     assert_eq!(f.server.inflight_count(), 0);
+    // ...but the audit log still shows the call ending.
+    assert_eq!(post_records(&f.server), 1);
 }
 
 #[tokio::test]

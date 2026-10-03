@@ -40,6 +40,10 @@ struct Inflight {
     /// The JSON-RPC id, as its JSON text (`1` and `"1"` are different ids).
     request_id: Option<String>,
     token: CancelToken,
+    /// Set only by [`Server::cancel_request`], never by the kill switch: the
+    /// transports use it to tell "the client withdrew this request" (send no
+    /// response) from "we stopped it" (the client is still waiting).
+    client_cancelled: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Removes a call from the in-flight registry however it ends, including a
@@ -103,6 +107,8 @@ impl Server {
         let mut found = false;
         for call in map.values() {
             if call.request_id.as_deref() == Some(key.as_str()) {
+                call.client_cancelled
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
                 call.token.cancel();
                 found = true;
             }
@@ -168,6 +174,7 @@ impl Server {
     ) -> Envelope {
         self.dispatch_call_for(name, args, progress_token, None)
             .await
+            .0
     }
 
     /// As [`Self::dispatch_call_with`], remembering which JSON-RPC request this
@@ -178,10 +185,11 @@ impl Server {
         args: Value,
         progress_token: Option<Value>,
         request_id: Option<&Value>,
-    ) -> Envelope {
+    ) -> (Envelope, bool) {
         // Registered before the gate, so a cancel that lands while a consent
         // prompt is open is not lost; removed when this future ends.
         let cancel = CancelToken::new();
+        let client_cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let key = self
             .next_call
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -193,9 +201,27 @@ impl Server {
                 Inflight {
                     request_id: request_id.map(Value::to_string),
                     token: cancel.clone(),
+                    client_cancelled: client_cancelled.clone(),
                 },
             );
         let _inflight = InflightGuard { server: self, key };
+        let env = self.run_call(name, args, progress_token, &cancel).await;
+        // Read after the call ends, so a cancel that landed at any point
+        // before now counts. Returned with the envelope so the transport can
+        // decline to answer a request the client has withdrawn.
+        let withdrawn = client_cancelled.load(std::sync::atomic::Ordering::SeqCst);
+        (env, withdrawn)
+    }
+
+    /// The gate-to-audit pipeline for one call, with its cancel token already
+    /// registered by [`Self::dispatch_call_for`].
+    async fn run_call(
+        &self,
+        name: &str,
+        args: Value,
+        progress_token: Option<Value>,
+        cancel: &CancelToken,
+    ) -> Envelope {
         // 1. Kill switch first.
         if self.policy.kill_switch_tripped() {
             let mut pre = AuditRecord::pre(&self.session_id, name);
@@ -376,6 +402,14 @@ impl Server {
 
         // 5. Execute (descriptor borrow has ended; `module` is an owned Arc).
         if cancel.is_cancelled() {
+            // The pre-record is already written; close the pair so the log
+            // shows the call ended, and why.
+            let mut post = AuditRecord::post(&self.session_id, name);
+            post.role = self.policy.active_role().map(String::from);
+            post.ok = Some(false);
+            post.error_code = Some(enum_str(&ErrorCode::Timeout));
+            post.latency_ms = Some(0);
+            self.policy.audit(&post);
             return Envelope::fail_with(
                 name,
                 ErrorCode::Timeout,
@@ -565,7 +599,8 @@ impl Server {
         json!({ "content": content, "isError": is_error })
     }
 
-    /// Route one parsed request. Returns `None` for notifications (no `id`).
+    /// Route one parsed request. Returns `None` for notifications (no `id`) and
+    /// for a `tools/call` the client cancelled, which gets no response.
     pub async fn handle_request(&self, req: Request) -> Option<Response> {
         let is_notification = req.id.is_none();
         let id = req.id.clone();
@@ -597,9 +632,16 @@ impl Server {
                     .and_then(|m| m.get("progressToken"))
                     .filter(|t| t.is_string() || t.is_i64() || t.is_u64())
                     .cloned();
-                let env = self
+                let (env, withdrawn) = self
                     .dispatch_call_for(name, args, progress_token, id.as_ref())
                     .await;
+                // The spec says a receiver SHOULD NOT answer a request the
+                // client cancelled. The audit post-record has been written by
+                // now; only the reply is withheld. A kill-switch stop is not
+                // this case: the client is still waiting for that one.
+                if withdrawn {
+                    return None;
+                }
                 Response::success(id, self.tool_call_result(env))
             }
             // A notification: the client no longer wants the answer to an

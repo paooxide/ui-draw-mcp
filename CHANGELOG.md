@@ -185,6 +185,10 @@ All notable changes to this project are documented here. The format follows
   the next one gets a 503 rather than queueing), each with the full origin, token and size checks, so a
   cancel POST reaches a `tools/call` POST that is still running. The 30 s read timeout now bounds only
   receiving the request, not the tool call.
+- A request the client cancelled with `notifications/cancelled` was still answered. The MCP spec says
+  the receiver should not respond, so neither transport now writes a reply for it (HTTP returns an empty
+  `202`); the audit post-record is still written, including for a call cancelled before it started. A call
+  stopped by the kill switch is still answered, since the client is still waiting.
 
 ### Security
 

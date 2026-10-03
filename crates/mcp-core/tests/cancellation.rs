@@ -139,8 +139,9 @@ async fn a_cancel_notification_stops_only_the_named_request() {
     };
     let (l1, l2) = (call_line(1), call_line(2));
     let (one, two, ()) = tokio::join!(server.handle_line(&l1), server.handle_line(&l2), cancel);
-    assert!(was_cancelled(&one.unwrap()));
-    assert!(was_cancelled(&two.unwrap()));
+    // Both were withdrawn by the client, so neither is answered.
+    assert!(one.is_none(), "{one:?}");
+    assert!(two.is_none(), "{two:?}");
     assert!(started.elapsed() < Duration::from_secs(3));
     assert_eq!(server.inflight_count(), 0);
 }
@@ -171,10 +172,47 @@ async fn a_cancel_frame_is_read_from_the_stream_while_a_call_is_running() {
     let lines: Vec<&str> = std::str::from_utf8(&out).unwrap().lines().collect();
     assert_eq!(
         lines.len(),
-        2,
-        "one reply per request, none for the notification"
+        1,
+        "no reply for the notification or for the cancelled call"
     );
-    assert!(was_cancelled(lines[0]));
-    let ping: Value = serde_json::from_str(lines[1]).unwrap();
+    let ping: Value = serde_json::from_str(lines[0]).unwrap();
     assert_eq!(ping["id"], 3);
+}
+
+#[tokio::test]
+async fn a_client_cancelled_call_still_writes_its_post_audit_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let (server, _stop) = server_in(dir.path());
+    let input = format!("{}\n{}\n", call_line(1), cancel_line(json!(1)));
+    let mut out: Vec<u8> = Vec::new();
+    server
+        .serve_stream(BufReader::new(input.as_bytes()), &mut out)
+        .await
+        .unwrap();
+    assert!(out.is_empty(), "a cancelled request must not be answered");
+    let phases: Vec<String> = server
+        .policy()
+        .audit_sink()
+        .memory_records()
+        .iter()
+        .filter(|r| r["tool"] == "spin_wait")
+        .map(|r| r["phase"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(phases, ["pre", "post"]);
+}
+
+#[tokio::test]
+async fn a_kill_switch_stop_is_still_answered_on_stdio() {
+    let dir = tempfile::tempdir().unwrap();
+    let (server, _stop) = server_in(dir.path());
+    let line = call_line(5);
+    let trip = async {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        server
+            .policy()
+            .trip_kill_switch("cancel-session", "human took over");
+    };
+    let (resp, ()) = tokio::join!(server.handle_line(&line), trip);
+    let resp = resp.expect("the client is still waiting; it must get a response");
+    assert!(was_cancelled(&resp));
 }
