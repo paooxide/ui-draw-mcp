@@ -374,11 +374,8 @@ fn file_url_path(token: &str) -> Option<String> {
     }
     let rest = &token[7..];
     // file:///etc/x or file://localhost/etc/x
-    let path = match rest.find('/') {
-        Some(i) => &rest[i..],
-        None => return None,
-    };
-    Some(path.to_string())
+    let i = rest.find('/')?;
+    Some(rest[i..].to_string())
 }
 
 fn looks_like_path(token: &str) -> bool {
