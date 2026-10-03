@@ -67,7 +67,7 @@ mcp-macos = { path = "../crates/mcp-macos" }
 mcp-input = { path = "../crates/mcp-input" }
 # Used only by the human-override live test, to move the pointer the way a
 # person does: from outside agentctl, so it is never recorded as ours.
-core-graphics = "0.24"
+core-graphics = "0.25"
 
 # Real macOS backend (AXUIElement), only on macOS.
 [target.'cfg(target_os = "macos")'.dependencies]

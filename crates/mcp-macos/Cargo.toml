@@ -24,7 +24,7 @@ serde_json.workspace = true
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = "0.10"
 core-foundation-sys = "0.8"
-core-graphics = { version = "0.24", features = ["highsierra"] }
+core-graphics = { version = "0.25", features = ["highsierra"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros"] }
