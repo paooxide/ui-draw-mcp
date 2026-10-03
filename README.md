@@ -35,7 +35,13 @@ The policy layer is the security boundary. Read this before running it.
   credential values and cookies are redacted from results and from the audit log.
 - **Kill switch.** Creating `~/.agentctl/STOP` aborts in-flight work; it is checked before every policy
   decision.
-- **Full audit.** Every call is written before and after execution to an append-only JSONL log.
+- **Full audit.** Every call is written before and after execution to an append-only JSONL log, hash-chained
+  and Ed25519-signed. With an operator key (`agentctl audit keygen`) a rewritten log fails
+  `agentctl audit verify --pubkey`; without one, verify says the log is only self-consistent.
+- **Roles and invariants.** A role (`policy.role`) narrows what a session may call and never widens it.
+  `[invariants]` refuses protected paths and denied domains anywhere in a call's arguments, before the gate
+  and under every profile. Invariants read argument text: they are a tripwire, not containment, and their
+  known gaps are pinned in tests.
 - **Run it from a different terminal than it controls.** If the agent drives GUI apps, keystrokes go to
   whatever is frontmost. Typed text destined for a shell is screened for destructive commands, and editors
   with integrated terminals are screened too.
@@ -294,6 +300,10 @@ never sent to the judge. The action still carries the real value to the OS. With
 would be logged verbatim, so the flag is the difference between a password that persists and one that does
 not.
 
+`browser_act` and `browser_fill_form` take the same flag. A recorded browser flow never stores a password:
+the recorder writes a named `secret_ref`, and the value is supplied when the flow is replayed
+(`browser_flow run` with `secrets`, or `AGENTCTL_SECRET_<REF>` for `agentctl test`).
+
 Two limits worth knowing. A GUI password field's *contents* are never readable (secure fields are redacted
 from every perception tool), but writing to one is allowed, which is what entering a password needs. And on
 Wayland `keyboard_type` needs the target window focused; `set_value` on a field ref does not, so for a
@@ -362,6 +372,36 @@ an engine.
 
 ---
 
+## Personal data (optional)
+
+With `policy.anonymize = true`, tool results reach the model with personal data replaced by stable tokens:
+`Patient SSN 123-45-6789` becomes `Patient SSN <SSN_1>`, and the audit log records the token. Card numbers
+are Luhn-checked, SSNs follow SSA rules, phone numbers must look like phone numbers, and names you register
+are matched exactly. When the model types `<SSN_1>` into a field (`keyboard_type`, `set_value`,
+`ui_fill_form`, `browser_fill_form`, `browser_act`), the real value goes to the field. A token anywhere
+else, such as a URL, a command or a file, is refused, so it cannot be sent off the machine by
+de-tokenization.
+
+What it does not do: a model that types a token into a field on a page it chose, or into a terminal, still
+delivers the value there. It is off by default because it rewrites every result, including addresses and
+numbers in network and system output.
+
+---
+
+## Verifying an audit log
+
+```sh
+agentctl audit keygen                     # once: writes a 0600 key and prints its public key
+# config.toml: [policy] audit_signing_key = "<path it printed>"
+agentctl audit verify <session> --pubkey <hex>
+agentctl audit export <session> --pubkey <hex> --format soc2   # or soc2-json, csv, hipaa-json
+```
+
+Keep the public key somewhere the agent cannot write. The exports describe what the log contains; they are
+evidence for a review, not a certification.
+
+---
+
 ## Status
 
 Every planned capability category has an engine, and both halves are validated against real systems rather
@@ -371,7 +411,10 @@ than test doubles. There are no fake backends in this repository by policy.
 |---|---|
 | Protocol, policy, consent, audit, kill switch | Shipped, verified end to end |
 | Perception, input, windows, menus, capture | Shipped, validated on real macOS and on GNOME 50 (Wayland) |
-| Browser (CDP) | Shipped, validated against live Chrome |
+| Browser (CDP), including forms, profiles, branches, checkpoints, recording | Shipped, validated against live Chrome |
+| Browser on Safari (WebDriver) | Experimental; its live suite has not yet been run on a real Safari |
+| PII tokenizer, signed audit and compliance export, roles and invariants | Shipped, opt-in |
+| Demo mode (pointer glide, browser overlay) | Shipped, off by default |
 | Terminal, filesystem, network, system, credentials, PTY, packages, recall | Shipped |
 | Hardening: fuzzing, red-team suites, HTTP transport, CI | Shipped; six real defects found and fixed |
 | Windows desktop backend | Not started |
