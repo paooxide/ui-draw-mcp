@@ -8,6 +8,15 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- **Reproducible latency bench** (`cargo run --release --example bench -- --n 30`, see `docs/bench/`).
+  It starts `agentctl serve` over stdio under a temporary config and times `ping`, `list_windows`,
+  `capture_screen`, `ocr_region`, and `browser_snapshot` and `browser_act` against a local fixture page, after
+  5 discarded warm-up calls, reporting min, median, p95, max and standard deviation. Each call is timed twice:
+  the client round trip, and the server's own `latency_ms` read back from the audit log. Raw samples, the
+  commit, OS, CPU, display and Chrome version go to `docs/bench/results/`. An operation that fails (a missing
+  Screen Recording grant, say) is recorded as skipped with the server's error code, never filled in. Pointer
+  movement only runs under `AGENTCTL_LIVE_GUI=1`. There is no cloud comparison: that needs the same task run
+  end to end against a hosted model.
 - **PII tokenizer, opt-in** (`policy.anonymize`, `AGENTCTL_ANONYMIZE`). Tool results reach the model with
   personal data replaced by stable tokens (`<SSN_1>`, `<EMAIL_2>`): registered names, SSA-valid SSNs,
   Luhn-checked card numbers, phone numbers, emails, MRNs, IPv4 addresses and common API key formats. The
