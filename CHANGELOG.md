@@ -200,6 +200,10 @@ All notable changes to this project are documented here. The format follows
   pair and, as far as a block-based table of combining marks, joiners, skin tones and flags allows, never
   a grapheme cluster. A takeover between pieces stops the typing and says how much was typed. The 200
   character live test is written but has not been run.
+- `--demo-speed` accepted any string and quietly ran at the default speed, while the config file and the
+  environment refused an unknown one. An unknown or missing value is now a usage error (exit 2) naming
+  `cinematic, demo, snappy, instant, off`, and the browser showcase speed comes from the same preset as
+  the pointer glide instead of a second copy of the mapping.
 
 ### Security
 

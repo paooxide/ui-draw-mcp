@@ -100,9 +100,21 @@ pub fn vision_config(c: &PolicyConfig) -> mcp_vision::VisionConfig {
 ///
 /// Config loading already refuses a name `GlidePreset::from_speed` does not
 /// know, so the fallback to `Demo` is only reachable by a caller that skipped
-/// loading (`--demo-speed` on the command line, until that path validates).
+/// loading; the `--demo-speed` flag is validated in `main.rs` before it gets
+/// here.
 pub(crate) fn demo_glide_preset(speed: &str) -> mcp_input::GlidePreset {
     mcp_input::GlidePreset::from_speed(speed).unwrap_or(mcp_input::GlidePreset::Demo)
+}
+
+/// The browser showcase speed for a configured `demo_speed`, derived from the
+/// same preset the pointer glide uses so the two cannot disagree.
+pub fn showcase_speed(speed: &str) -> mcp_browser::ShowcaseSpeed {
+    match demo_glide_preset(speed) {
+        mcp_input::GlidePreset::Cinematic => mcp_browser::ShowcaseSpeed::Cinematic,
+        mcp_input::GlidePreset::Demo => mcp_browser::ShowcaseSpeed::Demo,
+        mcp_input::GlidePreset::Snappy => mcp_browser::ShowcaseSpeed::Snappy,
+        mcp_input::GlidePreset::Instant => mcp_browser::ShowcaseSpeed::Off,
+    }
 }
 
 /// Wire every engine the config enables.
@@ -180,14 +192,8 @@ pub fn build_stack(cfg: &PolicyConfig) -> (Vec<Arc<dyn ToolModule>>, Wiring) {
         use mcp_sys::SysModule;
 
         let showcase = if engines.demo {
-            let speed = match demo_glide_preset(&engines.demo_speed) {
-                mcp_input::GlidePreset::Cinematic => mcp_browser::ShowcaseSpeed::Cinematic,
-                mcp_input::GlidePreset::Demo => mcp_browser::ShowcaseSpeed::Demo,
-                mcp_input::GlidePreset::Snappy => mcp_browser::ShowcaseSpeed::Snappy,
-                mcp_input::GlidePreset::Instant => mcp_browser::ShowcaseSpeed::Off,
-            };
             mcp_browser::ShowcaseConfig {
-                speed,
+                speed: showcase_speed(&engines.demo_speed),
                 ..Default::default()
             }
         } else {

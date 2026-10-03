@@ -16,7 +16,7 @@ pub mod tools_doc;
 pub mod tools_system;
 pub mod transcript;
 
-pub use engines::{build_modules, build_stack, EngineConfig, Wiring};
+pub use engines::{build_modules, build_stack, showcase_speed, EngineConfig, Wiring};
 
 /// The out-of-band human-approval channel.
 ///

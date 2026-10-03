@@ -134,13 +134,6 @@ fn build_config() -> Result<PolicyConfig, String> {
             cfg.demo = true;
         } else if arg == "--no-demo" {
             cfg.demo = false;
-        } else if arg == "--demo-speed" && i + 1 < raw_args.len() {
-            cfg.demo_speed = raw_args[i + 1].clone();
-            cfg.demo = true;
-            i += 1;
-        } else if let Some(stripped) = arg.strip_prefix("--demo-speed=") {
-            cfg.demo_speed = stripped.to_string();
-            cfg.demo = true;
         } else if arg == "--role" && i + 1 < raw_args.len() {
             role_cli = Some(raw_args[i + 1].clone());
             i += 1;
@@ -148,6 +141,13 @@ fn build_config() -> Result<PolicyConfig, String> {
             role_cli = Some(stripped.to_string());
         }
         i += 1;
+    }
+
+    // Validated like the config and environment paths are: a typo must not
+    // silently run at the default speed.
+    if let Some(speed) = demo_speed_from_args(&raw_args)? {
+        cfg.demo_speed = speed;
+        cfg.demo = true;
     }
 
     // Role precedence: CLI flag > AGENTCTL_ROLE env var > config default_role
@@ -170,6 +170,41 @@ fn build_config() -> Result<PolicyConfig, String> {
     }
 
     Ok(cfg)
+}
+
+/// The value of `--demo-speed <speed>` / `--demo-speed=<speed>`, if given
+/// (the last one wins), checked against the speeds the config accepts and the
+/// glide engine knows. An unknown or missing value is a usage error naming the
+/// accepted ones.
+fn demo_speed_from_args(args: &[String]) -> Result<Option<String>, String> {
+    let mut found = None;
+    let mut i = 0;
+    while i < args.len() {
+        let raw = if args[i] == "--demo-speed" {
+            i += 1;
+            match args.get(i) {
+                Some(v) => v.as_str(),
+                None => "",
+            }
+        } else if let Some(v) = args[i].strip_prefix("--demo-speed=") {
+            v
+        } else {
+            i += 1;
+            continue;
+        };
+        i += 1;
+        let v = raw.trim().to_ascii_lowercase();
+        let known = mcp_policy::DEMO_SPEEDS.contains(&v.as_str())
+            && mcp_input::GlidePreset::from_speed(&v).is_some();
+        if !known {
+            return Err(format!(
+                "--demo-speed: unknown value '{raw}' (expected one of: {})",
+                mcp_policy::DEMO_SPEEDS.join(", ")
+            ));
+        }
+        found = Some(v);
+    }
+    Ok(found)
 }
 
 /// Load config or exit with a clear message (fail-closed).
@@ -461,14 +496,8 @@ async fn test_cmd(args: &[String]) -> std::io::Result<()> {
     let headless = resolve_launch_headless(args);
 
     let showcase = if cfg.demo {
-        let speed = match cfg.demo_speed.to_ascii_lowercase().as_str() {
-            "cinematic" => mcp_browser::ShowcaseSpeed::Cinematic,
-            "snappy" => mcp_browser::ShowcaseSpeed::Snappy,
-            "off" | "instant" => mcp_browser::ShowcaseSpeed::Off,
-            _ => mcp_browser::ShowcaseSpeed::Demo,
-        };
         mcp_browser::ShowcaseConfig {
-            speed,
+            speed: agentctl::showcase_speed(&cfg.demo_speed),
             ..Default::default()
         }
     } else {
@@ -1716,6 +1745,44 @@ fn print_help() {
 #[cfg(test)]
 mod test_cmd_tests {
     use super::*;
+
+    #[test]
+    fn demo_speed_flag_accepts_known_speeds_in_both_spellings() {
+        let a = |v: &[&str]| -> Vec<String> { v.iter().map(|x| x.to_string()).collect() };
+        for name in mcp_policy::DEMO_SPEEDS {
+            assert_eq!(
+                demo_speed_from_args(&a(&["agentctl", "--demo-speed", name])),
+                Ok(Some(name.to_string()))
+            );
+            assert_eq!(
+                demo_speed_from_args(&a(&["agentctl", &format!("--demo-speed={name}")])),
+                Ok(Some(name.to_string()))
+            );
+        }
+        assert_eq!(
+            demo_speed_from_args(&a(&["agentctl", "--demo-speed", "SNAPPY"])),
+            Ok(Some("snappy".to_string()))
+        );
+        assert_eq!(demo_speed_from_args(&a(&["agentctl", "--demo"])), Ok(None));
+    }
+
+    #[test]
+    fn demo_speed_flag_refuses_unknown_or_missing_values_naming_the_choices() {
+        let a = |v: &[&str]| -> Vec<String> { v.iter().map(|x| x.to_string()).collect() };
+        for bad in [
+            a(&["agentctl", "--demo-speed", "slow"]),
+            a(&["agentctl", "--demo-speed=slow"]),
+            a(&["agentctl", "--demo-speed="]),
+            a(&["agentctl", "--demo-speed"]),
+            a(&["agentctl", "--demo-speed", "--demo"]),
+        ] {
+            let e = demo_speed_from_args(&bad).unwrap_err();
+            assert!(e.contains("--demo-speed"), "{e}");
+            for name in mcp_policy::DEMO_SPEEDS {
+                assert!(e.contains(name), "'{name}' missing from: {e}");
+            }
+        }
+    }
 
     fn s(v: &[&str]) -> Vec<String> {
         v.iter().map(|x| x.to_string()).collect()
