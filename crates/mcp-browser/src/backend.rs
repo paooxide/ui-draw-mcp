@@ -794,6 +794,35 @@ fn safari_eval_script(expr: &str) -> String {
     )
 }
 
+/// `execute/async` script that runs `code` as the WebDriver script body, with
+/// no `eval`: the driver injects that body itself, so a page CSP without
+/// `unsafe-eval` does not block it. `expression` wraps the code in `( ... )`
+/// (its value is the result); otherwise it is a function body, whose `return`
+/// value is the result. A returned promise is awaited either way. The newline
+/// before the closing token keeps a trailing `//` comment from eating it.
+fn safari_noeval_script(code: &str, expression: bool) -> String {
+    let value = if expression {
+        format!("({code}\n)")
+    } else {
+        format!("(function(){{\n{code}\n}}).call(window)")
+    };
+    format!(
+        "var done = arguments[arguments.length - 1];\n\
+         try {{\n\
+           Promise.resolve({value}).then(\n\
+             function(v){{ done({{ok:true,value:v===undefined?null:v}}); }},\n\
+             function(e){{ done({{ok:false,error:String(e)}}); }});\n\
+         }} catch(e) {{ done({{ok:false,error:String(e)}}); }}"
+    )
+}
+
+/// Whether an `eval` failure is the page's CSP refusing string evaluation (as
+/// opposed to the user's code throwing), the only case worth a second route.
+/// The refusal happens before any user code runs, so retrying repeats nothing.
+fn is_csp_eval_refusal(msg: &str) -> bool {
+    msg.starts_with("EvalError") && msg.contains("Content Security Policy")
+}
+
 /// Refuse a Safari (WebKit) target for a feature built on CDP, saying so,
 /// rather than letting it fail later as a target that "was not found".
 fn require_cdp_target(target: &str, what: &str) -> Result<(), BrowserError> {
@@ -3268,10 +3297,36 @@ impl BrowserBackend for CdpBackend {
             } else {
                 // Same semantics as the Chrome path: the value of the last
                 // statement, with a returned promise awaited.
-                let env = entry
+                let mut env = entry
                     .session
                     .execute_async(&safari_eval_script(expression), &[])
                     .await?;
+                let refused = env
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .is_some_and(is_csp_eval_refusal);
+                if refused {
+                    // The page's CSP forbids `eval`. The driver's own script
+                    // body is not subject to it: try the code as an expression,
+                    // and as a function body when it is not one.
+                    env = match entry
+                        .session
+                        .execute_async(&safari_noeval_script(expression, true), &[])
+                        .await
+                    {
+                        // The wrapper catches every runtime throw, so a driver
+                        // "javascript error" here is the code failing to parse
+                        // as an expression (Safari words it "Unexpected
+                        // keyword ..."), not a result.
+                        Err(e) if err_msg(&e).contains("javascript error") => {
+                            entry
+                                .session
+                                .execute_async(&safari_noeval_script(expression, false), &[])
+                                .await?
+                        }
+                        other => other?,
+                    };
+                }
                 if env.get("ok").and_then(Value::as_bool) != Some(true) {
                     let msg = env
                         .get("error")
@@ -5660,6 +5715,26 @@ mod tests {
             "return (function(){})();"
         );
         assert_eq!(safari_return("1"), "return 1;");
+    }
+
+    #[test]
+    fn csp_refusal_is_told_from_user_errors() {
+        let csp = "EvalError: Refused to evaluate a string as JavaScript because 'unsafe-eval' is not an allowed source of script in the following Content Security Policy directive";
+        assert!(is_csp_eval_refusal(csp));
+        assert!(!is_csp_eval_refusal("EvalError: user thing"));
+        assert!(!is_csp_eval_refusal("Error: Content Security Policy"));
+    }
+
+    #[test]
+    fn safari_noeval_script_shapes() {
+        let e = safari_noeval_script("1 + 1 // c", true);
+        assert!(e.contains("Promise.resolve((1 + 1 // c\n))"), "{e}");
+        assert!(!e.contains("eval"));
+        let f = safari_noeval_script("a(); return 2", false);
+        assert!(
+            f.contains("(function(){\na(); return 2\n}).call(window)"),
+            "{f}"
+        );
     }
 
     #[test]

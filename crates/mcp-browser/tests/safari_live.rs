@@ -293,6 +293,13 @@ const ROUTES: &[Route] = &[
         ..route("/htmx.min.js", include_str!("fixtures/htmx.min.js"))
     },
     Route {
+        headers: "Content-Security-Policy: script-src 'self'\r\n",
+        ..route(
+            "/csp",
+            "<!doctype html><title>csp</title><div id=\"o\">csp page</div>",
+        )
+    },
+    Route {
         delay_ms: 600,
         ..route("/frag", "<p id=\"swapped\">swapped</p>")
     },
@@ -610,6 +617,49 @@ async fn safari_real_htmx_settled_waits_for_a_real_swap() {
         .await
         .unwrap();
     assert_eq!(swapped["result"], "swapped");
+
+    b.disconnect(id, true).await.unwrap();
+}
+
+/// Under `script-src 'self'` the page's own `eval` is blocked. `browser_eval`
+/// must still evaluate, as CDP's `Runtime.evaluate` does.
+#[tokio::test(flavor = "multi_thread")]
+async fn safari_eval_works_under_a_csp_without_unsafe_eval() {
+    let Some((b, id, t)) = open_safari("eval_csp", "/csp").await else {
+        return;
+    };
+    // The premise: the page really cannot eval.
+    let blocked = b
+        .eval(
+            &t,
+            "(function(){ try { return String(eval('1')); } catch (e) { return e.name; } })()",
+        )
+        .await
+        .unwrap();
+    assert_eq!(blocked["result"], "EvalError", "{blocked}");
+
+    // An expression, statements (which need an explicit `return` here: with
+    // no `eval` there is no completion value), and a promise.
+    let v = b.eval(&t, "1 + 2").await.unwrap();
+    assert_eq!(v["result"], 3, "{v}");
+    let v = b
+        .eval(&t, "var n = 20; document.title = 'stmts'; return n + 1")
+        .await
+        .unwrap();
+    assert_eq!(v["result"], 21, "{v}");
+    let v = b.eval(&t, "document.title").await.unwrap();
+    assert_eq!(v["result"], "stmts", "{v}");
+    let v = b
+        .eval(
+            &t,
+            "new Promise(function (r) { setTimeout(function () { r('later'); }, 50); })",
+        )
+        .await
+        .unwrap();
+    assert_eq!(v["result"], "later", "{v}");
+    // A real error is still an error, not swallowed by the fallback.
+    let e = b.eval(&t, "throw new Error('boom')").await.unwrap_err();
+    assert!(format!("{e:?}").contains("boom"), "{e:?}");
 
     b.disconnect(id, true).await.unwrap();
 }

@@ -181,6 +181,13 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- **Safari: `browser_eval` fails on a page whose CSP has no `unsafe-eval`.** `browser_eval` evaluated the text with
+  an indirect `eval` inside the page, which `Content-Security-Policy: script-src 'self'` refuses (`EvalError`), so
+  every eval on such a page was an error. On that refusal (and only that: it happens before any of the code runs,
+  so nothing is repeated) it now sends the code as the WebDriver script body itself, which the driver injects and
+  the page CSP does not govern: first as an expression, then, if it does not parse as one, as a function body. A
+  returned promise is awaited either way. On that route statements have no completion value, so they need an
+  explicit `return`. Chrome is unaffected: `Runtime.evaluate` bypasses the page CSP.
 - **Safari: `htmx_settled` is now tested against the real htmx.** The earlier live test used a stand-in that faked
   htmx's events. A test now serves the vendored htmx 2.0.4 (`crates/mcp-browser/tests/fixtures/`), clicks an
   `hx-get` button whose response the server delays, and checks that `htmx_settled` holds until the swap is in the
