@@ -10,7 +10,7 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-use crate::cdp::{http_json, CdpConn, DialogPolicy};
+use crate::cdp::{http_json, CdpConn, DialogPolicy, RecordDialogs};
 use crate::nav::NavPolicy;
 
 /// Why a browser operation failed.
@@ -145,19 +145,24 @@ pub trait BrowserBackend: Send + Sync {
     /// the Rust side as they happen. Both run in an isolated world of the tab
     /// (shared DOM, separate JavaScript globals), and the binding exists only
     /// there, so page script can neither call it nor reach the recorder's
-    /// state. Needs a persistent session, so only the CDP engine supports it.
+    /// state. `dialogs` says who answers the page's JavaScript dialogs while
+    /// it is watched; `None` picks `Human` for a visible browser and the
+    /// tab's dialog policy (dismiss by default) for a headless one. Needs a
+    /// persistent session, so only the CDP engine supports it.
     async fn observe_start(
         &self,
         target: &str,
         binding: &str,
         new_document_script: &str,
         current_document_script: &str,
+        dialogs: Option<RecordDialogs>,
     ) -> Result<Value, BrowserError> {
         let _ = (
             target,
             binding,
             new_document_script,
             current_document_script,
+            dialogs,
         );
         Err(BrowserError::Unsupported(
             "watching a tab across navigations needs the CDP (Chrome) engine".into(),
@@ -468,19 +473,77 @@ struct Watch {
     started: std::time::Instant,
     /// Execution contexts of the recorder's isolated world.
     worlds: std::collections::HashSet<i64>,
+    /// A person answers the page's dialogs (nobody else does).
+    human: bool,
+    /// The dialog on screen right now: `(type, message, url)`.
+    open_dialog: Option<(String, String, String)>,
 }
 
-/// One message from a watched page: a dialog it raised is answered (attaching
-/// with the Page domain, which registering a new-document script requires,
-/// makes this session the one Chrome asks), anything else may be an event.
+impl Watch {
+    /// A dialog is waiting for a person, so the page's thread is blocked and
+    /// nothing can be evaluated in it until they answer.
+    fn blocked_on_person(&self) -> bool {
+        self.human && self.open_dialog.is_some()
+    }
+
+    fn push_event(&self, mut ev: Value) {
+        if let Some(map) = ev.as_object_mut() {
+            map.insert(
+                "timestamp_ms".into(),
+                json!(self.started.elapsed().as_millis() as u64),
+            );
+            if let Ok(mut v) = self.events.lock() {
+                if v.len() < MAX_OBSERVED_EVENTS {
+                    v.push(ev);
+                }
+            }
+        }
+    }
+}
+
+/// One message from a watched page. A dialog it raises is answered with the
+/// recording's dialog setting, or left to the person at the window; either way
+/// how it ended becomes a `dialog` event, so the flow can reproduce it.
+/// (Attaching with the Page domain, which registering a new-document script
+/// requires, makes this session one Chrome announces dialogs to.)
 async fn observe_message(c: &mut CdpConn, v: &Value, w: &mut Watch) {
     track_world(v, &mut w.worlds);
-    if v.get("method").and_then(Value::as_str) == Some("Page.javascriptDialogOpening") {
-        let params = v.get("params").cloned().unwrap_or_else(|| json!({}));
-        let _ = c.answer_dialog(&params).await;
-        return;
+    let params = v.get("params").cloned().unwrap_or_else(|| json!({}));
+    let text = |k: &str| {
+        params
+            .get(k)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    };
+    match v.get("method").and_then(Value::as_str) {
+        Some("Page.javascriptDialogOpening") => {
+            w.open_dialog = Some((text("type"), text("message"), text("url")));
+            if !w.human {
+                let _ = c.answer_dialog(&params).await;
+            }
+        }
+        Some("Page.javascriptDialogClosed") => {
+            let Some((kind, message, url)) = w.open_dialog.take() else {
+                return;
+            };
+            let accepted = params.get("result").and_then(Value::as_bool) == Some(true);
+            let policy = if accepted { "accept" } else { "dismiss" };
+            if w.human {
+                c.note_dialog(json!({
+                    "type": kind, "message": message, "url": url,
+                    "answered": if accepted { "accepted" } else { "dismissed" },
+                    "by": "person",
+                }));
+            }
+            // The typed answer of a prompt is not kept: it may be a secret.
+            w.push_event(json!({
+                "kind": "dialog", "tag": "", "selector": "",
+                "text": kind, "value": policy, "url": url,
+            }));
+        }
+        _ => record_observed(v, &w.binding, &w.events, w.started),
     }
-    record_observed(v, &w.binding, &w.events, w.started);
 }
 
 /// Keep a `binding(jsonString)` call from the page as an event, stamped with
@@ -552,14 +615,20 @@ async fn observe_session(
         }
     };
     c.keep_events(true);
-    // The recorder lives in its isolated world(s), not the page's main world.
-    for id in w.worlds.clone() {
-        let _ = c
-            .call(
-                "Runtime.evaluate",
-                json!({ "expression": teardown, "contextId": id, "returnByValue": true }),
-            )
-            .await;
+    // A dialog still waiting for the person blocks the page: evaluating or
+    // removing a script would only hang. Closing this session drops the
+    // new-document script with it, and the dialog stays on screen to answer.
+    let blocked = w.blocked_on_person();
+    if !blocked {
+        // The recorder lives in its isolated world(s), not the main world.
+        for id in w.worlds.clone() {
+            let _ = c
+                .call(
+                    "Runtime.evaluate",
+                    json!({ "expression": teardown, "contextId": id, "returnByValue": true }),
+                )
+                .await;
+        }
     }
     for v in c.take_events() {
         observe_message(&mut c, &v, &mut w).await;
@@ -571,14 +640,14 @@ async fn observe_session(
         observe_message(&mut c, &v, &mut w).await;
     }
     let script_removed = match script_id {
-        Some(id) => c
+        Some(id) if !blocked => c
             .call(
                 "Page.removeScriptToEvaluateOnNewDocument",
                 json!({ "identifier": id }),
             )
             .await
             .is_ok(),
-        None => false,
+        _ => false,
     };
     let _ = reply.send(ObserverDone {
         script_removed,
@@ -880,6 +949,23 @@ impl CdpBackend {
         Err(BrowserError::NotFound(format!(
             "target '{target}' not found in any connected browser"
         )))
+    }
+
+    /// Whether the browser that owns `target` has no window (the user agent
+    /// says `HeadlessChrome`). When that cannot be told, assume headless: the
+    /// answer decides whether a person is there to answer a dialog, and a
+    /// wrong "yes" hangs the tab.
+    async fn target_is_headless(&self, target: &str) -> bool {
+        let Ok((b, _)) = self.browser_ws_for_target(target).await else {
+            return true;
+        };
+        match http_json(&b.host, b.port, "GET", "/json/version").await {
+            Ok(v) => v
+                .get("User-Agent")
+                .and_then(Value::as_str)
+                .map_or(true, |ua| ua.contains("Headless")),
+            Err(_) => true,
+        }
     }
 
     async fn conn(&self, target: &str) -> Result<CdpConn, BrowserError> {
@@ -2826,6 +2912,7 @@ impl BrowserBackend for CdpBackend {
         binding: &str,
         new_document_script: &str,
         current_document_script: &str,
+        dialogs: Option<RecordDialogs>,
     ) -> Result<Value, BrowserError> {
         if target.starts_with("safari-") {
             return Err(BrowserError::Unsupported(
@@ -2843,15 +2930,39 @@ impl BrowserBackend for CdpBackend {
                 m.remove(target);
             }
         }
+        // Who answers dialogs. A person can only at a visible window, so the
+        // default is `Human` there and the tab's policy in a headless
+        // browser; asking for `Human` in a headless one would hang the tab.
+        let headless = self.target_is_headless(target).await;
+        let tab_policy = self.dialog_policy(target);
+        let mode = match dialogs {
+            Some(RecordDialogs::Human) if headless => {
+                return Err(BrowserError::Unsupported(
+                    "dialogs 'human' needs a visible browser window: this browser is headless, so nobody could answer a dialog and the tab would hang. Use 'accept' or 'dismiss'".into(),
+                ))
+            }
+            Some(m) => m,
+            None if !headless => RecordDialogs::Human,
+            None if matches!(tab_policy, DialogPolicy::Accept(_)) => RecordDialogs::Accept,
+            None => RecordDialogs::Dismiss,
+        };
         let ws = self.resolve_ws(target).await?;
         let mut c = CdpConn::connect(&ws).await?;
         // `Page.enable` is not optional here: Chrome only applies a
         // new-document script while a Page-domain client is attached (it is
         // dropped by `Page.disable`). The cost is that this session becomes
-        // the one Chrome hands the page's JavaScript dialogs to, so it answers
-        // them with the tab's dialog policy (dismiss unless set otherwise).
-        // `observe_stop` lists the ones it answered.
-        c.set_dialog_policy(self.dialog_policy(target));
+        // one Chrome announces the page's JavaScript dialogs to. Chrome also
+        // shows the dialog natively, so with `Human` the recorder just
+        // listens; otherwise it answers (the tab's typed text for an accept).
+        // `observe_stop` lists the dialogs and how they ended.
+        match mode {
+            RecordDialogs::Human => c.leave_dialogs_to_person(true),
+            RecordDialogs::Dismiss => c.set_dialog_policy(DialogPolicy::Dismiss),
+            RecordDialogs::Accept => c.set_dialog_policy(match tab_policy {
+                DialogPolicy::Accept(t) => DialogPolicy::Accept(t),
+                DialogPolicy::Dismiss => DialogPolicy::Accept(None),
+            }),
+        }
         c.keep_events(true);
         c.call("Runtime.enable", json!({})).await?;
         // The binding exists only in the recorder's isolated world, never in
@@ -2935,6 +3046,8 @@ impl BrowserBackend for CdpBackend {
             events: events.clone(),
             started,
             worlds,
+            human: mode == RecordDialogs::Human,
+            open_dialog: None,
         };
         let task = tokio::spawn(observe_session(c, watch, script_id, early, stop_rx));
         self.observers.lock().map_err(|_| poisoned())?.insert(
@@ -2949,7 +3062,8 @@ impl BrowserBackend for CdpBackend {
         );
         Ok(json!({
             "installed": installed.get("installed").and_then(Value::as_bool).unwrap_or(false),
-            "url": start_url
+            "url": start_url,
+            "dialogs": mode.as_str(),
         }))
     }
 

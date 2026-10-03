@@ -871,7 +871,7 @@ Fill multiple form fields (input, select, checkbox, radio) in one call and optio
 
 `browser_flow` · standard tier
 
-Save and replay a browser UI test. 'save' (name + steps) records a flow; 'run' (name + target_id) replays it deterministically, stopping at the first failing step (set continue_on_error to run all); 'list'/'get'/'delete' manage them. A step is {op: navigate|act|wait|capture|assert, ...} using the same fields as those tools (e.g. {op:'act',by:'text',query:'Login',action:'click'}, {op:'assert',text:'Welcome'}). A secret step never holds its value: use {op:'act',action:'type',query:'#pw',secret:true,secret_ref:'pw'} and pass secrets:{pw:'...'} to 'run'; 'save' refuses a secret step with a literal value. A green run never needs a model.
+Save and replay a browser UI test. 'save' (name + steps) records a flow; 'run' (name + target_id) replays it deterministically, stopping at the first failing step (set continue_on_error to run all); 'list'/'get'/'delete' manage them. A step is {op: navigate|act|wait|capture|assert|dialog, ...} using the same fields as those tools (e.g. {op:'act',by:'text',query:'Login',action:'click'}, {op:'assert',text:'Welcome'}). A secret step never holds its value: use {op:'act',action:'type',query:'#pw',secret:true,secret_ref:'pw'} and pass secrets:{pw:'...'} to 'run'; 'save' refuses a secret step with a literal value. A green run never needs a model.
 
 | Argument | Type | Required | Description |
 |---|---|---|---|
@@ -937,11 +937,12 @@ Resolve node ref(s) by css selector, xpath, or visible text.
 
 `browser_record` · standard tier
 
-Shadow observation & macro learning mode (Ghost Mode). Observes human interactions in a tab, across page loads and navigations (a link or form post becomes a wait for the next page, a typed URL or reload a goto), debounces keystrokes and click bursts, strips noise, and synthesizes clean, deterministic browser_flow steps. Secret fields are never recorded: they become steps with a secret_ref, supplied as secrets when the flow runs. Chrome only; while recording, the tab's JavaScript dialogs are answered by the recorder's dialog policy (dismiss by default).
+Shadow observation & macro learning mode (Ghost Mode). Observes human interactions in a tab, across page loads and navigations (a link or form post becomes a wait for the next page, a typed URL or reload a goto), debounces keystrokes and click bursts, strips noise, and synthesizes clean, deterministic browser_flow steps. Secret fields are never recorded: they become steps with a secret_ref, supplied as secrets when the flow runs. Chrome only. JavaScript dialogs raised while recording are answered as 'dialogs' says: by the person at a visible window by default (the recording keeps the answer as a dialog step the flow replays before the action that raised it; a prompt's typed text is not kept), by the recorder in a headless browser (dismiss unless browser_dialog says accept).
 
 | Argument | Type | Required | Description |
 |---|---|---|---|
 | `action` | one of: start, stop, status |  | recording action (default: status) |
+| `dialogs` | one of: human, accept, dismiss |  | start: who answers the page's JavaScript dialogs (confirm/prompt/alert/beforeunload) while recording. human: nobody does, so the person at the browser window answers and the recording keeps how they did (needs a visible browser; the default there). accept / dismiss: the recorder answers (dismiss, or the tab's browser_dialog policy, is the default for a headless browser). Every confirm/prompt/beforeunload becomes a dialog step in the flow |
 | `name` | string |  | optional flow name to auto-save to flow store upon stop |
 | `target_id` | string | yes |  |
 

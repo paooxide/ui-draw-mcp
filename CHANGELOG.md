@@ -65,7 +65,16 @@ All notable changes to this project are documented here. The format follows
   replays. Password, PIN, one-time-code, card, token and API-key fields are recorded as a named
   `secret_ref`; their values are supplied at replay time (`browser_flow run` `secrets`, or
   `AGENTCTL_SECRET_<REF>` for `agentctl test`) and never stored or logged. While a recording runs, the
-  tab's JavaScript dialogs are answered by its dialog policy.
+  tab's JavaScript dialogs are answered as `dialogs` says. A person recording by hand answers their own
+  `confirm()`: in a visible browser the default is `human`, where the recorder only listens (Chrome shows
+  the dialog natively and also announces it to the Page-domain client), and how the person answered
+  becomes a `dialog` step. `accept` and `dismiss` have the recorder answer; a headless browser has nobody
+  to answer, so `dismiss` (or the tab's `browser_dialog` policy) is its default and `human` is refused
+  rather than left to hang the tab. A `dialog` step sets the tab's standing policy, so it is placed
+  before the click, typing or key press that raised the dialog; alerts are not recorded (they have one
+  way out) and a prompt's typed text is not kept, since it may be a secret, so replay accepts it empty.
+  Recording with `dialogs: "accept"`, and running a flow with an accepting dialog step, ask for the same
+  consent as `browser_dialog policy: "accept"`.
 - **Safari, experimental.** `browser_connect` takes `launch.browser = "safari"` and drives Safari through
   `safaridriver`'s W3C WebDriver. Operations WebDriver cannot do (key presses, device emulation, branching,
   checkpoints, recording, network capture) return `UNSUPPORTED`. Needs a one-time `safaridriver --enable`;

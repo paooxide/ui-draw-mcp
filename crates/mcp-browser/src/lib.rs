@@ -19,7 +19,7 @@ mod visual;
 
 pub use backend::{BrowserBackend, BrowserError, CdpBackend, Locator, Shot, CHROME_BINS};
 pub use branch::{Branch, BranchError, BranchManager, BranchStatus};
-pub use cdp::DialogPolicy;
+pub use cdp::{DialogPolicy, RecordDialogs};
 pub use challenge::{ChallengeKind, ChallengeManager, ChallengeStatus};
 pub use checkpoint::{Checkpoint, CheckpointStore, FormInputState};
 pub use flow::{Flow, FlowError, FlowStore};

@@ -181,12 +181,50 @@ pub enum DialogPolicy {
     Accept(Option<String>),
 }
 
+/// Who answers the page's JavaScript dialogs while a tab is being recorded.
+///
+/// Chrome shows a dialog natively *and* announces it to every client that has
+/// the `Page` domain enabled (`hasBrowserHandler: true`; checked against
+/// Chrome 154), so a person at a visible window can answer it while the
+/// recorder only listens. Nobody can answer in a headless browser, where
+/// leaving a dialog unanswered blocks the tab for good.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordDialogs {
+    /// Leave every dialog to the person; record how they answered it.
+    Human,
+    /// Answer every dialog "yes" (confirm, prompt with empty text).
+    Accept,
+    /// Answer every dialog "no" (cancel).
+    Dismiss,
+}
+
+impl RecordDialogs {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "human" => Some(Self::Human),
+            "accept" => Some(Self::Accept),
+            "dismiss" => Some(Self::Dismiss),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Human => "human",
+            Self::Accept => "accept",
+            Self::Dismiss => "dismiss",
+        }
+    }
+}
+
 /// A single client WebSocket to one CDP target.
 pub struct CdpConn {
     stream: TcpStream,
     next_id: u64,
     rng: u64,
     dialog_policy: DialogPolicy,
+    /// Never answer a dialog on this connection: a person does.
+    leave_dialogs: bool,
     dialogs: Vec<Value>,
     /// Bytes read from the socket that do not yet make a whole frame.
     rbuf: Vec<u8>,
@@ -257,6 +295,7 @@ impl CdpConn {
             next_id: 1,
             rng: seed,
             dialog_policy: DialogPolicy::default(),
+            leave_dialogs: false,
             dialogs: Vec::new(),
             rbuf: Vec::new(),
             partial: Vec::new(),
@@ -267,6 +306,18 @@ impl CdpConn {
 
     pub fn set_dialog_policy(&mut self, policy: DialogPolicy) {
         self.dialog_policy = policy;
+    }
+
+    /// Leave the page's dialogs to a person instead of answering them. The
+    /// connection then lets `Page.javascriptDialogOpening` through to its
+    /// caller like any other event, and answers nothing.
+    pub(crate) fn leave_dialogs_to_person(&mut self, on: bool) {
+        self.leave_dialogs = on;
+    }
+
+    /// Add an entry to the dialog log.
+    pub(crate) fn note_dialog(&mut self, entry: Value) {
+        self.dialogs.push(entry);
     }
 
     /// Take the JavaScript dialogs observed (and answered) since the last call.
@@ -455,7 +506,9 @@ impl CdpConn {
             let v = timeout(CALL_TIMEOUT, self.read_message())
                 .await
                 .map_err(|_| BrowserError::Timeout(format!("cdp {method} timed out")))??;
-            if v.get("method").and_then(Value::as_str) == Some("Page.javascriptDialogOpening") {
+            if !self.leave_dialogs
+                && v.get("method").and_then(Value::as_str) == Some("Page.javascriptDialogOpening")
+            {
                 let params = v.get("params").cloned().unwrap_or_else(|| json!({}));
                 self.answer_dialog(&params).await?;
                 continue;

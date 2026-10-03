@@ -866,7 +866,27 @@ impl BrowserModule {
         let action = str_arg(args, "action").unwrap_or("status");
         match action {
             "start" => {
-                match crate::record::RecordManager::start(self.backend.as_ref(), target).await {
+                let dialogs = match str_arg(args, "dialogs") {
+                    None => None,
+                    Some(s) => match crate::cdp::RecordDialogs::parse(s) {
+                        Some(d) => Some(d),
+                        None => {
+                            return Envelope::fail_with(
+                                tool,
+                                ErrorCode::InvalidArgs,
+                                format!("unknown dialogs setting '{s}'"),
+                                "use 'human' (the person answers), 'accept' or 'dismiss'",
+                            )
+                        }
+                    },
+                };
+                match crate::record::RecordManager::start_with(
+                    self.backend.as_ref(),
+                    target,
+                    dialogs,
+                )
+                .await
+                {
                     Ok(v) => Envelope::ok(tool, v),
                     Err(e) => browser_err(tool, e),
                 }
@@ -1521,6 +1541,24 @@ impl BrowserModule {
                     )
                     .await
             }
+            "dialog" => {
+                // How the tab answers its JavaScript dialogs from here on (the
+                // same standing policy as `browser_dialog`). A recording puts
+                // one before the action that raised the dialog.
+                let policy = match str_arg(step, "policy") {
+                    Some("accept") => {
+                        DialogPolicy::Accept(str_arg(step, "prompt_text").map(str::to_string))
+                    }
+                    Some("dismiss") => DialogPolicy::Dismiss,
+                    _ => {
+                        return (
+                            false,
+                            json!("dialog step needs 'policy': 'accept' or 'dismiss'"),
+                        )
+                    }
+                };
+                self.backend.dialog(target, Some(policy)).await
+            }
             "viewport" => {
                 let width = step.get("width").and_then(Value::as_u64).unwrap_or(0) as u32;
                 let height = step.get("height").and_then(Value::as_u64).unwrap_or(0) as u32;
@@ -1586,6 +1624,12 @@ impl BrowserModule {
             Err(e) => (false, json!(browser_err_msg(&e))),
         }
     }
+}
+
+/// A flow step that makes the tab answer its dialogs "yes".
+fn is_accepting_dialog_step(step: &Value) -> bool {
+    step.get("op").and_then(Value::as_str) == Some("dialog")
+        && step.get("policy").and_then(Value::as_str) == Some("accept")
 }
 
 /// The `secrets` argument of a flow run: an object of string values. A wrong
@@ -1894,12 +1938,13 @@ impl ToolModule for BrowserModule {
                 "browser_record",
                 Category::Browser,
                 Tier::Standard,
-                "Shadow observation & macro learning mode (Ghost Mode). Observes human interactions in a tab, across page loads and navigations (a link or form post becomes a wait for the next page, a typed URL or reload a goto), debounces keystrokes and click bursts, strips noise, and synthesizes clean, deterministic browser_flow steps. Secret fields are never recorded: they become steps with a secret_ref, supplied as secrets when the flow runs. Chrome only; while recording, the tab's JavaScript dialogs are answered by the recorder's dialog policy (dismiss by default).",
+                "Shadow observation & macro learning mode (Ghost Mode). Observes human interactions in a tab, across page loads and navigations (a link or form post becomes a wait for the next page, a typed URL or reload a goto), debounces keystrokes and click bursts, strips noise, and synthesizes clean, deterministic browser_flow steps. Secret fields are never recorded: they become steps with a secret_ref, supplied as secrets when the flow runs. Chrome only. JavaScript dialogs raised while recording are answered as 'dialogs' says: by the person at a visible window by default (the recording keeps the answer as a dialog step the flow replays before the action that raised it; a prompt's typed text is not kept), by the recorder in a headless browser (dismiss unless browser_dialog says accept).",
                 obj(
                     json!({
                         "target_id": { "type": "string" },
                         "action": { "type": "string", "enum": ["start", "stop", "status"], "description": "recording action (default: status)" },
-                        "name": { "type": "string", "description": "optional flow name to auto-save to flow store upon stop" }
+                        "name": { "type": "string", "description": "optional flow name to auto-save to flow store upon stop" },
+                        "dialogs": { "type": "string", "enum": ["human", "accept", "dismiss"], "description": "start: who answers the page's JavaScript dialogs (confirm/prompt/alert/beforeunload) while recording. human: nobody does, so the person at the browser window answers and the recording keeps how they did (needs a visible browser; the default there). accept / dismiss: the recorder answers (dismiss, or the tab's browser_dialog policy, is the default for a headless browser). Every confirm/prompt/beforeunload becomes a dialog step in the flow" }
                     }),
                     json!(["target_id"]),
                 ),
@@ -2067,7 +2112,7 @@ impl ToolModule for BrowserModule {
                 "Save and replay a browser UI test. 'save' (name + steps) records a flow; 'run' \
                  (name + target_id) replays it deterministically, stopping at the first failing \
                  step (set continue_on_error to run all); 'list'/'get'/'delete' manage them. A \
-                 step is {op: navigate|act|wait|capture|assert, ...} using the same fields as \
+                 step is {op: navigate|act|wait|capture|assert|dialog, ...} using the same fields as \
                  those tools (e.g. {op:'act',by:'text',query:'Login',action:'click'}, \
                  {op:'assert',text:'Welcome'}). A secret step never holds its value: use \
                  {op:'act',action:'type',query:'#pw',secret:true,secret_ref:'pw'} and pass \
@@ -2110,13 +2155,30 @@ impl ToolModule for BrowserModule {
     /// not plumbing: `confirm("Delete this account?")` becomes "yes". Dismissal
     /// (the default) needs no approval because it is the null answer.
     fn consent_prompt(&self, name: &str, args: &Value) -> Option<String> {
-        if name != "browser_dialog" {
-            return None;
-        }
-        if args.get("policy").and_then(Value::as_str) != Some("accept") {
-            return None;
-        }
-        Some("Automatically ACCEPT JavaScript dialogs in this tab? Any confirm() the page raises will be answered 'yes' without further prompting.".to_string())
+        let accepts = match name {
+            "browser_dialog" => args.get("policy").and_then(Value::as_str) == Some("accept"),
+            // Recording that answers every dialog "yes" is the same decision.
+            "browser_record" => {
+                args.get("action").and_then(Value::as_str) == Some("start")
+                    && args.get("dialogs").and_then(Value::as_str) == Some("accept")
+            }
+            // So is a flow step that does, whether it is being saved or run.
+            "browser_flow" => {
+                let steps = match args.get("action").and_then(Value::as_str) {
+                    Some("save") => args.get("steps").and_then(Value::as_array).cloned(),
+                    Some("run") => args
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .zip(self.flows.as_ref())
+                        .and_then(|(n, s)| s.get(n).ok().flatten())
+                        .map(|f| f.steps),
+                    _ => None,
+                };
+                steps.is_some_and(|s| s.iter().any(is_accepting_dialog_step))
+            }
+            _ => false,
+        };
+        accepts.then(|| "Automatically ACCEPT JavaScript dialogs in this tab? Any confirm() the page raises will be answered 'yes' without further prompting.".to_string())
     }
 
     /// Stop browsers this session launched. Without this, a `serve` that ends
@@ -2397,6 +2459,51 @@ mod act_tests {
         ));
         let _ = std::fs::remove_file(&p);
         BrowserModule::new(Arc::new(Recorder::default())).with_flow_store(FlowStore::new(p, 50, 50))
+    }
+
+    #[tokio::test]
+    async fn answering_dialogs_yes_needs_consent_however_it_is_asked_for() {
+        let m = module_with_flows("dialog-consent");
+        let asks = |name: &str, args: Value| m.consent_prompt(name, &args).is_some();
+        // The direct tool, and both new ways to make every confirm "yes".
+        assert!(asks("browser_dialog", json!({"policy": "accept"})));
+        assert!(asks(
+            "browser_record",
+            json!({"action": "start", "dialogs": "accept"})
+        ));
+        let accepting = json!([{"op": "dialog", "policy": "accept", "type": "confirm"}]);
+        assert!(asks(
+            "browser_flow",
+            json!({"action": "save", "name": "f", "steps": accepting})
+        ));
+        // A stored flow that accepts asks when it is run, not only when saved.
+        let saved = m
+            .call(
+                "browser_flow",
+                json!({"action": "save", "name": "yes", "steps": accepting}),
+                &CallCtx::new("test", mcp_types::CancelToken::new()),
+            )
+            .await;
+        assert!(saved.ok, "{saved:?}");
+        assert!(asks(
+            "browser_flow",
+            json!({"action": "run", "name": "yes"})
+        ));
+        // Dismissing, the default, and a flow with no accepting step do not.
+        assert!(!asks("browser_dialog", json!({"policy": "dismiss"})));
+        assert!(!asks("browser_record", json!({"action": "start"})));
+        assert!(!asks(
+            "browser_record",
+            json!({"action": "start", "dialogs": "dismiss"})
+        ));
+        assert!(!asks(
+            "browser_flow",
+            json!({"action": "save", "name": "f", "steps": [{"op": "dialog", "policy": "dismiss"}]})
+        ));
+        assert!(!asks(
+            "browser_flow",
+            json!({"action": "run", "name": "nope"})
+        ));
     }
 
     fn module_with_profiles_and_rec(tag: &str) -> (BrowserModule, Arc<Recorder>) {

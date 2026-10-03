@@ -8,12 +8,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::backend::{BrowserBackend, BrowserError};
+use crate::cdp::RecordDialogs;
 use crate::flow::{Flow, FlowError, FlowStore};
 
 /// Raw interaction event captured from DOM event listeners.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RawInteractionEvent {
-    pub kind: String, // "click", "input", "change", "keydown", "navigate"
+    pub kind: String, // "click", "input", "change", "keydown", "navigate", "dialog"
     pub tag: String,
     pub selector: String,
     pub text: Option<String>,
@@ -175,6 +176,24 @@ pub struct MacroSynthesizer;
 impl MacroSynthesizer {
     /// Convert raw DOM events into clean `Flow` steps.
     pub fn synthesize(events: &[RawInteractionEvent]) -> Vec<Value> {
+        // Dialogs are set aside first (a `beforeunload` dialog sits between a
+        // click and the navigation it caused, which must still be seen as
+        // that click's navigation) and put back below.
+        let mut core: Vec<RawInteractionEvent> = Vec::new();
+        let mut dialogs: Vec<(usize, Value)> = Vec::new();
+        for ev in events {
+            if ev.kind == "dialog" {
+                if let Some(step) = Self::dialog_step(ev) {
+                    dialogs.push((core.len(), step));
+                }
+            } else {
+                core.push(ev.clone());
+            }
+        }
+        let events: &[RawInteractionEvent] = &core;
+        // `starts[k]`: where in `steps` the interaction holding event `k`
+        // began, to place a dialog before the step that raised it.
+        let mut starts: Vec<usize> = Vec::with_capacity(events.len());
         let mut steps = Vec::new();
         let mut i = 0;
         // (selector, secret_ref) of the secret fields named so far.
@@ -182,6 +201,7 @@ impl MacroSynthesizer {
 
         while i < events.len() {
             let ev = &events[i];
+            let (first, steps_before) = (i, steps.len());
 
             match ev.kind.as_str() {
                 "navigate" => {
@@ -353,9 +373,39 @@ impl MacroSynthesizer {
                     i += 1;
                 }
             }
+            starts.resize(starts.len() + (i - first), steps_before);
+        }
+
+        // A dialog is answered by the tab's standing policy, so its step goes
+        // before the step whose action raised it: the last click, typing or
+        // key press before it (or the very start, for one the page raised
+        // on its own). Inserted last-first so equal positions keep their order.
+        for (seen, step) in dialogs.into_iter().rev() {
+            let at = events[..seen]
+                .iter()
+                .rposition(|e| matches!(e.kind.as_str(), "click" | "input" | "change" | "keydown"))
+                .map_or(0, |k| starts[k]);
+            steps.insert(at, step);
         }
 
         steps
+    }
+
+    /// The `dialog` step for a recorded dialog, or `None` for an `alert`
+    /// (it has one way out, so there is nothing to reproduce). `policy` is how
+    /// the dialog ended; a `prompt`'s typed text is not kept, because it may
+    /// be a secret, so replay accepts it with empty text.
+    fn dialog_step(ev: &RawInteractionEvent) -> Option<Value> {
+        let kind = ev.text.as_deref().unwrap_or("");
+        if kind == "alert" {
+            return None;
+        }
+        let policy = if ev.value.as_deref() == Some("accept") {
+            "accept"
+        } else {
+            "dismiss"
+        };
+        Some(json!({ "op": "dialog", "policy": policy, "type": kind }))
     }
 
     /// Whether `events[idx]` is a navigation the interaction at `cause_ts`
@@ -625,15 +675,34 @@ impl RecordManager {
         backend: &dyn BrowserBackend,
         target_id: &str,
     ) -> Result<Value, BrowserError> {
+        Self::start_with(backend, target_id, None).await
+    }
+
+    /// [`Self::start`] with a say over who answers the page's JavaScript
+    /// dialogs: `Human` leaves them to the person at the window and records
+    /// how they answered, `Accept`/`Dismiss` answer them. `None` is `Human`
+    /// for a visible browser and the tab's dialog policy otherwise.
+    pub async fn start_with(
+        backend: &dyn BrowserBackend,
+        target_id: &str,
+        dialogs: Option<RecordDialogs>,
+    ) -> Result<Value, BrowserError> {
         let current = format!("window.__agentctl_rec_initial = true; {JS_RECORDER_INSTALL}");
         let res = backend
-            .observe_start(target_id, RECORDER_BINDING, JS_RECORDER_INSTALL, &current)
+            .observe_start(
+                target_id,
+                RECORDER_BINDING,
+                JS_RECORDER_INSTALL,
+                &current,
+                dialogs,
+            )
             .await?;
         Ok(json!({
             "recording": true,
             "target_id": target_id,
             "installed": res.get("installed").and_then(Value::as_bool).unwrap_or(false),
-            "url": res.get("url").cloned().unwrap_or(Value::Null)
+            "url": res.get("url").cloned().unwrap_or(Value::Null),
+            "dialogs": res.get("dialogs").cloned().unwrap_or(Value::Null)
         }))
     }
 
@@ -1093,6 +1162,97 @@ mod tests {
             .map(|s| s["secret_ref"].as_str().unwrap())
             .collect();
         assert_eq!(refs, ["password", "password_2", "password"]);
+    }
+
+    #[test]
+    fn test_a_dialog_step_comes_before_the_action_that_raised_the_dialog() {
+        let dialog = |kind: &str, answer: &str, ts: u64| RawInteractionEvent {
+            text: Some(kind.into()),
+            value: Some(answer.into()),
+            ..ev("dialog", "", "", ts)
+        };
+        let events = vec![
+            nav("http://x/a", 0),
+            ev("click", "BUTTON", "#first", 1_000),
+            dialog("confirm", "accept", 1_050),
+            ev("click", "BUTTON", "#second", 2_000),
+            dialog("confirm", "dismiss", 2_050),
+        ];
+        let steps = MacroSynthesizer::synthesize(&events);
+        let ops: Vec<String> = steps
+            .iter()
+            .map(|s| match s["op"].as_str().unwrap() {
+                "dialog" => format!("dialog:{}", s["policy"].as_str().unwrap()),
+                "act" => format!("click:{}", s["query"].as_str().unwrap()),
+                other => other.to_string(),
+            })
+            .collect();
+        assert_eq!(
+            ops,
+            [
+                "navigate",
+                "wait",
+                "dialog:accept",
+                "click:#first",
+                "wait",
+                "dialog:dismiss",
+                "click:#second",
+                "wait",
+            ],
+            "{steps:?}"
+        );
+        assert_eq!(steps[2]["type"], "confirm");
+    }
+
+    #[test]
+    fn test_alerts_are_not_recorded_and_a_prompt_keeps_no_typed_text() {
+        let mut alert = ev("dialog", "", "", 1_050);
+        alert.text = Some("alert".into());
+        alert.value = Some("accept".into());
+        let mut prompt = ev("dialog", "", "", 2_050);
+        prompt.text = Some("prompt".into());
+        prompt.value = Some("accept".into());
+        // Even if a stray field carried the typed answer, it is never copied.
+        prompt.key = Some("hunter2".into());
+        let events = vec![
+            ev("click", "BUTTON", "#a", 1_000),
+            alert,
+            ev("click", "BUTTON", "#b", 2_000),
+            prompt,
+        ];
+        let steps = MacroSynthesizer::synthesize(&events);
+        let dialogs: Vec<&Value> = steps.iter().filter(|s| s["op"] == "dialog").collect();
+        assert_eq!(
+            dialogs.len(),
+            1,
+            "the alert has nothing to reproduce: {steps:?}"
+        );
+        assert_eq!(dialogs[0]["type"], "prompt");
+        assert!(!serde_json::to_string(&steps).unwrap().contains("hunter2"));
+    }
+
+    #[test]
+    fn test_a_beforeunload_dialog_does_not_turn_the_navigation_into_a_goto() {
+        let events = vec![
+            nav("http://x/a", 0),
+            ev("click", "A", "#leave", 1_000),
+            RawInteractionEvent {
+                text: Some("beforeunload".into()),
+                value: Some("accept".into()),
+                ..ev("dialog", "", "", 1_050)
+            },
+            nav("http://x/b", 1_200),
+        ];
+        let steps = MacroSynthesizer::synthesize(&events);
+        let gotos = steps
+            .iter()
+            .filter(|s| s["op"] == "navigate" && s["action"] == "goto")
+            .count();
+        assert_eq!(gotos, 1, "only the starting page is a goto: {steps:?}");
+        assert!(steps
+            .iter()
+            .any(|s| s["op"] == "wait" && s["navigation"] == true));
+        assert_eq!(steps[2]["op"], "dialog", "{steps:?}");
     }
 
     #[test]
