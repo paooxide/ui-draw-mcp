@@ -1928,9 +1928,11 @@ impl ToolModule for BrowserModule {
                 Tier::Standard,
                 "In-memory state checkpointing and rollback (T-1) for browser tabs. 'save' captures \
                  a deep copy of form state (input values, checks, select indexes, scroll), storage, \
-                 cookies and URL (not the DOM tree); 'rollback' navigates back if needed, waits for \
-                 the page to load, restores that state and fails with the reason if any part could \
-                 not be restored; 'list'/'delete' manage checkpoints. Re-saving a tag makes it the \
+                 cookies and URL (not the DOM tree); 'rollback' navigates back if needed (loading \
+                 the page from the network with Chrome's HTTP cache bypassed, so a server that is \
+                 down is an error, not a stale cached page; the result says cache_bypassed), waits \
+                 for the page to load, restores that state and fails with the reason if any part \
+                 could not be restored; 'list'/'delete' manage checkpoints. Re-saving a tag makes it the \
                  newest ('latest'). File inputs are skipped.",
                 obj(
                     json!({

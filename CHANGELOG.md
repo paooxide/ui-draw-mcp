@@ -192,6 +192,13 @@ All notable changes to this project are documented here. The format follows
   marker, so the wait is for the history entry's page. An entry made by `history.pushState` or a fragment
   change keeps the document, and Chrome says so, so the marker is dropped and the wait settles at once
   instead of running out its timeout.
+- `browser_checkpoint rollback` could succeed from Chrome's HTTP cache. It navigates to the saved URL, and
+  for a page served with `max-age` Chrome answered from disk: with the server down the rollback reported
+  `rolled_back: true` for a page nobody had fetched, and with the server up it could restore form state
+  into an out-of-date copy. The load now bypasses the HTTP cache (for that load only), so an unreachable
+  server fails the rollback with the navigation error and a changed page is the one you see. The result
+  carries `cache_bypassed`, true when the rollback navigated. A rollback that finds the tab already on the
+  checkpoint's URL loads nothing, as before.
 - The CDP client could lose half a WebSocket frame when a read was cancelled by a timeout, corrupting the
   rest of the stream. Reads are now buffered and cancel-safe.
 - `pty_spawn` with no `shell` picked the first allowed shell whether or not it existed, so on a machine

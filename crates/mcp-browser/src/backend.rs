@@ -1173,16 +1173,28 @@ impl CdpBackend {
     /// `Page.navigate` the old document still reports `complete`, so a marker
     /// is planted on it and the wait is for a document without that marker.
     /// Errors on a denied URL, a navigation error (`errorText`) or a timeout.
+    ///
+    /// With `bypass_cache` the load (the document and everything it pulls in)
+    /// goes to the network: Chrome's HTTP cache is switched off for this
+    /// session, which ends when the call returns, so the setting never leaks
+    /// into the page's later loads. A server that is down is then an error
+    /// rather than a page served from disk.
     async fn goto_and_wait(
         &self,
         target: &str,
         url: &str,
         timeout_ms: u64,
+        bypass_cache: bool,
     ) -> Result<(), BrowserError> {
         if let Err(denied) = self.nav.check(url).await {
             return Err(BrowserError::PermissionDenied(denied.message()));
         }
         let mut c = self.conn(target).await?;
+        if bypass_cache {
+            c.call("Network.enable", json!({})).await?;
+            c.call("Network.setCacheDisabled", json!({ "cacheDisabled": true }))
+                .await?;
+        }
         // Best effort: a page that cannot be scripted just loses the marker.
         Self::eval_value(&mut c, "window.__agentctl_nav_mark = true; true")
             .await
@@ -4124,7 +4136,7 @@ impl BrowserBackend for CdpBackend {
         // finish *before* restoring storage, which is origin-scoped.
         let blank = final_url == "about:blank";
         if !blank {
-            self.goto_and_wait(&branch.parent_target_id, &final_url, 15_000)
+            self.goto_and_wait(&branch.parent_target_id, &final_url, 15_000, false)
                 .await
                 .map_err(|e| ctx_err(e, "cannot navigate the parent tab to the branch URL"))?;
             let restored = self
@@ -4411,8 +4423,12 @@ impl BrowserBackend for CdpBackend {
             .unwrap_or(Value::Null);
         let cur_url = cur_url_val.as_str().unwrap_or("");
         let navigated = !cp.url.is_empty() && cur_url != cp.url;
+        // The page is loaded from the network, not Chrome's cache: a cached
+        // copy can differ from the server's state (or outlive the server), and
+        // a rollback that reports success for it would be vouching for a page
+        // nobody just fetched.
         if navigated {
-            self.goto_and_wait(target_id, &cp.url, 15_000)
+            self.goto_and_wait(target_id, &cp.url, 15_000, true)
                 .await
                 .map_err(|e| ctx_err(e, "rollback could not navigate back to the checkpoint"))?;
         }
@@ -4521,6 +4537,7 @@ impl BrowserBackend for CdpBackend {
             "url": cp.url,
             "title": cp.title,
             "navigated": navigated,
+            "cache_bypassed": navigated,
             "cookies_restored": cp.cookies.len(),
             "restored_inputs": restored_count,
             "missing_inputs": missing_inputs,
