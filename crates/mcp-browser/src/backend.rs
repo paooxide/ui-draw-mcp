@@ -1216,18 +1216,69 @@ impl CdpBackend {
     /// Run JS in the page and return the deserialized value (or a JS-exception
     /// error). Enables the Runtime domain first.
     async fn eval_value(c: &mut CdpConn, expr: &str) -> Result<Value, BrowserError> {
+        Self::eval_value_in(c, expr, None).await
+    }
+
+    /// The execution context of the recorder's isolated world in the tab's
+    /// top document, when a recording is running on `target`. The act scripts
+    /// run there so the events they dispatch can be told apart from the
+    /// page's own (see `JS_ARM`). `None` when nothing is recording, or the
+    /// world cannot be found (the act then runs in the page's world and the
+    /// recorder drops its synthetic events).
+    async fn recorder_context(&self, target: &str, c: &mut CdpConn) -> Option<i64> {
+        let live = self
+            .observers
+            .lock()
+            .ok()?
+            .get(target)
+            .is_some_and(|o| !o.task.is_finished());
+        if !live {
+            return None;
+        }
+        let tree = c.call("Page.getFrameTree", json!({})).await.ok()?;
+        let top = tree
+            .get("frameTree")?
+            .get("frame")?
+            .get("id")?
+            .as_str()?
+            .to_string();
+        // Enabling Runtime announces every context that exists now.
+        c.keep_events(true);
+        let enabled = c.call("Runtime.enable", json!({})).await;
+        c.keep_events(false);
+        let events = c.take_events();
+        enabled.ok()?;
+        events.iter().rev().find_map(|ev| {
+            if ev.get("method").and_then(Value::as_str) != Some("Runtime.executionContextCreated") {
+                return None;
+            }
+            let ctx = ev.get("params")?.get("context")?;
+            let aux = ctx.get("auxData")?;
+            (ctx.get("name").and_then(Value::as_str) == Some(RECORDER_WORLD)
+                && aux.get("frameId").and_then(Value::as_str) == Some(top.as_str())
+                && aux.get("isDefault").and_then(Value::as_bool) == Some(false))
+            .then(|| ctx.get("id").and_then(Value::as_i64))
+            .flatten()
+        })
+    }
+
+    /// `eval_value` in a given execution context (the page's own when `None`).
+    async fn eval_value_in(
+        c: &mut CdpConn,
+        expr: &str,
+        context: Option<i64>,
+    ) -> Result<Value, BrowserError> {
         c.call("Runtime.enable", json!({})).await.ok();
-        let r = c
-            .call(
-                "Runtime.evaluate",
-                json!({
-                    "expression": expr,
-                    "returnByValue": true,
-                    "awaitPromise": true,
-                    "userGesture": true
-                }),
-            )
-            .await?;
+        let mut params = json!({
+            "expression": expr,
+            "returnByValue": true,
+            "awaitPromise": true,
+            "userGesture": true
+        });
+        if let (Some(id), Some(m)) = (context, params.as_object_mut()) {
+            m.insert("contextId".into(), json!(id));
+        }
+        let r = c.call("Runtime.evaluate", params).await?;
         if let Some(exc) = r.get("exceptionDetails") {
             let text = exc
                 .get("exception")
@@ -1698,9 +1749,28 @@ const JS_DOM_SETTLED: &str = r##"(function(){
   return document.readyState === 'complete' && quiet >= 150;
 })()"##;
 
+/// Lets the act scripts tell the recorder "the next `type` event on `el` is
+/// mine". Only meaningful in the recorder's isolated world, where
+/// `window.__agentctl_recorder` is the recorder's own; elsewhere (`__ISO__`
+/// false) both helpers do nothing, so a page's same-named global is never
+/// touched. One event is armed right before the one dispatch that uses it.
+const JS_ARM: &str = r#"var __iso = __ISO__;
+  function __arm(el, type){
+    if(!__iso) return;
+    var r = window.__agentctl_recorder;
+    if(r && r.expect) r.expect.push({type: type, target: el});
+  }
+  function __disarm(){
+    if(!__iso) return;
+    var r = window.__agentctl_recorder;
+    if(r && r.expect) r.expect.length = 0;
+  }
+  __disarm();"#;
+
 /// In-page script that batches multiple form field updates and optional submit.
 const JS_FILL_FORM: &str = r##"(async function(){
   {JS_XPATH}
+  {JS_ARM}
   {JS_SHOWCASE_INIT}
   var fields = __FIELDS__;
   var submit = __SUBMIT__;
@@ -1711,6 +1781,7 @@ const JS_FILL_FORM: &str = r##"(async function(){
     if(f.selector) return document.querySelector(f.selector);
     return null;
   }
+  try {
   for(var i=0; i<fields.length; i++){
     var f = fields[i];
     var el = resolve(f);
@@ -1728,14 +1799,18 @@ const JS_FILL_FORM: &str = r##"(async function(){
       var fType = (f.type || '').toLowerCase();
       if(tag === 'select' || fType === 'select'){
         el.value = String(val == null ? '' : val);
+        __arm(el, 'input');
         el.dispatchEvent(new Event('input', {bubbles: true}));
+        __arm(el, 'change');
         el.dispatchEvent(new Event('change', {bubbles: true}));
         filled++;
       } else if(inputType === 'checkbox' || inputType === 'radio' || fType === 'checkbox' || fType === 'radio'){
         var shouldCheck = Boolean(val);
         if(el.checked !== shouldCheck){
           el.checked = shouldCheck;
+          __arm(el, 'input');
           el.dispatchEvent(new Event('input', {bubbles: true}));
+          __arm(el, 'change');
           el.dispatchEvent(new Event('change', {bubbles: true}));
         }
         filled++;
@@ -1745,7 +1820,9 @@ const JS_FILL_FORM: &str = r##"(async function(){
         } else {
           el.textContent = (val == null ? '' : String(val));
         }
+        __arm(el, 'input');
         el.dispatchEvent(new Event('input', {bubbles: true}));
+        __arm(el, 'change');
         el.dispatchEvent(new Event('change', {bubbles: true}));
         if(el.blur) el.blur();
         filled++;
@@ -1759,6 +1836,7 @@ const JS_FILL_FORM: &str = r##"(async function(){
     var subEl = resolve(submit);
     if(subEl){
       {JS_SHOWCASE_SUBMIT}
+      __arm(subEl, 'click');
       if(subEl.click) subEl.click();
       else if(subEl.form && subEl.form.requestSubmit) subEl.form.requestSubmit();
       else if(subEl.form && subEl.form.submit) subEl.form.submit();
@@ -1767,6 +1845,7 @@ const JS_FILL_FORM: &str = r##"(async function(){
       errors.push({field: 'submit', error: 'submit element not found'});
     }
   }
+  } finally { __disarm(); }
   return { ok: errors.length === 0, filled: filled, submitted: submitted, errors: errors };
 })()"##;
 
@@ -2662,6 +2741,18 @@ impl BrowserBackend for CdpBackend {
         } else {
             Some(self.conn(target).await?)
         };
+        // While this tab is being recorded, the script runs in the recorder's
+        // isolated world: the DOM is the same, but there it can tell the
+        // recorder which synthetic events are agentctl's own (`JS_ARM`).
+        // A canvas region is published by the page as a property of the
+        // canvas, which an isolated world cannot see; its click is a real CDP
+        // pointer event anyway, so nothing needs arming.
+        let canvas_ref = matches!(&locator, Locator::Ref(r) if r.contains("::canvas["));
+        let iso = match c_opt.as_mut() {
+            Some(c) if !canvas_ref => self.recorder_context(target, c).await,
+            _ => None,
+        };
+        let js_arm = JS_ARM.replace("__ISO__", if iso.is_some() { "true" } else { "false" });
         // Resolve to an element in the same eval: a `ref` via XPath, or a
         // selector via `__find`, so a scripted action is one round trip.
         let resolve = match locator {
@@ -2726,11 +2817,22 @@ impl BrowserBackend for CdpBackend {
             .as_ref()
             .map(|t| format!("window.__agentctl_nav_token = {t:?};"))
             .unwrap_or_default();
+        // `wait navigation` reads the token from the page's world, which an
+        // isolated-world script cannot write.
+        let nav_mark_in_script = if iso.is_some() {
+            if let (Some(c), false) = (c_opt.as_mut(), nav_mark.is_empty()) {
+                Self::eval_value(c, &format!("{nav_mark} true")).await?;
+            }
+            String::new()
+        } else {
+            nav_mark
+        };
 
         let expr = format!(
             r#"(async function(){{
   {JS_XPATH}
   {JS_FIND}
+  {js_arm}
   {showcase_init}
   var el, action={act}, value={val};
   try {{ el = {resolve}; }} catch(e) {{ return {{ok:false,error:String(e && e.message ? e.message : e)}}; }}
@@ -2757,9 +2859,10 @@ impl BrowserBackend for CdpBackend {
   }}
   try{{ el.scrollIntoView({{block:'center',inline:'center'}}); }}catch(e){{}}
   {showcase_call}
-  {nav_mark}
+  {nav_mark_in_script}
+  try {{
   switch(action){{
-    case 'click': el.click(); break;
+    case 'click': __arm(el, 'click'); el.click(); break;
     case 'focus': el.focus(); break;
     case 'press': el.focus(); break;
     case 'hover': el.dispatchEvent(new MouseEvent('mouseover',{{bubbles:true}})); break;
@@ -2770,15 +2873,18 @@ impl BrowserBackend for CdpBackend {
       else return {{ok:false,error:'element has no form to submit'}};
       break;
     case 'select':
-      el.value=value; el.dispatchEvent(new Event('change',{{bubbles:true}})); break;
+      el.value=value; __arm(el, 'change'); el.dispatchEvent(new Event('change',{{bubbles:true}})); break;
     case 'type':
       if(el.focus) el.focus();
       if('value' in el){{ el.value=value; }} else {{ el.textContent=value; }}
+      __arm(el, 'input');
       el.dispatchEvent(new Event('input',{{bubbles:true}}));
+      __arm(el, 'change');
       el.dispatchEvent(new Event('change',{{bubbles:true}}));
       break;
     default: return {{ok:false,error:'unknown action '+action}};
   }}
+  }} finally {{ __disarm(); }}
   return {{ok:true,action:action,showcase:{}}};
 }})()"#,
             showcase_cfg.enabled
@@ -2789,7 +2895,7 @@ impl BrowserBackend for CdpBackend {
             entry.session.eval_promise(&expr).await?
         } else {
             let c = c_opt.as_mut().unwrap();
-            Self::eval_value(c, &expr).await?
+            Self::eval_value_in(c, &expr, iso).await?
         };
         // Success must be affirmed. A missing `ok` (for instance `{}` from an
         // un-awaited promise) is a failure, never a silent success.
@@ -3918,6 +4024,10 @@ impl BrowserBackend for CdpBackend {
         } else {
             Some(self.conn(target).await?)
         };
+        let iso = match c_opt.as_mut() {
+            Some(c) => self.recorder_context(target, c).await,
+            None => None,
+        };
         let fields_json = serde_json::to_string(fields).unwrap_or_else(|_| "[]".into());
         let submit_json = match submit {
             Some(s) => serde_json::to_string(s).unwrap_or_else(|_| "null".into()),
@@ -3964,6 +4074,10 @@ impl BrowserBackend for CdpBackend {
 
         let expr = JS_FILL_FORM
             .replace("{JS_XPATH}", JS_XPATH)
+            .replace(
+                "{JS_ARM}",
+                &JS_ARM.replace("__ISO__", if iso.is_some() { "true" } else { "false" }),
+            )
             .replace("{JS_SHOWCASE_INIT}", showcase_init)
             .replace("{JS_SHOWCASE_FIELD}", &showcase_field)
             .replace("{JS_SHOWCASE_SUBMIT}", &showcase_submit)
@@ -3975,7 +4089,7 @@ impl BrowserBackend for CdpBackend {
             entry.session.eval_promise(&expr).await?
         } else {
             let c = c_opt.as_mut().unwrap();
-            Self::eval_value(c, &expr).await?
+            Self::eval_value_in(c, &expr, iso).await?
         };
         if v.get("ok").and_then(Value::as_bool) != Some(true) {
             let errs = v.get("errors").and_then(Value::as_array);

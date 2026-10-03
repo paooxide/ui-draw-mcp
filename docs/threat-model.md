@@ -256,8 +256,18 @@ in its name or id, or an `autocomplete` token (`one-time-code`, `*-password`, `c
 names a `secret_ref` that the operator supplies at replay (`AGENTCTL_SECRET_<NAME>`). A secret typed into a
 field that matches none of those (an SSN in a plain `<input name="q">`) is recorded verbatim in
 `browser_flows.json`. The recorder runs in an isolated world, so page script cannot call its binding or
-read its state, but the DOM is shared: a page can still dispatch synthetic events that the recorder sees
-as input. Review a recording before replaying it with consent.
+read its state, and it records an event only if the browser made it (`isTrusted`) or agentctl armed it:
+while a tab is recorded, `browser_act` and `browser_fill_form` run in that same isolated world and, just
+before each synthetic `click`, `input` or `change` they dispatch, queue one expectation (type and target)
+that the recorder uses up on the first matching event. Page script cannot reach that world, so its own
+`el.click()`, `dispatchEvent` and synthetic Enter are dropped, and so is a handler that re-dispatches the
+agent's event (the recorder's capture listener consumes the agent's event first). What a page can still do:
+change what a trusted or armed event carries or points at. The recorder reads a field's value in its capture
+listener, before page handlers for that event run, but a handler of an earlier event (the agent's `input`
+before its `change`) or a script that edits the field between a person's keystrokes changes what is read
+next; an overlay can put a different element under a real click; and a person who clicks where the page
+tells them to is recorded doing so. A canvas-region click is a real pointer event and needs no arming.
+Review a recording before replaying it with consent.
 
 **A client can withhold its own reply, never a stop.**
 A `notifications/cancelled` marks the call client-cancelled and the server sends no response (stdio writes

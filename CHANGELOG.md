@@ -258,6 +258,13 @@ All notable changes to this project are documented here. The format follows
 
 ### Security
 
+- **The browser recorder ignores synthetic DOM events.** Page script could `el.click()`, dispatch `input` or
+  `change` after setting a value, or fire a synthetic Enter, and the recorder saved each as something the
+  person did. It now records an event only when it is trusted (`isTrusted`) or when agentctl armed it: while a
+  tab is recorded, `browser_act` (click, type, select) and `browser_fill_form` run in the recorder's isolated
+  world and queue one expectation per synthetic event they dispatch, which the first matching event uses up,
+  so a page handler that re-dispatches the same event is dropped too. `docs/threat-model.md` lists what a page
+  can still influence.
 - **Browser snapshot `semantic_intent` and `bound_state` are sanitized and bounded.** Both come from the page
   (`data-intent`, `data-state`, React props, canvas region fields), so a hostile page could put quotes,
   newlines or a forged `@e9` line in an intent, or hand over a cyclic or 100 KB state. An intent is now

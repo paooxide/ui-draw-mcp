@@ -470,7 +470,9 @@ pub const JS_RECORDER_INSTALL: &str = r#"(function() {
     return { installed: true, already_active: true, url: window.location.href };
   }
 
-  window.__agentctl_recorder = { active: true };
+  // `expect` holds the synthetic events agentctl itself is about to dispatch
+  // (see `arm` in the act scripts). Only code in this world can add to it.
+  window.__agentctl_recorder = { active: true, expect: [] };
 
   function getBestSelector(el) {
     if (!el || el.nodeType !== Node.ELEMENT_NODE) return 'body';
@@ -590,8 +592,25 @@ pub const JS_RECORDER_INSTALL: &str = r#"(function() {
     }
   });
 
+  // A person's events are trusted. An untrusted one is page script (el.click(),
+  // dispatchEvent) unless agentctl armed it a moment ago: it matches the head
+  // of the expectation queue by type and target and uses it up, so a handler
+  // that re-dispatches the same event finds the queue empty and is dropped.
+  function accepted(e) {
+    if (e.isTrusted) return true;
+    var q = window.__agentctl_recorder.expect;
+    // composedPath()[0], not target: inside an open shadow root the event
+    // reaches this window listener retargeted to the host.
+    var origin = e.composedPath ? e.composedPath()[0] : e.target;
+    if (q && q.length && q[0].type === e.type && q[0].target === origin) {
+      q.shift();
+      return true;
+    }
+    return false;
+  }
+
   window.addEventListener('click', function(e) {
-    if (!window.__agentctl_recorder.active) return;
+    if (!window.__agentctl_recorder.active || !accepted(e)) return;
     var target = e.target;
     emit({
       kind: 'click',
@@ -605,7 +624,7 @@ pub const JS_RECORDER_INSTALL: &str = r#"(function() {
   }, true);
 
   function emitValue(kind, e) {
-    if (!window.__agentctl_recorder.active) return;
+    if (!window.__agentctl_recorder.active || !accepted(e)) return;
     var target = e.target;
     var secret = isSecret(target);
     emit({
@@ -625,7 +644,7 @@ pub const JS_RECORDER_INSTALL: &str = r#"(function() {
   window.addEventListener('change', function(e) { emitValue('change', e); }, true);
 
   window.addEventListener('keydown', function(e) {
-    if (!window.__agentctl_recorder.active) return;
+    if (!window.__agentctl_recorder.active || !accepted(e)) return;
     if (e.key === 'Enter' || e.key === 'Escape' || e.key === 'Tab') {
       var target = e.target;
       emit({
