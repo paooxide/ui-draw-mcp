@@ -122,9 +122,13 @@ async fn safari_session_act_and_failure_reporting() {
     {
         Ok(c) => c,
         Err(BrowserError::PermissionDenied(m)) => {
-            // Remote automation is off: assert the mapping and say so.
+            // Safari would not take an automation session (setting off, or a
+            // prompt unanswered): assert the mapping and say so.
             assert!(m.contains("safaridriver --enable"), "{m}");
-            eprintln!("safari live test: remote automation disabled; only the error path ran");
+            assert!(m.contains("Allow Remote Automation"), "{m}");
+            eprintln!(
+                "safari live test: automation not enabled or not accepted; only the error path ran"
+            );
             return;
         }
         Err(e) => panic!("connect failed: {e:?}"),

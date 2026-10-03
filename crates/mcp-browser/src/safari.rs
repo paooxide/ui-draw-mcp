@@ -16,6 +16,12 @@ use crate::backend::BrowserError;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// Read timeout for `POST /session` only. safaridriver waits about 30 s for
+/// Safari to take the automation session before it answers "session not
+/// created"; a shorter client timeout would hide that answer behind a bare
+/// timeout. Every other request keeps `DEFAULT_TIMEOUT`.
+const SESSION_CREATE_TIMEOUT: Duration = Duration::from_secs(45);
+
 /// Known macOS system locations for Apple's native `safaridriver`.
 pub const SAFARI_DRIVER_BINS: &[&str] = &[
     "/usr/bin/safaridriver",
@@ -200,7 +206,15 @@ impl SafariSession {
             }
         });
 
-        let resp = webdriver_request("127.0.0.1", port, "POST", "/session", Some(&payload)).await?;
+        let resp = webdriver_request_with_timeout(
+            "127.0.0.1",
+            port,
+            "POST",
+            "/session",
+            Some(&payload),
+            SESSION_CREATE_TIMEOUT,
+        )
+        .await?;
 
         let session_id = resp
             .get("value")
@@ -547,6 +561,17 @@ pub async fn webdriver_request(
     path: &str,
     body: Option<&Value>,
 ) -> Result<Value, BrowserError> {
+    webdriver_request_with_timeout(host, port, method, path, body, DEFAULT_TIMEOUT).await
+}
+
+async fn webdriver_request_with_timeout(
+    host: &str,
+    port: u16,
+    method: &str,
+    path: &str,
+    body: Option<&Value>,
+    read_timeout: Duration,
+) -> Result<Value, BrowserError> {
     let connect_future = TcpStream::connect((host, port));
     let mut stream = timeout(DEFAULT_TIMEOUT, connect_future)
         .await
@@ -591,7 +616,7 @@ pub async fn webdriver_request(
     // Bounded: a misbehaving peer must not exhaust memory.
     let mut limited = (&mut stream).take(MAX_BODY as u64 + 1);
     let read_future = limited.read_to_end(&mut resp_buf);
-    timeout(DEFAULT_TIMEOUT, read_future)
+    timeout(read_timeout, read_future)
         .await
         .map_err(|_| BrowserError::Timeout("timeout reading safaridriver response".into()))?
         .map_err(|e| BrowserError::Failed(format!("read response: {e}")))?;
@@ -626,6 +651,30 @@ fn decode_chunked(mut b: &[u8]) -> Result<Vec<u8>, BrowserError> {
         out.extend_from_slice(&b[..size]);
         b = &b[size + 2..];
     }
+}
+
+/// Fix for every "Safari will not take an automation session" failure.
+const AUTOMATION_HELP: &str = "Safari did not accept a remote automation session. To fix it:\n\
+     1. In Safari, enable Develop > Allow Remote Automation (Safari > Settings > Advanced > \
+     'Show features for web developers' shows the Develop menu).\n\
+     2. Run 'safaridriver --enable' in Terminal once (it asks for an administrator password).\n\
+     3. Quit and reopen Safari.\n\
+     4. Accept any prompt Safari shows asking to allow automation, then retry.";
+
+/// Whether a safaridriver error means automation is not enabled or not
+/// accepted, as opposed to some other failure. Pure over the driver's
+/// `value.error` and `value.message`.
+///
+/// Two shapes occur: an explicit "enable Allow remote automation" message, and,
+/// when the setting is off or a prompt is unanswered, a "session not created"
+/// whose message says the session timed out connecting to a Safari instance.
+fn automation_not_enabled(error: &str, message: &str) -> bool {
+    let msg = message.to_ascii_lowercase();
+    if msg.contains("remote automation") {
+        return true;
+    }
+    error == "session not created"
+        && msg.contains("timed out while connecting to a safari instance")
 }
 
 fn parse_http_response(buf: &[u8]) -> Result<Value, BrowserError> {
@@ -692,15 +741,8 @@ fn parse_http_response(buf: &[u8]) -> Result<Value, BrowserError> {
             .and_then(Value::as_str)
             .unwrap_or("");
 
-        if err_msg.contains("Allow remote automation") || err_msg.contains("remote automation") {
-            return Err(BrowserError::PermissionDenied(
-                "Safari remote automation is disabled. To enable it on macOS:\n\
-                 1. Open Safari > Settings (or Preferences) > Advanced\n\
-                 2. Check 'Show features for web developers' (or 'Show Develop menu in menu bar')\n\
-                 3. Click the 'Develop' menu in the macOS menu bar > check 'Allow Remote Automation'\n\
-                 4. Or run 'safaridriver --enable' in Terminal and re-run your command."
-                    .into(),
-            ));
+        if automation_not_enabled(err_code, err_msg) {
+            return Err(BrowserError::PermissionDenied(AUTOMATION_HELP.into()));
         }
 
         return Err(BrowserError::Failed(format!(
@@ -750,6 +792,54 @@ Content-Length: 174\r\n\r\n\
             }
             other => panic!("expected PermissionDenied error, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn session_timeout_while_connecting_is_automation_not_enabled() {
+        // Captured verbatim from safaridriver with automation not accepted.
+        let body = "{\"value\":{\"error\":\"session not created\",\"message\":\"Could not create a session: The session timed out while connecting to a Safari instance. The following asynchronous operation timed out: Request creation of a new automation session\",\"stacktrace\":\"\"}}";
+        let raw = format!(
+            "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        match parse_http_response(raw.as_bytes()).unwrap_err() {
+            BrowserError::PermissionDenied(m) => {
+                assert!(m.contains("Allow Remote Automation"));
+                assert!(m.contains("safaridriver --enable"));
+                assert!(m.contains("Quit and reopen Safari"));
+                assert!(m.contains("prompt"));
+            }
+            other => panic!("expected PermissionDenied, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn automation_matcher_is_narrow() {
+        assert!(automation_not_enabled(
+            "session not created",
+            "You must enable 'Allow remote automation' in the Developer section"
+        ));
+        assert!(automation_not_enabled(
+            "session not created",
+            "The session timed out while connecting to a Safari instance."
+        ));
+        // The same timeout text on another error kind is not this problem.
+        assert!(!automation_not_enabled(
+            "timeout",
+            "timed out while connecting to a Safari instance"
+        ));
+        assert!(!automation_not_enabled("no such element", "no element"));
+        assert!(!automation_not_enabled(
+            "session not created",
+            "Safari is not installed"
+        ));
+    }
+
+    #[test]
+    fn session_create_outlasts_the_drivers_own_timeout() {
+        // safaridriver gives up on a session after about 30 s.
+        assert!(SESSION_CREATE_TIMEOUT > Duration::from_secs(30));
+        assert!(SESSION_CREATE_TIMEOUT > DEFAULT_TIMEOUT);
     }
 
     #[test]

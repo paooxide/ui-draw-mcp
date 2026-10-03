@@ -175,6 +175,12 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- **Safari session creation no longer hides "automation not enabled" behind a timeout.** safaridriver waits ~30 s
+  for Safari before answering "session not created ... timed out while connecting to a Safari instance", but the
+  client gave up after 15 s and reported a bare `Timeout`. Session creation now waits 45 s, and that answer (like
+  the explicit "Allow remote automation" one) is a `PermissionDenied` that says to enable Develop > Allow Remote
+  Automation, run `safaridriver --enable`, restart Safari and accept any prompt.
+
 - A running call could not be stopped: the per-call cancel token was never tripped, so the kill switch
   and a human taking the mouse only blocked the next call. A running call now checks the kill switch every
   50 ms and cancels its token, and `notifications/cancelled` reaches the call it names; the stdio loop
