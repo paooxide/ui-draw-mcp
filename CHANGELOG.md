@@ -181,6 +181,20 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- **Safari: `browser_capture start` never armed the page, `browser_eval` ran only expressions, and `branch`/`checkpoint`
+  said the tab was not found.** The live suite on a real Safari showed three faults. The capture hook starts with a
+  line break, so `return <hook>` returned before running it (automatic semicolon insertion) and `start` reported
+  success with nothing recording. `browser_eval` wrapped the text in `return (...)`, so `a(); b` was a syntax error
+  and a returned promise came back as `{}`; it now evaluates like the Chrome path (last statement's value, promises
+  awaited, a throw is an error). `branch_create`, `checkpoint_save` and `checkpoint_rollback` on a Safari tab
+  failed with "target not found in any connected browser" and now return `UNSUPPORTED`.
+  `browser_wait htmx_settled` on a page without htmx is `NOT_FOUND` as on Chrome, and `challenge_cleared` works on
+  Safari instead of being an unknown condition.
+- **Safari live tests** now cover snapshot, click and type by ref, `fill_form`, `within`, `htmx_settled` against a
+  local fixture (no CDN), hostile semantic fields, and the explicit `UNSUPPORTED` results (recorder, network,
+  branches, checkpoints, emulation). The fixture servers handle each connection on its own thread: Safari opens idle
+  speculative sockets, and a one-at-a-time server stalled the page load behind one.
+
 - **Safari session creation no longer hides "automation not enabled" behind a timeout.** safaridriver waits ~30 s
   for Safari before answering "session not created ... timed out while connecting to a Safari instance", but the
   client gave up after 15 s and reported a bare `Timeout`. Session creation now waits 45 s, and that answer (like

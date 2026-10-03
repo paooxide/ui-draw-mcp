@@ -173,8 +173,11 @@ printf '%s\n' \
 The `browser` engine drives a Chromium-family browser (Chrome, Chromium, Edge or Brave) over the DevTools
 Protocol, and it is built for an agent to run regressions and UI tests natively. Safari is available on macOS
 as an experimental second engine through `safaridriver` (`launch.browser: "safari"`; run
-`safaridriver --enable` once). It covers navigation, `browser_act`, forms, cookies and screenshots, but has no
-network interception, dialog policy or device emulation. Firefox speaks a different protocol and is not
+`safaridriver --enable` once, enable Develop > Allow Remote Automation, and restart Safari). Verified live on
+Safari 27: navigation, snapshot, `browser_act` click and type by ref and selector, `within`, `browser_fill_form`,
+`htmx_settled`, cookies, profile state and restore, capture and screenshots. It has no network interception,
+dialog policy, key presses, device emulation, recording, branches or checkpoints (each returns `UNSUPPORTED`).
+`browser_capture` arms only the page that is open, not later navigations. Firefox speaks a different protocol and is not
 supported.
 
 - `browser_act` acts on a `ref` or, in one call, a `by`+`query` selector (no separate `browser_query`).
@@ -412,7 +415,7 @@ than test doubles. There are no fake backends in this repository by policy.
 | Protocol, policy, consent, audit, kill switch | Shipped, verified end to end |
 | Perception, input, windows, menus, capture | Shipped, validated on real macOS and on GNOME 50 (Wayland) |
 | Browser (CDP), including forms, profiles, branches, checkpoints, recording | Shipped, validated against live Chrome |
-| Browser on Safari (WebDriver) | Experimental; its live suite has not yet been run on a real Safari |
+| Browser on Safari (WebDriver) | Experimental; live suite run on Safari 27 (macOS 26.7); CDP-only features return `UNSUPPORTED` |
 | PII tokenizer, signed audit and compliance export, roles and invariants | Shipped, opt-in |
 | Demo mode (pointer glide, browser overlay) | Shipped, off by default |
 | Terminal, filesystem, network, system, credentials, PTY, packages, recall | Shipped |

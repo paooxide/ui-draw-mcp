@@ -770,6 +770,41 @@ struct NavPending {
     certain: bool,
 }
 
+/// `return <expr>;` for `execute/sync`. The expression is trimmed first: a
+/// `return` followed by a newline returns `undefined` (automatic semicolon
+/// insertion) and never runs the expression, which a constant that begins with
+/// a line break (`JS_CAPTURE_HOOK`) did, reporting success without arming.
+fn safari_return(expr: &str) -> String {
+    format!("return {};", expr.trim())
+}
+
+/// Script for `execute/async` that evaluates `expr` the way CDP
+/// `Runtime.evaluate` does: as a script whose completion value is the result
+/// (so `a(); b` and a plain expression both work), awaiting a returned
+/// promise. Reports `{ok, value}` or `{ok:false, error}`; never throws.
+fn safari_eval_script(expr: &str) -> String {
+    let src = serde_json::to_string(expr).unwrap_or_else(|_| "\"\"".into());
+    format!(
+        "var done = arguments[arguments.length - 1];\n\
+         try {{\n\
+           Promise.resolve((0, eval)({src})).then(\n\
+             function(v){{ done({{ok:true,value:v===undefined?null:v}}); }},\n\
+             function(e){{ done({{ok:false,error:String(e)}}); }});\n\
+         }} catch(e) {{ done({{ok:false,error:String(e)}}); }}"
+    )
+}
+
+/// Refuse a Safari (WebKit) target for a feature built on CDP, saying so,
+/// rather than letting it fail later as a target that "was not found".
+fn require_cdp_target(target: &str, what: &str) -> Result<(), BrowserError> {
+    if target.starts_with("safari-") {
+        return Err(BrowserError::Unsupported(format!(
+            "{what} needs the CDP (Chrome) engine; the WebKit engine cannot do it"
+        )));
+    }
+    Ok(())
+}
+
 /// A fresh marker value, unique within the process.
 fn new_nav_token() -> String {
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -1114,7 +1149,7 @@ impl CdpBackend {
                     if let Ok(entry) = self.get_safari_session(&t) {
                         let _ = entry
                             .session
-                            .execute_sync(&format!("return {script};"), &[])
+                            .execute_sync(&safari_return(script), &[])
                             .await;
                     }
                 } else if let Ok(mut c) = self.conn(&t).await {
@@ -2537,7 +2572,7 @@ impl BrowserBackend for CdpBackend {
             let entry = self.get_safari_session(target)?;
             let v = entry
                 .session
-                .execute_sync(&format!("return {expr};"), &[])
+                .execute_sync(&safari_return(&expr), &[])
                 .await?;
             return Ok(finish_snapshot(v));
         }
@@ -2578,7 +2613,7 @@ impl BrowserBackend for CdpBackend {
             let entry = self.get_safari_session(target)?;
             entry
                 .session
-                .execute_sync(&format!("return {expr};"), &[])
+                .execute_sync(&safari_return(&expr), &[])
                 .await?
         } else {
             let mut c = self.conn(target).await?;
@@ -2849,6 +2884,17 @@ impl BrowserBackend for CdpBackend {
         if target.starts_with("safari-") {
             let entry = self.get_safari_session(target)?;
             let deadline = Instant::now() + Duration::from_millis(timeout_ms.clamp(50, 60_000));
+            if cond == "challenge_cleared" || cond == "challenge" {
+                // Detection and the HUD run through `eval`, which the Safari
+                // engine has.
+                let res = crate::challenge::ChallengeManager::wait_for_clearance(
+                    self, target, timeout_ms,
+                )
+                .await?;
+                return Ok(json!({
+                    "settled": true, "condition": cond, "challenge": res, "engine": "webkit"
+                }));
+            }
             let probe = match cond {
                 "selector" => {
                     let s = arg.ok_or_else(|| {
@@ -2860,8 +2906,8 @@ impl BrowserBackend for CdpBackend {
                 "navigation" | "network_idle" => {
                     "return document.readyState==='complete';".to_string()
                 }
-                "dom_settled" => format!("return {JS_DOM_SETTLED};"),
-                "htmx_settled" => format!("return {JS_HTMX_SETTLED};"),
+                "dom_settled" => safari_return(JS_DOM_SETTLED),
+                "htmx_settled" => safari_return(JS_HTMX_SETTLED),
                 other => {
                     return Err(BrowserError::Failed(format!(
                         "unknown wait condition '{other}'"
@@ -2869,7 +2915,14 @@ impl BrowserBackend for CdpBackend {
                 }
             };
             loop {
-                let hit = entry.session.execute_sync(&probe, &[]).await?;
+                let hit = entry.session.execute_sync(&probe, &[]).await.map_err(|e| {
+                    // The probe throws this when `window.htmx` is missing.
+                    if cond == "htmx_settled" && err_msg(&e).contains("htmx not present") {
+                        BrowserError::NotFound("htmx not present on page".into())
+                    } else {
+                        e
+                    }
+                })?;
                 if hit.as_bool() == Some(true) {
                     if cond == "network_idle" {
                         sleep(Duration::from_millis(400)).await;
@@ -2977,7 +3030,7 @@ impl BrowserBackend for CdpBackend {
             );
             let found = entry
                 .session
-                .execute_sync(&format!("return {expr};"), &[])
+                .execute_sync(&safari_return(&expr), &[])
                 .await?;
             let (Some(el), Some(dims)) = (found.get(0), found.get(1)) else {
                 return Err(BrowserError::NotFound(format!("ref '{r}' not found")));
@@ -3103,14 +3156,25 @@ impl BrowserBackend for CdpBackend {
     async fn eval(&self, target: &str, expression: &str) -> Result<Value, BrowserError> {
         if target.starts_with("safari-") {
             let entry = self.get_safari_session(target)?;
-            let script = if expression.trim().starts_with("return ")
-                || expression.trim().starts_with("function")
-            {
-                expression.to_string()
+            let t = expression.trim();
+            let v = if t.starts_with("return ") || t.starts_with("function") {
+                entry.session.execute_sync(expression, &[]).await?
             } else {
-                format!("return ({expression});")
+                // Same semantics as the Chrome path: the value of the last
+                // statement, with a returned promise awaited.
+                let env = entry
+                    .session
+                    .execute_async(&safari_eval_script(expression), &[])
+                    .await?;
+                if env.get("ok").and_then(Value::as_bool) != Some(true) {
+                    let msg = env
+                        .get("error")
+                        .and_then(Value::as_str)
+                        .unwrap_or("eval returned no result");
+                    return Err(BrowserError::Failed(format!("eval: {msg}")));
+                }
+                env.get("value").cloned().unwrap_or(Value::Null)
             };
-            let v = entry.session.execute_sync(&script, &[]).await?;
             return Ok(json!({ "result": v, "engine": "webkit" }));
         }
 
@@ -3597,7 +3661,7 @@ impl BrowserBackend for CdpBackend {
             let entry = self.get_safari_session(target)?;
             match action {
                 "start" => {
-                    let expr = format!("return {JS_CAPTURE_HOOK};");
+                    let expr = safari_return(JS_CAPTURE_HOOK);
                     let now = entry.session.execute_sync(&expr, &[]).await?;
                     return Ok(json!({ "ok": true, "current_page": now, "engine": "webkit" }));
                 }
@@ -3815,7 +3879,7 @@ impl BrowserBackend for CdpBackend {
             let entry = self.get_safari_session(target)?;
             entry
                 .session
-                .execute_sync(&format!("return {expr};"), &[])
+                .execute_sync(&safari_return(&expr), &[])
                 .await?
         } else {
             let mut c = c_opt.unwrap();
@@ -3948,7 +4012,7 @@ impl BrowserBackend for CdpBackend {
             let entry = self.get_safari_session(target)?;
             entry
                 .session
-                .execute_sync(&format!("return {expr};"), &[])
+                .execute_sync(&safari_return(&expr), &[])
                 .await?
         } else {
             let mut c = self.conn(target).await?;
@@ -4088,6 +4152,7 @@ impl BrowserBackend for CdpBackend {
     }
 
     async fn branch_create(&self, target_id: &str, branch_id: &str) -> Result<Value, BrowserError> {
+        require_cdp_target(target_id, "branch_create")?;
         let b_id = branch_id.trim();
         if b_id.is_empty() {
             return Err(BrowserError::Failed("branch_id must not be empty".into()));
@@ -4396,6 +4461,7 @@ impl BrowserBackend for CdpBackend {
         target_id: &str,
         tag: Option<&str>,
     ) -> Result<Value, BrowserError> {
+        require_cdp_target(target_id, "checkpoint_save")?;
         let mut c = self.conn(target_id).await?;
         c.call("Network.enable", json!({})).await.ok();
         let r = c.call("Network.getCookies", json!({})).await?;
@@ -4531,6 +4597,7 @@ impl BrowserBackend for CdpBackend {
         target_id: &str,
         tag: Option<&str>,
     ) -> Result<Value, BrowserError> {
+        require_cdp_target(target_id, "checkpoint_rollback")?;
         let cp = {
             let store = self
                 .checkpoints
@@ -4762,7 +4829,7 @@ impl BrowserBackend for CdpBackend {
                 if let Ok(entry) = self.get_safari_session(target) {
                     let _ = entry
                         .session
-                        .execute_sync(&format!("return {init_script};"), &[])
+                        .execute_sync(&safari_return(&init_script), &[])
                         .await;
                 }
             } else if let Ok(mut c) = self.conn(target).await {
@@ -5461,5 +5528,30 @@ mod tests {
             b.resolve_ws("ABC").await,
             Err(BrowserError::NotFound(_))
         ));
+    }
+
+    #[test]
+    fn cdp_only_features_refuse_a_safari_target_explicitly() {
+        assert!(matches!(
+            require_cdp_target("safari-1", "branch_create"),
+            Err(BrowserError::Unsupported(m)) if m.contains("branch_create")
+        ));
+        assert!(require_cdp_target("ABC123", "branch_create").is_ok());
+    }
+
+    #[test]
+    fn safari_return_is_not_defeated_by_a_leading_newline() {
+        assert_eq!(
+            safari_return("\n  (function(){})()\n"),
+            "return (function(){})();"
+        );
+        assert_eq!(safari_return("1"), "return 1;");
+    }
+
+    #[test]
+    fn safari_eval_script_embeds_the_expression_as_a_string_literal() {
+        let s = safari_eval_script("a(); \"q\"\n+ 1");
+        assert!(s.contains(r#"(0, eval)("a(); \"q\"\n+ 1")"#), "{s}");
+        assert!(s.contains("Promise.resolve"));
     }
 }
