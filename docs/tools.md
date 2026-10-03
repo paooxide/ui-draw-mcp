@@ -1016,7 +1016,7 @@ Emulate a viewport for responsive testing: override the page's device metrics (w
 
 `browser_wait` · read tier
 
-Wait for a settle signal: a selector to appear, dom_settled (DOM mutations and animation frames settled for >=150ms), htmx_settled (HTMX requests and DOM swaps settled; errors if htmx is not present on the page), navigation to complete (after a goto, reload, click, submit or key press in this session it waits for the NEW document, not the one being left; a click that starts no navigation within 2s settles on the loaded page with navigated:false), the network to idle, or verification challenge clearance.
+Wait for a settle signal: a selector to appear, dom_settled (DOM mutations and animation frames settled for >=150ms), htmx_settled (HTMX requests and DOM swaps settled; errors if htmx is not present on the page), navigation to complete (after a goto, reload, click, submit or key press in this session it waits for the NEW document, not the one being left; a click that starts no navigation within navigation_timeout_ms, default 2s, settles on the loaded page with navigated:false; raise it for a handler that navigates later than that), the network to idle, or verification challenge clearance.
 
 | Argument | Type | Required | Description |
 |---|---|---|---|
@@ -1025,6 +1025,7 @@ Wait for a settle signal: a selector to appear, dom_settled (DOM mutations and a
 | `dom_settled` | boolean |  |  |
 | `htmx_settled` | boolean |  |  |
 | `navigation` | boolean |  |  |
+| `navigation_timeout_ms` | integer |  | navigation only: how long (ms, 0-30000, default 2000) to keep expecting a navigation that a click, submit or key press has not started yet, before settling on the loaded page with navigated:false. Does not apply after goto, reload, back or forward, which always navigate; timeout_ms still bounds the whole wait |
 | `network_idle` | boolean |  |  |
 | `selector` | string |  |  |
 | `target_id` | string | yes |  |

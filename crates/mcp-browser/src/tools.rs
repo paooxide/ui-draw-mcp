@@ -786,9 +786,34 @@ impl BrowserModule {
                 "provide one of 'selector', 'dom_settled', 'htmx_settled', 'navigation', 'network_idle', or 'challenge_cleared'",
             );
         };
+        let nav_window = match args.get("navigation_timeout_ms") {
+            None | Some(Value::Null) => None,
+            Some(v) => match nav_window_arg(v) {
+                Some(n) => Some(n),
+                None => {
+                    return Envelope::fail(
+                        "browser_wait",
+                        ErrorCode::InvalidArgs,
+                        format!(
+                            "navigation_timeout_ms must be an integer from 0 to {}",
+                            crate::backend::NAV_EXPECT_MAX_MS
+                        ),
+                    )
+                }
+            },
+        };
+        if nav_window.is_some() && cond != "navigation" {
+            return Envelope::fail(
+                "browser_wait",
+                ErrorCode::InvalidArgs,
+                "navigation_timeout_ms only applies to the 'navigation' condition",
+            );
+        }
         result(
             "browser_wait",
-            self.backend.wait(target, cond, arg, timeout_ms).await,
+            self.backend
+                .wait_window(target, cond, arg, timeout_ms, nav_window)
+                .await,
         )
     }
 
@@ -1602,7 +1627,19 @@ impl BrowserModule {
                     .get("timeout_ms")
                     .and_then(Value::as_u64)
                     .unwrap_or(10_000);
-                self.backend.wait(target, cond, arg, t).await
+                let window = match step.get("navigation_timeout_ms") {
+                    None | Some(Value::Null) => None,
+                    Some(v) => match nav_window_arg(v) {
+                        Some(n) => Some(n),
+                        None => {
+                            return (
+                                false,
+                                json!("navigation_timeout_ms must be an integer from 0 to 30000"),
+                            )
+                        }
+                    },
+                };
+                self.backend.wait_window(target, cond, arg, t, window).await
             }
             "capture" => {
                 self.backend
@@ -1624,6 +1661,12 @@ impl BrowserModule {
             Err(e) => (false, json!(browser_err_msg(&e))),
         }
     }
+}
+
+/// A `navigation_timeout_ms` value: an integer within the allowed window.
+fn nav_window_arg(v: &Value) -> Option<u64> {
+    v.as_u64()
+        .filter(|n| *n <= crate::backend::NAV_EXPECT_MAX_MS)
 }
 
 /// A flow step that makes the tab answer its dialogs "yes".
@@ -1903,7 +1946,7 @@ impl ToolModule for BrowserModule {
                 Category::Browser,
                 Tier::Read,
                 "Wait for a settle signal: a selector to appear, dom_settled (DOM mutations and \
-                 animation frames settled for >=150ms), htmx_settled (HTMX requests and DOM swaps settled; errors if htmx is not present on the page), navigation to complete (after a goto, reload, click, submit or key press in this session it waits for the NEW document, not the one being left; a click that starts no navigation within 2s settles on the loaded page with navigated:false), the network to idle, or verification challenge clearance.",
+                 animation frames settled for >=150ms), htmx_settled (HTMX requests and DOM swaps settled; errors if htmx is not present on the page), navigation to complete (after a goto, reload, click, submit or key press in this session it waits for the NEW document, not the one being left; a click that starts no navigation within navigation_timeout_ms, default 2s, settles on the loaded page with navigated:false; raise it for a handler that navigates later than that), the network to idle, or verification challenge clearance.",
                 obj(
                     json!({
                         "target_id": { "type": "string" },
@@ -1914,7 +1957,8 @@ impl ToolModule for BrowserModule {
                         "network_idle": { "type": "boolean" },
                         "challenge_cleared": { "type": "boolean" },
                         "condition": { "type": "string", "enum": ["selector", "dom_settled", "htmx_settled", "navigation", "network_idle", "challenge_cleared"] },
-                        "timeout_ms": { "type": "integer" }
+                        "timeout_ms": { "type": "integer" },
+                        "navigation_timeout_ms": { "type": "integer", "description": "navigation only: how long (ms, 0-30000, default 2000) to keep expecting a navigation that a click, submit or key press has not started yet, before settling on the loaded page with navigated:false. Does not apply after goto, reload, back or forward, which always navigate; timeout_ms still bounds the whole wait" }
                     }),
                     json!(["target_id"]),
                 ),

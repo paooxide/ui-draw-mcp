@@ -183,6 +183,15 @@ All notable changes to this project are documented here. The format follows
   later (a timer, a debounce), because that page still reports `complete`. It now waits for a loaded
   document that is not the one the action left, and a click that navigates nowhere within 2 s settles
   with `navigated: false`.
+- `browser_wait navigation` gave up on a click whose handler navigated later than the fixed 2 s window
+  (a slow analytics call before `location` changes), settling on the old page with `navigated: false`
+  while the new one was still coming. `navigation_timeout_ms` (0 to 30000, default 2000) sets the window
+  per call, and a `wait` flow step takes it too. `timeout_ms` still bounds the whole wait.
+- `browser_navigate back` and `forward` did not mark the document they left the way `goto` and `reload`
+  do, so a `wait navigation` after them had only the old page's `readyState` to go on. They now plant the
+  marker, so the wait is for the history entry's page. An entry made by `history.pushState` or a fragment
+  change keeps the document, and Chrome says so, so the marker is dropped and the wait settles at once
+  instead of running out its timeout.
 - The CDP client could lose half a WebSocket frame when a read was cancelled by a timeout, corrupting the
   rest of the stream. Reads are now buffered and cancel-safe.
 - `pty_spawn` with no `shell` picked the first allowed shell whether or not it existed, so on a machine

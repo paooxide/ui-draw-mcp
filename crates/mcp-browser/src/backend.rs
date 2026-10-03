@@ -121,6 +121,22 @@ pub trait BrowserBackend: Send + Sync {
         arg: Option<&str>,
         timeout_ms: u64,
     ) -> Result<Value, BrowserError>;
+    /// [`BrowserBackend::wait`] with `nav_window_ms`: for `navigation` after a
+    /// click, submit or key press, how long to keep expecting a navigation
+    /// that has not begun yet (a handler that defers `location`) before
+    /// settling on the loaded page with `navigated: false`. `None` is the
+    /// default (2 s); values above 30 s are capped. Other conditions ignore it.
+    async fn wait_window(
+        &self,
+        target: &str,
+        cond: &str,
+        arg: Option<&str>,
+        timeout_ms: u64,
+        nav_window_ms: Option<u64>,
+    ) -> Result<Value, BrowserError> {
+        let _ = nav_window_ms;
+        self.wait(target, cond, arg, timeout_ms).await
+    }
     /// Screenshot the page or one element.
     async fn screenshot(&self, target: &str, node_ref: Option<&str>) -> Result<Shot, BrowserError>;
     /// Emulate a viewport for responsive testing (device metrics override).
@@ -659,8 +675,13 @@ async fn observe_session(
 /// submit or key press may have started but that has not begun yet (a handler
 /// that defers `location` with a timer). After this the click is taken to
 /// have navigated nowhere and the wait settles on the loaded page, reporting
-/// `navigated: false`. Not applied to goto/reload, which always navigate.
+/// `navigated: false`. Not applied to goto/reload/back/forward, which always
+/// navigate. This is the default; `browser_wait` can set it per call
+/// (`navigation_timeout_ms`) up to [`NAV_EXPECT_MAX_MS`].
 const NAV_EXPECT_MS: u64 = 2_000;
+
+/// The most a caller may raise the window to.
+pub const NAV_EXPECT_MAX_MS: u64 = 30_000;
 
 /// A document-identity marker waiting to be left behind. See
 /// [`CdpBackend::nav_pending`].
@@ -694,6 +715,7 @@ fn nav_probe_verdict(
     pending_token: &str,
     certain: bool,
     since_set: std::time::Duration,
+    expect_ms: u64,
 ) -> Option<bool> {
     if ready_state != "complete" {
         return None;
@@ -701,7 +723,7 @@ fn nav_probe_verdict(
     if marker != Some(pending_token) {
         return Some(true);
     }
-    if !certain && since_set >= std::time::Duration::from_millis(NAV_EXPECT_MS) {
+    if !certain && since_set >= std::time::Duration::from_millis(expect_ms) {
         return Some(false);
     }
     None
@@ -779,6 +801,7 @@ impl CdpBackend {
         c: &mut CdpConn,
         pending: NavPending,
         timeout_ms: u64,
+        expect_ms: u64,
     ) -> Result<Value, BrowserError> {
         let deadline = tokio::time::Instant::now()
             + tokio::time::Duration::from_millis(timeout_ms.clamp(50, 60_000));
@@ -795,6 +818,7 @@ impl CdpBackend {
                     &pending.token,
                     pending.certain,
                     pending.set_at.elapsed(),
+                    expect_ms,
                 );
                 if let Some(navigated) = verdict {
                     self.clear_nav_pending(target, Some(&pending.token));
@@ -2137,11 +2161,36 @@ impl BrowserBackend for CdpBackend {
                     .get("id")
                     .cloned()
                     .unwrap_or(json!(0));
-                c.call(
-                    "Page.navigateToHistoryEntry",
-                    json!({ "entryId": entry_id }),
-                )
-                .await?;
+                // Mark the document being left, like goto and reload do, so a
+                // `wait navigation` that follows waits for the entry's page
+                // instead of returning on this one while the load is slow.
+                self.plant_nav_token(&mut c, target, true).await;
+                c.keep_events(true);
+                let went = c
+                    .call(
+                        "Page.navigateToHistoryEntry",
+                        json!({ "entryId": entry_id }),
+                    )
+                    .await;
+                c.keep_events(false);
+                let early = c.take_events();
+                if let Err(e) = went {
+                    self.clear_nav_pending(target, None);
+                    return Err(e);
+                }
+                // An entry made by `history.pushState` or a fragment change
+                // keeps the document (and the marker): nothing to wait for.
+                // Chrome reports it as soon as the history entry is applied.
+                let within = |v: &Value| {
+                    v.get("method").and_then(Value::as_str) == Some("Page.navigatedWithinDocument")
+                };
+                let same_document = early.iter().any(within)
+                    || c.collect_events(&["Page.navigatedWithinDocument"], 150, 1)
+                        .await
+                        .is_ok_and(|e| !e.is_empty());
+                if same_document {
+                    self.clear_nav_pending(target, None);
+                }
                 let u = entries[target_idx as usize].get("url").cloned();
                 json!({ "url": u })
             }
@@ -2633,6 +2682,17 @@ impl BrowserBackend for CdpBackend {
         arg: Option<&str>,
         timeout_ms: u64,
     ) -> Result<Value, BrowserError> {
+        self.wait_window(target, cond, arg, timeout_ms, None).await
+    }
+
+    async fn wait_window(
+        &self,
+        target: &str,
+        cond: &str,
+        arg: Option<&str>,
+        timeout_ms: u64,
+        nav_window_ms: Option<u64>,
+    ) -> Result<Value, BrowserError> {
         use tokio::time::{sleep, Duration, Instant};
         if target.starts_with("safari-") {
             let entry = self.get_safari_session(target)?;
@@ -2680,8 +2740,11 @@ impl BrowserBackend for CdpBackend {
         // document from the new, so the plain `readyState` check below stands.
         if cond == "navigation" {
             if let Some(pending) = self.nav_pending_for(target) {
+                let expect_ms = nav_window_ms
+                    .unwrap_or(NAV_EXPECT_MS)
+                    .min(NAV_EXPECT_MAX_MS);
                 return self
-                    .wait_replaced_document(target, &mut c, pending, timeout_ms)
+                    .wait_replaced_document(target, &mut c, pending, timeout_ms, expect_ms)
                     .await;
             }
         }
@@ -4958,44 +5021,99 @@ mod tests {
         let ms = Duration::from_millis;
         // Still the marked (old) document: keep waiting, however loaded it looks.
         assert_eq!(
-            nav_probe_verdict(Some("t1"), "complete", "t1", true, ms(5)),
+            nav_probe_verdict(Some("t1"), "complete", "t1", true, ms(5), NAV_EXPECT_MS),
             None
         );
         // New document, still loading: keep waiting.
-        assert_eq!(nav_probe_verdict(None, "loading", "t1", true, ms(5)), None);
         assert_eq!(
-            nav_probe_verdict(None, "interactive", "t1", true, ms(5)),
+            nav_probe_verdict(None, "loading", "t1", true, ms(5), NAV_EXPECT_MS),
+            None
+        );
+        assert_eq!(
+            nav_probe_verdict(None, "interactive", "t1", true, ms(5), NAV_EXPECT_MS),
             None
         );
         // New document, loaded: done, and it did navigate. A different marker
         // (a page that set its own) is also a different document.
         assert_eq!(
-            nav_probe_verdict(None, "complete", "t1", true, ms(5)),
+            nav_probe_verdict(None, "complete", "t1", true, ms(5), NAV_EXPECT_MS),
             Some(true)
         );
         assert_eq!(
-            nav_probe_verdict(Some("t0"), "complete", "t1", false, ms(5)),
+            nav_probe_verdict(Some("t0"), "complete", "t1", false, ms(5), NAV_EXPECT_MS),
             Some(true)
         );
         // goto/reload always navigate: never give up on the marked document.
         assert_eq!(
-            nav_probe_verdict(Some("t1"), "complete", "t1", true, ms(NAV_EXPECT_MS * 10)),
+            nav_probe_verdict(
+                Some("t1"),
+                "complete",
+                "t1",
+                true,
+                ms(NAV_EXPECT_MS * 10),
+                NAV_EXPECT_MS
+            ),
             None
         );
         // A click might not: within the grace keep waiting, after it settle
         // on the loaded page and say nothing navigated.
         assert_eq!(
-            nav_probe_verdict(Some("t1"), "complete", "t1", false, ms(NAV_EXPECT_MS - 1)),
+            nav_probe_verdict(
+                Some("t1"),
+                "complete",
+                "t1",
+                false,
+                ms(NAV_EXPECT_MS - 1),
+                NAV_EXPECT_MS
+            ),
             None
         );
         assert_eq!(
-            nav_probe_verdict(Some("t1"), "complete", "t1", false, ms(NAV_EXPECT_MS)),
+            nav_probe_verdict(
+                Some("t1"),
+                "complete",
+                "t1",
+                false,
+                ms(NAV_EXPECT_MS),
+                NAV_EXPECT_MS
+            ),
             Some(false)
         );
         // ...but never while the marked document is still loading.
         assert_eq!(
-            nav_probe_verdict(Some("t1"), "loading", "t1", false, ms(NAV_EXPECT_MS * 5)),
+            nav_probe_verdict(
+                Some("t1"),
+                "loading",
+                "t1",
+                false,
+                ms(NAV_EXPECT_MS * 5),
+                NAV_EXPECT_MS
+            ),
             None
+        );
+    }
+
+    /// The window a click's navigation is expected within is the caller's.
+    #[test]
+    fn nav_probe_verdict_uses_the_callers_window() {
+        let ms = std::time::Duration::from_millis;
+        assert_eq!(
+            nav_probe_verdict(Some("t1"), "complete", "t1", false, ms(4_999), 5_000),
+            None
+        );
+        assert_eq!(
+            nav_probe_verdict(Some("t1"), "complete", "t1", false, ms(5_000), 5_000),
+            Some(false)
+        );
+        // A zero window gives up as soon as the document has loaded.
+        assert_eq!(
+            nav_probe_verdict(Some("t1"), "complete", "t1", false, ms(0), 0),
+            Some(false)
+        );
+        // Whatever the window, a replaced document still wins.
+        assert_eq!(
+            nav_probe_verdict(None, "complete", "t1", false, ms(1), 5_000),
+            Some(true)
         );
     }
 
