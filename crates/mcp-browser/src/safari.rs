@@ -592,12 +592,13 @@ async fn webdriver_request_with_timeout(
     let req_headers = format!(
         "{method} {path} HTTP/1.1\r\n\
          Host: {host}:{port}\r\n\
-         User-Agent: agentctl/0.1.0\r\n\
+         User-Agent: agentctl/{version}\r\n\
          Accept: application/json\r\n\
          Content-Type: application/json\r\n\
          Content-Length: {}\r\n\
          Connection: close\r\n\r\n",
-        body_bytes.len()
+        body_bytes.len(),
+        version = env!("CARGO_PKG_VERSION"),
     );
 
     stream

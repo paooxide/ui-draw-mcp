@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-04
+
 ### Added
 
 - **`browser_connect` `launch.port = 0`** (also the default when `port` is omitted) lets Chrome choose its own
@@ -320,6 +322,8 @@ All notable changes to this project are documented here. The format follows
 
 ### Changed
 
+- Release archives are built for macOS (Apple silicon and Intel) and Linux (x86_64 and ARM64) only. There is
+  no Windows archive: the Windows desktop backend does not exist, and nothing else has been tested on Windows.
 - The SSRF guard moved from `mcp-net` into its own dependency-free crate, `mcp-ssrf`, so the browser
   engine can share it without one engine depending on another. `mcp-net` re-exports it unchanged.
 - Driving a local development server through the browser now needs `browser.allow_private = true`.
@@ -514,5 +518,6 @@ Field bugs that only a run on real hardware could surface:
 - The destructive-command gate cannot see through shell expansion, and hard links are invisible to path
   resolution. Both are documented in [`SECURITY.md`](SECURITY.md) and asserted by tests.
 
-[Unreleased]: https://github.com/paooxide/ui-draw-mcp/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/paooxide/ui-draw-mcp/releases/tag/v0.1.0
+[Unreleased]: https://github.com/paooxide/ui-draw-mcp/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/paooxide/ui-draw-mcp/compare/v0.1.0...v0.2.0
+[0.1.0]: https://github.com/paooxide/ui-draw-mcp/tree/v0.1.0

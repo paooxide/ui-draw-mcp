@@ -93,10 +93,10 @@ filesystem, process, network, system, credential, PTY, package and recall engine
 **From a release.** Download the archive for your platform, verify it, and unpack:
 
 ```sh
-curl -LO https://github.com/paooxide/ui-draw-mcp/releases/download/v0.1.0/agentctl-v0.1.0-aarch64-apple-darwin.tar.gz
-curl -LO https://github.com/paooxide/ui-draw-mcp/releases/download/v0.1.0/SHA256SUMS
+curl -LO https://github.com/paooxide/ui-draw-mcp/releases/download/v0.2.0/agentctl-v0.2.0-aarch64-apple-darwin.tar.gz
+curl -LO https://github.com/paooxide/ui-draw-mcp/releases/download/v0.2.0/SHA256SUMS
 shasum -a 256 -c SHA256SUMS --ignore-missing
-tar xzf agentctl-v0.1.0-aarch64-apple-darwin.tar.gz
+tar xzf agentctl-v0.2.0-aarch64-apple-darwin.tar.gz
 ```
 
 Release binaries are **not signed or notarized**. macOS quarantines anything a browser downloaded, so clear
