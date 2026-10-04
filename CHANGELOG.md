@@ -324,6 +324,8 @@ All notable changes to this project are documented here. The format follows
 
 - Release archives are built for macOS (Apple silicon and Intel) and Linux (x86_64 and ARM64) only. There is
   no Windows archive: the Windows desktop backend does not exist, and nothing else has been tested on Windows.
+  The Linux archives link against glibc 2.28, so they run on RHEL 8, Debian 10, Ubuntu 20.04 and anything
+  newer; the release workflow fails a Linux build that needs more, or that does not start on AlmaLinux 8.
 - The SSRF guard moved from `mcp-net` into its own dependency-free crate, `mcp-ssrf`, so the browser
   engine can share it without one engine depending on another. `mcp-net` re-exports it unchanged.
 - Driving a local development server through the browser now needs `browser.allow_private = true`.

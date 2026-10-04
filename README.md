@@ -90,7 +90,9 @@ against the previous frame, so polling an unchanged screen costs nothing.
 Desktop control runs on macOS (AXUIElement) and Linux (AT-SPI and the desktop portals). The browser,
 filesystem, process, network, system, credential, PTY, package and recall engines run on both.
 
-**From a release.** Download the archive for your platform, verify it, and unpack:
+**From a release.** Archives are built for macOS (Apple silicon and Intel) and Linux (x86_64 and ARM64;
+glibc 2.28 or newer, so RHEL 8, Debian 10, Ubuntu 20.04 and later). Download the one for your platform,
+verify it, and unpack:
 
 ```sh
 curl -LO https://github.com/paooxide/ui-draw-mcp/releases/download/v0.2.0/agentctl-v0.2.0-aarch64-apple-darwin.tar.gz
