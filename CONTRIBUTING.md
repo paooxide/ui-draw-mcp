@@ -1,5 +1,7 @@
 # Contributing
 
+Participation is covered by the [Code of Conduct](CODE_OF_CONDUCT.md).
+
 ## Build and check
 
 ```sh
