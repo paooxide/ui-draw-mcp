@@ -25,20 +25,13 @@ jobs:
         include:
           - os: macos-latest
             target: aarch64-apple-darwin
-            archive: tar.gz
           # Cross-compiled on the arm64 runner: Apple's toolchain links both.
           - os: macos-latest
             target: x86_64-apple-darwin
-            archive: tar.gz
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            archive: tar.gz
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
-            archive: tar.gz
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            archive: zip
     steps:
       - uses: actions/checkout@v7
 
@@ -74,19 +67,11 @@ jobs:
           version=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
           name="agentctl-v${version}-${{ matrix.target }}"
           mkdir -p "dist/$name"
-          if [ "${{ matrix.archive }}" = "zip" ]; then
-            cp "target/${{ matrix.target }}/release/agentctl.exe" "dist/$name/"
-          else
-            cp "target/${{ matrix.target }}/release/agentctl" "dist/$name/"
-          fi
+          cp "target/${{ matrix.target }}/release/agentctl" "dist/$name/"
           cp LICENSE README.md CHANGELOG.md config.example.toml "dist/$name/"
           cd dist
-          if [ "${{ matrix.archive }}" = "zip" ]; then
-            7z a -tzip "$name.zip" "$name" > /dev/null
-          else
-            tar czf "$name.tar.gz" "$name"
-          fi
-          echo "ASSET=$name.${{ matrix.archive }}" >> "$GITHUB_ENV"
+          tar czf "$name.tar.gz" "$name"
+          echo "ASSET=$name.tar.gz" >> "$GITHUB_ENV"
 
       - uses: actions/upload-artifact@v7
         with:
@@ -110,7 +95,7 @@ jobs:
       - name: Checksums
         working-directory: dist
         run: |
-          sha256sum ./*.tar.gz ./*.zip > SHA256SUMS
+          sha256sum ./*.tar.gz > SHA256SUMS
           cat SHA256SUMS
 
       # The changelog section for this tag becomes the release body, so the
