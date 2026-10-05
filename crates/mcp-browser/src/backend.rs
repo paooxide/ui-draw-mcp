@@ -5557,39 +5557,60 @@ pub(crate) fn eval_timeout_message(timeout_ms: u64, terminate_sent: bool) -> Str
     )
 }
 
-/// Flags that may not be passed through `launch.args`: either ones agentctl
-/// manages itself, or ones that switch off a protection the rest of the tool
-/// surface relies on (the DevTools socket staying on loopback and
-/// origin-checked, the sandbox, same-origin and TLS checks, extensions, and
-/// the navigation policy, which `--app`, proxy and host-resolver flags would
-/// sidestep). Names only, without the leading `--`.
-pub(crate) const DENIED_LAUNCH_FLAGS: &[&str] = &[
-    "remote-debugging-port",
-    "remote-debugging-address",
-    "remote-debugging-pipe",
-    "remote-allow-origins",
-    "user-data-dir",
-    "no-sandbox",
-    "disable-web-security",
-    "disable-site-isolation-trials",
-    "ignore-certificate-errors",
-    "allow-running-insecure-content",
-    "allow-file-access-from-files",
-    "unsafely-treat-insecure-origin-as-secure",
-    "load-extension",
-    "app",
-    "proxy-server",
-    "proxy-pac-url",
-    "host-resolver-rules",
-    "host-rules",
+/// Flags `launch.args` may pass, names only (without the leading `--`). An
+/// allowlist, not a denylist: Chrome has flags that run a program of the
+/// caller's choosing (`--renderer-cmd-prefix`, `--gpu-launcher`,
+/// `--browser-subprocess-path`), open the DevTools socket beyond loopback, or
+/// switch off the sandbox, site isolation, TLS checks or the navigation
+/// policy, and new ones arrive with each release. `browser_connect` is
+/// standard tier, so it may only reach flags that change how the browser looks
+/// and paces itself.
+pub(crate) const ALLOWED_LAUNCH_FLAGS: &[&str] = &[
+    "window-size",
+    "window-position",
+    "start-maximized",
+    "start-fullscreen",
+    "force-device-scale-factor",
+    "hide-scrollbars",
+    "force-dark-mode",
+    "lang",
+    "accept-lang",
+    "user-agent",
+    "mute-audio",
+    "autoplay-policy",
+    "disable-gpu",
+    "disable-extensions",
+    "disable-notifications",
+    "disable-default-apps",
+    "disable-sync",
+    "disable-search-engine-choice-screen",
+    "use-fake-device-for-media-stream",
+    "auto-open-devtools-for-tabs",
+    "incognito",
+    "disable-backgrounding-occluded-windows",
+    "disable-renderer-backgrounding",
+    "disable-background-timer-throttling",
+    "disable-features",
+];
+
+/// Features `--disable-features` may name. Restricted for the same reason as
+/// the flags: the feature list also reaches site isolation and private
+/// network protections (`--disable-features=IsolateOrigins,site-per-process`).
+pub(crate) const ALLOWED_DISABLED_FEATURES: &[&str] = &[
+    "CalculateNativeWinOcclusion",
+    "Translate",
+    "MediaRouter",
+    "OptimizationHints",
+    "AutofillServerCommunication",
+    "PaintHolding",
 ];
 
 const MAX_LAUNCH_ARGS: usize = 32;
 const MAX_LAUNCH_ARG_LEN: usize = 256;
 
 /// Validate `launch.args`: an array of at most 32 strings, each a `--flag` or
-/// `--flag=value` with no whitespace or control characters, none on the
-/// denylist. Returns them as given.
+/// `--flag=value` with no whitespace or control characters, each on
+/// [`ALLOWED_LAUNCH_FLAGS`]. Returns them as given.
 pub(crate) fn validate_launch_args(args: &Value) -> Result<Vec<String>, String> {
     let Some(arr) = args.as_array() else {
         return Err("launch.args must be an array of strings".into());
@@ -5627,10 +5648,23 @@ pub(crate) fn validate_launch_args(args: &Value) -> Result<Vec<String>, String> 
         {
             return Err(format!("launch.args entry {a:?} is not a valid --flag"));
         }
-        if DENIED_LAUNCH_FLAGS.contains(&name.as_str()) {
+        if !ALLOWED_LAUNCH_FLAGS.contains(&name.as_str()) {
             return Err(format!(
-                "launch.args flag --{name} is not allowed: agentctl manages it or it weakens a protection"
+                "launch.args flag --{name} is not allowed; permitted: --{}",
+                ALLOWED_LAUNCH_FLAGS.join(", --")
             ));
+        }
+        if name == "disable-features" {
+            let list = body.split_once('=').map(|(_, v)| v).unwrap_or("");
+            if let Some(f) = list
+                .split(',')
+                .find(|f| !f.is_empty() && !ALLOWED_DISABLED_FEATURES.contains(f))
+            {
+                return Err(format!(
+                    "launch.args --disable-features may not name {f:?}; permitted: {}",
+                    ALLOWED_DISABLED_FEATURES.join(", ")
+                ));
+            }
         }
         out.push(a.to_string());
     }
@@ -5846,30 +5880,61 @@ mod tests {
         ] {
             assert!(validate_launch_args(&bad).is_err(), "{bad}");
         }
-        let many: Vec<String> = (0..33).map(|i| format!("--flag{i}")).collect();
+        let many: Vec<String> = (0..33).map(|i| format!("--lang=l{i}")).collect();
         assert!(validate_launch_args(&json!(many)).is_err());
-        let max: Vec<String> = (0..32).map(|i| format!("--flag{i}")).collect();
+        let max: Vec<String> = (0..32).map(|i| format!("--lang=l{i}")).collect();
         assert_eq!(validate_launch_args(&json!(max)).unwrap().len(), 32);
     }
 
     #[test]
-    fn launch_args_reject_every_denied_flag_in_any_spelling() {
-        for name in DENIED_LAUNCH_FLAGS {
-            assert!(
-                validate_launch_args(&json!([format!("--{name}")])).is_err(),
-                "{name}"
-            );
-            assert!(
-                validate_launch_args(&json!([format!("--{name}=x")])).is_err(),
-                "{name}=x"
-            );
-            assert!(
-                validate_launch_args(&json!([format!("--{}=x", name.to_uppercase())])).is_err(),
-                "{name} upper-cased"
-            );
+    fn launch_args_refuse_flags_off_the_allowlist() {
+        // Flags that run a program, widen the DevTools socket, or drop a
+        // protection; any spelling.
+        for name in [
+            "renderer-cmd-prefix",
+            "gpu-launcher",
+            "utility-cmd-prefix",
+            "browser-subprocess-path",
+            "remote-debugging-address",
+            "remote-debugging-port",
+            "remote-allow-origins",
+            "user-data-dir",
+            "no-sandbox",
+            "disable-web-security",
+            "ignore-certificate-errors",
+            "load-extension",
+            "app",
+            "proxy-server",
+            "host-resolver-rules",
+            "enable-features",
+        ] {
+            for spelled in [
+                format!("--{name}"),
+                format!("--{name}=x"),
+                format!("--{}=x", name.to_uppercase()),
+            ] {
+                assert!(
+                    validate_launch_args(&json!([spelled])).is_err(),
+                    "{spelled}"
+                );
+            }
         }
-        let e = validate_launch_args(&json!(["--remote-debugging-address=0.0.0.0"])).unwrap_err();
-        assert!(e.contains("remote-debugging-address"), "{e}");
+        let e = validate_launch_args(&json!(["--gpu-launcher=/tmp/x"])).unwrap_err();
+        assert!(e.contains("gpu-launcher") && e.contains("--lang"), "{e}");
+        for name in ALLOWED_LAUNCH_FLAGS {
+            assert!(validate_launch_args(&json!([format!("--{name}")])).is_ok());
+        }
+    }
+
+    #[test]
+    fn disable_features_is_limited_to_harmless_features() {
+        assert!(validate_launch_args(&json!(["--disable-features=Translate,MediaRouter"])).is_ok());
+        for bad in [
+            "--disable-features=IsolateOrigins,site-per-process",
+            "--disable-features=Translate,BlockInsecurePrivateNetworkRequests",
+        ] {
+            assert!(validate_launch_args(&json!([bad])).is_err(), "{bad}");
+        }
     }
 
     #[test]
