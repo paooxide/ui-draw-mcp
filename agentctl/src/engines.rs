@@ -223,6 +223,7 @@ pub fn build_stack(cfg: &PolicyConfig) -> (Vec<Arc<dyn ToolModule>>, Wiring) {
                     state_dir(cfg).join("browser_baselines.json"),
                     500,
                 ))
+                .with_media_dir(state_dir(cfg).join("media"))
                 .with_judge(judge.clone()),
         ));
 

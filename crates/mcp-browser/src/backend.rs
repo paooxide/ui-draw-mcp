@@ -139,6 +139,34 @@ pub trait BrowserBackend: Send + Sync {
     }
     /// Screenshot the page or one element.
     async fn screenshot(&self, target: &str, node_ref: Option<&str>) -> Result<Shot, BrowserError>;
+    /// Start recording a tab to numbered JPEG frames under `media_dir`.
+    async fn screencast_start(
+        &self,
+        target: &str,
+        media_dir: &std::path::Path,
+        opts: crate::screencast::ScreencastOpts,
+    ) -> Result<Value, BrowserError> {
+        let _ = (target, media_dir, opts);
+        Err(BrowserError::Unsupported(
+            "this backend cannot record video".into(),
+        ))
+    }
+    /// Stop a recording (by tab or recording id) and encode it.
+    async fn screencast_stop(
+        &self,
+        target: Option<&str>,
+        recording_id: Option<&str>,
+        keep_frames: bool,
+    ) -> Result<Value, BrowserError> {
+        let _ = (target, recording_id, keep_frames);
+        Err(BrowserError::Unsupported(
+            "this backend cannot record video".into(),
+        ))
+    }
+    /// The active recordings.
+    async fn screencast_status(&self) -> Result<Value, BrowserError> {
+        Ok(json!({ "recordings": [] }))
+    }
     /// Emulate a viewport for responsive testing (device metrics override).
     /// `width == 0` clears the override and restores the real window size.
     async fn set_viewport(
@@ -416,6 +444,8 @@ pub struct CdpBackend {
     nav_pending: Mutex<HashMap<String, NavPending>>,
     /// Tabs being watched across navigations (the recorder), by target id.
     observers: Mutex<HashMap<String, Observer>>,
+    /// Video recordings (`browser_screencast`), each on its own session.
+    screencasts: crate::screencast::ScreencastHub,
 }
 
 /// Longest semantic intent kept in a snapshot node. Mirrors `INTENT_MAX` in
@@ -901,6 +931,7 @@ impl CdpBackend {
             showcase: Mutex::new(crate::showcase::ShowcaseConfig::default()),
             nav_pending: Mutex::new(HashMap::new()),
             observers: Mutex::new(HashMap::new()),
+            screencasts: crate::screencast::ScreencastHub::default(),
         }
     }
 
@@ -2118,6 +2149,7 @@ impl BrowserBackend for CdpBackend {
                 o.task.abort();
             }
         }
+        self.screencasts.abort_all();
         self.reap_all();
     }
 
@@ -2156,6 +2188,7 @@ impl BrowserBackend for CdpBackend {
             }));
         }
 
+        self.screencasts.abort_browser(browser_id);
         let existed = {
             let mut g = self.browsers.lock().expect("browsers mutex");
             let before = g.len();
@@ -3227,6 +3260,34 @@ impl BrowserBackend for CdpBackend {
             width: w,
             height: h,
         })
+    }
+
+    async fn screencast_start(
+        &self,
+        target: &str,
+        media_dir: &std::path::Path,
+        opts: crate::screencast::ScreencastOpts,
+    ) -> Result<Value, BrowserError> {
+        require_cdp_target(target, "browser_screencast")?;
+        let (b, _) = self.browser_ws_for_target(target).await?;
+        self.screencasts
+            .start((b.id, &b.host, b.port), target, media_dir, opts)
+            .await
+    }
+
+    async fn screencast_stop(
+        &self,
+        target: Option<&str>,
+        recording_id: Option<&str>,
+        keep_frames: bool,
+    ) -> Result<Value, BrowserError> {
+        self.screencasts
+            .stop(target, recording_id, keep_frames)
+            .await
+    }
+
+    async fn screencast_status(&self) -> Result<Value, BrowserError> {
+        Ok(self.screencasts.status())
     }
 
     async fn set_viewport(

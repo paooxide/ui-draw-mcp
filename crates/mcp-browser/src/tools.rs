@@ -20,6 +20,8 @@ pub struct BrowserModule {
     profiles: Option<crate::profile::ProfileStore>,
     judge: Option<Arc<mcp_judge::Judge>>,
     showcase: std::sync::Mutex<crate::showcase::ShowcaseConfig>,
+    /// Where saved screenshots and screencasts are written; never caller-chosen.
+    media_dir: Option<std::path::PathBuf>,
 }
 
 impl BrowserModule {
@@ -31,7 +33,15 @@ impl BrowserModule {
             profiles: None,
             judge: None,
             showcase: std::sync::Mutex::new(crate::showcase::ShowcaseConfig::default()),
+            media_dir: None,
         }
+    }
+
+    /// Enable `browser_screenshot save` and `browser_screencast`: files are
+    /// written under this agentctl-owned directory, with generated names.
+    pub fn with_media_dir(mut self, dir: std::path::PathBuf) -> Self {
+        self.media_dir = Some(dir);
+        self
     }
 
     /// Enable `browser_flow` (save/replay UI tests) backed by a JSON file.
@@ -1019,7 +1029,25 @@ impl BrowserModule {
             Ok(t) => t,
             Err(e) => return e,
         };
+        let save = args.get("save").and_then(Value::as_bool).unwrap_or(false);
+        let media = if save {
+            match self.media_dir_for("browser_screenshot") {
+                Ok(d) => Some(d),
+                Err(e) => return e,
+            }
+        } else {
+            None
+        };
         match self.backend.screenshot(target, str_arg(args, "ref")).await {
+            Ok(shot) if media.is_some() => result(
+                "browser_screenshot",
+                crate::screencast::save_screenshot(
+                    media.as_deref().unwrap_or(std::path::Path::new("")),
+                    &shot.base64,
+                    shot.width,
+                    shot.height,
+                ),
+            ),
             Ok(shot) => Envelope::ok_image(
                 "browser_screenshot",
                 json!({ "width": shot.width, "height": shot.height }),
@@ -1029,6 +1057,69 @@ impl BrowserModule {
                 },
             ),
             Err(e) => browser_err("browser_screenshot", e),
+        }
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn media_dir_for(&self, tool: &str) -> Result<std::path::PathBuf, Envelope> {
+        self.media_dir.clone().ok_or_else(|| {
+            browser_err(
+                tool,
+                BrowserError::Unsupported(
+                    "no media directory is configured, so nothing can be saved to disk".into(),
+                ),
+            )
+        })
+    }
+
+    async fn screencast(&self, args: &Value) -> Envelope {
+        let tool = "browser_screencast";
+        let int = |k: &str| {
+            args.get(k)
+                .and_then(|v| v.as_i64().or_else(|| v.as_f64().map(|f| f as i64)))
+        };
+        match str_arg(args, "action").unwrap_or("status") {
+            "start" => {
+                let target = match require(args, "target_id", tool) {
+                    Ok(t) => t,
+                    Err(e) => return e,
+                };
+                let media = match self.media_dir_for(tool) {
+                    Ok(d) => d,
+                    Err(e) => return e,
+                };
+                let opts = crate::screencast::ScreencastOpts::from_args(
+                    int("fps"),
+                    int("quality"),
+                    int("max_seconds"),
+                );
+                result(
+                    tool,
+                    self.backend.screencast_start(target, &media, opts).await,
+                )
+            }
+            "stop" => {
+                let (target, id) = (str_arg(args, "target_id"), str_arg(args, "recording_id"));
+                if target.is_none() && id.is_none() {
+                    return Envelope::fail(
+                        tool,
+                        ErrorCode::InvalidArgs,
+                        "stop needs 'target_id' or 'recording_id'",
+                    );
+                }
+                let keep = args
+                    .get("keep_frames")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                result(tool, self.backend.screencast_stop(target, id, keep).await)
+            }
+            "status" => result(tool, self.backend.screencast_status().await),
+            other => Envelope::fail_with(
+                tool,
+                ErrorCode::InvalidArgs,
+                format!("unknown action '{other}'"),
+                "use 'start', 'stop' or 'status'",
+            ),
         }
     }
 
@@ -2000,13 +2091,43 @@ impl ToolModule for BrowserModule {
                 "browser_screenshot",
                 Category::Browser,
                 Tier::Read,
-                "Capture a PNG of the page (or a single element by ref).",
+                "Capture a PNG of the page (or a single element by ref). Returned inline as an image \
+                 by default. With save=true the PNG is written to agentctl's media directory \
+                 (screenshots/, a generated file name) and only {path, width, height, bytes} comes \
+                 back, with no image payload.",
                 obj(
                     json!({
                         "target_id": { "type": "string" },
-                        "ref": { "type": "string" }
+                        "ref": { "type": "string" },
+                        "save": { "type": "boolean", "description": "write the PNG to disk and return its path instead of the image (default false)" }
                     }),
                     json!(["target_id"]),
+                ),
+            ),
+            ToolDescriptor::new(
+                "browser_screencast",
+                Category::Browser,
+                Tier::Standard,
+                "Record a tab to an mp4 video (browser_record is something else: it learns a replayable \
+                 flow of steps, not video). start begins capturing the page at fps (default 15) on a \
+                 dedicated session that keeps the page rendering even if its window is hidden or \
+                 unfocused; stop ends it and encodes frames.ffconcat with ffmpeg (variable frame rate, \
+                 real timestamps, 30 fps H.264) when ffmpeg is on PATH, else it keeps the frames and \
+                 says how to encode them. Files land in agentctl's media directory under \
+                 screencasts/<recording_id>/; the result gives the path. One recording per tab, which \
+                 stops by itself at max_seconds. The showcase cursor and ripples are part of the page, \
+                 so they appear in the video. Not available on Safari.",
+                obj(
+                    json!({
+                        "action": { "type": "string", "enum": ["start", "stop", "status"], "description": "default: status" },
+                        "target_id": { "type": "string", "description": "start: the tab to record; stop: the tab whose recording to stop" },
+                        "recording_id": { "type": "string", "description": "stop: the recording to stop, instead of target_id" },
+                        "fps": { "type": "integer", "description": "start: frames per second to capture, 1 to 30 (default 15)" },
+                        "quality": { "type": "integer", "description": "start: JPEG quality, 30 to 95 (default 80)" },
+                        "max_seconds": { "type": "integer", "description": "start: stop automatically after this long, 1 to 1800 (default 300)" },
+                        "keep_frames": { "type": "boolean", "description": "stop: keep the JPEG frames and frames.ffconcat after a successful encode (default false)" }
+                    }),
+                    json!([]),
                 ),
             ),
             ToolDescriptor::new(
@@ -2251,6 +2372,7 @@ impl ToolModule for BrowserModule {
             "browser_record" => self.record(&args).await,
             "browser_showcase" => self.showcase(&args).await,
             "browser_screenshot" => self.screenshot(&args).await,
+            "browser_screencast" => self.screencast(&args).await,
             "browser_viewport" => self.viewport(&args).await,
             "browser_eval" => self.eval(&args).await,
             "browser_dialog" => self.dialog(&args).await,
