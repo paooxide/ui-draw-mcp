@@ -8,7 +8,7 @@ Tiers gate what an agent may call: `read` and `standard` tools are available ins
 enabled category, while a `dangerous` tool additionally has to be named in
 `policy.enable`. Enabling a category never enables its dangerous tools.
 
-**122 tools across 12 categories.**
+**123 tools across 12 categories.**
 
 | Tool | Category | Tier | Summary |
 |---|---|---|---|
@@ -70,12 +70,13 @@ enabled category, while a `dangerous` tool additionally has to be named in
 | [`browser_profile`](#browser-profile) | browser | standard | Save, restore, list, or delete browser session profiles (cookies, localStorage, sessionStorage) for instant user or auth state swapping with… |
 | [`browser_query`](#browser-query) | browser | read | Resolve node ref(s) by css selector, xpath, or visible text. |
 | [`browser_record`](#browser-record) | browser | standard | Shadow observation & macro learning mode (Ghost Mode). |
+| [`browser_screencast`](#browser-screencast) | browser | standard | Record a tab to an mp4 video (browser_record is something else: it learns a replayable flow of steps, not video). |
 | [`browser_screenshot`](#browser-screenshot) | browser | read | Capture a PNG of the page (or a single element by ref). |
 | [`browser_showcase`](#browser-showcase) | browser | standard | Configure visual flair for demos, screencasts, and presentations: animated virtual SVG cursor, smooth cubic-bezier gliding, click ripples, and floating typing HUD, drawn inside the tab on Chrome and Safari. |
 | [`browser_snapshot`](#browser-snapshot) | browser | read | Flatten a page into interactable node refs (dom/accessibility) or raw text. |
 | [`browser_tabs`](#browser-tabs) | browser | standard | List/open/activate/close tabs (targets) of a connected browser. |
 | [`browser_viewport`](#browser-viewport) | browser | standard | Emulate a viewport for responsive testing: override the page's device metrics (width/height, optionally mobile and a device scale factor). |
-| [`browser_wait`](#browser-wait) | browser | read | Wait for a settle signal: a selector to appear, dom_settled (DOM mutations and animation frames settled for >=150ms), htmx_settled (HTMX req… |
+| [`browser_wait`](#browser-wait) | browser | read | Wait for a settle signal: a selector to appear, dom_settled (no DOM mutation for >=150ms; animation frames are not tracked), htmx_settled (HTMX requests and DOM swaps settled; right after a browser_act it also waits up to 1.5s for an htmx request to start; errors if htmx is not present on the page), navigation to complete (after a goto, reload, click, submit or key press in this session it waits for the NEW document, not the one being left; a click that starts no navigation within navigation_timeout_ms, default 2s, settles on the loaded page with navigated:false; raise it for a handler that navigates later than that), network_idle (fetch/XHR started after a browser_act are tracked; settled when none is in flight and none began or finished for 500ms, and not before a navigation that act may have started has happened), or verification challenge clearance. |
 | [`command_info`](#command-info) | terminal | read | Resolve a command and capture its own --help and --version. |
 | [`exec`](#exec) | terminal | dangerous | Run an allowlisted command. |
 | [`man_page`](#man-page) | terminal | read | A manual page as clean plain text, pager and overstrike formatting removed. |
@@ -695,10 +696,13 @@ Act on a DOM node: click, type, select, hover, focus, scroll_into_view, submit, 
 | `index` | integer |  | optional 0-based match index if query matches multiple elements (default 0) |
 | `query` | string |  | selector to resolve and act on in one call, instead of 'ref' |
 | `ref` | string |  | a ref from browser_query/snapshot |
+| `scroll` | one of: none, nearest, center |  | how to bring the element into view first: nearest (default) moves the page only as far as needed and not at all when it is visible, center centres it (can scroll a wide page sideways), none does not scroll. scroll_into_view always scrolls |
 | `secret` | boolean |  | the value is a secret: keep it out of the audit log and never show it in the showcase typing HUD (password and one-time-code fields are masked automatically) |
 | `target_id` | string | yes |  |
 | `text` | string |  | optional text substring filter to narrow matches |
+| `timeout_ms` | integer |  | wait_after settle only: bound for the whole settle wait (default 10000); when it runs out the action still succeeded and the result has settled:false and settle_error |
 | `value` | string |  | text for type, option for select, or key name for press (Enter, Escape, Tab) |
+| `wait_after` | one of: none, settle |  | none (default) returns as soon as the action ran, when a click's request or navigation has usually not begun yet. settle then waits for a navigation it started to load, for htmx_settled if the page has htmx, and for the network to go quiet, and adds navigated, requests_started (fetch/XHR/htmx begun on the page since the action) and settled to the result. A click that starts no request and no navigation costs about 2s here; Chrome only |
 | `within` | string |  | optional CSS/XPath root selector to scope query search |
 
 ### browser-assert
@@ -782,13 +786,15 @@ In-memory state checkpointing and rollback (T-1) for browser tabs. 'save' captur
 
 `browser_connect` · standard tier
 
-Attach to a Chromium browser started with --remote-debugging-port, or launch a dedicated instance. Optionally auto-restores a saved profile. launch.browser='safari' drives Safari through safaridriver (macOS only, experimental: needs `safaridriver --enable` once, and a Safari that was already open when automation was enabled must be quit first; opens a visible window). On Safari, browser_network, browser_dialog, browser_viewport, browser_record, browser_branch, browser_checkpoint and browser_act 'press' return Unsupported.
+Attach to a Chromium browser started with --remote-debugging-port, or launch a dedicated instance. Optionally auto-restores a saved profile. The browser's active tab is brought to the front on connect (result 'foregrounded'). launch.browser='safari' drives Safari through safaridriver (macOS only, experimental: needs `safaridriver --enable` once, and a Safari that was already open when automation was enabled must be quit first; opens a visible window). On Safari, browser_network, browser_dialog, browser_viewport, browser_record, browser_branch, browser_checkpoint and browser_act 'press' return Unsupported.
 
 | Argument | Type | Required | Description |
 |---|---|---|---|
 | `attach` | object |  |  |
 | `attach.port` | integer |  |  |
 | `launch` | object |  |  |
+| `launch.args` | array&lt;string&gt; |  | Chromium only: extra command-line flags, each one entry written --name or --name=value (no spaces; at most 32). Only these are accepted: --window-size, --window-position, --start-maximized, --start-fullscreen, --force-device-scale-factor, --hide-scrollbars, --force-dark-mode, --lang, --accept-lang, --user-agent, --mute-audio, --autoplay-policy, --disable-gpu, --disable-extensions, --disable-notifications, --disable-default-apps, --disable-sync, --disable-search-engine-choice-screen, --use-fake-device-for-media-stream, --auto-open-devtools-for-tabs, --incognito, the three --disable-*background* flags, and --disable-features naming CalculateNativeWinOcclusion, Translate, MediaRouter, OptimizationHints, AutofillServerCommunication or PaintHolding (merged with agentctl's own) |
+| `launch.background_throttling` | boolean |  | Chromium only. A visible (headless=false) browser is started with flags that stop Chrome throttling timers, rendering and screen recording when its window is behind another or covered. Set true to leave Chrome's normal throttling on. Default false |
 | `launch.browser` | one of: chromium, safari |  | chromium (default) launches an auto-discovered Chrome/Chromium; safari launches experimental Safari via safaridriver (macOS only) |
 | `launch.headless` | boolean |  |  |
 | `launch.port` | integer |  | remote-debugging port; omit or 0 to let Chrome pick a free one (the connect result reports it) |
@@ -836,12 +842,14 @@ Disconnect from a browser. With kill=true, also stop a browser this session laun
 
 `browser_eval` · dangerous tier
 
-Evaluate arbitrary JavaScript in the page context. The result is the value of the last statement (a returned promise is awaited), JSON-serialized. Arbitrary code execution. On Safari, a page whose CSP forbids eval gets the code run without eval: an expression works as usual, but statements need an explicit `return` to produce a result.
+Evaluate arbitrary JavaScript in the page context. The result is the value of the last statement (a returned promise is awaited), JSON-serialized. Arbitrary code execution. If the script navigates the page the result is {navigated:true, value:null} rather than an error. On Safari, a page whose CSP forbids eval gets the code run without eval: an expression works as usual, but statements need an explicit `return` to produce a result.
 
 | Argument | Type | Required | Description |
 |---|---|---|---|
+| `detached` | boolean |  | start the script and return {started:true} without waiting for a promise it returns or for its result (Chrome only); its synchronous part still runs within the call and timeout_ms. A later rejection goes to the page console |
 | `expression` | string | yes |  |
 | `target_id` | string | yes |  |
+| `timeout_ms` | integer |  | stop waiting after this many ms (default 10000, clamped to 100-60000). Chrome stops script that is still running; a timeout is an error that says so. Async work already scheduled (timers, pending promises) can keep running in the page. Not enforced on Safari |
 
 ### browser-extract
 
@@ -946,29 +954,47 @@ Shadow observation & macro learning mode (Ghost Mode). Observes interactions in 
 | `name` | string |  | optional flow name to auto-save to flow store upon stop |
 | `target_id` | string | yes |  |
 
+### browser-screencast
+
+`browser_screencast` · standard tier
+
+Record a tab to an mp4 video (browser_record is something else: it learns a replayable flow of steps, not video). start begins capturing the page at fps (default 15) on a dedicated session that keeps the page rendering even if its window is hidden or unfocused; stop ends it and encodes frames.ffconcat with ffmpeg (variable frame rate, real timestamps, 30 fps H.264) when ffmpeg is on PATH, else it keeps the frames and says how to encode them. Files land in agentctl's media directory under screencasts/<recording_id>/; the result gives the path. One recording per tab, which stops by itself at max_seconds. The showcase cursor and ripples are part of the page, so they appear in the video. Not available on Safari.
+
+| Argument | Type | Required | Description |
+|---|---|---|---|
+| `action` | one of: start, stop, status |  | default: status |
+| `fps` | integer |  | start: frames per second to capture, 1 to 30 (default 15) |
+| `keep_frames` | boolean |  | stop: keep the JPEG frames and frames.ffconcat after a successful encode (default false) |
+| `max_seconds` | integer |  | start: stop automatically after this long, 1 to 1800 (default 300) |
+| `quality` | integer |  | start: JPEG quality, 30 to 95 (default 80) |
+| `recording_id` | string |  | stop: the recording to stop, instead of target_id |
+| `target_id` | string |  | start: the tab to record; stop: the tab whose recording to stop |
+
 ### browser-screenshot
 
 `browser_screenshot` · read tier
 
-Capture a PNG of the page (or a single element by ref).
+Capture a PNG of the page (or a single element by ref). Returned inline as an image by default. With save=true the PNG is written to agentctl's media directory (screenshots/, a generated file name) and only {path, width, height, bytes} comes back, with no image payload.
 
 | Argument | Type | Required | Description |
 |---|---|---|---|
 | `ref` | string |  |  |
+| `save` | boolean |  | write the PNG under agentctl's own media directory and return {path, width, height, bytes} instead of the image (default false). The newest 200 saved screenshots are kept; older ones are deleted |
 | `target_id` | string | yes |  |
 
 ### browser-showcase
 
 `browser_showcase` · standard tier
 
-Configure visual flair for demos, screencasts, and presentations: animated virtual SVG cursor, smooth cubic-bezier gliding, click ripples, and floating typing HUD, drawn inside the tab on Chrome and Safari. Decoration only: it never changes an action's result or error, and the typing HUD masks secrets and password/one-time-code fields.
+Configure visual flair for demos, screencasts, and presentations: animated virtual SVG cursor, smooth cubic-bezier gliding, click ripples, and floating typing HUD, drawn inside the tab on Chrome and Safari. While on, a browser_act on Chrome also moves the real pointer (trusted mousemove events) so hover styles and mouse listeners fire. The result's `rendered` says whether the cursor really is on the page, with a `warning` when it is not. Decoration only: it never changes an action's result or error, and the typing HUD masks secrets and password/one-time-code fields.
 
 | Argument | Type | Required | Description |
 |---|---|---|---|
 | `click_ripple` | boolean |  | expand glowing shockwave rings on click |
+| `cursor_size` | integer |  | pointer size in px, 16-96 (default 32; values outside are clamped) |
 | `cursor_style` | one of: glow_arrow, neon_cyan, minimal_dot |  | visual pointer style |
 | `enabled` | boolean |  | enable or disable visual overlays |
-| `glide_ms` | integer |  | custom glide duration in milliseconds |
+| `glide_ms` | integer |  | custom glide duration in milliseconds, 0-3000 (larger values are capped) |
 | `speed` | one of: cinematic, demo, snappy, off |  | gliding speed preset |
 | `target_id` | string | yes | the tab to configure showcase overlays for |
 | `typing_hud` | boolean |  | display floating action/typing badges next to cursor |
@@ -1016,18 +1042,18 @@ Emulate a viewport for responsive testing: override the page's device metrics (w
 
 `browser_wait` · read tier
 
-Wait for a settle signal: a selector to appear, dom_settled (DOM mutations and animation frames settled for >=150ms), htmx_settled (HTMX requests and DOM swaps settled; errors if htmx is not present on the page), navigation to complete (after a goto, reload, click, submit or key press in this session it waits for the NEW document, not the one being left; a click that starts no navigation within navigation_timeout_ms, default 2s, settles on the loaded page with navigated:false; raise it for a handler that navigates later than that), the network to idle, or verification challenge clearance.
+Wait for a settle signal: a selector to appear, dom_settled (no DOM mutation for >=150ms; animation frames are not tracked), htmx_settled (HTMX requests and DOM swaps settled; right after a browser_act it also waits up to 1.5s for an htmx request to start; errors if htmx is not present on the page), navigation to complete (after a goto, reload, click, submit or key press in this session it waits for the NEW document, not the one being left; a click that starts no navigation within navigation_timeout_ms, default 2s, settles on the loaded page with navigated:false; raise it for a handler that navigates later than that), network_idle (fetch/XHR started after a browser_act are tracked; settled when none is in flight and none began or finished for 500ms, and not before a navigation that act may have started has happened), or verification challenge clearance. Prefer 'condition'; the other arguments are aliases.
 
 | Argument | Type | Required | Description |
 |---|---|---|---|
-| `challenge_cleared` | boolean |  |  |
-| `condition` | one of: selector, dom_settled, htmx_settled, navigation, network_idle, challenge_cleared |  |  |
-| `dom_settled` | boolean |  |  |
-| `htmx_settled` | boolean |  |  |
-| `navigation` | boolean |  |  |
+| `challenge_cleared` | boolean |  | alias for condition 'challenge_cleared'; only true selects it |
+| `condition` | one of: selector, dom_settled, htmx_settled, navigation, network_idle, challenge_cleared |  | preferred way to choose what to wait for; 'selector' also needs the selector argument. Give exactly one condition: the aliases below conflict with it and with each other |
+| `dom_settled` | boolean |  | alias for condition 'dom_settled'; only true selects it |
+| `htmx_settled` | boolean |  | alias for condition 'htmx_settled'; only true selects it |
+| `navigation` | boolean |  | alias for condition 'navigation'; only true selects it |
 | `navigation_timeout_ms` | integer |  | navigation only: how long (ms, 0-30000, default 2000) to keep expecting a navigation that a click, submit or key press has not started yet, before settling on the loaded page with navigated:false. Does not apply after goto, reload, back or forward, which always navigate; timeout_ms still bounds the whole wait |
-| `network_idle` | boolean |  |  |
-| `selector` | string |  |  |
+| `network_idle` | boolean |  | alias for condition 'network_idle'; only true selects it |
+| `selector` | string |  | alias for condition 'selector': the CSS selector to wait for |
 | `target_id` | string | yes |  |
 | `timeout_ms` | integer |  |  |
 

@@ -6,6 +6,89 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+Most of this release comes from one field session: a QA run and a demo recording against a server-rendered
+HTMX app, where several browser tools answered before the page had done what the agent asked.
+
+### Added
+
+- **`browser_screencast`**, video of a tab: `start` polls `Page.captureScreenshot` (JPEG, 1 to 30 fps,
+  default 15) on a session of its own that keeps focus emulation on, `stop` writes an ffconcat with the real
+  frame timestamps and encodes an H.264 mp4 with ffmpeg, `status` lists what is running. Recordings survive
+  a navigation, end at `max_seconds` (default 300, at most 1800) or when the tab closes, and stop with
+  `browser_disconnect`. The showcase cursor is in the page, so it is in the video. Without ffmpeg (looked
+  for on `PATH`, then in Homebrew and `/usr` locations) the frames are kept with the command to encode them.
+  `browser_record` remains flow recording; it never made video, which its name suggested.
+- **`browser_screenshot` `save: true`** writes the PNG and returns `{path, width, height, bytes}` instead of
+  the image. Files go only under agentctl's state directory (`media/screenshots`, `media/screencasts`),
+  with names agentctl picks; the newest 200 screenshots are kept.
+- **`browser_showcase` `cursor_size`** (16 to 96 px, default 32), and the result now says whether the
+  overlay is really on the page: `rendered`, plus a `warning` when it is not (no tab, no `<body>` yet, the
+  script threw). `browser_act` adds `showcase_rendered`.
+- **`browser_act` `wait_after: "settle"`** waits for what the action started: a navigation, then
+  `htmx_settled` when the page has htmx, then the network going quiet, all bounded by `timeout_ms`. The
+  result adds `navigated`, `requests_started` and `settled` (plus `settle_error` when the wait ran out; the
+  action itself still counts as done). A click that starts nothing costs about 2 s here. Chrome only.
+- **`browser_act` `scroll: "none" | "nearest" | "center"`**, default `nearest`.
+- **`browser_eval` `timeout_ms`** (default 10000, 100 to 60000) and **`detached`**. On a timeout Chrome is
+  told to terminate the script, and the error says that timers and promises it already scheduled may still
+  run. A script that navigates the page now returns `{navigated: true, value: null}` instead of failing with
+  "Inspected target navigated or closed". `detached` returns `{started: true}` without awaiting a returned
+  promise.
+- **`browser_connect` `launch.args`** (an allowlist of display, language and pacing flags; anything else is
+  refused with the list) and **`launch.background_throttling`**.
+- **Built-in `browser` role** (`--role browser`, `AGENTCTL_ROLE=browser`, `policy.role`): only the browser
+  tools are advertised, 26 instead of 123. `access` turns every category on, so before this the only way to
+  get a browser-only list with `access` set was a custom role.
+
+### Changed
+
+- **The showcase pointer is real and visible.** With showcase on, Chrome gets eased `mouseMoved` events
+  along the glide, so the page sees the pointer arrive (`mousemove`, `:hover`, tooltips), and the drawn
+  cursor follows the same curve, starting where it last was even after a navigation. `hover` always moves
+  the real pointer, showcase or not, so CSS `:hover` applies; the synthetic `mouseover` remains for an
+  element something else covers. Clicks are still `el.click()`. The cursor is 32 px by default with a
+  coloured glow, the click ripple lasts 900 / 700 / 300 ms (cinematic / demo / snappy) and the click waits a
+  beat after it starts, so it is on screen when the click lands. In the field the cursor was a 15 px dark
+  arrow and a 400 ms ripple that a recording almost never caught.
+- **A headed `launch` no longer throttles behind other windows.** It passes
+  `--disable-backgrounding-occluded-windows --disable-renderer-backgrounding
+  --disable-background-timer-throttling --disable-features=CalculateNativeWinOcclusion`, and connecting
+  brings the active tab to the front. In the field a covered Chrome reported `visibilityState: "hidden"`,
+  ran `setTimeout(100)` in about 900 ms, and froze a screen recording. `background_throttling: true` opts
+  out. `browser_eval` also enables focus emulation on its session, since that does not outlive a connection.
+- **`browser_act` no longer scrolls a wide page sideways.** It scrolled every element to the centre on both
+  axes; in the field that left the page at `scrollX` 497 with a white strip after opening a drawer. It now
+  scrolls only as far as needed, instantly, and focuses with `preventScroll`. `browser_fill_form` focuses
+  with `preventScroll` too.
+- **`browser_wait` refuses ambiguous arguments.** Two different conditions (say `condition` plus
+  `network_idle: true`) are an error naming both, where the first match used to win silently;
+  `navigation: false` no longer selects a navigation wait; `condition: "selector"` without `selector` says
+  so. `condition` is the documented form and the booleans are aliases.
+- **The default `browser_eval` time limit is 10 s**, down from the 20 s transport timeout.
+
+### Fixed
+
+- **`cursor_style` did nothing**: every style drew the same arrow. Each now has its own look.
+- **`browser_showcase` reported `ok` for an overlay that was not drawn.** It was built with `innerHTML`,
+  which throws on a page that requires Trusted Types, and the throw was swallowed. It is now built with DOM
+  calls, and failure is reported (above).
+- **`demo = true` never turned on the browser overlay**, although 0.2.0 said it did; it only set the
+  glide speed.
+- **`glide_ms` was unbounded**; it is capped at 3000 ms.
+- **`network_idle` watched nothing.** It checked `document.readyState === 'complete'` and slept 400 ms, so
+  straight after a click it reported the old, still loaded page as settled before the click's request had
+  begun, and the next read saw the page as it was. Twice in the field this was taken for an app bug. It
+  now counts fetch and XHR (a hook that `browser_act` installs before acting, which wraps `window.fetch`
+  and `XMLHttpRequest.prototype.send`), checks the Performance API's resource entries, needs 500 ms of
+  quiet, and first waits for a navigation the last click, submit or key press may have started.
+  `browser_assert wait_network_idle` uses the same wait. A page that always has a request open (long
+  polling) now times out where it used to settle.
+- **`htmx_settled` settled before a delayed request began.** Its listeners went in on the first probe, so
+  a debounced or delayed `hx-trigger` looked settled. The act now installs them first, and right after an
+  act the wait gives a request up to 1.5 s to start.
+- **`dom_settled`'s description claimed animation frames were tracked.** They are not; the description
+  says so now.
+
 ## [0.2.0] - 2026-10-04
 
 ### Added
