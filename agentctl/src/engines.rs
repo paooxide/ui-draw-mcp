@@ -117,6 +117,17 @@ pub fn showcase_speed(speed: &str) -> mcp_browser::ShowcaseSpeed {
     }
 }
 
+/// The browser overlay for `demo` / `demo_speed`. Demo mode has to switch the
+/// overlay on (a config with only the speed set left it disabled, so a demo
+/// session drew no cursor); `demo_speed = "off"` still means no animation.
+pub fn demo_showcase(demo: bool, speed: &str) -> mcp_browser::ShowcaseConfig {
+    if demo {
+        mcp_browser::ShowcaseConfig::for_speed(showcase_speed(speed))
+    } else {
+        mcp_browser::ShowcaseConfig::default()
+    }
+}
+
 /// Wire every engine the config enables.
 ///
 /// Takes the whole `PolicyConfig` rather than a handful of extracted fields so
@@ -191,14 +202,7 @@ pub fn build_stack(cfg: &PolicyConfig) -> (Vec<Arc<dyn ToolModule>>, Wiring) {
         use mcp_sec::SecModule;
         use mcp_sys::SysModule;
 
-        let showcase = if engines.demo {
-            mcp_browser::ShowcaseConfig {
-                speed: showcase_speed(&engines.demo_speed),
-                ..Default::default()
-            }
-        } else {
-            mcp_browser::ShowcaseConfig::default()
-        };
+        let showcase = demo_showcase(engines.demo, &engines.demo_speed);
 
         let browser_backend = Arc::new(
             CdpBackend::new(NavPolicy::new(
@@ -426,5 +430,21 @@ mod tests {
             assert_eq!(demo_glide_preset(name), preset);
         }
         assert_eq!(demo_glide_preset("off"), mcp_input::GlidePreset::Instant);
+    }
+
+    #[test]
+    fn demo_turns_the_browser_overlay_on_at_the_configured_speed() {
+        let on = demo_showcase(true, "cinematic");
+        assert!(on.enabled);
+        assert_eq!(on.speed, mcp_browser::ShowcaseSpeed::Cinematic);
+        assert_eq!(on.glide_ms(), 350);
+        assert!(on.ripple_ms() > 0);
+        let default_speed = demo_showcase(true, "demo");
+        assert!(default_speed.enabled);
+        assert_eq!(default_speed.speed, mcp_browser::ShowcaseSpeed::Demo);
+        // No animation asked for: nothing to draw.
+        assert!(!demo_showcase(true, "off").enabled);
+        // Not in demo mode: untouched.
+        assert!(!demo_showcase(false, "cinematic").enabled);
     }
 }

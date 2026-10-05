@@ -510,6 +510,10 @@ pub struct CdpBackend {
     checkpoints: Mutex<crate::checkpoint::CheckpointStore>,
     /// Configured showcase visual flair (animated cursor, click ripples, typing HUD).
     showcase: Mutex<crate::showcase::ShowcaseConfig>,
+    /// Where the showcase pointer last was, per tab, in viewport CSS px. A
+    /// navigation resets the in-page cursor; this lets the next glide start
+    /// where the viewer last saw it instead of off-screen.
+    cursor_pos: Mutex<HashMap<String, (f64, f64)>>,
     /// Per target: the document-identity marker planted on the document an
     /// action (goto, reload, click, submit, press) was about to leave. A
     /// `wait navigation` that finds one waits for a document without it.
@@ -1030,6 +1034,7 @@ impl CdpBackend {
             )),
             checkpoints: Mutex::new(crate::checkpoint::CheckpointStore::new()),
             showcase: Mutex::new(crate::showcase::ShowcaseConfig::default()),
+            cursor_pos: Mutex::new(HashMap::new()),
             nav_pending: Mutex::new(HashMap::new()),
             observers: Mutex::new(HashMap::new()),
         }
@@ -1454,6 +1459,33 @@ impl CdpBackend {
         if let Some(map) = out.as_object_mut() {
             map.insert("dialogs".into(), json!(seen));
         }
+    }
+
+    /// Move the real pointer from `from` to `to` in eased `mouseMoved` steps
+    /// spread over `glide_ms` (a single event when it is 0). These are trusted
+    /// events: the page sees `mousemove`/`mouseover`, and CSS `:hover` applies.
+    /// Says whether the last one, at `to`, was delivered; a failure part-way
+    /// is not an error of the action (the pointer is decoration).
+    async fn glide_mouse(c: &mut CdpConn, from: (f64, f64), to: (f64, f64), glide_ms: u64) -> bool {
+        let path = crate::showcase::glide_path(from, to, glide_ms);
+        let delay = std::time::Duration::from_millis(glide_ms / path.len().max(1) as u64);
+        let last = path.len().saturating_sub(1);
+        for (i, (x, y)) in path.into_iter().enumerate() {
+            let sent = c
+                .call(
+                    "Input.dispatchMouseEvent",
+                    json!({ "type": "mouseMoved", "x": x, "y": y, "button": "none", "buttons": 0 }),
+                )
+                .await;
+            if i == last {
+                return sent.is_ok();
+            }
+            if sent.is_err() {
+                return false;
+            }
+            tokio::time::sleep(delay).await;
+        }
+        false
     }
 
     /// Real pointer input at a viewport CSS-pixel point: a `mouseMoved`, and
@@ -3187,6 +3219,12 @@ impl BrowserBackend for CdpBackend {
         } else {
             Some(self.conn(target).await?)
         };
+        // Focus emulation lasts as long as this connection, and every tool
+        // call opens its own: ask for it here so a headed window sitting
+        // behind others still sees focus/blur and `:focus` during the act.
+        if let Some(c) = c_opt.as_mut() {
+            Self::emulate_focus(c).await;
+        }
         // While this tab is being recorded, the script runs in the recorder's
         // isolated world: the DOM is the same, but there it can tell the
         // recorder which synthetic events are agentctl's own (`JS_ARM`).
@@ -3225,34 +3263,6 @@ impl BrowserBackend for CdpBackend {
         };
         let act = serde_json::to_string(action).unwrap_or_else(|_| "\"click\"".into());
         let val = serde_json::to_string(&value).unwrap_or_else(|_| "null".into());
-
-        let showcase_cfg = self
-            .showcase
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
-        let (showcase_init, showcase_call) = if showcase_cfg.enabled {
-            let glide_ms = showcase_cfg.glide_ms();
-            let click_ripple = showcase_cfg.click_ripple;
-            let typing_hud = showcase_cfg.typing_hud;
-            (
-                showcase_guarded(crate::showcase::JS_SHOWCASE_ENGINE),
-                format!(
-                    r#"
-  try {{
-    if(typeof window !== 'undefined' && window.__agentctl_showcase && typeof window.__agentctl_showcase.act === 'function') {{
-      var b = el.getBoundingClientRect();
-      var cx = Math.round(b.left + b.width / 2);
-      var cy = Math.round(b.top + b.height / 2);
-      await window.__agentctl_showcase.act(cx, cy, action, value, {glide_ms}, {click_ripple}, {typing_hud}, el, {secret});
-    }}
-  }} catch(e) {{}}
-"#
-                ),
-            )
-        } else {
-            (String::new(), String::new())
-        };
 
         // A click, submit or key press may start a navigation. Mark the
         // document it happens on, so a following `wait navigation` can tell
@@ -3298,13 +3308,131 @@ impl BrowserBackend for CdpBackend {
             let _ = Self::eval_value(c, &act_arm_js()).await;
         }
 
+        let showcase_cfg = self
+            .showcase
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let showcase_engine = showcase_cfg.engine_js();
+
+        // Real pointer movement (Chrome): the page gets trusted `mousemove`
+        // events along the glide, so `:hover`, tooltips and mouse listeners
+        // see the pointer arrive. A first script finds where the element is
+        // (after scrolling it into view); the pointer is then moved there from
+        // where it last was, while the drawn cursor glides alongside; the act
+        // script that follows only does the click/type itself. `hover` always
+        // moves the pointer, showcase or not. Canvas regions send their own
+        // real input below.
+        //
+        // The recorder only listens for click/input/change/keydown, so these
+        // `mouseMoved` events (no buttons, no click) are never recorded as
+        // steps, also while a recording is running; no recording-specific
+        // skip is needed.
+        let mut real_move = false;
+        if !is_safari && !canvas_ref && (action == "hover" || showcase_cfg.enabled) {
+            let last = self
+                .cursor_pos
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(target)
+                .copied();
+            let (engine_js, resume_js) = if showcase_cfg.enabled {
+                let resume = last
+                    .map(|(x, y)| {
+                        format!(
+                            "try{{ if(window.__agentctl_showcase) window.__agentctl_showcase.place({x},{y}); }}catch(e){{}}"
+                        )
+                    })
+                    .unwrap_or_default();
+                (showcase_guarded(&showcase_engine), resume)
+            } else {
+                (String::new(), String::new())
+            };
+            let probe = format!(
+                r#"(async function(){{
+  {JS_XPATH}
+  {JS_FIND}
+  {engine_js}
+  {resume_js}
+  var el;
+  try {{ el = {resolve}; }} catch(e) {{ return null; }}
+  if(!el || el.__is_canvas_target) return null;
+  {el_scroll}
+  var b = el.getBoundingClientRect();
+  if(!(b.width > 0 || b.height > 0)) return null;
+  return {{x: b.left + b.width / 2, y: b.top + b.height / 2}};
+}})()"#
+            );
+            if let Some(c) = c_opt.as_mut() {
+                let at = Self::eval_value_in(c, &probe, iso)
+                    .await
+                    .ok()
+                    .and_then(|v| Some((v.get("x")?.as_f64()?, v.get("y")?.as_f64()?)));
+                if let Some(to) = at {
+                    let glide_ms = showcase_cfg.glide_ms();
+                    let from = last.unwrap_or(if showcase_cfg.enabled { (0.0, 0.0) } else { to });
+                    if showcase_cfg.enabled {
+                        // The drawn cursor glides over the same time and curve.
+                        let kick = format!(
+                            "try{{ if(window.__agentctl_showcase){{ {} window.__agentctl_showcase.move({},{},{glide_ms}); }} }}catch(e){{}} true",
+                            if last.is_none() {
+                                format!("window.__agentctl_showcase.place({},{});", from.0, from.1)
+                            } else {
+                                String::new()
+                            },
+                            to.0,
+                            to.1
+                        );
+                        let _ = Self::eval_value_in(c, &kick, iso).await;
+                    }
+                    real_move = Self::glide_mouse(c, from, to, glide_ms).await;
+                    if real_move {
+                        self.cursor_pos
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .insert(target.to_string(), to);
+                    }
+                }
+            }
+        }
+
+        let (showcase_init, showcase_call) = if showcase_cfg.enabled {
+            // A glide that was already made with real mouse events leaves the
+            // page-side cursor only the snap, ripple and HUD to do.
+            let glide_ms = if real_move {
+                0
+            } else {
+                showcase_cfg.glide_ms()
+            };
+            let ripple_ms = showcase_cfg.ripple_ms();
+            let beat_ms = crate::showcase::ripple_beat_ms(ripple_ms);
+            let typing_hud = showcase_cfg.typing_hud;
+            (
+                showcase_guarded(&showcase_engine),
+                format!(
+                    r#"
+  try {{
+    if(typeof window !== 'undefined' && window.__agentctl_showcase && typeof window.__agentctl_showcase.act === 'function') {{
+      var b = el.getBoundingClientRect();
+      var cx = Math.round(b.left + b.width / 2);
+      var cy = Math.round(b.top + b.height / 2);
+      await window.__agentctl_showcase.act(cx, cy, action, value, {glide_ms}, {ripple_ms}, {beat_ms}, {typing_hud}, el, {secret});
+    }}
+  }} catch(e) {{}}
+"#
+                ),
+            )
+        } else {
+            (String::new(), String::new())
+        };
+
         let expr = format!(
             r#"(async function(){{
   {JS_XPATH}
   {JS_FIND}
   {js_arm}
   {showcase_init}
-  var el, action={act}, value={val};
+  var el, action={act}, value={val}, realMove={real_move};
   try {{ el = {resolve}; }} catch(e) {{ return {{ok:false,error:String(e && e.message ? e.message : e)}}; }}
   if(!el) return {{ok:false,error:'element not found'}};
   if(el.__is_canvas_target){{
@@ -3335,7 +3463,7 @@ impl BrowserBackend for CdpBackend {
     case 'click': __arm(el, 'click'); el.click(); break;
     case 'focus': el.focus({{preventScroll:true}}); break;
     case 'press': el.focus({{preventScroll:true}}); break;
-    case 'hover': el.dispatchEvent(new MouseEvent('mouseover',{{bubbles:true}})); break;
+    case 'hover': if(!realMove) el.dispatchEvent(new MouseEvent('mouseover',{{bubbles:true}})); break;
     case 'scroll_into_view': break;
     case 'submit':
       if(el.form){{ el.form.requestSubmit?el.form.requestSubmit():el.form.submit(); }}
@@ -3355,9 +3483,17 @@ impl BrowserBackend for CdpBackend {
     default: return {{ok:false,error:'unknown action '+action}};
   }}
   }} finally {{ __disarm(); }}
-  return {{ok:true,action:action,showcase:{}}};
+  return {{ok:true,action:action,showcase:{}{showcase_rendered}}};
 }})()"#,
-            showcase_cfg.enabled
+            showcase_cfg.enabled,
+            showcase_rendered = if showcase_cfg.enabled {
+                format!(
+                    ",showcase_rendered:{}",
+                    crate::showcase::JS_SHOWCASE_RENDERED
+                )
+            } else {
+                String::new()
+            }
         );
         let mut v = if is_safari {
             let entry = self.get_safari_session(target)?;
@@ -4658,8 +4794,10 @@ impl BrowserBackend for CdpBackend {
             .clone();
         let (showcase_init, showcase_field, showcase_submit) = if showcase_cfg.enabled {
             let glide_ms = showcase_cfg.glide_ms();
+            let ripple_ms = showcase_cfg.ripple_ms();
+            let beat_ms = crate::showcase::ripple_beat_ms(ripple_ms);
             (
-                showcase_guarded(crate::showcase::JS_SHOWCASE_ENGINE),
+                showcase_guarded(&showcase_cfg.engine_js()),
                 format!(
                     r#"
       try {{
@@ -4667,7 +4805,7 @@ impl BrowserBackend for CdpBackend {
           var fb = el.getBoundingClientRect();
           var fx = Math.round(fb.left + fb.width / 2);
           var fy = Math.round(fb.top + fb.height / 2);
-          await window.__agentctl_showcase.act(fx, fy, 'type', val, {glide_ms}, false, true, el, f.secret === true);
+          await window.__agentctl_showcase.act(fx, fy, 'type', val, {glide_ms}, 0, 0, true, el, f.secret === true);
         }}
       }} catch(e) {{}}
 "#
@@ -4679,7 +4817,7 @@ impl BrowserBackend for CdpBackend {
           var sb = subEl.getBoundingClientRect();
           var sx = Math.round(sb.left + sb.width / 2);
           var sy = Math.round(sb.top + sb.height / 2);
-          await window.__agentctl_showcase.act(sx, sy, 'click', null, {glide_ms}, true, true);
+          await window.__agentctl_showcase.act(sx, sy, 'click', null, {glide_ms}, {ripple_ms}, {beat_ms}, true);
         }}
       }} catch(e) {{}}
 "#
@@ -5550,30 +5688,85 @@ impl BrowserBackend for CdpBackend {
         if !cfg.enabled {
             self.teardown_showcase(None).await;
         }
-        if cfg.enabled && !target.is_empty() {
-            let is_safari = target.starts_with("safari-");
-            let init_script = format!(
-                r#"(function(){{ {} return true; }})()"#,
-                crate::showcase::JS_SHOWCASE_ENGINE
-            );
-            if is_safari {
-                if let Ok(entry) = self.get_safari_session(target) {
-                    if let Err(e) = entry
-                        .session
-                        .execute_sync(&safari_return(&init_script), &[])
-                        .await
-                    {
-                        tracing::warn!("showcase overlay could not be installed: {}", err_msg(&e));
+        let mut out = cfg.to_json();
+        if !cfg.enabled {
+            self.cursor_pos
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clear();
+            return Ok(out);
+        }
+        // Say whether the overlay exists in the page, not just that it was
+        // asked for: this is main-world, so `window.__agentctl_showcase` is
+        // the same object a page script would see.
+        let (rendered, problem) = if target.is_empty() {
+            (
+                false,
+                Some("no target_id: the overlay is only drawn into a page, and acts draw it when they run".to_string()),
+            )
+        } else {
+            let script = showcase_install_script(&cfg);
+            let probed = if target.starts_with("safari-") {
+                match self.get_safari_session(target) {
+                    Ok(entry) => {
+                        entry
+                            .session
+                            .execute_sync(&safari_return(&script), &[])
+                            .await
                     }
+                    Err(e) => Err(e),
                 }
-            } else if let Ok(mut c) = self.conn(target).await {
-                if let Err(e) = Self::eval_value(&mut c, &init_script).await {
-                    tracing::warn!("showcase overlay could not be installed: {}", err_msg(&e));
+            } else {
+                match self.conn(target).await {
+                    Ok(mut c) => Self::eval_value(&mut c, &script).await,
+                    Err(e) => Err(e),
                 }
+            };
+            match probed {
+                Ok(v) if v.get("rendered").and_then(Value::as_bool) == Some(true) => (true, None),
+                Ok(v) => (
+                    false,
+                    Some(
+                        v.get("reason")
+                            .and_then(Value::as_str)
+                            .unwrap_or("the overlay was not created")
+                            .to_string(),
+                    ),
+                ),
+                Err(e) => (
+                    false,
+                    Some(format!("overlay injection failed: {}", err_msg(&e))),
+                ),
+            }
+        };
+        if let Some(m) = out.as_object_mut() {
+            m.insert("rendered".into(), json!(rendered));
+            if let Some(w) = problem {
+                tracing::warn!("showcase overlay not rendered: {w}");
+                m.insert(
+                    "warning".into(),
+                    json!(format!(
+                        "showcase is enabled but the cursor overlay is not on the page: {w}"
+                    )),
+                );
             }
         }
-        Ok(cfg.to_json())
+        Ok(out)
     }
+}
+
+/// The script `browser_showcase` runs in a page: install the overlay, then
+/// report whether it is really there (`{rendered, reason?}`).
+fn showcase_install_script(cfg: &crate::showcase::ShowcaseConfig) -> String {
+    format!(
+        r#"(function(){{
+  if(!document || !document.body) return {{rendered:false, reason:'the page has no <body> yet (still loading, or not an HTML page)'}};
+  try {{ {engine} }} catch(e) {{ return {{rendered:false, reason:'overlay script threw: ' + String(e && e.message ? e.message : e)}}; }}
+  return {check} ? {{rendered:true}} : {{rendered:false, reason:'the overlay script ran but created no cursor element'}};
+}})()"#,
+        engine = cfg.engine_js(),
+        check = crate::showcase::JS_SHOWCASE_RENDERED
+    )
 }
 
 fn now_ms() -> u64 {
