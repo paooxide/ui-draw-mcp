@@ -63,6 +63,29 @@ fn test_builtin_qa_role() {
 }
 
 #[test]
+fn test_builtin_browser_role() {
+    let role = RoleProfile::browser();
+    assert_eq!(role.name, "browser");
+
+    let nav_tool = make_tool("browser_navigate", Category::Browser, Tier::Standard);
+    let eval_tool = make_tool("browser_eval", Category::Browser, Tier::Dangerous);
+    let click_tool = make_tool("mouse_action", Category::Input, Tier::Standard);
+    let fs_tool = make_tool("fs_read", Category::Filesystem, Tier::Read);
+    let pty_tool = make_tool("pty_spawn", Category::Terminal, Tier::Dangerous);
+
+    assert!(role.allows_tool(&nav_tool));
+    // The role narrows only; whether a dangerous tool runs is still the
+    // policy's call (access/enable), not the role's.
+    assert!(role.allows_tool(&eval_tool));
+    assert!(!role.allows_tool(&click_tool));
+    assert!(!role.allows_tool(&fs_tool));
+    assert!(!role.allows_tool(&pty_tool));
+
+    let resolved = mcp_policy::resolve_role_profile("browser", &Default::default());
+    assert_eq!(resolved, Some(role));
+}
+
+#[test]
 fn test_builtin_operator_role_requires_consent() {
     let role = RoleProfile::operator();
     let dangerous_tool = make_tool("format_disk", Category::System, Tier::Dangerous);

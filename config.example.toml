@@ -84,7 +84,10 @@ demo_speed = "demo"
 
 # Role profiles narrow what a session may call; they never widen it. Built in:
 # readonly (read tier only), qa (browser, vision, window, system, input; no
-# browser_eval), operator (dangerous tools always ask), admin (no extra limits).
+# browser_eval), browser (browser tools only, for web QA and demos), operator
+# (dangerous tools always ask), admin (no extra limits). Roles also filter the
+# advertised tool list, so `role = "browser"` is how to show only browser tools
+# when `access` is set (access turns every category on).
 # Pick one for this server, or define your own below.
 # role = "qa"
 

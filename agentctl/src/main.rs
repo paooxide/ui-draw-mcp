@@ -164,7 +164,7 @@ fn build_config() -> Result<PolicyConfig, String> {
     if let Some(ref role_name) = cfg.active_role {
         if cfg.get_role(role_name).is_none() {
             return Err(format!(
-                "unknown role '{role_name}'. Available built-in roles: readonly (or auditor), qa (or tester), operator, admin; or define custom roles in config.toml under [roles.<name>]"
+                "unknown role '{role_name}'. Available built-in roles: readonly (or auditor), qa (or tester), browser, operator, admin; or define custom roles in config.toml under [roles.<name>]"
             ));
         }
     }
@@ -1731,7 +1731,7 @@ fn print_help() {
          \x20   help             Show this help\n\
          \n\
          OPTIONS:\n\
-         \x20   --role <ROLE>         Set active RBAC role profile (readonly, qa, operator, admin)\n\
+         \x20   --role <ROLE>         Set active RBAC role profile (readonly, qa, browser, operator, admin)\n\
          \x20   --no-anonymize        Disable outbound/inbound PII/PHI tokenization\n\
          \x20   --no-pii              Alias for --no-anonymize\n\
          \x20   --anonymize           Explicitly enable PII/PHI tokenization (default: enabled)\n\
