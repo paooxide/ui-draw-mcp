@@ -498,12 +498,40 @@ impl CdpConn {
 
     /// Send a CDP command and return its `result`, draining unrelated events.
     pub async fn call(&mut self, method: &str, params: Value) -> Result<Value, BrowserError> {
+        self.call_inner(method, params, CALL_TIMEOUT, None).await
+    }
+
+    /// [`Self::call`] with a deadline on the whole exchange. `call` only
+    /// bounds the wait for each message, so a busy page that keeps emitting
+    /// events could outlast it; this stops waiting `total` after the command
+    /// was sent. Used where the caller promises a time limit (`browser_eval`).
+    pub async fn call_within(
+        &mut self,
+        method: &str,
+        params: Value,
+        total: Duration,
+    ) -> Result<Value, BrowserError> {
+        self.call_inner(method, params, total, Some(total)).await
+    }
+
+    async fn call_inner(
+        &mut self,
+        method: &str,
+        params: Value,
+        per_read: Duration,
+        total: Option<Duration>,
+    ) -> Result<Value, BrowserError> {
+        let deadline = total.map(|t| tokio::time::Instant::now() + t);
         let id = self.next_id;
         self.next_id += 1;
         let msg = json!({ "id": id, "method": method, "params": params }).to_string();
         self.send_text(&msg).await?;
         loop {
-            let v = timeout(CALL_TIMEOUT, self.read_message())
+            let wait = match deadline {
+                Some(d) => per_read.min(d.saturating_duration_since(tokio::time::Instant::now())),
+                None => per_read,
+            };
+            let v = timeout(wait, self.read_message())
                 .await
                 .map_err(|_| BrowserError::Timeout(format!("cdp {method} timed out")))??;
             if !self.leave_dialogs

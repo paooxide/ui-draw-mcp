@@ -32,6 +32,24 @@ pub struct Shot {
     pub height: u32,
 }
 
+/// Options for [`BrowserBackend::eval_with`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct EvalOptions {
+    /// How long to let the script run before giving up (clamped to
+    /// [`EVAL_TIMEOUT_MIN_MS`]..=[`EVAL_TIMEOUT_MAX_MS`]); `None` is
+    /// [`EVAL_TIMEOUT_DEFAULT_MS`].
+    pub timeout_ms: Option<u64>,
+    /// Start the script and return at once, without waiting for it or its
+    /// result.
+    pub detached: bool,
+}
+
+/// Default, floor and ceiling for `browser_eval`'s `timeout_ms`. The ceiling
+/// sits well under what the transport would wait for on its own.
+pub const EVAL_TIMEOUT_DEFAULT_MS: u64 = 10_000;
+pub const EVAL_TIMEOUT_MIN_MS: u64 = 100;
+pub const EVAL_TIMEOUT_MAX_MS: u64 = 60_000;
+
 /// The browser control surface. One real implementation ([`CdpBackend`]); the
 /// trait exists for the same module/engine symmetry the other categories use.
 /// How `act` locates the element to act on: either a `ref` from a prior
@@ -47,6 +65,56 @@ pub enum Locator<'a> {
         text: Option<&'a str>,
         index: Option<usize>,
     },
+}
+
+/// How `act` brings the element into view before acting on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ScrollMode {
+    /// Do not scroll (the element may be off screen; a click still lands).
+    None,
+    /// Scroll only as far as needed, on both axes: no movement when the
+    /// element is already visible. The default.
+    #[default]
+    Nearest,
+    /// Centre the element in the viewport, on both axes.
+    Center,
+}
+
+impl ScrollMode {
+    /// The `scrollIntoView` options for this mode, or `None` for no scroll.
+    /// `behavior: 'instant'` so a position read straight after is not
+    /// mid-way through a smooth scroll.
+    fn js_options(self) -> Option<&'static str> {
+        match self {
+            ScrollMode::None => None,
+            ScrollMode::Nearest => Some("{block:'nearest',inline:'nearest',behavior:'instant'}"),
+            ScrollMode::Center => Some("{block:'center',inline:'center',behavior:'instant'}"),
+        }
+    }
+}
+
+/// Options for `act` beyond what it acts on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ActOpts {
+    pub scroll: ScrollMode,
+    /// Wait for the page to settle after the action (`wait_after: "settle"`)
+    /// and report what happened: `navigated`, `requests_started`, `settled`.
+    pub settle: bool,
+    /// Bound for the settle wait.
+    pub timeout_ms: u64,
+}
+
+/// The `timeout_ms` default of a settle wait.
+pub const ACT_SETTLE_TIMEOUT_MS: u64 = 10_000;
+
+impl Default for ActOpts {
+    fn default() -> Self {
+        ActOpts {
+            scroll: ScrollMode::default(),
+            settle: false,
+            timeout_ms: ACT_SETTLE_TIMEOUT_MS,
+        }
+    }
 }
 
 #[async_trait]
@@ -113,6 +181,22 @@ pub trait BrowserBackend: Send + Sync {
         let _ = secret;
         self.act(target, locator, action, value).await
     }
+    /// [`BrowserBackend::act_masked`] with [`ActOpts`]: how the element is
+    /// scrolled to, and whether to wait for the page to settle afterwards.
+    /// Backends that do neither ignore the options.
+    async fn act_opts(
+        &self,
+        target: &str,
+        locator: Locator<'_>,
+        action: &str,
+        value: Option<&str>,
+        secret: bool,
+        opts: ActOpts,
+    ) -> Result<Value, BrowserError> {
+        let _ = opts;
+        self.act_masked(target, locator, action, value, secret)
+            .await
+    }
     /// Wait for a settle signal (`selector` / `navigation` / `network_idle`).
     async fn wait(
         &self,
@@ -139,6 +223,34 @@ pub trait BrowserBackend: Send + Sync {
     }
     /// Screenshot the page or one element.
     async fn screenshot(&self, target: &str, node_ref: Option<&str>) -> Result<Shot, BrowserError>;
+    /// Start recording a tab to numbered JPEG frames under `media_dir`.
+    async fn screencast_start(
+        &self,
+        target: &str,
+        media_dir: &std::path::Path,
+        opts: crate::screencast::ScreencastOpts,
+    ) -> Result<Value, BrowserError> {
+        let _ = (target, media_dir, opts);
+        Err(BrowserError::Unsupported(
+            "this backend cannot record video".into(),
+        ))
+    }
+    /// Stop a recording (by tab or recording id) and encode it.
+    async fn screencast_stop(
+        &self,
+        target: Option<&str>,
+        recording_id: Option<&str>,
+        keep_frames: bool,
+    ) -> Result<Value, BrowserError> {
+        let _ = (target, recording_id, keep_frames);
+        Err(BrowserError::Unsupported(
+            "this backend cannot record video".into(),
+        ))
+    }
+    /// The active recordings.
+    async fn screencast_status(&self) -> Result<Value, BrowserError> {
+        Ok(json!({ "recordings": [] }))
+    }
     /// Emulate a viewport for responsive testing (device metrics override).
     /// `width == 0` clears the override and restores the real window size.
     async fn set_viewport(
@@ -151,6 +263,22 @@ pub trait BrowserBackend: Send + Sync {
     ) -> Result<Value, BrowserError>;
     /// Evaluate arbitrary JS in the page (dangerous).
     async fn eval(&self, target: &str, expression: &str) -> Result<Value, BrowserError>;
+    /// [`BrowserBackend::eval`] with a time limit and an optional detached
+    /// mode (see [`EvalOptions`]). A backend that cannot honour an option says
+    /// so rather than ignoring it; the default only supports plain `eval`.
+    async fn eval_with(
+        &self,
+        target: &str,
+        expression: &str,
+        opts: &EvalOptions,
+    ) -> Result<Value, BrowserError> {
+        if opts.detached {
+            return Err(BrowserError::Unsupported(
+                "detached eval needs the CDP (Chrome) engine".into(),
+            ));
+        }
+        self.eval(target, expression).await
+    }
     /// Start watching a tab across navigations (the recorder's transport).
     ///
     /// `new_document_script` is registered to run at the start of every new
@@ -410,12 +538,18 @@ pub struct CdpBackend {
     checkpoints: Mutex<crate::checkpoint::CheckpointStore>,
     /// Configured showcase visual flair (animated cursor, click ripples, typing HUD).
     showcase: Mutex<crate::showcase::ShowcaseConfig>,
+    /// Where the showcase pointer last was, per tab, in viewport CSS px. A
+    /// navigation resets the in-page cursor; this lets the next glide start
+    /// where the viewer last saw it instead of off-screen.
+    cursor_pos: Mutex<HashMap<String, (f64, f64)>>,
     /// Per target: the document-identity marker planted on the document an
     /// action (goto, reload, click, submit, press) was about to leave. A
     /// `wait navigation` that finds one waits for a document without it.
     nav_pending: Mutex<HashMap<String, NavPending>>,
     /// Tabs being watched across navigations (the recorder), by target id.
     observers: Mutex<HashMap<String, Observer>>,
+    /// Video recordings (`browser_screencast`), each on its own session.
+    screencasts: crate::screencast::ScreencastHub,
 }
 
 /// Longest semantic intent kept in a snapshot node. Mirrors `INTENT_MAX` in
@@ -881,6 +1015,37 @@ fn nav_probe_verdict(
     None
 }
 
+/// [`nav_probe_verdict`] for an action that is being settled: also gives up
+/// waiting for a navigation as soon as the loaded, unreplaced document has
+/// started a fetch / XHR since the action. That is the page working in place
+/// (an htmx swap, an API call), and waiting out the whole navigation window
+/// for it would make every such click cost seconds.
+fn settle_nav_verdict(
+    marker: Option<&str>,
+    ready_state: &str,
+    pending_token: &str,
+    requests_since: u64,
+    since_set: std::time::Duration,
+    expect_ms: u64,
+) -> Option<bool> {
+    match nav_probe_verdict(
+        marker,
+        ready_state,
+        pending_token,
+        false,
+        since_set,
+        expect_ms,
+    ) {
+        None if ready_state == "complete"
+            && marker == Some(pending_token)
+            && requests_since > 0 =>
+        {
+            Some(false)
+        }
+        v => v,
+    }
+}
+
 impl CdpBackend {
     pub fn new(nav: NavPolicy) -> Self {
         CdpBackend {
@@ -899,8 +1064,10 @@ impl CdpBackend {
             )),
             checkpoints: Mutex::new(crate::checkpoint::CheckpointStore::new()),
             showcase: Mutex::new(crate::showcase::ShowcaseConfig::default()),
+            cursor_pos: Mutex::new(HashMap::new()),
             nav_pending: Mutex::new(HashMap::new()),
             observers: Mutex::new(HashMap::new()),
+            screencasts: crate::screencast::ScreencastHub::default(),
         }
     }
 
@@ -987,6 +1154,101 @@ impl CdpBackend {
             }
             tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
         }
+    }
+
+    /// What `browser_act wait_after:"settle"` does once the action has run:
+    /// wait for a navigation it started to land, then for htmx (when the page
+    /// has it), then for the network to go quiet, all bounded by `timeout_ms`.
+    /// Never fails: the action happened, so a wait that runs out is reported
+    /// as `settled: false` with `settle_error`.
+    async fn settle_after_act(
+        &self,
+        target: &str,
+        nav_token: Option<String>,
+        timeout_ms: u64,
+    ) -> Value {
+        use tokio::time::{sleep, Duration, Instant};
+        let started = Instant::now();
+        let deadline = started + Duration::from_millis(timeout_ms.clamp(50, 60_000));
+        let left = || {
+            deadline
+                .saturating_duration_since(Instant::now())
+                .as_millis() as u64
+        };
+        let mut navigated = false;
+        let mut error: Option<String> = None;
+        let mut htmx = false;
+        let mut c = match self.conn(target).await {
+            Ok(c) => c,
+            Err(e) => {
+                return json!({
+                    "navigated": false, "requests_started": 0, "settled": false,
+                    "settle_error": berr_msg(&e),
+                })
+            }
+        };
+        if let Some(token) = nav_token {
+            // A fetch / XHR / htmx request that began on the document the
+            // click ran on is the page doing its work in place; stop waiting
+            // for a navigation then (see `settle_nav_verdict`).
+            loop {
+                if let Ok(p) = Self::eval_value(&mut c, JS_ACT_PROBE).await {
+                    htmx = p.get("htmx").and_then(Value::as_bool) == Some(true);
+                    let verdict = settle_nav_verdict(
+                        p.get("tok").and_then(Value::as_str),
+                        p.get("state").and_then(Value::as_str).unwrap_or(""),
+                        &token,
+                        p.get("req").and_then(Value::as_u64).unwrap_or(0),
+                        started.elapsed(),
+                        NAV_EXPECT_MS,
+                    );
+                    if let Some(nav) = verdict {
+                        navigated = nav;
+                        self.clear_nav_pending(target, Some(&token));
+                        break;
+                    }
+                }
+                if Instant::now() >= deadline {
+                    error = Some(format!("the page was still loading after {timeout_ms}ms"));
+                    break;
+                }
+                sleep(Duration::from_millis(50)).await;
+            }
+        }
+        if error.is_none() {
+            if let Ok(p) = Self::eval_value(&mut c, JS_ACT_PROBE).await {
+                htmx = p.get("htmx").and_then(Value::as_bool) == Some(true);
+            }
+            if htmx {
+                if let Err(e) = self
+                    .wait_window(target, "htmx_settled", None, left(), None)
+                    .await
+                {
+                    error = Some(berr_msg(&e));
+                }
+            }
+        }
+        if error.is_none() {
+            if let Err(e) = self
+                .wait_window(target, "network_idle", None, left(), None)
+                .await
+            {
+                error = Some(berr_msg(&e));
+            }
+        }
+        let requests = match Self::eval_value(&mut c, JS_ACT_PROBE).await {
+            Ok(p) => p.get("req").and_then(Value::as_u64).unwrap_or(0),
+            Err(_) => 0,
+        };
+        let mut out = json!({
+            "navigated": navigated,
+            "requests_started": requests,
+            "settled": error.is_none(),
+        });
+        if let (Some(e), Some(m)) = (error, out.as_object_mut()) {
+            m.insert("settle_error".into(), json!(e));
+        }
+        out
     }
 
     /// Cap the number of simultaneously active speculative branches
@@ -1230,6 +1492,33 @@ impl CdpBackend {
         }
     }
 
+    /// Move the real pointer from `from` to `to` in eased `mouseMoved` steps
+    /// spread over `glide_ms` (a single event when it is 0). These are trusted
+    /// events: the page sees `mousemove`/`mouseover`, and CSS `:hover` applies.
+    /// Says whether the last one, at `to`, was delivered; a failure part-way
+    /// is not an error of the action (the pointer is decoration).
+    async fn glide_mouse(c: &mut CdpConn, from: (f64, f64), to: (f64, f64), glide_ms: u64) -> bool {
+        let path = crate::showcase::glide_path(from, to, glide_ms);
+        let delay = std::time::Duration::from_millis(glide_ms / path.len().max(1) as u64);
+        let last = path.len().saturating_sub(1);
+        for (i, (x, y)) in path.into_iter().enumerate() {
+            let sent = c
+                .call(
+                    "Input.dispatchMouseEvent",
+                    json!({ "type": "mouseMoved", "x": x, "y": y, "button": "none", "buttons": 0 }),
+                )
+                .await;
+            if i == last {
+                return sent.is_ok();
+            }
+            if sent.is_err() {
+                return false;
+            }
+            tokio::time::sleep(delay).await;
+        }
+        false
+    }
+
     /// Real pointer input at a viewport CSS-pixel point: a `mouseMoved`, and
     /// for `click` a left `mousePressed` + `mouseReleased` (clickCount 1).
     /// These are trusted events (`isTrusted === true`) in the page.
@@ -1252,6 +1541,45 @@ impl CdpBackend {
             .await?;
         }
         Ok(())
+    }
+
+    /// Bring the browser's active page (the first in `/json/list`, which Chrome
+    /// keeps in most-recently-active order) to the front. Best effort; says
+    /// whether it worked. The focus emulation set here ends with this
+    /// connection (see [`Self::emulate_focus`]); what keeps a headed
+    /// browser's timers running afterwards is the launch flags.
+    async fn foreground_active_page(&self, browser_id: u32) -> bool {
+        let Ok(list) = self.tabs(browser_id, "list", None, None).await else {
+            return false;
+        };
+        let Some(target) = list
+            .get("tabs")
+            .and_then(Value::as_array)
+            .and_then(|a| a.first())
+            .and_then(|t| t.get("target_id"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+        else {
+            return false;
+        };
+        let Ok(mut c) = self.conn(&target).await else {
+            return false;
+        };
+        Self::emulate_focus(&mut c).await;
+        c.call("Page.bringToFront", json!({})).await.is_ok()
+    }
+
+    /// Make the page believe it has focus (`document.hasFocus()`, focus and
+    /// blur events) even when its window is behind another. Best effort. The
+    /// emulation belongs to the DevTools session that asked for it and ends
+    /// with it, so it cannot be set once and left.
+    async fn emulate_focus(c: &mut CdpConn) {
+        c.call(
+            "Emulation.setFocusEmulationEnabled",
+            json!({ "enabled": true }),
+        )
+        .await
+        .ok();
     }
 
     /// Run JS in the page and return the deserialized value (or a JS-exception
@@ -1639,31 +1967,145 @@ function __find(by, q, within, textFilter, index){
 }
 "#;
 
-/// Check whether HTMX has finished all in-flight requests and DOM swaps.
+/// Idempotent htmx listeners, as a JS function `__hx_hook()` returning the
+/// shared state (or `null` while `window.htmx` is absent).
 ///
-/// `htmx` has no "is anything in flight" API, so the first probe installs
-/// (idempotently) capture-phase listeners on `document` for
-/// `htmx:beforeRequest` / `htmx:afterRequest` / `htmx:afterSettle`, keeping an
-/// in-flight counter and the time of the last event. Settled means: counter 0,
-/// no element carrying `htmx-request` / `htmx-settling` / `htmx-swapping`
-/// (this also covers requests that started before the probe was installed),
-/// and no htmx event for a short quiet window. Throws when `window.htmx` is
-/// absent so a page without htmx is an error, not "settled".
-const JS_HTMX_SETTLED: &str = r#"(function(){
-  if (!window.htmx) throw new Error('htmx not present on page');
+/// `htmx` has no "is anything in flight" API, so the hook installs
+/// capture-phase listeners on `document` for `htmx:beforeRequest` /
+/// `htmx:afterRequest` / `htmx:afterSettle`, keeping an in-flight counter, the
+/// number of requests seen (`seen`) and the time of the last event. The act
+/// path installs it *before* the action, so a request the action starts is
+/// counted even when it begins late (a debounced or delayed trigger).
+const JS_HTMX_HOOK: &str = r#"
+function __hx_hook(){
+  if (!window.htmx) return null;
   var st = window.__agentctl_htmx;
   if (!st) {
-    st = window.__agentctl_htmx = { inflight: 0, last: Date.now() };
+    st = window.__agentctl_htmx = { inflight: 0, last: Date.now(), seen: 0, mark: 0 };
     var touch = function(){ st.last = Date.now(); };
-    document.addEventListener('htmx:beforeRequest', function(){ st.inflight++; touch(); }, true);
+    document.addEventListener('htmx:beforeRequest', function(){ st.inflight++; st.seen++; touch(); }, true);
     document.addEventListener('htmx:afterRequest', function(){ if (st.inflight > 0) st.inflight--; touch(); }, true);
     document.addEventListener('htmx:afterSettle', touch, true);
   }
+  return st;
+}"#;
+
+/// Idempotent fetch / XHR counter, as a JS function `__net_hook()` returning
+/// the shared state `{inflight, started, last, mark, act_at}`. `started` counts
+/// every fetch and XHR (htmx uses XHR) begun since the hook went in; the act
+/// path sets `mark` and `act_at`, so "started since the last act" is
+/// `started - mark`. A request already in flight when the hook goes in is not
+/// seen until it completes (the Performance API lists it only then), which is
+/// why the act path installs the hook before it acts.
+const JS_NET_HOOK: &str = r#"
+function __net_hook(){
+  var st = window.__agentctl_net;
+  if (st) return st;
+  st = window.__agentctl_net = { inflight: 0, started: 0, last: Date.now(), mark: 0, act_at: null };
+  var begin = function(){ st.inflight++; st.started++; st.last = Date.now(); };
+  var end = function(){ if (st.inflight > 0) st.inflight--; st.last = Date.now(); };
+  try {
+    if (window.fetch) {
+      var of = window.fetch;
+      window.fetch = function(){
+        begin();
+        var p;
+        try { p = of.apply(this, arguments); } catch(e) { end(); throw e; }
+        p.then(end, end);
+        return p;
+      };
+    }
+    var os = XMLHttpRequest.prototype.send;
+    XMLHttpRequest.prototype.send = function(){
+      var x = this, done = false;
+      begin();
+      x.addEventListener('loadend', function(){ if (!done) { done = true; end(); } });
+      try { return os.apply(this, arguments); } catch(e) { if (!done) { done = true; end(); } throw e; }
+    };
+  } catch(e) {}
+  return st;
+}"#;
+
+/// How long `htmx_settled` waits, after an act, for an htmx request to start
+/// before taking it that none will (a debounced `hx-trigger` can begin
+/// hundreds of milliseconds after the event).
+const HTMX_GRACE_MS: u64 = 1_500;
+
+/// Quiet period `network_idle` requires: no fetch/XHR in flight, and none
+/// begun or finished for this long.
+const NET_QUIET_MS: u64 = 500;
+
+/// Run right before an action: install both hooks, then record "an action
+/// happened now, with this many requests seen so far".
+fn act_arm_js() -> String {
+    format!(
+        r#"(function(){{
+  {JS_NET_HOOK}
+  {JS_HTMX_HOOK}
+  var n = __net_hook();
+  n.mark = n.started; n.act_at = Date.now();
+  var h = __hx_hook();
+  if (h) h.mark = h.seen;
+  return true;
+}})()"#
+    )
+}
+
+/// Probe: has HTMX finished all in-flight requests and DOM swaps?
+///
+/// Settled means: counter 0, no element carrying `htmx-request` /
+/// `htmx-settling` / `htmx-swapping` (this also covers requests that started
+/// before the hook was installed), no htmx event for a short quiet window, and
+/// (right after an act) either a request was seen since it or the
+/// [`HTMX_GRACE_MS`] grace has run out. Throws when `window.htmx` is absent so
+/// a page without htmx is an error, not "settled".
+fn htmx_settled_js() -> String {
+    format!(
+        r#"(function(){{
+  {JS_HTMX_HOOK}
+  var st = __hx_hook();
+  if (!st) throw new Error('htmx not present on page');
   if (st.inflight > 0) return false;
   if (document.querySelector('.htmx-request, .htmx-settling, .htmx-swapping') !== null) return false;
   if (Date.now() - st.last < 100) return false;
+  var n = window.__agentctl_net;
+  if (n && n.act_at !== null && st.seen === st.mark && Date.now() - n.act_at < {HTMX_GRACE_MS}) return false;
   return document.readyState === 'complete' || document.readyState === 'interactive';
-})()"#;
+}})()"#
+    )
+}
+
+/// Probe for `network_idle`: loaded, no fetch/XHR in flight, and nothing begun
+/// or finished for [`NET_QUIET_MS`] (the Performance API's resource entries
+/// cover requests the hook did not see begin).
+fn net_idle_js() -> String {
+    format!(
+        r#"(function(){{
+  {JS_NET_HOOK}
+  var st = __net_hook();
+  if (document.readyState !== 'complete') return false;
+  if (st.inflight > 0) return false;
+  if (Date.now() - st.last < {NET_QUIET_MS}) return false;
+  try {{
+    var es = performance.getEntriesByType('resource'), now = performance.now();
+    for (var i = es.length - 1, k = 0; i >= 0 && k < 64; i--, k++) {{
+      if (now - es[i].responseEnd < {NET_QUIET_MS}) return false;
+    }}
+  }} catch(e) {{}}
+  return true;
+}})()"#
+    )
+}
+
+/// Page state for settling an act: the requests started since the act and
+/// the navigation marker, in one read. Throws nothing; `req` is 0 when the
+/// hook is absent (a replaced document).
+const JS_ACT_PROBE: &str = r#"({
+  tok: window.__agentctl_nav_token === undefined ? null : String(window.__agentctl_nav_token),
+  state: document.readyState,
+  req: window.__agentctl_net ? window.__agentctl_net.started - window.__agentctl_net.mark : 0,
+  htmx: !!window.htmx
+})"#;
 
 /// Page hook that records fetch/XHR (method, url, status, request+response
 /// bodies, bounded) and console errors / uncaught exceptions into ring buffers
@@ -1831,8 +2273,8 @@ const JS_FILL_FORM: &str = r##"(async function(){
       continue;
     }
     try {
-      if(el.scrollIntoView) el.scrollIntoView({block:'nearest', inline:'nearest'});
-      if(el.focus) el.focus();
+      if(el.scrollIntoView) el.scrollIntoView({block:'nearest', inline:'nearest', behavior:'instant'});
+      if(el.focus) el.focus({preventScroll:true});
       var val = f.value;
       {JS_SHOWCASE_FIELD}
       var tag = (el.tagName || '').toLowerCase();
@@ -1982,6 +2424,13 @@ impl BrowserBackend for CdpBackend {
                 ));
             }
             if browser_name == "safari" || browser_name == "webkit" {
+                for key in ["args", "background_throttling"] {
+                    if spec.get(key).is_some() {
+                        return Err(BrowserError::Unsupported(format!(
+                            "launch.{key} is a Chromium option; Safari is started by safaridriver and takes no command-line flags"
+                        )));
+                    }
+                }
                 if !crate::safari::is_safari_available() {
                     return Err(BrowserError::Unsupported(
                         "Safari WebDriver is only supported on macOS with safaridriver installed"
@@ -2103,6 +2552,7 @@ impl BrowserBackend for CdpBackend {
             "browser": ver.get("Browser"),
             "protocol": ver.get("Protocol-Version"),
         });
+        out["foregrounded"] = json!(self.foreground_active_page(id).await);
         // Only a profile we created (and will delete on disconnect) is reported.
         if let Some(dir) = owned_profile {
             out["owned_user_data_dir"] = json!(dir);
@@ -2118,6 +2568,7 @@ impl BrowserBackend for CdpBackend {
                 o.task.abort();
             }
         }
+        self.screencasts.abort_all();
         self.reap_all();
     }
 
@@ -2156,6 +2607,7 @@ impl BrowserBackend for CdpBackend {
             }));
         }
 
+        self.screencasts.abort_browser(browser_id);
         let existed = {
             let mut g = self.browsers.lock().expect("browsers mutex");
             let before = g.len();
@@ -2761,7 +3213,25 @@ impl BrowserBackend for CdpBackend {
         value: Option<&str>,
         secret: bool,
     ) -> Result<Value, BrowserError> {
+        self.act_opts(target, locator, action, value, secret, ActOpts::default())
+            .await
+    }
+
+    async fn act_opts(
+        &self,
+        target: &str,
+        locator: Locator<'_>,
+        action: &str,
+        value: Option<&str>,
+        secret: bool,
+        opts: ActOpts,
+    ) -> Result<Value, BrowserError> {
         let is_safari = target.starts_with("safari-");
+        if is_safari && opts.settle {
+            return Err(BrowserError::Unsupported(
+                "wait_after 'settle' needs the CDP (Chrome) engine; use browser_wait on the WebKit engine".into(),
+            ));
+        }
         let press_key = if action == "press" {
             if is_safari {
                 return Err(BrowserError::Unsupported(
@@ -2782,6 +3252,12 @@ impl BrowserBackend for CdpBackend {
         } else {
             Some(self.conn(target).await?)
         };
+        // Focus emulation lasts as long as this connection, and every tool
+        // call opens its own: ask for it here so a headed window sitting
+        // behind others still sees focus/blur and `:focus` during the act.
+        if let Some(c) = c_opt.as_mut() {
+            Self::emulate_focus(c).await;
+        }
         // While this tab is being recorded, the script runs in the recorder's
         // isolated world: the DOM is the same, but there it can tell the
         // recorder which synthetic events are agentctl's own (`JS_ARM`).
@@ -2821,34 +3297,6 @@ impl BrowserBackend for CdpBackend {
         let act = serde_json::to_string(action).unwrap_or_else(|_| "\"click\"".into());
         let val = serde_json::to_string(&value).unwrap_or_else(|_| "null".into());
 
-        let showcase_cfg = self
-            .showcase
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
-        let (showcase_init, showcase_call) = if showcase_cfg.enabled {
-            let glide_ms = showcase_cfg.glide_ms();
-            let click_ripple = showcase_cfg.click_ripple;
-            let typing_hud = showcase_cfg.typing_hud;
-            (
-                showcase_guarded(crate::showcase::JS_SHOWCASE_ENGINE),
-                format!(
-                    r#"
-  try {{
-    if(typeof window !== 'undefined' && window.__agentctl_showcase && typeof window.__agentctl_showcase.act === 'function') {{
-      var b = el.getBoundingClientRect();
-      var cx = Math.round(b.left + b.width / 2);
-      var cy = Math.round(b.top + b.height / 2);
-      await window.__agentctl_showcase.act(cx, cy, action, value, {glide_ms}, {click_ripple}, {typing_hud}, el, {secret});
-    }}
-  }} catch(e) {{}}
-"#
-                ),
-            )
-        } else {
-            (String::new(), String::new())
-        };
-
         // A click, submit or key press may start a navigation. Mark the
         // document it happens on, so a following `wait navigation` can tell
         // that document from the one it lands on.
@@ -2869,13 +3317,155 @@ impl BrowserBackend for CdpBackend {
             nav_mark
         };
 
+        // `scroll_into_view` is the one action whose whole point is the
+        // scroll, so it never skips it.
+        let scroll = if action == "scroll_into_view" && opts.scroll == ScrollMode::None {
+            ScrollMode::Nearest
+        } else {
+            opts.scroll
+        };
+        let scroll_js = |target: &str| {
+            scroll
+                .js_options()
+                .map(|o| format!("try{{ {target}.scrollIntoView({o}); }}catch(e){{}}"))
+                .unwrap_or_default()
+        };
+        let canvas_scroll = scroll_js("c");
+        let el_scroll = scroll_js("el");
+
+        // Install the request counters and mark "an action happens now" before
+        // it does, so a request it starts (however late) is seen by the
+        // settle waits. Best effort: a page that cannot be scripted just has
+        // no counters.
+        if let (Some(c), false) = (c_opt.as_mut(), action == "scroll_into_view") {
+            let _ = Self::eval_value(c, &act_arm_js()).await;
+        }
+
+        let showcase_cfg = self
+            .showcase
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let showcase_engine = showcase_cfg.engine_js();
+
+        // Real pointer movement (Chrome): the page gets trusted `mousemove`
+        // events along the glide, so `:hover`, tooltips and mouse listeners
+        // see the pointer arrive. A first script finds where the element is
+        // (after scrolling it into view); the pointer is then moved there from
+        // where it last was, while the drawn cursor glides alongside; the act
+        // script that follows only does the click/type itself. `hover` always
+        // moves the pointer, showcase or not. Canvas regions send their own
+        // real input below.
+        //
+        // The recorder only listens for click/input/change/keydown, so these
+        // `mouseMoved` events (no buttons, no click) are never recorded as
+        // steps, also while a recording is running; no recording-specific
+        // skip is needed.
+        let mut real_move = false;
+        if !is_safari && !canvas_ref && (action == "hover" || showcase_cfg.enabled) {
+            let last = self
+                .cursor_pos
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(target)
+                .copied();
+            let (engine_js, resume_js) = if showcase_cfg.enabled {
+                let resume = last
+                    .map(|(x, y)| {
+                        format!(
+                            "try{{ if(window.__agentctl_showcase) window.__agentctl_showcase.place({x},{y}); }}catch(e){{}}"
+                        )
+                    })
+                    .unwrap_or_default();
+                (showcase_guarded(&showcase_engine), resume)
+            } else {
+                (String::new(), String::new())
+            };
+            let probe = format!(
+                r#"(async function(){{
+  {JS_XPATH}
+  {JS_FIND}
+  {engine_js}
+  {resume_js}
+  var el;
+  try {{ el = {resolve}; }} catch(e) {{ return null; }}
+  if(!el || el.__is_canvas_target) return null;
+  {el_scroll}
+  var b = el.getBoundingClientRect();
+  if(!(b.width > 0 || b.height > 0)) return null;
+  return {{x: b.left + b.width / 2, y: b.top + b.height / 2}};
+}})()"#
+            );
+            if let Some(c) = c_opt.as_mut() {
+                let at = Self::eval_value_in(c, &probe, iso)
+                    .await
+                    .ok()
+                    .and_then(|v| Some((v.get("x")?.as_f64()?, v.get("y")?.as_f64()?)));
+                if let Some(to) = at {
+                    let glide_ms = showcase_cfg.glide_ms();
+                    let from = last.unwrap_or(if showcase_cfg.enabled { (0.0, 0.0) } else { to });
+                    if showcase_cfg.enabled {
+                        // The drawn cursor glides over the same time and curve.
+                        let kick = format!(
+                            "try{{ if(window.__agentctl_showcase){{ {} window.__agentctl_showcase.move({},{},{glide_ms}); }} }}catch(e){{}} true",
+                            if last.is_none() {
+                                format!("window.__agentctl_showcase.place({},{});", from.0, from.1)
+                            } else {
+                                String::new()
+                            },
+                            to.0,
+                            to.1
+                        );
+                        let _ = Self::eval_value_in(c, &kick, iso).await;
+                    }
+                    real_move = Self::glide_mouse(c, from, to, glide_ms).await;
+                    if real_move {
+                        self.cursor_pos
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .insert(target.to_string(), to);
+                    }
+                }
+            }
+        }
+
+        let (showcase_init, showcase_call) = if showcase_cfg.enabled {
+            // A glide that was already made with real mouse events leaves the
+            // page-side cursor only the snap, ripple and HUD to do.
+            let glide_ms = if real_move {
+                0
+            } else {
+                showcase_cfg.glide_ms()
+            };
+            let ripple_ms = showcase_cfg.ripple_ms();
+            let beat_ms = crate::showcase::ripple_beat_ms(ripple_ms);
+            let typing_hud = showcase_cfg.typing_hud;
+            (
+                showcase_guarded(&showcase_engine),
+                format!(
+                    r#"
+  try {{
+    if(typeof window !== 'undefined' && window.__agentctl_showcase && typeof window.__agentctl_showcase.act === 'function') {{
+      var b = el.getBoundingClientRect();
+      var cx = Math.round(b.left + b.width / 2);
+      var cy = Math.round(b.top + b.height / 2);
+      await window.__agentctl_showcase.act(cx, cy, action, value, {glide_ms}, {ripple_ms}, {beat_ms}, {typing_hud}, el, {secret});
+    }}
+  }} catch(e) {{}}
+"#
+                ),
+            )
+        } else {
+            (String::new(), String::new())
+        };
+
         let expr = format!(
             r#"(async function(){{
   {JS_XPATH}
   {JS_FIND}
   {js_arm}
   {showcase_init}
-  var el, action={act}, value={val};
+  var el, action={act}, value={val}, realMove={real_move};
   try {{ el = {resolve}; }} catch(e) {{ return {{ok:false,error:String(e && e.message ? e.message : e)}}; }}
   if(!el) return {{ok:false,error:'element not found'}};
   if(el.__is_canvas_target){{
@@ -2883,7 +3473,7 @@ impl BrowserBackend for CdpBackend {
     if(action !== 'click' && action !== 'hover' && action !== 'scroll_into_view'){{
       return {{ok:false,kind:'unsupported',error:"action '"+action+"' is not supported on a canvas region (only click, hover, scroll_into_view); the region is drawn pixels, not a DOM element"}};
     }}
-    try{{ c.scrollIntoView({{block:'center',inline:'center',behavior:'instant'}}); }}catch(e){{}}
+    {canvas_scroll}
     var box = __canvas_box(c, el.reg);
     var px = box.x + box.w / 2, py = box.y + box.h / 2;
     if(action === 'scroll_into_view') return {{ok:true,action:action,canvas_target:true}};
@@ -2898,15 +3488,23 @@ impl BrowserBackend for CdpBackend {
     }}
     return {{ok:true,action:action,canvas_target:true,canvas_point:true,x:px,y:py}};
   }}
-  try{{ el.scrollIntoView({{block:'center',inline:'center'}}); }}catch(e){{}}
+  {el_scroll}
   {showcase_call}
   {nav_mark_in_script}
   try {{
   switch(action){{
     case 'click': __arm(el, 'click'); el.click(); break;
-    case 'focus': el.focus(); break;
-    case 'press': el.focus(); break;
-    case 'hover': el.dispatchEvent(new MouseEvent('mouseover',{{bubbles:true}})); break;
+    case 'focus': el.focus({{preventScroll:true}}); break;
+    case 'press': el.focus({{preventScroll:true}}); break;
+    case 'hover': {{
+      // The real pointer lands on whatever is on top at the element's
+      // centre; when that is not the element (an overlay covers it), fall
+      // back to the synthetic event so the element still hears the hover.
+      var hb = el.getBoundingClientRect();
+      var top = realMove ? document.elementFromPoint(hb.left + hb.width / 2, hb.top + hb.height / 2) : null;
+      if(!top || !(top === el || el.contains(top))) el.dispatchEvent(new MouseEvent('mouseover',{{bubbles:true}}));
+      break;
+    }}
     case 'scroll_into_view': break;
     case 'submit':
       if(el.form){{ el.form.requestSubmit?el.form.requestSubmit():el.form.submit(); }}
@@ -2916,7 +3514,7 @@ impl BrowserBackend for CdpBackend {
     case 'select':
       el.value=value; __arm(el, 'change'); el.dispatchEvent(new Event('change',{{bubbles:true}})); break;
     case 'type':
-      if(el.focus) el.focus();
+      if(el.focus) el.focus({{preventScroll:true}});
       if('value' in el){{ el.value=value; }} else {{ el.textContent=value; }}
       __arm(el, 'input');
       el.dispatchEvent(new Event('input',{{bubbles:true}}));
@@ -2926,9 +3524,17 @@ impl BrowserBackend for CdpBackend {
     default: return {{ok:false,error:'unknown action '+action}};
   }}
   }} finally {{ __disarm(); }}
-  return {{ok:true,action:action,showcase:{}}};
+  return {{ok:true,action:action,showcase:{}{showcase_rendered}}};
 }})()"#,
-            showcase_cfg.enabled
+            showcase_cfg.enabled,
+            showcase_rendered = if showcase_cfg.enabled {
+                format!(
+                    ",showcase_rendered:{}",
+                    crate::showcase::JS_SHOWCASE_RENDERED
+                )
+            } else {
+                String::new()
+            }
         );
         let mut v = if is_safari {
             let entry = self.get_safari_session(target)?;
@@ -2952,10 +3558,10 @@ impl BrowserBackend for CdpBackend {
                 _ => BrowserError::NotFound(msg),
             });
         }
-        if let Some(token) = nav_token {
+        if let Some(token) = &nav_token {
             // The marker is on the document the action ran on; a click only
             // *might* navigate, so the wait for it is bounded (NAV_EXPECT_MS).
-            self.set_nav_pending(target, token, false);
+            self.set_nav_pending(target, token.clone(), false);
         }
         if v.get("canvas_point").and_then(Value::as_bool) == Some(true) {
             // A canvas region is only pixels: the click must be a real,
@@ -3006,6 +3612,15 @@ impl BrowserBackend for CdpBackend {
         if let Some(ref mut c) = c_opt {
             self.note_dialogs(target, c, &mut v);
         }
+        if opts.settle {
+            drop(c_opt);
+            let report = self
+                .settle_after_act(target, nav_token, opts.timeout_ms)
+                .await;
+            if let (Some(m), Some(r)) = (v.as_object_mut(), report.as_object()) {
+                m.extend(r.iter().map(|(k, x)| (k.clone(), x.clone())));
+            }
+        }
         Ok(v)
     }
 
@@ -3054,7 +3669,7 @@ impl BrowserBackend for CdpBackend {
                     "return document.readyState==='complete';".to_string()
                 }
                 "dom_settled" => safari_return(JS_DOM_SETTLED),
-                "htmx_settled" => safari_return(JS_HTMX_SETTLED),
+                "htmx_settled" => safari_return(&htmx_settled_js()),
                 other => {
                     return Err(BrowserError::Failed(format!(
                         "unknown wait condition '{other}'"
@@ -3108,6 +3723,22 @@ impl BrowserBackend for CdpBackend {
             self.note_dialogs(target, &mut c, &mut out);
             return Ok(out);
         }
+        // An action that may have navigated leaves the old document showing
+        // for a moment, and the old document is as quiet as any: look at the
+        // network only once the page has moved on (or the click has had its
+        // NAV_EXPECT_MS to start navigating and did not).
+        let mut navigated = None;
+        if cond == "network_idle" {
+            if let Some(pending) = self.nav_pending_for(target) {
+                let left = deadline
+                    .saturating_duration_since(Instant::now())
+                    .as_millis() as u64;
+                let r = self
+                    .wait_replaced_document(target, &mut c, pending, left, NAV_EXPECT_MS)
+                    .await?;
+                navigated = r.get("navigated").cloned();
+            }
+        }
 
         let probe = match cond {
             "selector" => {
@@ -3117,9 +3748,9 @@ impl BrowserBackend for CdpBackend {
                 format!("!!document.querySelector({sl})")
             }
             "navigation" => "document.readyState==='complete'".to_string(),
-            "network_idle" => "document.readyState==='complete'".to_string(),
+            "network_idle" => net_idle_js(),
             "dom_settled" => JS_DOM_SETTLED.to_string(),
-            "htmx_settled" => JS_HTMX_SETTLED.to_string(),
+            "htmx_settled" => htmx_settled_js(),
             other => {
                 return Err(BrowserError::Failed(format!(
                     "unknown wait condition '{other}'"
@@ -3136,11 +3767,10 @@ impl BrowserBackend for CdpBackend {
                 }
             })?;
             if hit.as_bool() == Some(true) {
-                // network_idle: require a short additional quiet window.
-                if cond == "network_idle" {
-                    sleep(Duration::from_millis(400)).await;
-                }
                 let mut out = json!({ "settled": true, "condition": cond });
+                if let (Some(n), Some(m)) = (navigated, out.as_object_mut()) {
+                    m.insert("navigated".into(), n);
+                }
                 self.note_dialogs(target, &mut c, &mut out);
                 return Ok(out);
             }
@@ -3227,6 +3857,34 @@ impl BrowserBackend for CdpBackend {
             width: w,
             height: h,
         })
+    }
+
+    async fn screencast_start(
+        &self,
+        target: &str,
+        media_dir: &std::path::Path,
+        opts: crate::screencast::ScreencastOpts,
+    ) -> Result<Value, BrowserError> {
+        require_cdp_target(target, "browser_screencast")?;
+        let (b, _) = self.browser_ws_for_target(target).await?;
+        self.screencasts
+            .start((b.id, &b.host, b.port), target, media_dir, opts)
+            .await
+    }
+
+    async fn screencast_stop(
+        &self,
+        target: Option<&str>,
+        recording_id: Option<&str>,
+        keep_frames: bool,
+    ) -> Result<Value, BrowserError> {
+        self.screencasts
+            .stop(target, recording_id, keep_frames)
+            .await
+    }
+
+    async fn screencast_status(&self) -> Result<Value, BrowserError> {
+        Ok(self.screencasts.status())
     }
 
     async fn set_viewport(
@@ -3350,6 +4008,106 @@ impl BrowserBackend for CdpBackend {
 
         let mut c = self.conn(target).await?;
         let v = Self::eval_value(&mut c, expression).await?;
+        let mut out = json!({ "result": v });
+        self.note_dialogs(target, &mut c, &mut out);
+        Ok(out)
+    }
+
+    async fn eval_with(
+        &self,
+        target: &str,
+        expression: &str,
+        opts: &EvalOptions,
+    ) -> Result<Value, BrowserError> {
+        use tokio::time::Duration;
+        if target.starts_with("safari-") {
+            if opts.detached {
+                return Err(BrowserError::Unsupported(
+                    "detached eval needs the CDP (Chrome) engine; the WebKit engine cannot start a script and leave it running".into(),
+                ));
+            }
+            let mut out = self.eval(target, expression).await?;
+            if opts.timeout_ms.is_some() {
+                out["timeout_note"] = json!(
+                    "timeout_ms is not enforced on the WebKit engine; the script ran with the driver's own limit"
+                );
+            }
+            return Ok(out);
+        }
+
+        let mut c = self.conn(target).await?;
+        // Focus emulation lives and dies with this connection, so each
+        // session that runs page script asks for it again.
+        Self::emulate_focus(&mut c).await;
+        c.call("Runtime.enable", json!({})).await.ok();
+
+        let timeout_ms = clamp_eval_timeout(opts.timeout_ms);
+        // The transport deadline is the limit. Chrome's own `timeout`
+        // parameter would stop a synchronous loop too, but it reports it as an
+        // opaque "Internal error"; `Runtime.terminateExecution` below does the
+        // same job with a reply we can tell apart.
+        let params = json!({
+            "expression": expression,
+            "returnByValue": true,
+            // Detached: do not wait for a returned promise. The synchronous
+            // part still runs inside this call (and under its time limit);
+            // evaluating the code directly, rather than through a timer and
+            // `eval`, keeps it working on pages whose CSP forbids `eval`.
+            "awaitPromise": !opts.detached,
+            "userGesture": true
+        });
+        let called = c
+            .call_within(
+                "Runtime.evaluate",
+                params,
+                Duration::from_millis(timeout_ms),
+            )
+            .await;
+        let r = match called {
+            Ok(r) => r,
+            Err(BrowserError::Timeout(_)) => {
+                let attempted = c
+                    .call_within(
+                        "Runtime.terminateExecution",
+                        json!({}),
+                        Duration::from_secs(2),
+                    )
+                    .await
+                    .is_ok();
+                return Err(BrowserError::Timeout(eval_timeout_message(
+                    timeout_ms, attempted,
+                )));
+            }
+            Err(BrowserError::Failed(m)) if is_navigated_message(&m) => {
+                return Ok(json!({
+                    "navigated": true,
+                    "value": null,
+                    "result": null,
+                    "note": "the script navigated the page (or closed the tab) before it finished, so Chrome dropped its result; the script's own effects happened. Use browser_wait navigation / browser_snapshot to see the new page."
+                }));
+            }
+            Err(e) => return Err(e),
+        };
+        if let Some(exc) = r.get("exceptionDetails") {
+            let text = exc
+                .get("exception")
+                .and_then(|e| e.get("description").or_else(|| e.get("value")))
+                .and_then(Value::as_str)
+                .or_else(|| exc.get("text").and_then(Value::as_str))
+                .unwrap_or("javascript error");
+            return Err(BrowserError::Failed(format!("eval: {text}")));
+        }
+        if opts.detached {
+            return Ok(json!({
+                "started": true,
+                "note": "the script's synchronous part has run; anything it left pending (promises, timers) carries on in the page and its result is not reported (a rejection goes to the page console)."
+            }));
+        }
+        let v = r
+            .get("result")
+            .and_then(|o| o.get("value"))
+            .cloned()
+            .unwrap_or(Value::Null);
         let mut out = json!({ "result": v });
         self.note_dialogs(target, &mut c, &mut out);
         Ok(out)
@@ -4105,8 +4863,10 @@ impl BrowserBackend for CdpBackend {
             .clone();
         let (showcase_init, showcase_field, showcase_submit) = if showcase_cfg.enabled {
             let glide_ms = showcase_cfg.glide_ms();
+            let ripple_ms = showcase_cfg.ripple_ms();
+            let beat_ms = crate::showcase::ripple_beat_ms(ripple_ms);
             (
-                showcase_guarded(crate::showcase::JS_SHOWCASE_ENGINE),
+                showcase_guarded(&showcase_cfg.engine_js()),
                 format!(
                     r#"
       try {{
@@ -4114,7 +4874,7 @@ impl BrowserBackend for CdpBackend {
           var fb = el.getBoundingClientRect();
           var fx = Math.round(fb.left + fb.width / 2);
           var fy = Math.round(fb.top + fb.height / 2);
-          await window.__agentctl_showcase.act(fx, fy, 'type', val, {glide_ms}, false, true, el, f.secret === true);
+          await window.__agentctl_showcase.act(fx, fy, 'type', val, {glide_ms}, 0, 0, true, el, f.secret === true);
         }}
       }} catch(e) {{}}
 "#
@@ -4126,7 +4886,7 @@ impl BrowserBackend for CdpBackend {
           var sb = subEl.getBoundingClientRect();
           var sx = Math.round(sb.left + sb.width / 2);
           var sy = Math.round(sb.top + sb.height / 2);
-          await window.__agentctl_showcase.act(sx, sy, 'click', null, {glide_ms}, true, true);
+          await window.__agentctl_showcase.act(sx, sy, 'click', null, {glide_ms}, {ripple_ms}, {beat_ms}, true);
         }}
       }} catch(e) {{}}
 "#
@@ -4997,30 +5757,85 @@ impl BrowserBackend for CdpBackend {
         if !cfg.enabled {
             self.teardown_showcase(None).await;
         }
-        if cfg.enabled && !target.is_empty() {
-            let is_safari = target.starts_with("safari-");
-            let init_script = format!(
-                r#"(function(){{ {} return true; }})()"#,
-                crate::showcase::JS_SHOWCASE_ENGINE
-            );
-            if is_safari {
-                if let Ok(entry) = self.get_safari_session(target) {
-                    if let Err(e) = entry
-                        .session
-                        .execute_sync(&safari_return(&init_script), &[])
-                        .await
-                    {
-                        tracing::warn!("showcase overlay could not be installed: {}", err_msg(&e));
+        let mut out = cfg.to_json();
+        if !cfg.enabled {
+            self.cursor_pos
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clear();
+            return Ok(out);
+        }
+        // Say whether the overlay exists in the page, not just that it was
+        // asked for: this is main-world, so `window.__agentctl_showcase` is
+        // the same object a page script would see.
+        let (rendered, problem) = if target.is_empty() {
+            (
+                false,
+                Some("no target_id: the overlay is only drawn into a page, and acts draw it when they run".to_string()),
+            )
+        } else {
+            let script = showcase_install_script(&cfg);
+            let probed = if target.starts_with("safari-") {
+                match self.get_safari_session(target) {
+                    Ok(entry) => {
+                        entry
+                            .session
+                            .execute_sync(&safari_return(&script), &[])
+                            .await
                     }
+                    Err(e) => Err(e),
                 }
-            } else if let Ok(mut c) = self.conn(target).await {
-                if let Err(e) = Self::eval_value(&mut c, &init_script).await {
-                    tracing::warn!("showcase overlay could not be installed: {}", err_msg(&e));
+            } else {
+                match self.conn(target).await {
+                    Ok(mut c) => Self::eval_value(&mut c, &script).await,
+                    Err(e) => Err(e),
                 }
+            };
+            match probed {
+                Ok(v) if v.get("rendered").and_then(Value::as_bool) == Some(true) => (true, None),
+                Ok(v) => (
+                    false,
+                    Some(
+                        v.get("reason")
+                            .and_then(Value::as_str)
+                            .unwrap_or("the overlay was not created")
+                            .to_string(),
+                    ),
+                ),
+                Err(e) => (
+                    false,
+                    Some(format!("overlay injection failed: {}", err_msg(&e))),
+                ),
+            }
+        };
+        if let Some(m) = out.as_object_mut() {
+            m.insert("rendered".into(), json!(rendered));
+            if let Some(w) = problem {
+                tracing::warn!("showcase overlay not rendered: {w}");
+                m.insert(
+                    "warning".into(),
+                    json!(format!(
+                        "showcase is enabled but the cursor overlay is not on the page: {w}"
+                    )),
+                );
             }
         }
-        Ok(cfg.to_json())
+        Ok(out)
     }
+}
+
+/// The script `browser_showcase` runs in a page: install the overlay, then
+/// report whether it is really there (`{rendered, reason?}`).
+fn showcase_install_script(cfg: &crate::showcase::ShowcaseConfig) -> String {
+    format!(
+        r#"(function(){{
+  if(!document || !document.body) return {{rendered:false, reason:'the page has no <body> yet (still loading, or not an HTML page)'}};
+  try {{ {engine} }} catch(e) {{ return {{rendered:false, reason:'overlay script threw: ' + String(e && e.message ? e.message : e)}}; }}
+  return {check} ? {{rendered:true}} : {{rendered:false, reason:'the overlay script ran but created no cursor element'}};
+}})()"#,
+        engine = cfg.engine_js(),
+        check = crate::showcase::JS_SHOWCASE_RENDERED
+    )
 }
 
 fn now_ms() -> u64 {
@@ -5347,6 +6162,200 @@ fn reap_one(mut child: std::process::Child, user_data_dir: Option<&std::path::Pa
     }
 }
 
+/// `browser_eval`'s `timeout_ms` as it will be applied.
+pub(crate) fn clamp_eval_timeout(requested: Option<u64>) -> u64 {
+    requested
+        .unwrap_or(EVAL_TIMEOUT_DEFAULT_MS)
+        .clamp(EVAL_TIMEOUT_MIN_MS, EVAL_TIMEOUT_MAX_MS)
+}
+
+/// Chrome's reply when the script navigated the page (or closed the tab)
+/// while `Runtime.evaluate` was still waiting for it.
+pub(crate) fn is_navigated_message(msg: &str) -> bool {
+    msg.contains("Inspected target navigated or closed")
+}
+
+/// What a timed-out eval reports. Termination only reaches script that is
+/// running right now, not one that is waiting, so the message does not claim
+/// more than that.
+pub(crate) fn eval_timeout_message(timeout_ms: u64, terminate_sent: bool) -> String {
+    let what = if terminate_sent {
+        "Runtime.terminateExecution was sent (it stops script that is running, such as a loop, not one that is waiting)"
+    } else {
+        "Runtime.terminateExecution could not be sent"
+    };
+    format!(
+        "browser_eval timed out after {timeout_ms} ms; {what}. Async work the script already \
+         scheduled (timers, pending promises, event handlers) may still be running in the page \
+         and can interleave with later calls; reload the tab if that matters"
+    )
+}
+
+/// Flags `launch.args` may pass, names only (without the leading `--`). An
+/// allowlist, not a denylist: Chrome has flags that run a program of the
+/// caller's choosing (`--renderer-cmd-prefix`, `--gpu-launcher`,
+/// `--browser-subprocess-path`), open the DevTools socket beyond loopback, or
+/// switch off the sandbox, site isolation, TLS checks or the navigation
+/// policy, and new ones arrive with each release. `browser_connect` is
+/// standard tier, so it may only reach flags that change how the browser looks
+/// and paces itself.
+pub(crate) const ALLOWED_LAUNCH_FLAGS: &[&str] = &[
+    "window-size",
+    "window-position",
+    "start-maximized",
+    "start-fullscreen",
+    "force-device-scale-factor",
+    "hide-scrollbars",
+    "force-dark-mode",
+    "lang",
+    "accept-lang",
+    "user-agent",
+    "mute-audio",
+    "autoplay-policy",
+    "disable-gpu",
+    "disable-extensions",
+    "disable-notifications",
+    "disable-default-apps",
+    "disable-sync",
+    "disable-search-engine-choice-screen",
+    "use-fake-device-for-media-stream",
+    "auto-open-devtools-for-tabs",
+    "incognito",
+    "disable-backgrounding-occluded-windows",
+    "disable-renderer-backgrounding",
+    "disable-background-timer-throttling",
+    "disable-features",
+];
+
+/// Features `--disable-features` may name. Restricted for the same reason as
+/// the flags: the feature list also reaches site isolation and private
+/// network protections (`--disable-features=IsolateOrigins,site-per-process`).
+pub(crate) const ALLOWED_DISABLED_FEATURES: &[&str] = &[
+    "CalculateNativeWinOcclusion",
+    "Translate",
+    "MediaRouter",
+    "OptimizationHints",
+    "AutofillServerCommunication",
+    "PaintHolding",
+];
+
+const MAX_LAUNCH_ARGS: usize = 32;
+const MAX_LAUNCH_ARG_LEN: usize = 256;
+
+/// Validate `launch.args`: an array of at most 32 strings, each a `--flag` or
+/// `--flag=value` with no whitespace or control characters, each on
+/// [`ALLOWED_LAUNCH_FLAGS`]. Returns them as given.
+pub(crate) fn validate_launch_args(args: &Value) -> Result<Vec<String>, String> {
+    let Some(arr) = args.as_array() else {
+        return Err("launch.args must be an array of strings".into());
+    };
+    if arr.len() > MAX_LAUNCH_ARGS {
+        return Err(format!(
+            "launch.args has {} entries; at most {MAX_LAUNCH_ARGS} are allowed",
+            arr.len()
+        ));
+    }
+    let mut out = Vec::with_capacity(arr.len());
+    for v in arr {
+        let Some(a) = v.as_str() else {
+            return Err("launch.args must be an array of strings".into());
+        };
+        if a.len() > MAX_LAUNCH_ARG_LEN {
+            return Err(format!(
+                "launch.args entry is {} bytes; at most {MAX_LAUNCH_ARG_LEN} are allowed",
+                a.len()
+            ));
+        }
+        if a.chars().any(|ch| ch.is_whitespace() || ch.is_control()) {
+            return Err(format!(
+                "launch.args entry {a:?} contains whitespace or a control character; give one flag per entry, as --name=value"
+            ));
+        }
+        let Some(body) = a.strip_prefix("--") else {
+            return Err(format!("launch.args entry {a:?} must start with --"));
+        };
+        let name = body.split('=').next().unwrap_or("").to_ascii_lowercase();
+        if name.is_empty()
+            || !name
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
+        {
+            return Err(format!("launch.args entry {a:?} is not a valid --flag"));
+        }
+        if !ALLOWED_LAUNCH_FLAGS.contains(&name.as_str()) {
+            return Err(format!(
+                "launch.args flag --{name} is not allowed; permitted: --{}",
+                ALLOWED_LAUNCH_FLAGS.join(", --")
+            ));
+        }
+        if name == "disable-features" {
+            let list = body.split_once('=').map(|(_, v)| v).unwrap_or("");
+            if let Some(f) = list
+                .split(',')
+                .find(|f| !f.is_empty() && !ALLOWED_DISABLED_FEATURES.contains(f))
+            {
+                return Err(format!(
+                    "launch.args --disable-features may not name {f:?}; permitted: {}",
+                    ALLOWED_DISABLED_FEATURES.join(", ")
+                ));
+            }
+        }
+        out.push(a.to_string());
+    }
+    Ok(out)
+}
+
+/// Flags that keep a headed Chrome running at full speed when its window is
+/// covered or behind another (otherwise timers throttle, `visibilityState`
+/// goes `hidden`, and screen recordings freeze).
+const FOREGROUND_FLAGS: &[&str] = &[
+    "--disable-backgrounding-occluded-windows",
+    "--disable-renderer-backgrounding",
+    "--disable-background-timer-throttling",
+];
+const FOREGROUND_DISABLED_FEATURES: &[&str] = &["CalculateNativeWinOcclusion"];
+
+/// The full Chrome command line (without the binary). `extra` must already
+/// have passed [`validate_launch_args`]. Any `--disable-features` among them is
+/// merged with ours into a single flag, since Chrome keeps only the last.
+pub(crate) fn chrome_launch_flags(
+    port: u16,
+    user_data_dir: &str,
+    headless: bool,
+    background_throttling: bool,
+    extra: &[String],
+) -> Vec<String> {
+    let mut flags = vec![
+        format!("--remote-debugging-port={port}"),
+        format!("--user-data-dir={user_data_dir}"),
+        "--no-first-run".to_string(),
+        "--no-default-browser-check".to_string(),
+    ];
+    let mut features: Vec<String> = Vec::new();
+    if headless {
+        flags.push("--headless=new".to_string());
+    } else if !background_throttling {
+        flags.extend(FOREGROUND_FLAGS.iter().map(|f| f.to_string()));
+        features.extend(FOREGROUND_DISABLED_FEATURES.iter().map(|f| f.to_string()));
+    }
+    for a in extra {
+        match a.strip_prefix("--disable-features=") {
+            Some(list) => features.extend(
+                list.split(',')
+                    .filter(|f| !f.is_empty())
+                    .map(str::to_string),
+            ),
+            None => flags.push(a.clone()),
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    features.retain(|f| seen.insert(f.clone()));
+    if !features.is_empty() {
+        flags.push(format!("--disable-features={}", features.join(",")));
+    }
+    flags
+}
+
 /// Launch a dedicated Chromium instance with a debugging port and poll until
 /// its CDP endpoint answers.
 ///
@@ -5377,6 +6386,14 @@ async fn launch_browser(spec: &Value) -> Result<Launch, BrowserError> {
         .get("headless")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    let extra_args = match spec.get("args") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(a) => validate_launch_args(a).map_err(BrowserError::Failed)?,
+    };
+    let background_throttling = spec
+        .get("background_throttling")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     // Only a directory we chose is ours to delete later.
     let (user_data_dir, owned) = match spec.get("user_data_dir").and_then(Value::as_str) {
         Some(p) => (std::path::PathBuf::from(p), None),
@@ -5404,13 +6421,13 @@ async fn launch_browser(spec: &Value) -> Result<Launch, BrowserError> {
         })?;
 
     let mut cmd = std::process::Command::new(bin);
-    cmd.arg(format!("--remote-debugging-port={requested_port}"))
-        .arg(format!("--user-data-dir={user_data_dir}"))
-        .arg("--no-first-run")
-        .arg("--no-default-browser-check");
-    if headless {
-        cmd.arg("--headless=new");
-    }
+    cmd.args(chrome_launch_flags(
+        requested_port,
+        &user_data_dir,
+        headless,
+        background_throttling,
+        &extra_args,
+    ));
     cmd.stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
     let child = cmd
@@ -5446,6 +6463,162 @@ async fn launch_browser(spec: &Value) -> Result<Launch, BrowserError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn eval_timeout_is_defaulted_and_clamped() {
+        assert_eq!(clamp_eval_timeout(None), 10_000);
+        assert_eq!(clamp_eval_timeout(Some(0)), 100);
+        assert_eq!(clamp_eval_timeout(Some(5_000)), 5_000);
+        assert_eq!(clamp_eval_timeout(Some(u64::MAX)), 60_000);
+    }
+
+    #[test]
+    fn eval_chrome_messages_are_recognised() {
+        assert!(is_navigated_message(
+            "Runtime.evaluate: Inspected target navigated or closed"
+        ));
+        assert!(!is_navigated_message("Runtime.evaluate: something else"));
+        let m = eval_timeout_message(250, true);
+        assert!(m.contains("timed out after 250 ms"));
+        assert!(m.contains("terminateExecution was sent"));
+        assert!(m.contains("may still be running"));
+        assert!(eval_timeout_message(250, false).contains("could not be sent"));
+    }
+
+    #[test]
+    fn launch_args_accept_plain_flags() {
+        let ok = validate_launch_args(&json!([
+            "--lang=fr",
+            "--mute-audio",
+            "--window-size=800,600"
+        ]))
+        .unwrap();
+        assert_eq!(ok.len(), 3);
+        assert!(validate_launch_args(&json!([])).unwrap().is_empty());
+    }
+
+    #[test]
+    fn launch_args_reject_malformed_entries() {
+        for bad in [
+            json!("--a"),
+            json!([1]),
+            json!(["lang=fr"]),
+            json!(["-x"]),
+            json!(["--"]),
+            json!(["--=x"]),
+            json!(["--lang fr"]),
+            json!(["--lang=fr\n--no-sandbox"]),
+            json!(["--a\tb"]),
+            json!(["--a_b"]),
+            json!([format!("--{}", "a".repeat(300))]),
+        ] {
+            assert!(validate_launch_args(&bad).is_err(), "{bad}");
+        }
+        let many: Vec<String> = (0..33).map(|i| format!("--lang=l{i}")).collect();
+        assert!(validate_launch_args(&json!(many)).is_err());
+        let max: Vec<String> = (0..32).map(|i| format!("--lang=l{i}")).collect();
+        assert_eq!(validate_launch_args(&json!(max)).unwrap().len(), 32);
+    }
+
+    #[test]
+    fn launch_args_refuse_flags_off_the_allowlist() {
+        // Flags that run a program, widen the DevTools socket, or drop a
+        // protection; any spelling.
+        for name in [
+            "renderer-cmd-prefix",
+            "gpu-launcher",
+            "utility-cmd-prefix",
+            "browser-subprocess-path",
+            "remote-debugging-address",
+            "remote-debugging-port",
+            "remote-allow-origins",
+            "user-data-dir",
+            "no-sandbox",
+            "disable-web-security",
+            "ignore-certificate-errors",
+            "load-extension",
+            "app",
+            "proxy-server",
+            "host-resolver-rules",
+            "enable-features",
+        ] {
+            for spelled in [
+                format!("--{name}"),
+                format!("--{name}=x"),
+                format!("--{}=x", name.to_uppercase()),
+            ] {
+                assert!(
+                    validate_launch_args(&json!([spelled])).is_err(),
+                    "{spelled}"
+                );
+            }
+        }
+        let e = validate_launch_args(&json!(["--gpu-launcher=/tmp/x"])).unwrap_err();
+        assert!(e.contains("gpu-launcher") && e.contains("--lang"), "{e}");
+        for name in ALLOWED_LAUNCH_FLAGS {
+            assert!(validate_launch_args(&json!([format!("--{name}")])).is_ok());
+        }
+    }
+
+    #[test]
+    fn disable_features_is_limited_to_harmless_features() {
+        assert!(validate_launch_args(&json!(["--disable-features=Translate,MediaRouter"])).is_ok());
+        for bad in [
+            "--disable-features=IsolateOrigins,site-per-process",
+            "--disable-features=Translate,BlockInsecurePrivateNetworkRequests",
+        ] {
+            assert!(validate_launch_args(&json!([bad])).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn headed_launch_gets_foreground_flags_and_headless_does_not() {
+        let headed = chrome_launch_flags(0, "/p", false, false, &[]);
+        assert_eq!(headed[0], "--remote-debugging-port=0");
+        assert_eq!(headed[1], "--user-data-dir=/p");
+        for f in [
+            "--disable-backgrounding-occluded-windows",
+            "--disable-renderer-backgrounding",
+            "--disable-background-timer-throttling",
+            "--disable-features=CalculateNativeWinOcclusion",
+        ] {
+            assert!(headed.iter().any(|a| a == f), "{f} missing from {headed:?}");
+        }
+        assert!(!headed.iter().any(|a| a.starts_with("--headless")));
+
+        let headless = chrome_launch_flags(0, "/p", true, false, &[]);
+        assert!(headless.iter().any(|a| a == "--headless=new"));
+        assert!(!headless.iter().any(|a| a.contains("backgrounding")));
+
+        let opted_out = chrome_launch_flags(0, "/p", false, true, &[]);
+        assert!(!opted_out.iter().any(|a| a.contains("backgrounding")));
+        assert!(!opted_out
+            .iter()
+            .any(|a| a.starts_with("--disable-features")));
+    }
+
+    #[test]
+    fn user_disable_features_is_merged_not_duplicated() {
+        let extra = vec![
+            "--lang=fr".to_string(),
+            "--disable-features=Translate,CalculateNativeWinOcclusion".to_string(),
+        ];
+        let flags = chrome_launch_flags(9222, "/p", false, false, &extra);
+        let df: Vec<&String> = flags
+            .iter()
+            .filter(|a| a.starts_with("--disable-features="))
+            .collect();
+        assert_eq!(
+            df,
+            ["--disable-features=CalculateNativeWinOcclusion,Translate"]
+        );
+        assert!(flags.iter().any(|a| a == "--lang=fr"));
+        // With throttling left on, the user's list stands alone.
+        let flags = chrome_launch_flags(9222, "/p", false, true, &extra);
+        assert!(flags
+            .iter()
+            .any(|a| a == "--disable-features=Translate,CalculateNativeWinOcclusion"));
+    }
 
     #[test]
     fn intent_token_drops_everything_but_identifier_characters() {
@@ -5592,6 +6765,55 @@ mod tests {
             nav_probe_verdict(None, "complete", "t1", false, ms(1), 5_000),
             Some(true)
         );
+    }
+
+    #[test]
+    fn settle_gives_up_on_a_navigation_once_the_page_works_in_place() {
+        let ms = std::time::Duration::from_millis;
+        // A request began on the unreplaced, loaded document: not navigating.
+        assert_eq!(
+            settle_nav_verdict(Some("t1"), "complete", "t1", 1, ms(5), NAV_EXPECT_MS),
+            Some(false)
+        );
+        // No request yet and the window still open: keep waiting.
+        assert_eq!(
+            settle_nav_verdict(Some("t1"), "complete", "t1", 0, ms(5), NAV_EXPECT_MS),
+            None
+        );
+        // Still loading: a request does not decide anything.
+        assert_eq!(
+            settle_nav_verdict(Some("t1"), "loading", "t1", 3, ms(5), NAV_EXPECT_MS),
+            None
+        );
+        // The document was replaced: that wins over any count.
+        assert_eq!(
+            settle_nav_verdict(None, "complete", "t1", 2, ms(5), NAV_EXPECT_MS),
+            Some(true)
+        );
+        // Nothing happened for the whole window.
+        assert_eq!(
+            settle_nav_verdict(
+                Some("t1"),
+                "complete",
+                "t1",
+                0,
+                ms(NAV_EXPECT_MS),
+                NAV_EXPECT_MS
+            ),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn scroll_modes_map_to_scroll_into_view_options() {
+        assert_eq!(ScrollMode::default(), ScrollMode::Nearest);
+        assert_eq!(ScrollMode::None.js_options(), None);
+        let nearest = ScrollMode::Nearest.js_options().unwrap();
+        assert!(nearest.contains("block:'nearest'") && nearest.contains("inline:'nearest'"));
+        let center = ScrollMode::Center.js_options().unwrap();
+        assert!(center.contains("block:'center'") && center.contains("inline:'center'"));
+        // A position read right after must not catch a smooth scroll mid-way.
+        assert!(nearest.contains("behavior:'instant'") && center.contains("behavior:'instant'"));
     }
 
     #[test]

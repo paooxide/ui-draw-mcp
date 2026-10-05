@@ -13,11 +13,15 @@ mod nav;
 mod profile;
 pub mod record;
 pub mod safari;
+mod screencast;
 pub mod showcase;
 mod tools;
 mod visual;
 
-pub use backend::{BrowserBackend, BrowserError, CdpBackend, Locator, Shot, CHROME_BINS};
+pub use backend::{
+    ActOpts, BrowserBackend, BrowserError, CdpBackend, EvalOptions, Locator, ScrollMode, Shot,
+    CHROME_BINS,
+};
 pub use branch::{Branch, BranchError, BranchManager, BranchStatus};
 pub use cdp::{DialogPolicy, RecordDialogs};
 pub use challenge::{ChallengeKind, ChallengeManager, ChallengeStatus};
@@ -29,6 +33,7 @@ pub use record::{MacroSynthesizer, RawInteractionEvent, RecordManager};
 pub use safari::{
     find_safaridriver, is_safari_available, SafariDriverConfig, SafariProcess, SafariSession,
 };
+pub use screencast::ScreencastOpts;
 pub use showcase::{CursorStyle, ShowcaseConfig, ShowcaseSpeed};
 pub use tools::BrowserModule;
 pub use visual::{Baseline, VisualStore};

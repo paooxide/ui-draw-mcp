@@ -104,6 +104,25 @@ impl RoleProfile {
         }
     }
 
+    /// Browser-only profile: advertises and permits just the browser engine's
+    /// tools, so a web QA or demo session isn't handed the whole tool surface.
+    /// Narrows only: dangerous browser tools still need `access` or `enable`.
+    pub fn browser() -> Self {
+        RoleProfile {
+            name: "browser".to_string(),
+            description: "Browser automation only (no desktop, shell, files or network tools)"
+                .to_string(),
+            allowed_tiers: None,
+            allowed_categories: Some(vec![Category::Browser]),
+            denied_categories: Vec::new(),
+            allowed_tools: None,
+            denied_tools: Vec::new(),
+            require_consent_for_tiers: Vec::new(),
+            require_consent_for_tools: Vec::new(),
+            max_denials: None,
+        }
+    }
+
     /// Standard Human-in-the-Loop Operator profile.
     /// General operations permitted; dangerous actions require interactive consent.
     pub fn operator() -> Self {
@@ -452,6 +471,7 @@ pub fn resolve_role_profile(
     match name.to_ascii_lowercase().as_str() {
         "readonly" | "auditor" => Some(RoleProfile::readonly()),
         "qa" | "tester" => Some(RoleProfile::qa()),
+        "browser" => Some(RoleProfile::browser()),
         "operator" => Some(RoleProfile::operator()),
         "admin" | "superadmin" => Some(RoleProfile::admin()),
         _ => None,

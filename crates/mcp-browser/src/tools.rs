@@ -20,6 +20,8 @@ pub struct BrowserModule {
     profiles: Option<crate::profile::ProfileStore>,
     judge: Option<Arc<mcp_judge::Judge>>,
     showcase: std::sync::Mutex<crate::showcase::ShowcaseConfig>,
+    /// Where saved screenshots and screencasts are written; never caller-chosen.
+    media_dir: Option<std::path::PathBuf>,
 }
 
 impl BrowserModule {
@@ -31,7 +33,15 @@ impl BrowserModule {
             profiles: None,
             judge: None,
             showcase: std::sync::Mutex::new(crate::showcase::ShowcaseConfig::default()),
+            media_dir: None,
         }
+    }
+
+    /// Enable `browser_screenshot save` and `browser_screencast`: files are
+    /// written under this agentctl-owned directory, with generated names.
+    pub fn with_media_dir(mut self, dir: std::path::PathBuf) -> Self {
+        self.media_dir = Some(dir);
+        self
     }
 
     /// Enable `browser_flow` (save/replay UI tests) backed by a JSON file.
@@ -446,10 +456,21 @@ impl BrowserModule {
         };
         let action = str_arg(args, "action").unwrap_or("click");
         let secret = args.get("secret").and_then(Value::as_bool) == Some(true);
+        let opts = match parse_act_opts(args) {
+            Ok(o) => o,
+            Err(m) => return Envelope::fail("browser_act", ErrorCode::InvalidArgs, m),
+        };
         result(
             "browser_act",
             self.backend
-                .act_masked(target, locator, action, str_arg(args, "value"), secret)
+                .act_opts(
+                    target,
+                    locator,
+                    action,
+                    str_arg(args, "value"),
+                    secret,
+                    opts,
+                )
                 .await,
         )
     }
@@ -755,36 +776,9 @@ impl BrowserModule {
             .get("timeout_ms")
             .and_then(Value::as_u64)
             .unwrap_or(10_000);
-        // exactly one of selector | dom_settled | navigation | network_idle
-        let (cond, arg) = if let Some(sel) = str_arg(args, "selector") {
-            ("selector", Some(sel))
-        } else if args.get("dom_settled").and_then(Value::as_bool) == Some(true)
-            || str_arg(args, "condition") == Some("dom_settled")
-        {
-            ("dom_settled", None)
-        } else if args.get("htmx_settled").and_then(Value::as_bool) == Some(true)
-            || str_arg(args, "condition") == Some("htmx_settled")
-        {
-            ("htmx_settled", None)
-        } else if args.get("navigation").is_some()
-            || str_arg(args, "condition") == Some("navigation")
-        {
-            ("navigation", None)
-        } else if args.get("network_idle").and_then(Value::as_bool) == Some(true)
-            || str_arg(args, "condition") == Some("network_idle")
-        {
-            ("network_idle", None)
-        } else if args.get("challenge_cleared").and_then(Value::as_bool) == Some(true)
-            || str_arg(args, "condition") == Some("challenge_cleared")
-            || str_arg(args, "condition") == Some("challenge")
-        {
-            ("challenge_cleared", None)
-        } else {
-            return Envelope::fail(
-                "browser_wait",
-                ErrorCode::InvalidArgs,
-                "provide one of 'selector', 'dom_settled', 'htmx_settled', 'navigation', 'network_idle', or 'challenge_cleared'",
-            );
+        let (cond, arg) = match parse_wait_condition(args) {
+            Ok(c) => c,
+            Err(m) => return Envelope::fail("browser_wait", ErrorCode::InvalidArgs, m),
         };
         let nav_window = match args.get("navigation_timeout_ms") {
             None | Some(Value::Null) => None,
@@ -999,14 +993,7 @@ impl BrowserModule {
         if let Some(h) = args.get("typing_hud").and_then(Value::as_bool) {
             cfg.typing_hud = h;
         }
-        if let Some(style) = str_arg(args, "cursor_style") {
-            if let Some(cs) = crate::showcase::CursorStyle::parse(style) {
-                cfg.cursor_style = cs;
-            }
-        }
-        if let Some(dur) = args.get("glide_ms").and_then(Value::as_u64) {
-            cfg.custom_glide_ms = Some(dur);
-        }
+        cfg.apply_visual_args(args);
         *self
             .showcase
             .lock()
@@ -1019,7 +1006,25 @@ impl BrowserModule {
             Ok(t) => t,
             Err(e) => return e,
         };
+        let save = args.get("save").and_then(Value::as_bool).unwrap_or(false);
+        let media = if save {
+            match self.media_dir_for("browser_screenshot") {
+                Ok(d) => Some(d),
+                Err(e) => return e,
+            }
+        } else {
+            None
+        };
         match self.backend.screenshot(target, str_arg(args, "ref")).await {
+            Ok(shot) if media.is_some() => result(
+                "browser_screenshot",
+                crate::screencast::save_screenshot(
+                    media.as_deref().unwrap_or(std::path::Path::new("")),
+                    &shot.base64,
+                    shot.width,
+                    shot.height,
+                ),
+            ),
             Ok(shot) => Envelope::ok_image(
                 "browser_screenshot",
                 json!({ "width": shot.width, "height": shot.height }),
@@ -1032,6 +1037,69 @@ impl BrowserModule {
         }
     }
 
+    #[allow(clippy::result_large_err)]
+    fn media_dir_for(&self, tool: &str) -> Result<std::path::PathBuf, Envelope> {
+        self.media_dir.clone().ok_or_else(|| {
+            browser_err(
+                tool,
+                BrowserError::Unsupported(
+                    "no media directory is configured, so nothing can be saved to disk".into(),
+                ),
+            )
+        })
+    }
+
+    async fn screencast(&self, args: &Value) -> Envelope {
+        let tool = "browser_screencast";
+        let int = |k: &str| {
+            args.get(k)
+                .and_then(|v| v.as_i64().or_else(|| v.as_f64().map(|f| f as i64)))
+        };
+        match str_arg(args, "action").unwrap_or("status") {
+            "start" => {
+                let target = match require(args, "target_id", tool) {
+                    Ok(t) => t,
+                    Err(e) => return e,
+                };
+                let media = match self.media_dir_for(tool) {
+                    Ok(d) => d,
+                    Err(e) => return e,
+                };
+                let opts = crate::screencast::ScreencastOpts::from_args(
+                    int("fps"),
+                    int("quality"),
+                    int("max_seconds"),
+                );
+                result(
+                    tool,
+                    self.backend.screencast_start(target, &media, opts).await,
+                )
+            }
+            "stop" => {
+                let (target, id) = (str_arg(args, "target_id"), str_arg(args, "recording_id"));
+                if target.is_none() && id.is_none() {
+                    return Envelope::fail(
+                        tool,
+                        ErrorCode::InvalidArgs,
+                        "stop needs 'target_id' or 'recording_id'",
+                    );
+                }
+                let keep = args
+                    .get("keep_frames")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                result(tool, self.backend.screencast_stop(target, id, keep).await)
+            }
+            "status" => result(tool, self.backend.screencast_status().await),
+            other => Envelope::fail_with(
+                tool,
+                ErrorCode::InvalidArgs,
+                format!("unknown action '{other}'"),
+                "use 'start', 'stop' or 'status'",
+            ),
+        }
+    }
+
     async fn eval(&self, args: &Value) -> Envelope {
         let target = match require(args, "target_id", "browser_eval") {
             Ok(t) => t,
@@ -1041,7 +1109,17 @@ impl BrowserModule {
             Ok(e) => e,
             Err(e) => return e,
         };
-        result("browser_eval", self.backend.eval(target, expr).await)
+        let opts = crate::backend::EvalOptions {
+            timeout_ms: args.get("timeout_ms").and_then(Value::as_u64),
+            detached: args
+                .get("detached")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        };
+        result(
+            "browser_eval",
+            self.backend.eval_with(target, expr, &opts).await,
+        )
     }
 
     async fn dialog(&self, args: &Value) -> Envelope {
@@ -1663,6 +1741,107 @@ impl BrowserModule {
     }
 }
 
+/// The conditions `browser_wait` knows, as the `condition` enum spells them.
+const WAIT_CONDITIONS: [&str; 6] = [
+    "selector",
+    "dom_settled",
+    "htmx_settled",
+    "navigation",
+    "network_idle",
+    "challenge_cleared",
+];
+
+/// Which condition a `browser_wait` call asks for. `condition` is the
+/// preferred form; `selector` and the boolean flags are aliases for it. A
+/// flag selects its condition only when `true` (`navigation:false` selects
+/// nothing), and asking for more than one condition is an error, not a silent
+/// pick. Naming the same condition twice (`condition:"navigation"` with
+/// `navigation:true`) is one condition.
+fn parse_wait_condition(args: &Value) -> Result<(&'static str, Option<&str>), String> {
+    let mut found: Vec<&'static str> = Vec::new();
+    let mut arg = None;
+    if let Some(sel) = str_arg(args, "selector") {
+        found.push("selector");
+        arg = Some(sel);
+    }
+    for flag in &WAIT_CONDITIONS[1..] {
+        match args.get(*flag) {
+            None | Some(Value::Null) => {}
+            Some(Value::Bool(true)) => found.push(flag),
+            Some(Value::Bool(false)) => {}
+            Some(_) => return Err(format!("'{flag}' must be a boolean")),
+        }
+    }
+    if let Some(cond) = str_arg(args, "condition") {
+        let cond = if cond == "challenge" {
+            "challenge_cleared"
+        } else {
+            cond
+        };
+        let Some(known) = WAIT_CONDITIONS.iter().find(|k| **k == cond) else {
+            return Err(format!(
+                "unknown condition '{cond}'; use one of {}",
+                WAIT_CONDITIONS.join(", ")
+            ));
+        };
+        if *known == "selector" && arg.is_none() {
+            return Err(
+                "condition 'selector' needs the 'selector' argument (the CSS selector to wait for)"
+                    .into(),
+            );
+        }
+        if !found.contains(known) {
+            found.push(known);
+        }
+    }
+    match found.as_slice() {
+        [] => Err(format!(
+            "provide one wait condition: 'condition' (one of {}), or the alias 'selector' or a boolean flag set to true",
+            WAIT_CONDITIONS.join(", ")
+        )),
+        [one] => Ok((one, arg.filter(|_| *one == "selector"))),
+        many => Err(format!(
+            "give one wait condition, got {}: {}",
+            many.len(),
+            many.join(", ")
+        )),
+    }
+}
+
+/// The `scroll`, `wait_after` and `timeout_ms` arguments of `browser_act`.
+fn parse_act_opts(args: &Value) -> Result<crate::backend::ActOpts, String> {
+    use crate::backend::{ActOpts, ScrollMode};
+    let mut opts = ActOpts::default();
+    match str_arg(args, "scroll") {
+        None => {}
+        Some("none") => opts.scroll = ScrollMode::None,
+        Some("nearest") => opts.scroll = ScrollMode::Nearest,
+        Some("center") => opts.scroll = ScrollMode::Center,
+        Some(other) => {
+            return Err(format!(
+                "unknown scroll '{other}'; use none, nearest (default) or center"
+            ))
+        }
+    }
+    match str_arg(args, "wait_after") {
+        None | Some("none") => {}
+        Some("settle") => opts.settle = true,
+        Some(other) => {
+            return Err(format!(
+                "unknown wait_after '{other}'; use none (default) or settle"
+            ))
+        }
+    }
+    match args.get("timeout_ms") {
+        None | Some(Value::Null) => {}
+        Some(v) => match v.as_u64() {
+            Some(n) => opts.timeout_ms = n,
+            None => return Err("timeout_ms must be a non-negative integer".into()),
+        },
+    }
+    Ok(opts)
+}
+
 /// A `navigation_timeout_ms` value: an integer within the allowed window.
 fn nav_window_arg(v: &Value) -> Option<u64> {
     v.as_u64()
@@ -1729,7 +1908,7 @@ impl ToolModule for BrowserModule {
                 "browser_connect",
                 Category::Browser,
                 Tier::Standard,
-                "Attach to a Chromium browser started with --remote-debugging-port, or launch a dedicated instance. Optionally auto-restores a saved profile. launch.browser='safari' drives Safari through safaridriver (macOS only, experimental: needs `safaridriver --enable` once, and a Safari that was already open when automation was enabled must be quit first; opens a visible window). On Safari, browser_network, browser_dialog, browser_viewport, browser_record, browser_branch, browser_checkpoint and browser_act 'press' return Unsupported.",
+                "Attach to a Chromium browser started with --remote-debugging-port, or launch a dedicated instance. Optionally auto-restores a saved profile. The browser's active tab is brought to the front on connect (result 'foregrounded'). launch.browser='safari' drives Safari through safaridriver (macOS only, experimental: needs `safaridriver --enable` once, and a Safari that was already open when automation was enabled must be quit first; opens a visible window). On Safari, browser_network, browser_dialog, browser_viewport, browser_record, browser_branch, browser_checkpoint and browser_act 'press' return Unsupported.",
                 obj(
                     json!({
                         "attach": { "type": "object", "properties": { "port": { "type": "integer" } } },
@@ -1738,6 +1917,8 @@ impl ToolModule for BrowserModule {
                             "url": { "type": "string", "description": "first page to open; Safari only (Chromium: use browser_navigate); checked against the navigation policy" },
                             "port": { "type": "integer", "description": "remote-debugging port; omit or 0 to let Chrome pick a free one (the connect result reports it)" },
                             "headless": { "type": "boolean" },
+                            "args": { "type": "array", "items": { "type": "string" }, "description": "Chromium only: extra command-line flags, each one entry written --name or --name=value (no spaces; at most 32). Only these are accepted: --window-size, --window-position, --start-maximized, --start-fullscreen, --force-device-scale-factor, --hide-scrollbars, --force-dark-mode, --lang, --accept-lang, --user-agent, --mute-audio, --autoplay-policy, --disable-gpu, --disable-extensions, --disable-notifications, --disable-default-apps, --disable-sync, --disable-search-engine-choice-screen, --use-fake-device-for-media-stream, --auto-open-devtools-for-tabs, --incognito, the three --disable-*background* flags, and --disable-features naming CalculateNativeWinOcclusion, Translate, MediaRouter, OptimizationHints, AutofillServerCommunication or PaintHolding (merged with agentctl's own)" },
+                            "background_throttling": { "type": "boolean", "description": "Chromium only. A visible (headless=false) browser is started with flags that stop Chrome throttling timers, rendering and screen recording when its window is behind another or covered. Set true to leave Chrome's normal throttling on. Default false" },
                             "user_data_dir": { "type": "string" },
                             "profile": { "type": "string", "description": "saved profile name to auto-restore upon connecting" }
                         } },
@@ -1840,7 +2021,10 @@ impl ToolModule for BrowserModule {
                         "index": { "type": "integer", "description": "optional 0-based match index if query matches multiple elements (default 0)" },
                         "action": { "type": "string", "enum": ["click", "type", "select", "hover", "focus", "scroll_into_view", "submit", "press"] },
                         "value": { "type": "string", "description": "text for type, option for select, or key name for press (Enter, Escape, Tab)" },
-                        "secret": { "type": "boolean", "description": "the value is a secret: keep it out of the audit log and never show it in the showcase typing HUD (password and one-time-code fields are masked automatically)" }
+                        "secret": { "type": "boolean", "description": "the value is a secret: keep it out of the audit log and never show it in the showcase typing HUD (password and one-time-code fields are masked automatically)" },
+                        "scroll": { "type": "string", "enum": ["none", "nearest", "center"], "description": "how to bring the element into view first: nearest (default) moves the page only as far as needed and not at all when it is visible, center centres it (can scroll a wide page sideways), none does not scroll. scroll_into_view always scrolls" },
+                        "wait_after": { "type": "string", "enum": ["none", "settle"], "description": "none (default) returns as soon as the action ran, when a click's request or navigation has usually not begun yet. settle then waits for a navigation it started to load, for htmx_settled if the page has htmx, and for the network to go quiet, and adds navigated, requests_started (fetch/XHR/htmx begun on the page since the action) and settled to the result. A click that starts no request and no navigation costs about 2s here; Chrome only" },
+                        "timeout_ms": { "type": "integer", "description": "wait_after settle only: bound for the whole settle wait (default 10000); when it runs out the action still succeeded and the result has settled:false and settle_error" }
                     }),
                     json!(["target_id", "action"]),
                 ),
@@ -1948,18 +2132,18 @@ impl ToolModule for BrowserModule {
                 "browser_wait",
                 Category::Browser,
                 Tier::Read,
-                "Wait for a settle signal: a selector to appear, dom_settled (DOM mutations and \
-                 animation frames settled for >=150ms), htmx_settled (HTMX requests and DOM swaps settled; errors if htmx is not present on the page), navigation to complete (after a goto, reload, click, submit or key press in this session it waits for the NEW document, not the one being left; a click that starts no navigation within navigation_timeout_ms, default 2s, settles on the loaded page with navigated:false; raise it for a handler that navigates later than that), the network to idle, or verification challenge clearance.",
+                "Wait for a settle signal: a selector to appear, dom_settled (no DOM mutation for \
+                 >=150ms; animation frames are not tracked), htmx_settled (HTMX requests and DOM swaps settled; right after a browser_act it also waits up to 1.5s for an htmx request to start; errors if htmx is not present on the page), navigation to complete (after a goto, reload, click, submit or key press in this session it waits for the NEW document, not the one being left; a click that starts no navigation within navigation_timeout_ms, default 2s, settles on the loaded page with navigated:false; raise it for a handler that navigates later than that), network_idle (fetch/XHR started after a browser_act are tracked; settled when none is in flight and none began or finished for 500ms, and not before a navigation that act may have started has happened), or verification challenge clearance. Prefer 'condition'; the other arguments are aliases.",
                 obj(
                     json!({
                         "target_id": { "type": "string" },
-                        "selector": { "type": "string" },
-                        "dom_settled": { "type": "boolean" },
-                        "htmx_settled": { "type": "boolean" },
-                        "navigation": { "type": "boolean" },
-                        "network_idle": { "type": "boolean" },
-                        "challenge_cleared": { "type": "boolean" },
-                        "condition": { "type": "string", "enum": ["selector", "dom_settled", "htmx_settled", "navigation", "network_idle", "challenge_cleared"] },
+                        "condition": { "type": "string", "enum": ["selector", "dom_settled", "htmx_settled", "navigation", "network_idle", "challenge_cleared"], "description": "preferred way to choose what to wait for; 'selector' also needs the selector argument. Give exactly one condition: the aliases below conflict with it and with each other" },
+                        "selector": { "type": "string", "description": "alias for condition 'selector': the CSS selector to wait for" },
+                        "dom_settled": { "type": "boolean", "description": "alias for condition 'dom_settled'; only true selects it" },
+                        "htmx_settled": { "type": "boolean", "description": "alias for condition 'htmx_settled'; only true selects it" },
+                        "navigation": { "type": "boolean", "description": "alias for condition 'navigation'; only true selects it" },
+                        "network_idle": { "type": "boolean", "description": "alias for condition 'network_idle'; only true selects it" },
+                        "challenge_cleared": { "type": "boolean", "description": "alias for condition 'challenge_cleared'; only true selects it" },
                         "timeout_ms": { "type": "integer" },
                         "navigation_timeout_ms": { "type": "integer", "description": "navigation only: how long (ms, 0-30000, default 2000) to keep expecting a navigation that a click, submit or key press has not started yet, before settling on the loaded page with navigated:false. Does not apply after goto, reload, back or forward, which always navigate; timeout_ms still bounds the whole wait" }
                     }),
@@ -2000,13 +2184,43 @@ impl ToolModule for BrowserModule {
                 "browser_screenshot",
                 Category::Browser,
                 Tier::Read,
-                "Capture a PNG of the page (or a single element by ref).",
+                "Capture a PNG of the page (or a single element by ref). Returned inline as an image \
+                 by default. With save=true the PNG is written to agentctl's media directory \
+                 (screenshots/, a generated file name) and only {path, width, height, bytes} comes \
+                 back, with no image payload.",
                 obj(
                     json!({
                         "target_id": { "type": "string" },
-                        "ref": { "type": "string" }
+                        "ref": { "type": "string" },
+                        "save": { "type": "boolean", "description": "write the PNG under agentctl's own media directory and return {path, width, height, bytes} instead of the image (default false). The newest 200 saved screenshots are kept; older ones are deleted" }
                     }),
                     json!(["target_id"]),
+                ),
+            ),
+            ToolDescriptor::new(
+                "browser_screencast",
+                Category::Browser,
+                Tier::Standard,
+                "Record a tab to an mp4 video (browser_record is something else: it learns a replayable \
+                 flow of steps, not video). start begins capturing the page at fps (default 15) on a \
+                 dedicated session that keeps the page rendering even if its window is hidden or \
+                 unfocused; stop ends it and encodes frames.ffconcat with ffmpeg (variable frame rate, \
+                 real timestamps, 30 fps H.264) when ffmpeg is on PATH, else it keeps the frames and \
+                 says how to encode them. Files land in agentctl's media directory under \
+                 screencasts/<recording_id>/; the result gives the path. One recording per tab, which \
+                 stops by itself at max_seconds. The showcase cursor and ripples are part of the page, \
+                 so they appear in the video. Not available on Safari.",
+                obj(
+                    json!({
+                        "action": { "type": "string", "enum": ["start", "stop", "status"], "description": "default: status" },
+                        "target_id": { "type": "string", "description": "start: the tab to record; stop: the tab whose recording to stop" },
+                        "recording_id": { "type": "string", "description": "stop: the recording to stop, instead of target_id" },
+                        "fps": { "type": "integer", "description": "start: frames per second to capture, 1 to 30 (default 15)" },
+                        "quality": { "type": "integer", "description": "start: JPEG quality, 30 to 95 (default 80)" },
+                        "max_seconds": { "type": "integer", "description": "start: stop automatically after this long, 1 to 1800 (default 300)" },
+                        "keep_frames": { "type": "boolean", "description": "stop: keep the JPEG frames and frames.ffconcat after a successful encode (default false)" }
+                    }),
+                    json!([]),
                 ),
             ),
             ToolDescriptor::new(
@@ -2031,11 +2245,13 @@ impl ToolModule for BrowserModule {
                 "browser_eval",
                 Category::Browser,
                 Tier::Dangerous,
-                "Evaluate arbitrary JavaScript in the page context. The result is the value of the last statement (a returned promise is awaited), JSON-serialized. Arbitrary code execution. On Safari, a page whose CSP forbids eval gets the code run without eval: an expression works as usual, but statements need an explicit `return` to produce a result.",
+                "Evaluate arbitrary JavaScript in the page context. The result is the value of the last statement (a returned promise is awaited), JSON-serialized. Arbitrary code execution. If the script navigates the page the result is {navigated:true, value:null} rather than an error. On Safari, a page whose CSP forbids eval gets the code run without eval: an expression works as usual, but statements need an explicit `return` to produce a result.",
                 obj(
                     json!({
                         "target_id": { "type": "string" },
-                        "expression": { "type": "string" }
+                        "expression": { "type": "string" },
+                        "timeout_ms": { "type": "integer", "description": "stop waiting after this many ms (default 10000, clamped to 100-60000). Chrome stops script that is still running; a timeout is an error that says so. Async work already scheduled (timers, pending promises) can keep running in the page. Not enforced on Safari" },
+                        "detached": { "type": "boolean", "description": "start the script and return {started:true} without waiting for a promise it returns or for its result (Chrome only); its synchronous part still runs within the call and timeout_ms. A later rejection goes to the page console" }
                     }),
                     json!(["target_id", "expression"]),
                 ),
@@ -2181,7 +2397,7 @@ impl ToolModule for BrowserModule {
                 "browser_showcase",
                 Category::Browser,
                 Tier::Standard,
-                "Configure visual flair for demos, screencasts, and presentations: animated virtual SVG cursor, smooth cubic-bezier gliding, click ripples, and floating typing HUD, drawn inside the tab on Chrome and Safari. Decoration only: it never changes an action's result or error, and the typing HUD masks secrets and password/one-time-code fields.",
+                "Configure visual flair for demos, screencasts, and presentations: animated virtual SVG cursor, smooth cubic-bezier gliding, click ripples, and floating typing HUD, drawn inside the tab on Chrome and Safari. While on, a browser_act on Chrome also moves the real pointer (trusted mousemove events) so hover styles and mouse listeners fire. The result's `rendered` says whether the cursor really is on the page, with a `warning` when it is not. Decoration only: it never changes an action's result or error, and the typing HUD masks secrets and password/one-time-code fields.",
                 obj(
                     json!({
                         "target_id": { "type": "string", "description": "the tab to configure showcase overlays for" },
@@ -2190,7 +2406,8 @@ impl ToolModule for BrowserModule {
                         "click_ripple": { "type": "boolean", "description": "expand glowing shockwave rings on click" },
                         "typing_hud": { "type": "boolean", "description": "display floating action/typing badges next to cursor" },
                         "cursor_style": { "type": "string", "enum": ["glow_arrow", "neon_cyan", "minimal_dot"], "description": "visual pointer style" },
-                        "glide_ms": { "type": "integer", "description": "custom glide duration in milliseconds" }
+                        "glide_ms": { "type": "integer", "description": "custom glide duration in milliseconds, 0-3000 (larger values are capped)" },
+                        "cursor_size": { "type": "integer", "description": "pointer size in px, 16-96 (default 32; values outside are clamped)" }
                     }),
                     json!(["target_id"]),
                 ),
@@ -2251,6 +2468,7 @@ impl ToolModule for BrowserModule {
             "browser_record" => self.record(&args).await,
             "browser_showcase" => self.showcase(&args).await,
             "browser_screenshot" => self.screenshot(&args).await,
+            "browser_screencast" => self.screencast(&args).await,
             "browser_viewport" => self.viewport(&args).await,
             "browser_eval" => self.eval(&args).await,
             "browser_dialog" => self.dialog(&args).await,
@@ -3304,5 +3522,126 @@ mod act_tests {
             .await;
         assert!(!res.ok);
         assert_eq!(res.error.unwrap().code, ErrorCode::InvalidArgs);
+    }
+}
+
+#[cfg(test)]
+mod arg_tests {
+    use super::*;
+    use crate::backend::ScrollMode;
+
+    fn cond(args: Value) -> Result<(&'static str, Option<String>), String> {
+        parse_wait_condition(&args).map(|(c, a)| (c, a.map(str::to_string)))
+    }
+
+    #[test]
+    fn wait_condition_accepts_the_preferred_and_alias_forms() {
+        assert_eq!(
+            cond(json!({ "condition": "network_idle" })).unwrap().0,
+            "network_idle"
+        );
+        assert_eq!(
+            cond(json!({ "network_idle": true })).unwrap().0,
+            "network_idle"
+        );
+        assert_eq!(
+            cond(json!({ "condition": "challenge" })).unwrap().0,
+            "challenge_cleared"
+        );
+        assert_eq!(
+            cond(json!({ "selector": "#a" })).unwrap(),
+            ("selector", Some("#a".into()))
+        );
+        assert_eq!(
+            cond(json!({ "condition": "selector", "selector": "#a" })).unwrap(),
+            ("selector", Some("#a".into()))
+        );
+    }
+
+    #[test]
+    fn a_false_flag_selects_nothing() {
+        // `navigation:false` used to select navigation because the key was present.
+        assert!(cond(json!({ "navigation": false })).is_err());
+        assert_eq!(
+            cond(json!({ "navigation": false, "condition": "network_idle" }))
+                .unwrap()
+                .0,
+            "network_idle"
+        );
+        assert_eq!(
+            cond(json!({ "navigation": false, "dom_settled": true }))
+                .unwrap()
+                .0,
+            "dom_settled"
+        );
+        assert!(cond(json!({ "navigation": "yes" }))
+            .unwrap_err()
+            .contains("boolean"));
+    }
+
+    #[test]
+    fn conflicting_wait_conditions_are_named_not_picked() {
+        let e = cond(json!({ "condition": "network_idle", "navigation": true })).unwrap_err();
+        assert!(
+            e.contains("network_idle") && e.contains("navigation"),
+            "{e}"
+        );
+        let e = cond(json!({ "dom_settled": true, "htmx_settled": true })).unwrap_err();
+        assert!(
+            e.contains("dom_settled") && e.contains("htmx_settled"),
+            "{e}"
+        );
+        let e = cond(json!({ "selector": "#a", "condition": "navigation" })).unwrap_err();
+        assert!(e.contains("selector") && e.contains("navigation"), "{e}");
+        // The same condition said twice is still one.
+        assert_eq!(
+            cond(json!({ "condition": "navigation", "navigation": true }))
+                .unwrap()
+                .0,
+            "navigation"
+        );
+    }
+
+    #[test]
+    fn wait_condition_errors_are_specific() {
+        let e = cond(json!({ "condition": "selector" })).unwrap_err();
+        assert!(e.contains("needs the 'selector' argument"), "{e}");
+        let e = cond(json!({ "condition": "bogus" })).unwrap_err();
+        assert!(e.contains("unknown condition 'bogus'"), "{e}");
+        assert!(cond(json!({}))
+            .unwrap_err()
+            .contains("provide one wait condition"));
+    }
+
+    #[test]
+    fn act_opts_default_to_nearest_scroll_and_no_wait() {
+        let o = parse_act_opts(&json!({})).unwrap();
+        assert_eq!(o, crate::backend::ActOpts::default());
+        assert_eq!(o.scroll, ScrollMode::Nearest);
+        assert!(!o.settle);
+    }
+
+    #[test]
+    fn act_opts_parse_scroll_wait_after_and_timeout() {
+        let o = parse_act_opts(
+            &json!({ "scroll": "center", "wait_after": "settle", "timeout_ms": 2500 }),
+        )
+        .unwrap();
+        assert_eq!(o.scroll, ScrollMode::Center);
+        assert!(o.settle);
+        assert_eq!(o.timeout_ms, 2500);
+        assert_eq!(
+            parse_act_opts(&json!({ "scroll": "none", "wait_after": "none" }))
+                .unwrap()
+                .scroll,
+            ScrollMode::None
+        );
+        assert!(parse_act_opts(&json!({ "scroll": "smooth" }))
+            .unwrap_err()
+            .contains("scroll"));
+        assert!(parse_act_opts(&json!({ "wait_after": "idle" }))
+            .unwrap_err()
+            .contains("wait_after"));
+        assert!(parse_act_opts(&json!({ "timeout_ms": "soon" })).is_err());
     }
 }

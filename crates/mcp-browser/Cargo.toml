@@ -17,7 +17,7 @@ async-trait.workspace = true
 tracing.workspace = true
 # `net` is not in the workspace tokio feature set; the browser engine needs it
 # to talk CDP over TCP. Cargo unions features across the workspace.
-tokio = { workspace = true, features = ["net", "io-util", "time", "rt"] }
+tokio = { workspace = true, features = ["net", "io-util", "time", "rt", "fs", "process", "sync"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros", "time", "net", "io-util"] }

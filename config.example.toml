@@ -74,8 +74,10 @@ anonymize = false
 
 # Demo mode, for screencasts. The pointer glides along an eased curve instead
 # of jumping, and browser pages get a visible pointer, click ripples and a
-# typing overlay (secret fields masked). It slows every pointer action and
-# adds elements to pages, so leave it off for real work and in CI.
+# typing overlay (secret fields masked). On Chrome the page also sees the
+# pointer arrive (real mousemove events, so :hover styles apply). It slows
+# every pointer action and adds elements to pages, so leave it off for real
+# work and in CI.
 # --demo / --demo-speed and AGENTCTL_DEMO / AGENTCTL_DEMO_SPEED override these.
 demo = false
 # cinematic (350 ms), demo (200 ms), snappy (100 ms), or instant (alias: off).
@@ -84,7 +86,10 @@ demo_speed = "demo"
 
 # Role profiles narrow what a session may call; they never widen it. Built in:
 # readonly (read tier only), qa (browser, vision, window, system, input; no
-# browser_eval), operator (dangerous tools always ask), admin (no extra limits).
+# browser_eval), browser (browser tools only, for web QA and demos), operator
+# (dangerous tools always ask), admin (no extra limits). Roles also filter the
+# advertised tool list, so `role = "browser"` is how to show only browser tools
+# when `access` is set (access turns every category on).
 # Pick one for this server, or define your own below.
 # role = "qa"
 
