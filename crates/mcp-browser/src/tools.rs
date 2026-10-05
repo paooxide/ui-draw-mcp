@@ -2099,7 +2099,7 @@ impl ToolModule for BrowserModule {
                     json!({
                         "target_id": { "type": "string" },
                         "ref": { "type": "string" },
-                        "save": { "type": "boolean", "description": "write the PNG to disk and return its path instead of the image (default false)" }
+                        "save": { "type": "boolean", "description": "write the PNG under agentctl's own media directory and return {path, width, height, bytes} instead of the image (default false). The newest 200 saved screenshots are kept; older ones are deleted" }
                     }),
                     json!(["target_id"]),
                 ),

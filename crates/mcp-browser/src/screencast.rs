@@ -219,6 +219,30 @@ pub fn create_private_dirs(media: &Path, parts: &[&str]) -> Result<PathBuf, Brow
     Ok(p)
 }
 
+/// Saved screenshots kept; older ones are deleted as new ones arrive, so a
+/// read-tier tool cannot fill the disk.
+pub const KEEP_SCREENSHOTS: usize = 200;
+
+/// Delete all but the newest `keep` files with extension `ext` in `dir`. The
+/// names sort by creation time ([`media_name`]), so name order is age order.
+/// Best effort.
+fn prune_oldest(dir: &Path, ext: &str, keep: usize) {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut names: Vec<PathBuf> = rd
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == ext))
+        .collect();
+    if names.len() <= keep {
+        return;
+    }
+    names.sort();
+    for old in &names[..names.len() - keep] {
+        let _ = std::fs::remove_file(old);
+    }
+}
+
 /// Write a base64 PNG under `media/screenshots/` and describe it. The
 /// dimensions are read from the file when the caller does not know them.
 pub fn save_screenshot(
@@ -236,6 +260,7 @@ pub fn save_screenshot(
     let dir = create_private_dirs(media, &["screenshots"])?;
     let path = dir.join(format!("{}.png", next_media_name()));
     std::fs::write(&path, &bytes).map_err(|e| io_fail("write screenshot", e))?;
+    prune_oldest(&dir, "png", KEEP_SCREENSHOTS);
     Ok(json!({
         "path": path.to_string_lossy(),
         "width": w,
@@ -583,10 +608,11 @@ impl ScreencastHub {
         let mut note = None;
         if ffmpeg == "missing" {
             note = Some(format!(
-                "ffmpeg is not on PATH, so no mp4 was made; frames and frames.ffconcat were kept. \
-                 To encode: cd '{}' && ffmpeg {}",
-                rec.dir.display(),
-                ffmpeg_args("frames.ffconcat", "screencast.mp4").join(" "),
+                "ffmpeg was not found (on PATH or in {}), so no mp4 was made; frames and \
+                 frames.ffconcat were kept. To encode: cd {} && ffmpeg {}",
+                FFMPEG_FALLBACKS.join(", "),
+                shell_line(&[rec.dir.to_string_lossy().into_owned()]),
+                shell_line(&ffmpeg_args("frames.ffconcat", "screencast.mp4")),
             ));
         } else if mp4.is_some() && !keep_frames {
             let _ = tokio::fs::remove_dir_all(rec.dir.join("frames")).await;
@@ -623,8 +649,43 @@ fn already(target: &str) -> BrowserError {
 
 /// Run ffmpeg over `dir/frames.ffconcat`. Returns the status string and the
 /// mp4 path on success.
+/// Where `ffmpeg` is looked for after `PATH`. A server started by a desktop
+/// app on macOS inherits launchd's short `PATH`, which has no Homebrew.
+const FFMPEG_FALLBACKS: &[&str] = &[
+    "/opt/homebrew/bin/ffmpeg",
+    "/usr/local/bin/ffmpeg",
+    "/usr/bin/ffmpeg",
+];
+
+/// The ffmpeg to run: the first on `PATH`, else the first fallback that
+/// exists, else `None`.
+fn find_ffmpeg() -> Option<PathBuf> {
+    let on_path = std::env::var_os("PATH").and_then(|paths| {
+        std::env::split_paths(&paths)
+            .map(|d| d.join("ffmpeg"))
+            .find(|p| p.is_file())
+    });
+    on_path.or_else(|| {
+        FFMPEG_FALLBACKS
+            .iter()
+            .map(PathBuf::from)
+            .find(|p| p.is_file())
+    })
+}
+
+/// `args` as one line a POSIX shell reads back unchanged.
+pub fn shell_line(args: &[String]) -> String {
+    args.iter()
+        .map(|a| format!("'{}'", a.replace('\'', r"'\''")))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 async fn encode(dir: &Path) -> (String, Option<PathBuf>) {
-    let mut cmd = tokio::process::Command::new("ffmpeg");
+    let Some(bin) = find_ffmpeg() else {
+        return ("missing".into(), None);
+    };
+    let mut cmd = tokio::process::Command::new(bin);
     cmd.args(ffmpeg_args("frames.ffconcat", "screencast.mp4"))
         .current_dir(dir)
         .stdin(std::process::Stdio::null())
@@ -650,6 +711,37 @@ async fn encode(dir: &Path) -> (String, Option<PathBuf>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shell_line_survives_quotes_and_parens() {
+        let line = shell_line(&["a b".into(), "it's".into(), "scale=trunc(iw/2)*2".into()]);
+        assert_eq!(line, r"'a b' 'it'\''s' 'scale=trunc(iw/2)*2'");
+    }
+
+    #[test]
+    fn prune_keeps_the_newest() {
+        let dir = std::env::temp_dir().join(format!("agentctl-prune-{}", next_media_name()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for i in 0..5u128 {
+            std::fs::write(dir.join(format!("{}.png", media_name(1_000 + i, 0))), b"x").unwrap();
+        }
+        std::fs::write(dir.join("other.txt"), b"x").unwrap();
+        prune_oldest(&dir, "png", 2);
+        let mut left: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            [
+                format!("{}.png", media_name(1_003, 0)),
+                format!("{}.png", media_name(1_004, 0)),
+                "other.txt".to_string()
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn opts_default_and_clamp() {
