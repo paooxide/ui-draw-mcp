@@ -993,14 +993,7 @@ impl BrowserModule {
         if let Some(h) = args.get("typing_hud").and_then(Value::as_bool) {
             cfg.typing_hud = h;
         }
-        if let Some(style) = str_arg(args, "cursor_style") {
-            if let Some(cs) = crate::showcase::CursorStyle::parse(style) {
-                cfg.cursor_style = cs;
-            }
-        }
-        if let Some(dur) = args.get("glide_ms").and_then(Value::as_u64) {
-            cfg.custom_glide_ms = Some(dur);
-        }
+        cfg.apply_visual_args(args);
         *self
             .showcase
             .lock()
@@ -2404,7 +2397,7 @@ impl ToolModule for BrowserModule {
                 "browser_showcase",
                 Category::Browser,
                 Tier::Standard,
-                "Configure visual flair for demos, screencasts, and presentations: animated virtual SVG cursor, smooth cubic-bezier gliding, click ripples, and floating typing HUD, drawn inside the tab on Chrome and Safari. Decoration only: it never changes an action's result or error, and the typing HUD masks secrets and password/one-time-code fields.",
+                "Configure visual flair for demos, screencasts, and presentations: animated virtual SVG cursor, smooth cubic-bezier gliding, click ripples, and floating typing HUD, drawn inside the tab on Chrome and Safari. While on, a browser_act on Chrome also moves the real pointer (trusted mousemove events) so hover styles and mouse listeners fire. The result's `rendered` says whether the cursor really is on the page, with a `warning` when it is not. Decoration only: it never changes an action's result or error, and the typing HUD masks secrets and password/one-time-code fields.",
                 obj(
                     json!({
                         "target_id": { "type": "string", "description": "the tab to configure showcase overlays for" },
@@ -2413,7 +2406,8 @@ impl ToolModule for BrowserModule {
                         "click_ripple": { "type": "boolean", "description": "expand glowing shockwave rings on click" },
                         "typing_hud": { "type": "boolean", "description": "display floating action/typing badges next to cursor" },
                         "cursor_style": { "type": "string", "enum": ["glow_arrow", "neon_cyan", "minimal_dot"], "description": "visual pointer style" },
-                        "glide_ms": { "type": "integer", "description": "custom glide duration in milliseconds" }
+                        "glide_ms": { "type": "integer", "description": "custom glide duration in milliseconds, 0-3000 (larger values are capped)" },
+                        "cursor_size": { "type": "integer", "description": "pointer size in px, 16-96 (default 32; values outside are clamped)" }
                     }),
                     json!(["target_id"]),
                 ),

@@ -74,8 +74,10 @@ anonymize = false
 
 # Demo mode, for screencasts. The pointer glides along an eased curve instead
 # of jumping, and browser pages get a visible pointer, click ripples and a
-# typing overlay (secret fields masked). It slows every pointer action and
-# adds elements to pages, so leave it off for real work and in CI.
+# typing overlay (secret fields masked). On Chrome the page also sees the
+# pointer arrive (real mousemove events, so :hover styles apply). It slows
+# every pointer action and adds elements to pages, so leave it off for real
+# work and in CI.
 # --demo / --demo-speed and AGENTCTL_DEMO / AGENTCTL_DEMO_SPEED override these.
 demo = false
 # cinematic (350 ms), demo (200 ms), snappy (100 ms), or instant (alias: off).

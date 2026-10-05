@@ -495,14 +495,7 @@ async fn test_cmd(args: &[String]) -> std::io::Result<()> {
     let attach_port = parse_attach_port("test", args);
     let headless = resolve_launch_headless(args);
 
-    let showcase = if cfg.demo {
-        mcp_browser::ShowcaseConfig {
-            speed: agentctl::showcase_speed(&cfg.demo_speed),
-            ..Default::default()
-        }
-    } else {
-        mcp_browser::ShowcaseConfig::default()
-    };
+    let showcase = agentctl::demo_showcase(cfg.demo, &cfg.demo_speed);
 
     let backend = Arc::new(
         CdpBackend::new(NavPolicy::new(
