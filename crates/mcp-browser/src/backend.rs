@@ -49,6 +49,56 @@ pub enum Locator<'a> {
     },
 }
 
+/// How `act` brings the element into view before acting on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ScrollMode {
+    /// Do not scroll (the element may be off screen; a click still lands).
+    None,
+    /// Scroll only as far as needed, on both axes: no movement when the
+    /// element is already visible. The default.
+    #[default]
+    Nearest,
+    /// Centre the element in the viewport, on both axes.
+    Center,
+}
+
+impl ScrollMode {
+    /// The `scrollIntoView` options for this mode, or `None` for no scroll.
+    /// `behavior: 'instant'` so a position read straight after is not
+    /// mid-way through a smooth scroll.
+    fn js_options(self) -> Option<&'static str> {
+        match self {
+            ScrollMode::None => None,
+            ScrollMode::Nearest => Some("{block:'nearest',inline:'nearest',behavior:'instant'}"),
+            ScrollMode::Center => Some("{block:'center',inline:'center',behavior:'instant'}"),
+        }
+    }
+}
+
+/// Options for `act` beyond what it acts on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ActOpts {
+    pub scroll: ScrollMode,
+    /// Wait for the page to settle after the action (`wait_after: "settle"`)
+    /// and report what happened: `navigated`, `requests_started`, `settled`.
+    pub settle: bool,
+    /// Bound for the settle wait.
+    pub timeout_ms: u64,
+}
+
+/// The `timeout_ms` default of a settle wait.
+pub const ACT_SETTLE_TIMEOUT_MS: u64 = 10_000;
+
+impl Default for ActOpts {
+    fn default() -> Self {
+        ActOpts {
+            scroll: ScrollMode::default(),
+            settle: false,
+            timeout_ms: ACT_SETTLE_TIMEOUT_MS,
+        }
+    }
+}
+
 #[async_trait]
 pub trait BrowserBackend: Send + Sync {
     /// Attach to (or launch) a browser; returns a `browser_id`.
@@ -112,6 +162,22 @@ pub trait BrowserBackend: Send + Sync {
     ) -> Result<Value, BrowserError> {
         let _ = secret;
         self.act(target, locator, action, value).await
+    }
+    /// [`BrowserBackend::act_masked`] with [`ActOpts`]: how the element is
+    /// scrolled to, and whether to wait for the page to settle afterwards.
+    /// Backends that do neither ignore the options.
+    async fn act_opts(
+        &self,
+        target: &str,
+        locator: Locator<'_>,
+        action: &str,
+        value: Option<&str>,
+        secret: bool,
+        opts: ActOpts,
+    ) -> Result<Value, BrowserError> {
+        let _ = opts;
+        self.act_masked(target, locator, action, value, secret)
+            .await
     }
     /// Wait for a settle signal (`selector` / `navigation` / `network_idle`).
     async fn wait(
@@ -881,6 +947,37 @@ fn nav_probe_verdict(
     None
 }
 
+/// [`nav_probe_verdict`] for an action that is being settled: also gives up
+/// waiting for a navigation as soon as the loaded, unreplaced document has
+/// started a fetch / XHR since the action. That is the page working in place
+/// (an htmx swap, an API call), and waiting out the whole navigation window
+/// for it would make every such click cost seconds.
+fn settle_nav_verdict(
+    marker: Option<&str>,
+    ready_state: &str,
+    pending_token: &str,
+    requests_since: u64,
+    since_set: std::time::Duration,
+    expect_ms: u64,
+) -> Option<bool> {
+    match nav_probe_verdict(
+        marker,
+        ready_state,
+        pending_token,
+        false,
+        since_set,
+        expect_ms,
+    ) {
+        None if ready_state == "complete"
+            && marker == Some(pending_token)
+            && requests_since > 0 =>
+        {
+            Some(false)
+        }
+        v => v,
+    }
+}
+
 impl CdpBackend {
     pub fn new(nav: NavPolicy) -> Self {
         CdpBackend {
@@ -987,6 +1084,101 @@ impl CdpBackend {
             }
             tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
         }
+    }
+
+    /// What `browser_act wait_after:"settle"` does once the action has run:
+    /// wait for a navigation it started to land, then for htmx (when the page
+    /// has it), then for the network to go quiet, all bounded by `timeout_ms`.
+    /// Never fails: the action happened, so a wait that runs out is reported
+    /// as `settled: false` with `settle_error`.
+    async fn settle_after_act(
+        &self,
+        target: &str,
+        nav_token: Option<String>,
+        timeout_ms: u64,
+    ) -> Value {
+        use tokio::time::{sleep, Duration, Instant};
+        let started = Instant::now();
+        let deadline = started + Duration::from_millis(timeout_ms.clamp(50, 60_000));
+        let left = || {
+            deadline
+                .saturating_duration_since(Instant::now())
+                .as_millis() as u64
+        };
+        let mut navigated = false;
+        let mut error: Option<String> = None;
+        let mut htmx = false;
+        let mut c = match self.conn(target).await {
+            Ok(c) => c,
+            Err(e) => {
+                return json!({
+                    "navigated": false, "requests_started": 0, "settled": false,
+                    "settle_error": berr_msg(&e),
+                })
+            }
+        };
+        if let Some(token) = nav_token {
+            // A fetch / XHR / htmx request that began on the document the
+            // click ran on is the page doing its work in place; stop waiting
+            // for a navigation then (see `settle_nav_verdict`).
+            loop {
+                if let Ok(p) = Self::eval_value(&mut c, JS_ACT_PROBE).await {
+                    htmx = p.get("htmx").and_then(Value::as_bool) == Some(true);
+                    let verdict = settle_nav_verdict(
+                        p.get("tok").and_then(Value::as_str),
+                        p.get("state").and_then(Value::as_str).unwrap_or(""),
+                        &token,
+                        p.get("req").and_then(Value::as_u64).unwrap_or(0),
+                        started.elapsed(),
+                        NAV_EXPECT_MS,
+                    );
+                    if let Some(nav) = verdict {
+                        navigated = nav;
+                        self.clear_nav_pending(target, Some(&token));
+                        break;
+                    }
+                }
+                if Instant::now() >= deadline {
+                    error = Some(format!("the page was still loading after {timeout_ms}ms"));
+                    break;
+                }
+                sleep(Duration::from_millis(50)).await;
+            }
+        }
+        if error.is_none() {
+            if let Ok(p) = Self::eval_value(&mut c, JS_ACT_PROBE).await {
+                htmx = p.get("htmx").and_then(Value::as_bool) == Some(true);
+            }
+            if htmx {
+                if let Err(e) = self
+                    .wait_window(target, "htmx_settled", None, left(), None)
+                    .await
+                {
+                    error = Some(berr_msg(&e));
+                }
+            }
+        }
+        if error.is_none() {
+            if let Err(e) = self
+                .wait_window(target, "network_idle", None, left(), None)
+                .await
+            {
+                error = Some(berr_msg(&e));
+            }
+        }
+        let requests = match Self::eval_value(&mut c, JS_ACT_PROBE).await {
+            Ok(p) => p.get("req").and_then(Value::as_u64).unwrap_or(0),
+            Err(_) => 0,
+        };
+        let mut out = json!({
+            "navigated": navigated,
+            "requests_started": requests,
+            "settled": error.is_none(),
+        });
+        if let (Some(e), Some(m)) = (error, out.as_object_mut()) {
+            m.insert("settle_error".into(), json!(e));
+        }
+        out
     }
 
     /// Cap the number of simultaneously active speculative branches
@@ -1639,31 +1831,145 @@ function __find(by, q, within, textFilter, index){
 }
 "#;
 
-/// Check whether HTMX has finished all in-flight requests and DOM swaps.
+/// Idempotent htmx listeners, as a JS function `__hx_hook()` returning the
+/// shared state (or `null` while `window.htmx` is absent).
 ///
-/// `htmx` has no "is anything in flight" API, so the first probe installs
-/// (idempotently) capture-phase listeners on `document` for
-/// `htmx:beforeRequest` / `htmx:afterRequest` / `htmx:afterSettle`, keeping an
-/// in-flight counter and the time of the last event. Settled means: counter 0,
-/// no element carrying `htmx-request` / `htmx-settling` / `htmx-swapping`
-/// (this also covers requests that started before the probe was installed),
-/// and no htmx event for a short quiet window. Throws when `window.htmx` is
-/// absent so a page without htmx is an error, not "settled".
-const JS_HTMX_SETTLED: &str = r#"(function(){
-  if (!window.htmx) throw new Error('htmx not present on page');
+/// `htmx` has no "is anything in flight" API, so the hook installs
+/// capture-phase listeners on `document` for `htmx:beforeRequest` /
+/// `htmx:afterRequest` / `htmx:afterSettle`, keeping an in-flight counter, the
+/// number of requests seen (`seen`) and the time of the last event. The act
+/// path installs it *before* the action, so a request the action starts is
+/// counted even when it begins late (a debounced or delayed trigger).
+const JS_HTMX_HOOK: &str = r#"
+function __hx_hook(){
+  if (!window.htmx) return null;
   var st = window.__agentctl_htmx;
   if (!st) {
-    st = window.__agentctl_htmx = { inflight: 0, last: Date.now() };
+    st = window.__agentctl_htmx = { inflight: 0, last: Date.now(), seen: 0, mark: 0 };
     var touch = function(){ st.last = Date.now(); };
-    document.addEventListener('htmx:beforeRequest', function(){ st.inflight++; touch(); }, true);
+    document.addEventListener('htmx:beforeRequest', function(){ st.inflight++; st.seen++; touch(); }, true);
     document.addEventListener('htmx:afterRequest', function(){ if (st.inflight > 0) st.inflight--; touch(); }, true);
     document.addEventListener('htmx:afterSettle', touch, true);
   }
+  return st;
+}"#;
+
+/// Idempotent fetch / XHR counter, as a JS function `__net_hook()` returning
+/// the shared state `{inflight, started, last, mark, act_at}`. `started` counts
+/// every fetch and XHR (htmx uses XHR) begun since the hook went in; the act
+/// path sets `mark` and `act_at`, so "started since the last act" is
+/// `started - mark`. A request already in flight when the hook goes in is not
+/// seen until it completes (the Performance API lists it only then), which is
+/// why the act path installs the hook before it acts.
+const JS_NET_HOOK: &str = r#"
+function __net_hook(){
+  var st = window.__agentctl_net;
+  if (st) return st;
+  st = window.__agentctl_net = { inflight: 0, started: 0, last: Date.now(), mark: 0, act_at: null };
+  var begin = function(){ st.inflight++; st.started++; st.last = Date.now(); };
+  var end = function(){ if (st.inflight > 0) st.inflight--; st.last = Date.now(); };
+  try {
+    if (window.fetch) {
+      var of = window.fetch;
+      window.fetch = function(){
+        begin();
+        var p;
+        try { p = of.apply(this, arguments); } catch(e) { end(); throw e; }
+        p.then(end, end);
+        return p;
+      };
+    }
+    var os = XMLHttpRequest.prototype.send;
+    XMLHttpRequest.prototype.send = function(){
+      var x = this, done = false;
+      begin();
+      x.addEventListener('loadend', function(){ if (!done) { done = true; end(); } });
+      try { return os.apply(this, arguments); } catch(e) { if (!done) { done = true; end(); } throw e; }
+    };
+  } catch(e) {}
+  return st;
+}"#;
+
+/// How long `htmx_settled` waits, after an act, for an htmx request to start
+/// before taking it that none will (a debounced `hx-trigger` can begin
+/// hundreds of milliseconds after the event).
+const HTMX_GRACE_MS: u64 = 1_500;
+
+/// Quiet period `network_idle` requires: no fetch/XHR in flight, and none
+/// begun or finished for this long.
+const NET_QUIET_MS: u64 = 500;
+
+/// Run right before an action: install both hooks, then record "an action
+/// happened now, with this many requests seen so far".
+fn act_arm_js() -> String {
+    format!(
+        r#"(function(){{
+  {JS_NET_HOOK}
+  {JS_HTMX_HOOK}
+  var n = __net_hook();
+  n.mark = n.started; n.act_at = Date.now();
+  var h = __hx_hook();
+  if (h) h.mark = h.seen;
+  return true;
+}})()"#
+    )
+}
+
+/// Probe: has HTMX finished all in-flight requests and DOM swaps?
+///
+/// Settled means: counter 0, no element carrying `htmx-request` /
+/// `htmx-settling` / `htmx-swapping` (this also covers requests that started
+/// before the hook was installed), no htmx event for a short quiet window, and
+/// (right after an act) either a request was seen since it or the
+/// [`HTMX_GRACE_MS`] grace has run out. Throws when `window.htmx` is absent so
+/// a page without htmx is an error, not "settled".
+fn htmx_settled_js() -> String {
+    format!(
+        r#"(function(){{
+  {JS_HTMX_HOOK}
+  var st = __hx_hook();
+  if (!st) throw new Error('htmx not present on page');
   if (st.inflight > 0) return false;
   if (document.querySelector('.htmx-request, .htmx-settling, .htmx-swapping') !== null) return false;
   if (Date.now() - st.last < 100) return false;
+  var n = window.__agentctl_net;
+  if (n && n.act_at !== null && st.seen === st.mark && Date.now() - n.act_at < {HTMX_GRACE_MS}) return false;
   return document.readyState === 'complete' || document.readyState === 'interactive';
-})()"#;
+}})()"#
+    )
+}
+
+/// Probe for `network_idle`: loaded, no fetch/XHR in flight, and nothing begun
+/// or finished for [`NET_QUIET_MS`] (the Performance API's resource entries
+/// cover requests the hook did not see begin).
+fn net_idle_js() -> String {
+    format!(
+        r#"(function(){{
+  {JS_NET_HOOK}
+  var st = __net_hook();
+  if (document.readyState !== 'complete') return false;
+  if (st.inflight > 0) return false;
+  if (Date.now() - st.last < {NET_QUIET_MS}) return false;
+  try {{
+    var es = performance.getEntriesByType('resource'), now = performance.now();
+    for (var i = es.length - 1, k = 0; i >= 0 && k < 64; i--, k++) {{
+      if (now - es[i].responseEnd < {NET_QUIET_MS}) return false;
+    }}
+  }} catch(e) {{}}
+  return true;
+}})()"#
+    )
+}
+
+/// Page state for settling an act: the requests started since the act and
+/// the navigation marker, in one read. Throws nothing; `req` is 0 when the
+/// hook is absent (a replaced document).
+const JS_ACT_PROBE: &str = r#"({
+  tok: window.__agentctl_nav_token === undefined ? null : String(window.__agentctl_nav_token),
+  state: document.readyState,
+  req: window.__agentctl_net ? window.__agentctl_net.started - window.__agentctl_net.mark : 0,
+  htmx: !!window.htmx
+})"#;
 
 /// Page hook that records fetch/XHR (method, url, status, request+response
 /// bodies, bounded) and console errors / uncaught exceptions into ring buffers
@@ -1831,8 +2137,8 @@ const JS_FILL_FORM: &str = r##"(async function(){
       continue;
     }
     try {
-      if(el.scrollIntoView) el.scrollIntoView({block:'nearest', inline:'nearest'});
-      if(el.focus) el.focus();
+      if(el.scrollIntoView) el.scrollIntoView({block:'nearest', inline:'nearest', behavior:'instant'});
+      if(el.focus) el.focus({preventScroll:true});
       var val = f.value;
       {JS_SHOWCASE_FIELD}
       var tag = (el.tagName || '').toLowerCase();
@@ -2761,7 +3067,25 @@ impl BrowserBackend for CdpBackend {
         value: Option<&str>,
         secret: bool,
     ) -> Result<Value, BrowserError> {
+        self.act_opts(target, locator, action, value, secret, ActOpts::default())
+            .await
+    }
+
+    async fn act_opts(
+        &self,
+        target: &str,
+        locator: Locator<'_>,
+        action: &str,
+        value: Option<&str>,
+        secret: bool,
+        opts: ActOpts,
+    ) -> Result<Value, BrowserError> {
         let is_safari = target.starts_with("safari-");
+        if is_safari && opts.settle {
+            return Err(BrowserError::Unsupported(
+                "wait_after 'settle' needs the CDP (Chrome) engine; use browser_wait on the WebKit engine".into(),
+            ));
+        }
         let press_key = if action == "press" {
             if is_safari {
                 return Err(BrowserError::Unsupported(
@@ -2869,6 +3193,30 @@ impl BrowserBackend for CdpBackend {
             nav_mark
         };
 
+        // `scroll_into_view` is the one action whose whole point is the
+        // scroll, so it never skips it.
+        let scroll = if action == "scroll_into_view" && opts.scroll == ScrollMode::None {
+            ScrollMode::Nearest
+        } else {
+            opts.scroll
+        };
+        let scroll_js = |target: &str| {
+            scroll
+                .js_options()
+                .map(|o| format!("try{{ {target}.scrollIntoView({o}); }}catch(e){{}}"))
+                .unwrap_or_default()
+        };
+        let canvas_scroll = scroll_js("c");
+        let el_scroll = scroll_js("el");
+
+        // Install the request counters and mark "an action happens now" before
+        // it does, so a request it starts (however late) is seen by the
+        // settle waits. Best effort: a page that cannot be scripted just has
+        // no counters.
+        if let (Some(c), false) = (c_opt.as_mut(), action == "scroll_into_view") {
+            let _ = Self::eval_value(c, &act_arm_js()).await;
+        }
+
         let expr = format!(
             r#"(async function(){{
   {JS_XPATH}
@@ -2883,7 +3231,7 @@ impl BrowserBackend for CdpBackend {
     if(action !== 'click' && action !== 'hover' && action !== 'scroll_into_view'){{
       return {{ok:false,kind:'unsupported',error:"action '"+action+"' is not supported on a canvas region (only click, hover, scroll_into_view); the region is drawn pixels, not a DOM element"}};
     }}
-    try{{ c.scrollIntoView({{block:'center',inline:'center',behavior:'instant'}}); }}catch(e){{}}
+    {canvas_scroll}
     var box = __canvas_box(c, el.reg);
     var px = box.x + box.w / 2, py = box.y + box.h / 2;
     if(action === 'scroll_into_view') return {{ok:true,action:action,canvas_target:true}};
@@ -2898,14 +3246,14 @@ impl BrowserBackend for CdpBackend {
     }}
     return {{ok:true,action:action,canvas_target:true,canvas_point:true,x:px,y:py}};
   }}
-  try{{ el.scrollIntoView({{block:'center',inline:'center'}}); }}catch(e){{}}
+  {el_scroll}
   {showcase_call}
   {nav_mark_in_script}
   try {{
   switch(action){{
     case 'click': __arm(el, 'click'); el.click(); break;
-    case 'focus': el.focus(); break;
-    case 'press': el.focus(); break;
+    case 'focus': el.focus({{preventScroll:true}}); break;
+    case 'press': el.focus({{preventScroll:true}}); break;
     case 'hover': el.dispatchEvent(new MouseEvent('mouseover',{{bubbles:true}})); break;
     case 'scroll_into_view': break;
     case 'submit':
@@ -2916,7 +3264,7 @@ impl BrowserBackend for CdpBackend {
     case 'select':
       el.value=value; __arm(el, 'change'); el.dispatchEvent(new Event('change',{{bubbles:true}})); break;
     case 'type':
-      if(el.focus) el.focus();
+      if(el.focus) el.focus({{preventScroll:true}});
       if('value' in el){{ el.value=value; }} else {{ el.textContent=value; }}
       __arm(el, 'input');
       el.dispatchEvent(new Event('input',{{bubbles:true}}));
@@ -2952,10 +3300,10 @@ impl BrowserBackend for CdpBackend {
                 _ => BrowserError::NotFound(msg),
             });
         }
-        if let Some(token) = nav_token {
+        if let Some(token) = &nav_token {
             // The marker is on the document the action ran on; a click only
             // *might* navigate, so the wait for it is bounded (NAV_EXPECT_MS).
-            self.set_nav_pending(target, token, false);
+            self.set_nav_pending(target, token.clone(), false);
         }
         if v.get("canvas_point").and_then(Value::as_bool) == Some(true) {
             // A canvas region is only pixels: the click must be a real,
@@ -3006,6 +3354,15 @@ impl BrowserBackend for CdpBackend {
         if let Some(ref mut c) = c_opt {
             self.note_dialogs(target, c, &mut v);
         }
+        if opts.settle {
+            drop(c_opt);
+            let report = self
+                .settle_after_act(target, nav_token, opts.timeout_ms)
+                .await;
+            if let (Some(m), Some(r)) = (v.as_object_mut(), report.as_object()) {
+                m.extend(r.iter().map(|(k, x)| (k.clone(), x.clone())));
+            }
+        }
         Ok(v)
     }
 
@@ -3054,7 +3411,7 @@ impl BrowserBackend for CdpBackend {
                     "return document.readyState==='complete';".to_string()
                 }
                 "dom_settled" => safari_return(JS_DOM_SETTLED),
-                "htmx_settled" => safari_return(JS_HTMX_SETTLED),
+                "htmx_settled" => safari_return(&htmx_settled_js()),
                 other => {
                     return Err(BrowserError::Failed(format!(
                         "unknown wait condition '{other}'"
@@ -3108,6 +3465,22 @@ impl BrowserBackend for CdpBackend {
             self.note_dialogs(target, &mut c, &mut out);
             return Ok(out);
         }
+        // An action that may have navigated leaves the old document showing
+        // for a moment, and the old document is as quiet as any: look at the
+        // network only once the page has moved on (or the click has had its
+        // NAV_EXPECT_MS to start navigating and did not).
+        let mut navigated = None;
+        if cond == "network_idle" {
+            if let Some(pending) = self.nav_pending_for(target) {
+                let left = deadline
+                    .saturating_duration_since(Instant::now())
+                    .as_millis() as u64;
+                let r = self
+                    .wait_replaced_document(target, &mut c, pending, left, NAV_EXPECT_MS)
+                    .await?;
+                navigated = r.get("navigated").cloned();
+            }
+        }
 
         let probe = match cond {
             "selector" => {
@@ -3117,9 +3490,9 @@ impl BrowserBackend for CdpBackend {
                 format!("!!document.querySelector({sl})")
             }
             "navigation" => "document.readyState==='complete'".to_string(),
-            "network_idle" => "document.readyState==='complete'".to_string(),
+            "network_idle" => net_idle_js(),
             "dom_settled" => JS_DOM_SETTLED.to_string(),
-            "htmx_settled" => JS_HTMX_SETTLED.to_string(),
+            "htmx_settled" => htmx_settled_js(),
             other => {
                 return Err(BrowserError::Failed(format!(
                     "unknown wait condition '{other}'"
@@ -3136,11 +3509,10 @@ impl BrowserBackend for CdpBackend {
                 }
             })?;
             if hit.as_bool() == Some(true) {
-                // network_idle: require a short additional quiet window.
-                if cond == "network_idle" {
-                    sleep(Duration::from_millis(400)).await;
-                }
                 let mut out = json!({ "settled": true, "condition": cond });
+                if let (Some(n), Some(m)) = (navigated, out.as_object_mut()) {
+                    m.insert("navigated".into(), n);
+                }
                 self.note_dialogs(target, &mut c, &mut out);
                 return Ok(out);
             }
@@ -5592,6 +5964,55 @@ mod tests {
             nav_probe_verdict(None, "complete", "t1", false, ms(1), 5_000),
             Some(true)
         );
+    }
+
+    #[test]
+    fn settle_gives_up_on_a_navigation_once_the_page_works_in_place() {
+        let ms = std::time::Duration::from_millis;
+        // A request began on the unreplaced, loaded document: not navigating.
+        assert_eq!(
+            settle_nav_verdict(Some("t1"), "complete", "t1", 1, ms(5), NAV_EXPECT_MS),
+            Some(false)
+        );
+        // No request yet and the window still open: keep waiting.
+        assert_eq!(
+            settle_nav_verdict(Some("t1"), "complete", "t1", 0, ms(5), NAV_EXPECT_MS),
+            None
+        );
+        // Still loading: a request does not decide anything.
+        assert_eq!(
+            settle_nav_verdict(Some("t1"), "loading", "t1", 3, ms(5), NAV_EXPECT_MS),
+            None
+        );
+        // The document was replaced: that wins over any count.
+        assert_eq!(
+            settle_nav_verdict(None, "complete", "t1", 2, ms(5), NAV_EXPECT_MS),
+            Some(true)
+        );
+        // Nothing happened for the whole window.
+        assert_eq!(
+            settle_nav_verdict(
+                Some("t1"),
+                "complete",
+                "t1",
+                0,
+                ms(NAV_EXPECT_MS),
+                NAV_EXPECT_MS
+            ),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn scroll_modes_map_to_scroll_into_view_options() {
+        assert_eq!(ScrollMode::default(), ScrollMode::Nearest);
+        assert_eq!(ScrollMode::None.js_options(), None);
+        let nearest = ScrollMode::Nearest.js_options().unwrap();
+        assert!(nearest.contains("block:'nearest'") && nearest.contains("inline:'nearest'"));
+        let center = ScrollMode::Center.js_options().unwrap();
+        assert!(center.contains("block:'center'") && center.contains("inline:'center'"));
+        // A position read right after must not catch a smooth scroll mid-way.
+        assert!(nearest.contains("behavior:'instant'") && center.contains("behavior:'instant'"));
     }
 
     #[test]
