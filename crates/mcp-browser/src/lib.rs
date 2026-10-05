@@ -17,7 +17,9 @@ pub mod showcase;
 mod tools;
 mod visual;
 
-pub use backend::{BrowserBackend, BrowserError, CdpBackend, Locator, Shot, CHROME_BINS};
+pub use backend::{
+    ActOpts, BrowserBackend, BrowserError, CdpBackend, Locator, ScrollMode, Shot, CHROME_BINS,
+};
 pub use branch::{Branch, BranchError, BranchManager, BranchStatus};
 pub use cdp::{DialogPolicy, RecordDialogs};
 pub use challenge::{ChallengeKind, ChallengeManager, ChallengeStatus};

@@ -446,10 +446,21 @@ impl BrowserModule {
         };
         let action = str_arg(args, "action").unwrap_or("click");
         let secret = args.get("secret").and_then(Value::as_bool) == Some(true);
+        let opts = match parse_act_opts(args) {
+            Ok(o) => o,
+            Err(m) => return Envelope::fail("browser_act", ErrorCode::InvalidArgs, m),
+        };
         result(
             "browser_act",
             self.backend
-                .act_masked(target, locator, action, str_arg(args, "value"), secret)
+                .act_opts(
+                    target,
+                    locator,
+                    action,
+                    str_arg(args, "value"),
+                    secret,
+                    opts,
+                )
                 .await,
         )
     }
@@ -755,36 +766,9 @@ impl BrowserModule {
             .get("timeout_ms")
             .and_then(Value::as_u64)
             .unwrap_or(10_000);
-        // exactly one of selector | dom_settled | navigation | network_idle
-        let (cond, arg) = if let Some(sel) = str_arg(args, "selector") {
-            ("selector", Some(sel))
-        } else if args.get("dom_settled").and_then(Value::as_bool) == Some(true)
-            || str_arg(args, "condition") == Some("dom_settled")
-        {
-            ("dom_settled", None)
-        } else if args.get("htmx_settled").and_then(Value::as_bool) == Some(true)
-            || str_arg(args, "condition") == Some("htmx_settled")
-        {
-            ("htmx_settled", None)
-        } else if args.get("navigation").is_some()
-            || str_arg(args, "condition") == Some("navigation")
-        {
-            ("navigation", None)
-        } else if args.get("network_idle").and_then(Value::as_bool) == Some(true)
-            || str_arg(args, "condition") == Some("network_idle")
-        {
-            ("network_idle", None)
-        } else if args.get("challenge_cleared").and_then(Value::as_bool) == Some(true)
-            || str_arg(args, "condition") == Some("challenge_cleared")
-            || str_arg(args, "condition") == Some("challenge")
-        {
-            ("challenge_cleared", None)
-        } else {
-            return Envelope::fail(
-                "browser_wait",
-                ErrorCode::InvalidArgs,
-                "provide one of 'selector', 'dom_settled', 'htmx_settled', 'navigation', 'network_idle', or 'challenge_cleared'",
-            );
+        let (cond, arg) = match parse_wait_condition(args) {
+            Ok(c) => c,
+            Err(m) => return Envelope::fail("browser_wait", ErrorCode::InvalidArgs, m),
         };
         let nav_window = match args.get("navigation_timeout_ms") {
             None | Some(Value::Null) => None,
@@ -1663,6 +1647,107 @@ impl BrowserModule {
     }
 }
 
+/// The conditions `browser_wait` knows, as the `condition` enum spells them.
+const WAIT_CONDITIONS: [&str; 6] = [
+    "selector",
+    "dom_settled",
+    "htmx_settled",
+    "navigation",
+    "network_idle",
+    "challenge_cleared",
+];
+
+/// Which condition a `browser_wait` call asks for. `condition` is the
+/// preferred form; `selector` and the boolean flags are aliases for it. A
+/// flag selects its condition only when `true` (`navigation:false` selects
+/// nothing), and asking for more than one condition is an error, not a silent
+/// pick. Naming the same condition twice (`condition:"navigation"` with
+/// `navigation:true`) is one condition.
+fn parse_wait_condition(args: &Value) -> Result<(&'static str, Option<&str>), String> {
+    let mut found: Vec<&'static str> = Vec::new();
+    let mut arg = None;
+    if let Some(sel) = str_arg(args, "selector") {
+        found.push("selector");
+        arg = Some(sel);
+    }
+    for flag in &WAIT_CONDITIONS[1..] {
+        match args.get(*flag) {
+            None | Some(Value::Null) => {}
+            Some(Value::Bool(true)) => found.push(flag),
+            Some(Value::Bool(false)) => {}
+            Some(_) => return Err(format!("'{flag}' must be a boolean")),
+        }
+    }
+    if let Some(cond) = str_arg(args, "condition") {
+        let cond = if cond == "challenge" {
+            "challenge_cleared"
+        } else {
+            cond
+        };
+        let Some(known) = WAIT_CONDITIONS.iter().find(|k| **k == cond) else {
+            return Err(format!(
+                "unknown condition '{cond}'; use one of {}",
+                WAIT_CONDITIONS.join(", ")
+            ));
+        };
+        if *known == "selector" && arg.is_none() {
+            return Err(
+                "condition 'selector' needs the 'selector' argument (the CSS selector to wait for)"
+                    .into(),
+            );
+        }
+        if !found.contains(known) {
+            found.push(known);
+        }
+    }
+    match found.as_slice() {
+        [] => Err(format!(
+            "provide one wait condition: 'condition' (one of {}), or the alias 'selector' or a boolean flag set to true",
+            WAIT_CONDITIONS.join(", ")
+        )),
+        [one] => Ok((one, arg.filter(|_| *one == "selector"))),
+        many => Err(format!(
+            "give one wait condition, got {}: {}",
+            many.len(),
+            many.join(", ")
+        )),
+    }
+}
+
+/// The `scroll`, `wait_after` and `timeout_ms` arguments of `browser_act`.
+fn parse_act_opts(args: &Value) -> Result<crate::backend::ActOpts, String> {
+    use crate::backend::{ActOpts, ScrollMode};
+    let mut opts = ActOpts::default();
+    match str_arg(args, "scroll") {
+        None => {}
+        Some("none") => opts.scroll = ScrollMode::None,
+        Some("nearest") => opts.scroll = ScrollMode::Nearest,
+        Some("center") => opts.scroll = ScrollMode::Center,
+        Some(other) => {
+            return Err(format!(
+                "unknown scroll '{other}'; use none, nearest (default) or center"
+            ))
+        }
+    }
+    match str_arg(args, "wait_after") {
+        None | Some("none") => {}
+        Some("settle") => opts.settle = true,
+        Some(other) => {
+            return Err(format!(
+                "unknown wait_after '{other}'; use none (default) or settle"
+            ))
+        }
+    }
+    match args.get("timeout_ms") {
+        None | Some(Value::Null) => {}
+        Some(v) => match v.as_u64() {
+            Some(n) => opts.timeout_ms = n,
+            None => return Err("timeout_ms must be a non-negative integer".into()),
+        },
+    }
+    Ok(opts)
+}
+
 /// A `navigation_timeout_ms` value: an integer within the allowed window.
 fn nav_window_arg(v: &Value) -> Option<u64> {
     v.as_u64()
@@ -1840,7 +1925,10 @@ impl ToolModule for BrowserModule {
                         "index": { "type": "integer", "description": "optional 0-based match index if query matches multiple elements (default 0)" },
                         "action": { "type": "string", "enum": ["click", "type", "select", "hover", "focus", "scroll_into_view", "submit", "press"] },
                         "value": { "type": "string", "description": "text for type, option for select, or key name for press (Enter, Escape, Tab)" },
-                        "secret": { "type": "boolean", "description": "the value is a secret: keep it out of the audit log and never show it in the showcase typing HUD (password and one-time-code fields are masked automatically)" }
+                        "secret": { "type": "boolean", "description": "the value is a secret: keep it out of the audit log and never show it in the showcase typing HUD (password and one-time-code fields are masked automatically)" },
+                        "scroll": { "type": "string", "enum": ["none", "nearest", "center"], "description": "how to bring the element into view first: nearest (default) moves the page only as far as needed and not at all when it is visible, center centres it (can scroll a wide page sideways), none does not scroll. scroll_into_view always scrolls" },
+                        "wait_after": { "type": "string", "enum": ["none", "settle"], "description": "none (default) returns as soon as the action ran, when a click's request or navigation has usually not begun yet. settle then waits for a navigation it started to load, for htmx_settled if the page has htmx, and for the network to go quiet, and adds navigated, requests_started (fetch/XHR/htmx begun on the page since the action) and settled to the result. A click that starts no request and no navigation costs about 2s here; Chrome only" },
+                        "timeout_ms": { "type": "integer", "description": "wait_after settle only: bound for the whole settle wait (default 10000); when it runs out the action still succeeded and the result has settled:false and settle_error" }
                     }),
                     json!(["target_id", "action"]),
                 ),
@@ -1948,18 +2036,18 @@ impl ToolModule for BrowserModule {
                 "browser_wait",
                 Category::Browser,
                 Tier::Read,
-                "Wait for a settle signal: a selector to appear, dom_settled (DOM mutations and \
-                 animation frames settled for >=150ms), htmx_settled (HTMX requests and DOM swaps settled; errors if htmx is not present on the page), navigation to complete (after a goto, reload, click, submit or key press in this session it waits for the NEW document, not the one being left; a click that starts no navigation within navigation_timeout_ms, default 2s, settles on the loaded page with navigated:false; raise it for a handler that navigates later than that), the network to idle, or verification challenge clearance.",
+                "Wait for a settle signal: a selector to appear, dom_settled (no DOM mutation for \
+                 >=150ms; animation frames are not tracked), htmx_settled (HTMX requests and DOM swaps settled; right after a browser_act it also waits up to 1.5s for an htmx request to start; errors if htmx is not present on the page), navigation to complete (after a goto, reload, click, submit or key press in this session it waits for the NEW document, not the one being left; a click that starts no navigation within navigation_timeout_ms, default 2s, settles on the loaded page with navigated:false; raise it for a handler that navigates later than that), network_idle (fetch/XHR started after a browser_act are tracked; settled when none is in flight and none began or finished for 500ms, and not before a navigation that act may have started has happened), or verification challenge clearance. Prefer 'condition'; the other arguments are aliases.",
                 obj(
                     json!({
                         "target_id": { "type": "string" },
-                        "selector": { "type": "string" },
-                        "dom_settled": { "type": "boolean" },
-                        "htmx_settled": { "type": "boolean" },
-                        "navigation": { "type": "boolean" },
-                        "network_idle": { "type": "boolean" },
-                        "challenge_cleared": { "type": "boolean" },
-                        "condition": { "type": "string", "enum": ["selector", "dom_settled", "htmx_settled", "navigation", "network_idle", "challenge_cleared"] },
+                        "condition": { "type": "string", "enum": ["selector", "dom_settled", "htmx_settled", "navigation", "network_idle", "challenge_cleared"], "description": "preferred way to choose what to wait for; 'selector' also needs the selector argument. Give exactly one condition: the aliases below conflict with it and with each other" },
+                        "selector": { "type": "string", "description": "alias for condition 'selector': the CSS selector to wait for" },
+                        "dom_settled": { "type": "boolean", "description": "alias for condition 'dom_settled'; only true selects it" },
+                        "htmx_settled": { "type": "boolean", "description": "alias for condition 'htmx_settled'; only true selects it" },
+                        "navigation": { "type": "boolean", "description": "alias for condition 'navigation'; only true selects it" },
+                        "network_idle": { "type": "boolean", "description": "alias for condition 'network_idle'; only true selects it" },
+                        "challenge_cleared": { "type": "boolean", "description": "alias for condition 'challenge_cleared'; only true selects it" },
                         "timeout_ms": { "type": "integer" },
                         "navigation_timeout_ms": { "type": "integer", "description": "navigation only: how long (ms, 0-30000, default 2000) to keep expecting a navigation that a click, submit or key press has not started yet, before settling on the loaded page with navigated:false. Does not apply after goto, reload, back or forward, which always navigate; timeout_ms still bounds the whole wait" }
                     }),
@@ -3304,5 +3392,126 @@ mod act_tests {
             .await;
         assert!(!res.ok);
         assert_eq!(res.error.unwrap().code, ErrorCode::InvalidArgs);
+    }
+}
+
+#[cfg(test)]
+mod arg_tests {
+    use super::*;
+    use crate::backend::ScrollMode;
+
+    fn cond(args: Value) -> Result<(&'static str, Option<String>), String> {
+        parse_wait_condition(&args).map(|(c, a)| (c, a.map(str::to_string)))
+    }
+
+    #[test]
+    fn wait_condition_accepts_the_preferred_and_alias_forms() {
+        assert_eq!(
+            cond(json!({ "condition": "network_idle" })).unwrap().0,
+            "network_idle"
+        );
+        assert_eq!(
+            cond(json!({ "network_idle": true })).unwrap().0,
+            "network_idle"
+        );
+        assert_eq!(
+            cond(json!({ "condition": "challenge" })).unwrap().0,
+            "challenge_cleared"
+        );
+        assert_eq!(
+            cond(json!({ "selector": "#a" })).unwrap(),
+            ("selector", Some("#a".into()))
+        );
+        assert_eq!(
+            cond(json!({ "condition": "selector", "selector": "#a" })).unwrap(),
+            ("selector", Some("#a".into()))
+        );
+    }
+
+    #[test]
+    fn a_false_flag_selects_nothing() {
+        // `navigation:false` used to select navigation because the key was present.
+        assert!(cond(json!({ "navigation": false })).is_err());
+        assert_eq!(
+            cond(json!({ "navigation": false, "condition": "network_idle" }))
+                .unwrap()
+                .0,
+            "network_idle"
+        );
+        assert_eq!(
+            cond(json!({ "navigation": false, "dom_settled": true }))
+                .unwrap()
+                .0,
+            "dom_settled"
+        );
+        assert!(cond(json!({ "navigation": "yes" }))
+            .unwrap_err()
+            .contains("boolean"));
+    }
+
+    #[test]
+    fn conflicting_wait_conditions_are_named_not_picked() {
+        let e = cond(json!({ "condition": "network_idle", "navigation": true })).unwrap_err();
+        assert!(
+            e.contains("network_idle") && e.contains("navigation"),
+            "{e}"
+        );
+        let e = cond(json!({ "dom_settled": true, "htmx_settled": true })).unwrap_err();
+        assert!(
+            e.contains("dom_settled") && e.contains("htmx_settled"),
+            "{e}"
+        );
+        let e = cond(json!({ "selector": "#a", "condition": "navigation" })).unwrap_err();
+        assert!(e.contains("selector") && e.contains("navigation"), "{e}");
+        // The same condition said twice is still one.
+        assert_eq!(
+            cond(json!({ "condition": "navigation", "navigation": true }))
+                .unwrap()
+                .0,
+            "navigation"
+        );
+    }
+
+    #[test]
+    fn wait_condition_errors_are_specific() {
+        let e = cond(json!({ "condition": "selector" })).unwrap_err();
+        assert!(e.contains("needs the 'selector' argument"), "{e}");
+        let e = cond(json!({ "condition": "bogus" })).unwrap_err();
+        assert!(e.contains("unknown condition 'bogus'"), "{e}");
+        assert!(cond(json!({}))
+            .unwrap_err()
+            .contains("provide one wait condition"));
+    }
+
+    #[test]
+    fn act_opts_default_to_nearest_scroll_and_no_wait() {
+        let o = parse_act_opts(&json!({})).unwrap();
+        assert_eq!(o, crate::backend::ActOpts::default());
+        assert_eq!(o.scroll, ScrollMode::Nearest);
+        assert!(!o.settle);
+    }
+
+    #[test]
+    fn act_opts_parse_scroll_wait_after_and_timeout() {
+        let o = parse_act_opts(
+            &json!({ "scroll": "center", "wait_after": "settle", "timeout_ms": 2500 }),
+        )
+        .unwrap();
+        assert_eq!(o.scroll, ScrollMode::Center);
+        assert!(o.settle);
+        assert_eq!(o.timeout_ms, 2500);
+        assert_eq!(
+            parse_act_opts(&json!({ "scroll": "none", "wait_after": "none" }))
+                .unwrap()
+                .scroll,
+            ScrollMode::None
+        );
+        assert!(parse_act_opts(&json!({ "scroll": "smooth" }))
+            .unwrap_err()
+            .contains("scroll"));
+        assert!(parse_act_opts(&json!({ "wait_after": "idle" }))
+            .unwrap_err()
+            .contains("wait_after"));
+        assert!(parse_act_opts(&json!({ "timeout_ms": "soon" })).is_err());
     }
 }
