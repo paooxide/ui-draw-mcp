@@ -18,7 +18,8 @@ mod tools;
 mod visual;
 
 pub use backend::{
-    ActOpts, BrowserBackend, BrowserError, CdpBackend, Locator, ScrollMode, Shot, CHROME_BINS,
+    ActOpts, BrowserBackend, BrowserError, CdpBackend, EvalOptions, Locator, ScrollMode, Shot,
+    CHROME_BINS,
 };
 pub use branch::{Branch, BranchError, BranchManager, BranchStatus};
 pub use cdp::{DialogPolicy, RecordDialogs};
