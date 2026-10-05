@@ -3463,7 +3463,15 @@ impl BrowserBackend for CdpBackend {
     case 'click': __arm(el, 'click'); el.click(); break;
     case 'focus': el.focus({{preventScroll:true}}); break;
     case 'press': el.focus({{preventScroll:true}}); break;
-    case 'hover': if(!realMove) el.dispatchEvent(new MouseEvent('mouseover',{{bubbles:true}})); break;
+    case 'hover': {{
+      // The real pointer lands on whatever is on top at the element's
+      // centre; when that is not the element (an overlay covers it), fall
+      // back to the synthetic event so the element still hears the hover.
+      var hb = el.getBoundingClientRect();
+      var top = realMove ? document.elementFromPoint(hb.left + hb.width / 2, hb.top + hb.height / 2) : null;
+      if(!top || !(top === el || el.contains(top))) el.dispatchEvent(new MouseEvent('mouseover',{{bubbles:true}}));
+      break;
+    }}
     case 'scroll_into_view': break;
     case 'submit':
       if(el.form){{ el.form.requestSubmit?el.form.requestSubmit():el.form.submit(); }}
