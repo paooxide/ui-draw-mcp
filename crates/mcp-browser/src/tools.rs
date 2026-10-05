@@ -1041,7 +1041,17 @@ impl BrowserModule {
             Ok(e) => e,
             Err(e) => return e,
         };
-        result("browser_eval", self.backend.eval(target, expr).await)
+        let opts = crate::backend::EvalOptions {
+            timeout_ms: args.get("timeout_ms").and_then(Value::as_u64),
+            detached: args
+                .get("detached")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        };
+        result(
+            "browser_eval",
+            self.backend.eval_with(target, expr, &opts).await,
+        )
     }
 
     async fn dialog(&self, args: &Value) -> Envelope {
@@ -1729,7 +1739,7 @@ impl ToolModule for BrowserModule {
                 "browser_connect",
                 Category::Browser,
                 Tier::Standard,
-                "Attach to a Chromium browser started with --remote-debugging-port, or launch a dedicated instance. Optionally auto-restores a saved profile. launch.browser='safari' drives Safari through safaridriver (macOS only, experimental: needs `safaridriver --enable` once, and a Safari that was already open when automation was enabled must be quit first; opens a visible window). On Safari, browser_network, browser_dialog, browser_viewport, browser_record, browser_branch, browser_checkpoint and browser_act 'press' return Unsupported.",
+                "Attach to a Chromium browser started with --remote-debugging-port, or launch a dedicated instance. Optionally auto-restores a saved profile. The browser's active tab is brought to the front on connect (result 'foregrounded'). launch.browser='safari' drives Safari through safaridriver (macOS only, experimental: needs `safaridriver --enable` once, and a Safari that was already open when automation was enabled must be quit first; opens a visible window). On Safari, browser_network, browser_dialog, browser_viewport, browser_record, browser_branch, browser_checkpoint and browser_act 'press' return Unsupported.",
                 obj(
                     json!({
                         "attach": { "type": "object", "properties": { "port": { "type": "integer" } } },
@@ -1738,6 +1748,8 @@ impl ToolModule for BrowserModule {
                             "url": { "type": "string", "description": "first page to open; Safari only (Chromium: use browser_navigate); checked against the navigation policy" },
                             "port": { "type": "integer", "description": "remote-debugging port; omit or 0 to let Chrome pick a free one (the connect result reports it)" },
                             "headless": { "type": "boolean" },
+                            "args": { "type": "array", "items": { "type": "string" }, "description": "Chromium only: extra command-line flags, each one entry written --name or --name=value (no spaces; at most 32). Refused: --remote-debugging-port/-address/-pipe, --remote-allow-origins, --user-data-dir (agentctl manages these) and flags that weaken a protection: --no-sandbox, --disable-web-security, --disable-site-isolation-trials, --ignore-certificate-errors, --allow-running-insecure-content, --allow-file-access-from-files, --unsafely-treat-insecure-origin-as-secure, --load-extension, --app, --proxy-server, --proxy-pac-url, --host-resolver-rules, --host-rules. A --disable-features list is merged with agentctl's own" },
+                            "background_throttling": { "type": "boolean", "description": "Chromium only. A visible (headless=false) browser is started with flags that stop Chrome throttling timers, rendering and screen recording when its window is behind another or covered. Set true to leave Chrome's normal throttling on. Default false" },
                             "user_data_dir": { "type": "string" },
                             "profile": { "type": "string", "description": "saved profile name to auto-restore upon connecting" }
                         } },
@@ -2031,11 +2043,13 @@ impl ToolModule for BrowserModule {
                 "browser_eval",
                 Category::Browser,
                 Tier::Dangerous,
-                "Evaluate arbitrary JavaScript in the page context. The result is the value of the last statement (a returned promise is awaited), JSON-serialized. Arbitrary code execution. On Safari, a page whose CSP forbids eval gets the code run without eval: an expression works as usual, but statements need an explicit `return` to produce a result.",
+                "Evaluate arbitrary JavaScript in the page context. The result is the value of the last statement (a returned promise is awaited), JSON-serialized. Arbitrary code execution. If the script navigates the page the result is {navigated:true, value:null} rather than an error. On Safari, a page whose CSP forbids eval gets the code run without eval: an expression works as usual, but statements need an explicit `return` to produce a result.",
                 obj(
                     json!({
                         "target_id": { "type": "string" },
-                        "expression": { "type": "string" }
+                        "expression": { "type": "string" },
+                        "timeout_ms": { "type": "integer", "description": "stop waiting after this many ms (default 10000, clamped to 100-60000). Chrome stops script that is still running; a timeout is an error that says so. Async work already scheduled (timers, pending promises) can keep running in the page. Not enforced on Safari" },
+                        "detached": { "type": "boolean", "description": "start the script and return {started:true} without waiting for a promise it returns or for its result (Chrome only); its synchronous part still runs within the call and timeout_ms. A later rejection goes to the page console" }
                     }),
                     json!(["target_id", "expression"]),
                 ),

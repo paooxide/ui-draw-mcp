@@ -32,6 +32,24 @@ pub struct Shot {
     pub height: u32,
 }
 
+/// Options for [`BrowserBackend::eval_with`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct EvalOptions {
+    /// How long to let the script run before giving up (clamped to
+    /// [`EVAL_TIMEOUT_MIN_MS`]..=[`EVAL_TIMEOUT_MAX_MS`]); `None` is
+    /// [`EVAL_TIMEOUT_DEFAULT_MS`].
+    pub timeout_ms: Option<u64>,
+    /// Start the script and return at once, without waiting for it or its
+    /// result.
+    pub detached: bool,
+}
+
+/// Default, floor and ceiling for `browser_eval`'s `timeout_ms`. The ceiling
+/// sits well under what the transport would wait for on its own.
+pub const EVAL_TIMEOUT_DEFAULT_MS: u64 = 10_000;
+pub const EVAL_TIMEOUT_MIN_MS: u64 = 100;
+pub const EVAL_TIMEOUT_MAX_MS: u64 = 60_000;
+
 /// The browser control surface. One real implementation ([`CdpBackend`]); the
 /// trait exists for the same module/engine symmetry the other categories use.
 /// How `act` locates the element to act on: either a `ref` from a prior
@@ -151,6 +169,22 @@ pub trait BrowserBackend: Send + Sync {
     ) -> Result<Value, BrowserError>;
     /// Evaluate arbitrary JS in the page (dangerous).
     async fn eval(&self, target: &str, expression: &str) -> Result<Value, BrowserError>;
+    /// [`BrowserBackend::eval`] with a time limit and an optional detached
+    /// mode (see [`EvalOptions`]). A backend that cannot honour an option says
+    /// so rather than ignoring it; the default only supports plain `eval`.
+    async fn eval_with(
+        &self,
+        target: &str,
+        expression: &str,
+        opts: &EvalOptions,
+    ) -> Result<Value, BrowserError> {
+        if opts.detached {
+            return Err(BrowserError::Unsupported(
+                "detached eval needs the CDP (Chrome) engine".into(),
+            ));
+        }
+        self.eval(target, expression).await
+    }
     /// Start watching a tab across navigations (the recorder's transport).
     ///
     /// `new_document_script` is registered to run at the start of every new
@@ -1254,6 +1288,45 @@ impl CdpBackend {
         Ok(())
     }
 
+    /// Bring the browser's active page (the first in `/json/list`, which Chrome
+    /// keeps in most-recently-active order) to the front. Best effort; says
+    /// whether it worked. The focus emulation set here ends with this
+    /// connection (see [`Self::emulate_focus`]); what keeps a headed
+    /// browser's timers running afterwards is the launch flags.
+    async fn foreground_active_page(&self, browser_id: u32) -> bool {
+        let Ok(list) = self.tabs(browser_id, "list", None, None).await else {
+            return false;
+        };
+        let Some(target) = list
+            .get("tabs")
+            .and_then(Value::as_array)
+            .and_then(|a| a.first())
+            .and_then(|t| t.get("target_id"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+        else {
+            return false;
+        };
+        let Ok(mut c) = self.conn(&target).await else {
+            return false;
+        };
+        Self::emulate_focus(&mut c).await;
+        c.call("Page.bringToFront", json!({})).await.is_ok()
+    }
+
+    /// Make the page believe it has focus (`document.hasFocus()`, focus and
+    /// blur events) even when its window is behind another. Best effort. The
+    /// emulation belongs to the DevTools session that asked for it and ends
+    /// with it, so it cannot be set once and left.
+    async fn emulate_focus(c: &mut CdpConn) {
+        c.call(
+            "Emulation.setFocusEmulationEnabled",
+            json!({ "enabled": true }),
+        )
+        .await
+        .ok();
+    }
+
     /// Run JS in the page and return the deserialized value (or a JS-exception
     /// error). Enables the Runtime domain first.
     async fn eval_value(c: &mut CdpConn, expr: &str) -> Result<Value, BrowserError> {
@@ -1982,6 +2055,13 @@ impl BrowserBackend for CdpBackend {
                 ));
             }
             if browser_name == "safari" || browser_name == "webkit" {
+                for key in ["args", "background_throttling"] {
+                    if spec.get(key).is_some() {
+                        return Err(BrowserError::Unsupported(format!(
+                            "launch.{key} is a Chromium option; Safari is started by safaridriver and takes no command-line flags"
+                        )));
+                    }
+                }
                 if !crate::safari::is_safari_available() {
                     return Err(BrowserError::Unsupported(
                         "Safari WebDriver is only supported on macOS with safaridriver installed"
@@ -2103,6 +2183,7 @@ impl BrowserBackend for CdpBackend {
             "browser": ver.get("Browser"),
             "protocol": ver.get("Protocol-Version"),
         });
+        out["foregrounded"] = json!(self.foreground_active_page(id).await);
         // Only a profile we created (and will delete on disconnect) is reported.
         if let Some(dir) = owned_profile {
             out["owned_user_data_dir"] = json!(dir);
@@ -3350,6 +3431,106 @@ impl BrowserBackend for CdpBackend {
 
         let mut c = self.conn(target).await?;
         let v = Self::eval_value(&mut c, expression).await?;
+        let mut out = json!({ "result": v });
+        self.note_dialogs(target, &mut c, &mut out);
+        Ok(out)
+    }
+
+    async fn eval_with(
+        &self,
+        target: &str,
+        expression: &str,
+        opts: &EvalOptions,
+    ) -> Result<Value, BrowserError> {
+        use tokio::time::Duration;
+        if target.starts_with("safari-") {
+            if opts.detached {
+                return Err(BrowserError::Unsupported(
+                    "detached eval needs the CDP (Chrome) engine; the WebKit engine cannot start a script and leave it running".into(),
+                ));
+            }
+            let mut out = self.eval(target, expression).await?;
+            if opts.timeout_ms.is_some() {
+                out["timeout_note"] = json!(
+                    "timeout_ms is not enforced on the WebKit engine; the script ran with the driver's own limit"
+                );
+            }
+            return Ok(out);
+        }
+
+        let mut c = self.conn(target).await?;
+        // Focus emulation lives and dies with this connection, so each
+        // session that runs page script asks for it again.
+        Self::emulate_focus(&mut c).await;
+        c.call("Runtime.enable", json!({})).await.ok();
+
+        let timeout_ms = clamp_eval_timeout(opts.timeout_ms);
+        // The transport deadline is the limit. Chrome's own `timeout`
+        // parameter would stop a synchronous loop too, but it reports it as an
+        // opaque "Internal error"; `Runtime.terminateExecution` below does the
+        // same job with a reply we can tell apart.
+        let params = json!({
+            "expression": expression,
+            "returnByValue": true,
+            // Detached: do not wait for a returned promise. The synchronous
+            // part still runs inside this call (and under its time limit);
+            // evaluating the code directly, rather than through a timer and
+            // `eval`, keeps it working on pages whose CSP forbids `eval`.
+            "awaitPromise": !opts.detached,
+            "userGesture": true
+        });
+        let called = c
+            .call_within(
+                "Runtime.evaluate",
+                params,
+                Duration::from_millis(timeout_ms),
+            )
+            .await;
+        let r = match called {
+            Ok(r) => r,
+            Err(BrowserError::Timeout(_)) => {
+                let attempted = c
+                    .call_within(
+                        "Runtime.terminateExecution",
+                        json!({}),
+                        Duration::from_secs(2),
+                    )
+                    .await
+                    .is_ok();
+                return Err(BrowserError::Timeout(eval_timeout_message(
+                    timeout_ms, attempted,
+                )));
+            }
+            Err(BrowserError::Failed(m)) if is_navigated_message(&m) => {
+                return Ok(json!({
+                    "navigated": true,
+                    "value": null,
+                    "result": null,
+                    "note": "the script navigated the page (or closed the tab) before it finished, so Chrome dropped its result; the script's own effects happened. Use browser_wait navigation / browser_snapshot to see the new page."
+                }));
+            }
+            Err(e) => return Err(e),
+        };
+        if let Some(exc) = r.get("exceptionDetails") {
+            let text = exc
+                .get("exception")
+                .and_then(|e| e.get("description").or_else(|| e.get("value")))
+                .and_then(Value::as_str)
+                .or_else(|| exc.get("text").and_then(Value::as_str))
+                .unwrap_or("javascript error");
+            return Err(BrowserError::Failed(format!("eval: {text}")));
+        }
+        if opts.detached {
+            return Ok(json!({
+                "started": true,
+                "note": "the script's synchronous part has run; anything it left pending (promises, timers) carries on in the page and its result is not reported (a rejection goes to the page console)."
+            }));
+        }
+        let v = r
+            .get("result")
+            .and_then(|o| o.get("value"))
+            .cloned()
+            .unwrap_or(Value::Null);
         let mut out = json!({ "result": v });
         self.note_dialogs(target, &mut c, &mut out);
         Ok(out)
@@ -5347,6 +5528,166 @@ fn reap_one(mut child: std::process::Child, user_data_dir: Option<&std::path::Pa
     }
 }
 
+/// `browser_eval`'s `timeout_ms` as it will be applied.
+pub(crate) fn clamp_eval_timeout(requested: Option<u64>) -> u64 {
+    requested
+        .unwrap_or(EVAL_TIMEOUT_DEFAULT_MS)
+        .clamp(EVAL_TIMEOUT_MIN_MS, EVAL_TIMEOUT_MAX_MS)
+}
+
+/// Chrome's reply when the script navigated the page (or closed the tab)
+/// while `Runtime.evaluate` was still waiting for it.
+pub(crate) fn is_navigated_message(msg: &str) -> bool {
+    msg.contains("Inspected target navigated or closed")
+}
+
+/// What a timed-out eval reports. Termination only reaches script that is
+/// running right now, not one that is waiting, so the message does not claim
+/// more than that.
+pub(crate) fn eval_timeout_message(timeout_ms: u64, terminate_sent: bool) -> String {
+    let what = if terminate_sent {
+        "Runtime.terminateExecution was sent (it stops script that is running, such as a loop, not one that is waiting)"
+    } else {
+        "Runtime.terminateExecution could not be sent"
+    };
+    format!(
+        "browser_eval timed out after {timeout_ms} ms; {what}. Async work the script already \
+         scheduled (timers, pending promises, event handlers) may still be running in the page \
+         and can interleave with later calls; reload the tab if that matters"
+    )
+}
+
+/// Flags that may not be passed through `launch.args`: either ones agentctl
+/// manages itself, or ones that switch off a protection the rest of the tool
+/// surface relies on (the DevTools socket staying on loopback and
+/// origin-checked, the sandbox, same-origin and TLS checks, extensions, and
+/// the navigation policy, which `--app`, proxy and host-resolver flags would
+/// sidestep). Names only, without the leading `--`.
+pub(crate) const DENIED_LAUNCH_FLAGS: &[&str] = &[
+    "remote-debugging-port",
+    "remote-debugging-address",
+    "remote-debugging-pipe",
+    "remote-allow-origins",
+    "user-data-dir",
+    "no-sandbox",
+    "disable-web-security",
+    "disable-site-isolation-trials",
+    "ignore-certificate-errors",
+    "allow-running-insecure-content",
+    "allow-file-access-from-files",
+    "unsafely-treat-insecure-origin-as-secure",
+    "load-extension",
+    "app",
+    "proxy-server",
+    "proxy-pac-url",
+    "host-resolver-rules",
+    "host-rules",
+];
+
+const MAX_LAUNCH_ARGS: usize = 32;
+const MAX_LAUNCH_ARG_LEN: usize = 256;
+
+/// Validate `launch.args`: an array of at most 32 strings, each a `--flag` or
+/// `--flag=value` with no whitespace or control characters, none on the
+/// denylist. Returns them as given.
+pub(crate) fn validate_launch_args(args: &Value) -> Result<Vec<String>, String> {
+    let Some(arr) = args.as_array() else {
+        return Err("launch.args must be an array of strings".into());
+    };
+    if arr.len() > MAX_LAUNCH_ARGS {
+        return Err(format!(
+            "launch.args has {} entries; at most {MAX_LAUNCH_ARGS} are allowed",
+            arr.len()
+        ));
+    }
+    let mut out = Vec::with_capacity(arr.len());
+    for v in arr {
+        let Some(a) = v.as_str() else {
+            return Err("launch.args must be an array of strings".into());
+        };
+        if a.len() > MAX_LAUNCH_ARG_LEN {
+            return Err(format!(
+                "launch.args entry is {} bytes; at most {MAX_LAUNCH_ARG_LEN} are allowed",
+                a.len()
+            ));
+        }
+        if a.chars().any(|ch| ch.is_whitespace() || ch.is_control()) {
+            return Err(format!(
+                "launch.args entry {a:?} contains whitespace or a control character; give one flag per entry, as --name=value"
+            ));
+        }
+        let Some(body) = a.strip_prefix("--") else {
+            return Err(format!("launch.args entry {a:?} must start with --"));
+        };
+        let name = body.split('=').next().unwrap_or("").to_ascii_lowercase();
+        if name.is_empty()
+            || !name
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
+        {
+            return Err(format!("launch.args entry {a:?} is not a valid --flag"));
+        }
+        if DENIED_LAUNCH_FLAGS.contains(&name.as_str()) {
+            return Err(format!(
+                "launch.args flag --{name} is not allowed: agentctl manages it or it weakens a protection"
+            ));
+        }
+        out.push(a.to_string());
+    }
+    Ok(out)
+}
+
+/// Flags that keep a headed Chrome running at full speed when its window is
+/// covered or behind another (otherwise timers throttle, `visibilityState`
+/// goes `hidden`, and screen recordings freeze).
+const FOREGROUND_FLAGS: &[&str] = &[
+    "--disable-backgrounding-occluded-windows",
+    "--disable-renderer-backgrounding",
+    "--disable-background-timer-throttling",
+];
+const FOREGROUND_DISABLED_FEATURES: &[&str] = &["CalculateNativeWinOcclusion"];
+
+/// The full Chrome command line (without the binary). `extra` must already
+/// have passed [`validate_launch_args`]. Any `--disable-features` among them is
+/// merged with ours into a single flag, since Chrome keeps only the last.
+pub(crate) fn chrome_launch_flags(
+    port: u16,
+    user_data_dir: &str,
+    headless: bool,
+    background_throttling: bool,
+    extra: &[String],
+) -> Vec<String> {
+    let mut flags = vec![
+        format!("--remote-debugging-port={port}"),
+        format!("--user-data-dir={user_data_dir}"),
+        "--no-first-run".to_string(),
+        "--no-default-browser-check".to_string(),
+    ];
+    let mut features: Vec<String> = Vec::new();
+    if headless {
+        flags.push("--headless=new".to_string());
+    } else if !background_throttling {
+        flags.extend(FOREGROUND_FLAGS.iter().map(|f| f.to_string()));
+        features.extend(FOREGROUND_DISABLED_FEATURES.iter().map(|f| f.to_string()));
+    }
+    for a in extra {
+        match a.strip_prefix("--disable-features=") {
+            Some(list) => features.extend(
+                list.split(',')
+                    .filter(|f| !f.is_empty())
+                    .map(str::to_string),
+            ),
+            None => flags.push(a.clone()),
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    features.retain(|f| seen.insert(f.clone()));
+    if !features.is_empty() {
+        flags.push(format!("--disable-features={}", features.join(",")));
+    }
+    flags
+}
+
 /// Launch a dedicated Chromium instance with a debugging port and poll until
 /// its CDP endpoint answers.
 ///
@@ -5377,6 +5718,14 @@ async fn launch_browser(spec: &Value) -> Result<Launch, BrowserError> {
         .get("headless")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    let extra_args = match spec.get("args") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(a) => validate_launch_args(a).map_err(BrowserError::Failed)?,
+    };
+    let background_throttling = spec
+        .get("background_throttling")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     // Only a directory we chose is ours to delete later.
     let (user_data_dir, owned) = match spec.get("user_data_dir").and_then(Value::as_str) {
         Some(p) => (std::path::PathBuf::from(p), None),
@@ -5404,13 +5753,13 @@ async fn launch_browser(spec: &Value) -> Result<Launch, BrowserError> {
         })?;
 
     let mut cmd = std::process::Command::new(bin);
-    cmd.arg(format!("--remote-debugging-port={requested_port}"))
-        .arg(format!("--user-data-dir={user_data_dir}"))
-        .arg("--no-first-run")
-        .arg("--no-default-browser-check");
-    if headless {
-        cmd.arg("--headless=new");
-    }
+    cmd.args(chrome_launch_flags(
+        requested_port,
+        &user_data_dir,
+        headless,
+        background_throttling,
+        &extra_args,
+    ));
     cmd.stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
     let child = cmd
@@ -5446,6 +5795,131 @@ async fn launch_browser(spec: &Value) -> Result<Launch, BrowserError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn eval_timeout_is_defaulted_and_clamped() {
+        assert_eq!(clamp_eval_timeout(None), 10_000);
+        assert_eq!(clamp_eval_timeout(Some(0)), 100);
+        assert_eq!(clamp_eval_timeout(Some(5_000)), 5_000);
+        assert_eq!(clamp_eval_timeout(Some(u64::MAX)), 60_000);
+    }
+
+    #[test]
+    fn eval_chrome_messages_are_recognised() {
+        assert!(is_navigated_message(
+            "Runtime.evaluate: Inspected target navigated or closed"
+        ));
+        assert!(!is_navigated_message("Runtime.evaluate: something else"));
+        let m = eval_timeout_message(250, true);
+        assert!(m.contains("timed out after 250 ms"));
+        assert!(m.contains("terminateExecution was sent"));
+        assert!(m.contains("may still be running"));
+        assert!(eval_timeout_message(250, false).contains("could not be sent"));
+    }
+
+    #[test]
+    fn launch_args_accept_plain_flags() {
+        let ok = validate_launch_args(&json!([
+            "--lang=fr",
+            "--mute-audio",
+            "--window-size=800,600"
+        ]))
+        .unwrap();
+        assert_eq!(ok.len(), 3);
+        assert!(validate_launch_args(&json!([])).unwrap().is_empty());
+    }
+
+    #[test]
+    fn launch_args_reject_malformed_entries() {
+        for bad in [
+            json!("--a"),
+            json!([1]),
+            json!(["lang=fr"]),
+            json!(["-x"]),
+            json!(["--"]),
+            json!(["--=x"]),
+            json!(["--lang fr"]),
+            json!(["--lang=fr\n--no-sandbox"]),
+            json!(["--a\tb"]),
+            json!(["--a_b"]),
+            json!([format!("--{}", "a".repeat(300))]),
+        ] {
+            assert!(validate_launch_args(&bad).is_err(), "{bad}");
+        }
+        let many: Vec<String> = (0..33).map(|i| format!("--flag{i}")).collect();
+        assert!(validate_launch_args(&json!(many)).is_err());
+        let max: Vec<String> = (0..32).map(|i| format!("--flag{i}")).collect();
+        assert_eq!(validate_launch_args(&json!(max)).unwrap().len(), 32);
+    }
+
+    #[test]
+    fn launch_args_reject_every_denied_flag_in_any_spelling() {
+        for name in DENIED_LAUNCH_FLAGS {
+            assert!(
+                validate_launch_args(&json!([format!("--{name}")])).is_err(),
+                "{name}"
+            );
+            assert!(
+                validate_launch_args(&json!([format!("--{name}=x")])).is_err(),
+                "{name}=x"
+            );
+            assert!(
+                validate_launch_args(&json!([format!("--{}=x", name.to_uppercase())])).is_err(),
+                "{name} upper-cased"
+            );
+        }
+        let e = validate_launch_args(&json!(["--remote-debugging-address=0.0.0.0"])).unwrap_err();
+        assert!(e.contains("remote-debugging-address"), "{e}");
+    }
+
+    #[test]
+    fn headed_launch_gets_foreground_flags_and_headless_does_not() {
+        let headed = chrome_launch_flags(0, "/p", false, false, &[]);
+        assert_eq!(headed[0], "--remote-debugging-port=0");
+        assert_eq!(headed[1], "--user-data-dir=/p");
+        for f in [
+            "--disable-backgrounding-occluded-windows",
+            "--disable-renderer-backgrounding",
+            "--disable-background-timer-throttling",
+            "--disable-features=CalculateNativeWinOcclusion",
+        ] {
+            assert!(headed.iter().any(|a| a == f), "{f} missing from {headed:?}");
+        }
+        assert!(!headed.iter().any(|a| a.starts_with("--headless")));
+
+        let headless = chrome_launch_flags(0, "/p", true, false, &[]);
+        assert!(headless.iter().any(|a| a == "--headless=new"));
+        assert!(!headless.iter().any(|a| a.contains("backgrounding")));
+
+        let opted_out = chrome_launch_flags(0, "/p", false, true, &[]);
+        assert!(!opted_out.iter().any(|a| a.contains("backgrounding")));
+        assert!(!opted_out
+            .iter()
+            .any(|a| a.starts_with("--disable-features")));
+    }
+
+    #[test]
+    fn user_disable_features_is_merged_not_duplicated() {
+        let extra = vec![
+            "--lang=fr".to_string(),
+            "--disable-features=Translate,CalculateNativeWinOcclusion".to_string(),
+        ];
+        let flags = chrome_launch_flags(9222, "/p", false, false, &extra);
+        let df: Vec<&String> = flags
+            .iter()
+            .filter(|a| a.starts_with("--disable-features="))
+            .collect();
+        assert_eq!(
+            df,
+            ["--disable-features=CalculateNativeWinOcclusion,Translate"]
+        );
+        assert!(flags.iter().any(|a| a == "--lang=fr"));
+        // With throttling left on, the user's list stands alone.
+        let flags = chrome_launch_flags(9222, "/p", false, true, &extra);
+        assert!(flags
+            .iter()
+            .any(|a| a == "--disable-features=Translate,CalculateNativeWinOcclusion"));
+    }
 
     #[test]
     fn intent_token_drops_everything_but_identifier_characters() {
