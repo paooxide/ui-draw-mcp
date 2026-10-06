@@ -60,6 +60,7 @@ impl RoleProfile {
             denied_tools: vec![
                 "browser_act".into(),
                 "browser_fill_form".into(),
+                "browser_upload".into(),
                 "browser_eval".into(),
                 "ui_action".into(),
                 "ui_fill_form".into(),
