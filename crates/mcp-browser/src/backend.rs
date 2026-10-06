@@ -197,6 +197,20 @@ pub trait BrowserBackend: Send + Sync {
         self.act_masked(target, locator, action, value, secret)
             .await
     }
+    /// Set files on an `<input type=file>` located like `act` does. `files`
+    /// are already-resolved absolute paths (the module layer jails and checks
+    /// them); the backend only drives the browser. Chrome only.
+    async fn upload(
+        &self,
+        target: &str,
+        locator: Locator<'_>,
+        files: &[String],
+    ) -> Result<Value, BrowserError> {
+        let _ = (target, locator, files);
+        Err(BrowserError::Unsupported(
+            "browser_upload needs the CDP (Chrome) engine".into(),
+        ))
+    }
     /// Wait for a settle signal (`selector` / `navigation` / `network_idle`).
     async fn wait(
         &self,
@@ -1663,6 +1677,63 @@ impl CdpBackend {
             .unwrap_or(Value::Null))
     }
 }
+
+/// JS expression resolving a [`Locator`] to an element (needs `JS_XPATH` and
+/// `JS_FIND` in scope): a `ref` via XPath, or a selector via `__find`.
+fn locator_js(locator: Locator<'_>) -> String {
+    match locator {
+        Locator::Ref(r) => {
+            format!(
+                "__resolve({})",
+                serde_json::to_string(r).unwrap_or_else(|_| "\"\"".into())
+            )
+        }
+        Locator::Selector {
+            by,
+            query,
+            within,
+            text,
+            index,
+        } => {
+            let by_json = serde_json::to_string(by).unwrap_or_else(|_| "\"css\"".into());
+            let query_json = serde_json::to_string(query).unwrap_or_else(|_| "\"\"".into());
+            let within_json = serde_json::to_string(&within).unwrap_or_else(|_| "null".into());
+            let text_json = serde_json::to_string(&text).unwrap_or_else(|_| "null".into());
+            let index_json = serde_json::to_string(&index).unwrap_or_else(|_| "null".into());
+            format!("__find({by_json},{query_json},{within_json},{text_json},{index_json})")
+        }
+    }
+}
+
+/// JS that resolves `__RESOLVE__` and settles on the `<input type=file>` it
+/// stands for, or throws a string saying what was found instead. A `<label>`
+/// goes to its `control`; anything else that is not a file input gets one try
+/// at a single `input[type=file]` descendant. More than one file needs
+/// `multiple`.
+const JS_UPLOAD_INPUT: &str = r#"(function(){
+  {JS_XPATH}
+  {JS_FIND}
+  var n = __COUNT__;
+  var el;
+  try { el = __RESOLVE__; } catch(e) { throw String(e && e.message ? e.message : e); }
+  if(!el) throw 'element not found';
+  if(el.__is_canvas_target) throw 'a canvas region is not a file input';
+  function isFile(x){ return !!x && x.tagName === 'INPUT' && String(x.type).toLowerCase() === 'file'; }
+  var found = el;
+  if(el.tagName === 'LABEL' && el.control) el = el.control;
+  if(!isFile(el) && el.querySelectorAll){
+    var inner = el.querySelectorAll('input[type=file]');
+    if(inner.length === 1) el = inner[0];
+  }
+  if(!isFile(el)){
+    var d = found.tagName ? found.tagName.toLowerCase() : String(found.nodeName);
+    if(found.tagName === 'INPUT') d += '[type=' + found.type + ']';
+    throw 'the element is a <' + d + '>, not a file input; target the input[type=file] itself (it is often hidden), e.g. query "input[type=file]"';
+  }
+  if(el.disabled) throw 'the file input is disabled';
+  if(n > 1 && !el.multiple) throw 'the file input has no multiple attribute but ' + n + ' files were given; give one path';
+  return el;
+})()"#;
 
 /// CDP key-event parameters for a named key.
 #[derive(Debug, PartialEq, Eq)]
@@ -3195,6 +3266,78 @@ impl BrowserBackend for CdpBackend {
         Ok(json!({ "matches": v, "count": count }))
     }
 
+    async fn upload(
+        &self,
+        target: &str,
+        locator: Locator<'_>,
+        files: &[String],
+    ) -> Result<Value, BrowserError> {
+        if target.starts_with("safari-") {
+            return Err(BrowserError::Unsupported(
+                "browser_upload needs the CDP (Chrome) engine; the WebKit engine cannot set files on a file input".into(),
+            ));
+        }
+        let mut c = self.conn(target).await?;
+        c.call("Runtime.enable", json!({})).await.ok();
+        let expr = JS_UPLOAD_INPUT
+            .replace("{JS_XPATH}", JS_XPATH)
+            .replace("{JS_FIND}", JS_FIND)
+            .replace("__COUNT__", &files.len().to_string())
+            .replace("__RESOLVE__", &locator_js(locator));
+        // The element is kept as a remote object, not copied by value: that
+        // handle is what `DOM.setFileInputFiles` takes. The page's own world
+        // is used (nothing here dispatches synthetic events, so the
+        // recorder's isolated world has no part in it).
+        let r = c
+            .call(
+                "Runtime.evaluate",
+                json!({ "expression": expr, "returnByValue": false, "userGesture": true }),
+            )
+            .await?;
+        if let Some(exc) = r.get("exceptionDetails") {
+            let text = exc
+                .get("exception")
+                .and_then(|e| e.get("value").or_else(|| e.get("description")))
+                .and_then(Value::as_str)
+                .or_else(|| exc.get("text").and_then(Value::as_str))
+                .unwrap_or("javascript error");
+            return Err(BrowserError::Failed(format!("upload: {text}")));
+        }
+        let object_id = r
+            .get("result")
+            .and_then(|o| o.get("objectId"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| BrowserError::Failed("upload: no element to set files on".into()))?;
+        let multiple = c
+            .call(
+                "Runtime.callFunctionOn",
+                json!({
+                    "objectId": object_id,
+                    "functionDeclaration": "function(){ return this.multiple === true; }",
+                    "returnByValue": true
+                }),
+            )
+            .await
+            .ok()
+            .and_then(|v| v.get("result")?.get("value")?.as_bool())
+            .unwrap_or(false);
+        // Chrome fires the trusted `input` and `change` events itself.
+        let set = c
+            .call(
+                "DOM.setFileInputFiles",
+                json!({ "files": files, "objectId": object_id }),
+            )
+            .await;
+        c.call("Runtime.releaseObject", json!({ "objectId": object_id }))
+            .await
+            .ok();
+        set?;
+        let mut out = json!({ "ok": true, "input_multiple": multiple });
+        self.note_dialogs(target, &mut c, &mut out);
+        Ok(out)
+    }
+
     async fn act(
         &self,
         target: &str,
@@ -3272,28 +3415,7 @@ impl BrowserBackend for CdpBackend {
         let js_arm = JS_ARM.replace("__ISO__", if iso.is_some() { "true" } else { "false" });
         // Resolve to an element in the same eval: a `ref` via XPath, or a
         // selector via `__find`, so a scripted action is one round trip.
-        let resolve = match locator {
-            Locator::Ref(r) => {
-                format!(
-                    "__resolve({})",
-                    serde_json::to_string(r).unwrap_or_else(|_| "\"\"".into())
-                )
-            }
-            Locator::Selector {
-                by,
-                query,
-                within,
-                text,
-                index,
-            } => {
-                let by_json = serde_json::to_string(by).unwrap_or_else(|_| "\"css\"".into());
-                let query_json = serde_json::to_string(query).unwrap_or_else(|_| "\"\"".into());
-                let within_json = serde_json::to_string(&within).unwrap_or_else(|_| "null".into());
-                let text_json = serde_json::to_string(&text).unwrap_or_else(|_| "null".into());
-                let index_json = serde_json::to_string(&index).unwrap_or_else(|_| "null".into());
-                format!("__find({by_json},{query_json},{within_json},{text_json},{index_json})")
-            }
-        };
+        let resolve = locator_js(locator);
         let act = serde_json::to_string(action).unwrap_or_else(|_| "\"click\"".into());
         let val = serde_json::to_string(&value).unwrap_or_else(|_| "null".into());
 

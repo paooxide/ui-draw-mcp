@@ -35,5 +35,5 @@ pub use safari::{
 };
 pub use screencast::ScreencastOpts;
 pub use showcase::{CursorStyle, ShowcaseConfig, ShowcaseSpeed};
-pub use tools::BrowserModule;
+pub use tools::{BrowserModule, UploadResolver};
 pub use visual::{Baseline, VisualStore};

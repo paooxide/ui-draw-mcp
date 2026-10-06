@@ -204,6 +204,8 @@ pub fn build_stack(cfg: &PolicyConfig) -> (Vec<Arc<dyn ToolModule>>, Wiring) {
 
         let showcase = demo_showcase(engines.demo, &engines.demo_speed);
 
+        // The same jail the fs engine uses (roots + credential deny-list).
+        let jail = Jail::new(engines.fs_roots.clone(), default_denied());
         let browser_backend = Arc::new(
             CdpBackend::new(NavPolicy::new(
                 &engines.allowed_origins,
@@ -211,27 +213,30 @@ pub fn build_stack(cfg: &PolicyConfig) -> (Vec<Arc<dyn ToolModule>>, Wiring) {
             ))
             .with_showcase(showcase.clone()),
         );
-        modules.push(Arc::new(
-            BrowserModule::new(browser_backend.clone())
-                .with_showcase(showcase)
-                .with_flow_store(FlowStore::new(
-                    state_dir(cfg).join("browser_flows.json"),
-                    200,
-                    200,
-                ))
-                .with_profile_store(ProfileStore::new(
-                    state_dir(cfg).join("browser_profiles.json"),
-                    50,
-                ))
-                .with_visual_store(VisualStore::new(
-                    state_dir(cfg).join("browser_baselines.json"),
-                    500,
-                ))
-                .with_media_dir(state_dir(cfg).join("media"))
-                .with_judge(judge.clone()),
-        ));
+        let mut browser = BrowserModule::new(browser_backend.clone())
+            .with_showcase(showcase)
+            .with_flow_store(FlowStore::new(
+                state_dir(cfg).join("browser_flows.json"),
+                200,
+                200,
+            ))
+            .with_profile_store(ProfileStore::new(
+                state_dir(cfg).join("browser_profiles.json"),
+                50,
+            ))
+            .with_visual_store(VisualStore::new(
+                state_dir(cfg).join("browser_baselines.json"),
+                500,
+            ))
+            .with_media_dir(state_dir(cfg).join("media"))
+            .with_judge(judge.clone());
+        // With no roots `browser_upload` stays unwired and refuses, naming
+        // `fs.roots`, rather than the jail turning every path into an escape.
+        if !jail.is_empty() {
+            browser = browser.with_upload_resolver(upload_resolver(jail.clone()));
+        }
+        modules.push(Arc::new(browser));
 
-        let jail = Jail::new(engines.fs_roots.clone(), default_denied());
         modules.push(Arc::new(FsModule::new(jail, 1_000_000, 500)));
 
         let exec_policy = ExecPolicy {
@@ -413,9 +418,67 @@ pub fn build_stack(cfg: &PolicyConfig) -> (Vec<Arc<dyn ToolModule>>, Wiring) {
     (modules, wiring)
 }
 
+/// What `browser_upload` resolves each path through: the fs engine's jail, so
+/// a file can only be attached from inside `fs.roots` and never from a
+/// credential store. The browser module uses only the path this returns.
+fn upload_resolver(jail: mcp_fs::Jail) -> mcp_browser::UploadResolver {
+    Arc::new(move |p: &str| jail.resolve(p).map_err(|e| e.message()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A file outside `fs.roots`, or under a credential directory inside one,
+    /// is refused before any browser is involved: the target here does not
+    /// exist, so a call that got as far as the backend would say NotFound.
+    #[tokio::test]
+    async fn upload_refuses_paths_the_fs_jail_refuses_before_the_backend() {
+        use mcp_types::{CallCtx, CancelToken, ErrorCode};
+        let root = std::fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("agentctl-upload-jail-{}", std::process::id()));
+        std::fs::create_dir_all(root.join(".ssh")).unwrap();
+        std::fs::write(root.join(".ssh/id_rsa"), b"secret").unwrap();
+        std::fs::write(root.join("cv.pdf"), b"cv").unwrap();
+        let jail = mcp_fs::Jail::new(vec![root.clone()], mcp_fs::default_denied());
+        let backend = Arc::new(mcp_browser::CdpBackend::new(mcp_browser::NavPolicy::new(
+            &[],
+            false,
+        )));
+        let m =
+            mcp_browser::BrowserModule::new(backend).with_upload_resolver(upload_resolver(jail));
+        let ctx = CallCtx::new("t", CancelToken::new());
+        for bad in [
+            root.join(".ssh/id_rsa").to_string_lossy().into_owned(),
+            "/etc/hosts".to_string(),
+            root.join("../outside").to_string_lossy().into_owned(),
+        ] {
+            let e = m
+                .call(
+                    "browser_upload",
+                    serde_json::json!({ "target_id": "T", "query": "input", "paths": [bad] }),
+                    &ctx,
+                )
+                .await;
+            assert!(!e.ok, "{bad} was not refused");
+            assert_eq!(e.error.unwrap().code, ErrorCode::PermDenied, "{bad}");
+        }
+        // The same module accepts a file inside the root as far as the path
+        // goes; it then fails on the missing tab, not on the path.
+        let e = m
+            .call(
+                "browser_upload",
+                serde_json::json!({
+                    "target_id": "T", "query": "input",
+                    "paths": [root.join("cv.pdf").to_string_lossy()]
+                }),
+                &ctx,
+            )
+            .await;
+        assert_ne!(e.error.map(|x| x.code), Some(ErrorCode::PermDenied));
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     /// `mcp-policy` validates `demo_speed` against its own list because it
     /// cannot depend on the engine; every name it lets through must map to the
