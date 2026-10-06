@@ -2005,8 +2005,8 @@ impl ToolModule for BrowserModule {
                 Category::Browser,
                 Tier::Standard,
                 "Act on a DOM node: click, type, select, hover, focus, scroll_into_view, submit, press \
-                 (value Enter, Escape or Tab, sent as a real key event to the focused node; Chrome only). \
-                 A page-published canvas region (a canvas-child ref from browser_snapshot) supports only click and hover, \
+                 (value Enter, Escape, Tab, ArrowDown, ArrowUp, ArrowLeft, ArrowRight, Home, End, PageUp, PageDown, Backspace, Delete or Space, sent as a real key event to the focused node; Chrome only). \
+                 On Chrome a click is real pointer input (mousedown, mouseup, click, as a person's) and type is a real insertion that replaces the field's content, so React-style controlled fields and menus that open on mousedown work; the result reports input 'cdp', or 'synthetic' with input_reason when the element is covered, off screen, in a frame, a select/option or a file input. type reports value_after (value_length for a password or secret field). A page-published canvas region (a canvas-child ref from browser_snapshot) supports only click and hover, \
                  sent as real mouse input at the region centre; other actions on it return Unsupported. \
                  Target it with 'ref' (from browser_query/snapshot) or, in one call, with \
                  'query' plus optional 'by' (css/xpath/text), 'within' (scoped container), 'text' (substring filter), and 'index'.",
@@ -2020,7 +2020,7 @@ impl ToolModule for BrowserModule {
                         "text": { "type": "string", "description": "optional text substring filter to narrow matches" },
                         "index": { "type": "integer", "description": "optional 0-based match index if query matches multiple elements (default 0)" },
                         "action": { "type": "string", "enum": ["click", "type", "select", "hover", "focus", "scroll_into_view", "submit", "press"] },
-                        "value": { "type": "string", "description": "text for type, option for select, or key name for press (Enter, Escape, Tab)" },
+                        "value": { "type": "string", "description": "text for type, option for select, or key name for press (Enter, Escape, Tab, ArrowDown, ArrowUp, ArrowLeft, ArrowRight, Home, End, PageUp, PageDown, Backspace, Delete, Space)" },
                         "secret": { "type": "boolean", "description": "the value is a secret: keep it out of the audit log and never show it in the showcase typing HUD (password and one-time-code fields are masked automatically)" },
                         "scroll": { "type": "string", "enum": ["none", "nearest", "center"], "description": "how to bring the element into view first: nearest (default) moves the page only as far as needed and not at all when it is visible, center centres it (can scroll a wide page sideways), none does not scroll. scroll_into_view always scrolls" },
                         "wait_after": { "type": "string", "enum": ["none", "settle"], "description": "none (default) returns as soon as the action ran, when a click's request or navigation has usually not begun yet. settle then waits for a navigation it started to load, for htmx_settled if the page has htmx, and for the network to go quiet, and adds navigated, requests_started (fetch/XHR/htmx begun on the page since the action) and settled to the result. A click that starts no request and no navigation costs about 2s here; Chrome only" },
