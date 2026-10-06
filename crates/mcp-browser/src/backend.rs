@@ -2299,6 +2299,24 @@ const JS_DOM_SETTLED: &str = r##"(function(){
   return document.readyState === 'complete' && quiet >= 150;
 })()"##;
 
+/// Assign `value` / `checked` the way a user's input would, past any
+/// instance-level override. React installs its own `value` accessor on each
+/// controlled element to track the last value it saw, and ignores an `input`
+/// event when the tracked value equals the new one; a plain `el.value = x`
+/// goes through that accessor, so React concludes nothing changed. These walk
+/// the prototype chain to the native setter (HTMLInputElement,
+/// HTMLTextAreaElement, HTMLSelectElement) and call it on the element, which
+/// leaves the tracker stale, so the event that follows is taken as a change.
+const JS_SET_VALUE: &str = r#"function __nativeSet(el, prop, v){
+    for(var o = Object.getPrototypeOf(el); o; o = Object.getPrototypeOf(o)){
+      var d = Object.getOwnPropertyDescriptor(o, prop);
+      if(d && d.set){ d.set.call(el, v); return; }
+    }
+    el[prop] = v;
+  }
+  function __setValue(el, v){ __nativeSet(el, 'value', v); }
+  function __setChecked(el, v){ __nativeSet(el, 'checked', v); }"#;
+
 /// Lets the act scripts tell the recorder "the next `type` event on `el` is
 /// mine". Only meaningful in the recorder's isolated world, where
 /// `window.__agentctl_recorder` is the recorder's own; elsewhere (`__ISO__`
@@ -2321,6 +2339,7 @@ const JS_ARM: &str = r#"var __iso = __ISO__;
 const JS_FILL_FORM: &str = r##"(async function(){
   {JS_XPATH}
   {JS_ARM}
+  {JS_SET_VALUE}
   {JS_SHOWCASE_INIT}
   var fields = __FIELDS__;
   var submit = __SUBMIT__;
@@ -2348,7 +2367,7 @@ const JS_FILL_FORM: &str = r##"(async function(){
       var inputType = (el.getAttribute('type') || '').toLowerCase();
       var fType = (f.type || '').toLowerCase();
       if(tag === 'select' || fType === 'select'){
-        el.value = String(val == null ? '' : val);
+        __setValue(el, String(val == null ? '' : val));
         __arm(el, 'input');
         el.dispatchEvent(new Event('input', {bubbles: true}));
         __arm(el, 'change');
@@ -2357,7 +2376,7 @@ const JS_FILL_FORM: &str = r##"(async function(){
       } else if(inputType === 'checkbox' || inputType === 'radio' || fType === 'checkbox' || fType === 'radio'){
         var shouldCheck = Boolean(val);
         if(el.checked !== shouldCheck){
-          el.checked = shouldCheck;
+          __setChecked(el, shouldCheck);
           __arm(el, 'input');
           el.dispatchEvent(new Event('input', {bubbles: true}));
           __arm(el, 'change');
@@ -2366,7 +2385,7 @@ const JS_FILL_FORM: &str = r##"(async function(){
         filled++;
       } else {
         if('value' in el){
-          el.value = (val == null ? '' : String(val));
+          __setValue(el, (val == null ? '' : String(val)));
         } else {
           el.textContent = (val == null ? '' : String(val));
         }
@@ -3531,6 +3550,7 @@ impl BrowserBackend for CdpBackend {
   {JS_XPATH}
   {JS_FIND}
   {js_arm}
+  {JS_SET_VALUE}
   {showcase_init}
   var el, action={act}, value={val}, realMove={real_move};
   try {{ el = {resolve}; }} catch(e) {{ return {{ok:false,error:String(e && e.message ? e.message : e)}}; }}
@@ -3579,10 +3599,10 @@ impl BrowserBackend for CdpBackend {
       else return {{ok:false,error:'element has no form to submit'}};
       break;
     case 'select':
-      el.value=value; __arm(el, 'change'); el.dispatchEvent(new Event('change',{{bubbles:true}})); break;
+      __setValue(el, value); __arm(el, 'change'); el.dispatchEvent(new Event('change',{{bubbles:true}})); break;
     case 'type':
       if(el.focus) el.focus({{preventScroll:true}});
-      if('value' in el){{ el.value=value; }} else {{ el.textContent=value; }}
+      if('value' in el){{ __setValue(el, value == null ? '' : String(value)); }} else {{ el.textContent=value; }}
       __arm(el, 'input');
       el.dispatchEvent(new Event('input',{{bubbles:true}}));
       __arm(el, 'change');
@@ -4969,6 +4989,7 @@ impl BrowserBackend for CdpBackend {
                 "{JS_ARM}",
                 &JS_ARM.replace("__ISO__", if iso.is_some() { "true" } else { "false" }),
             )
+            .replace("{JS_SET_VALUE}", JS_SET_VALUE)
             .replace("{JS_SHOWCASE_INIT}", &showcase_init)
             .replace("{JS_SHOWCASE_FIELD}", &showcase_field)
             .replace("{JS_SHOWCASE_SUBMIT}", &showcase_submit)
@@ -5656,6 +5677,7 @@ impl BrowserBackend for CdpBackend {
 
         let restore_js = format!(
             r#"(function(ls, ss, inputs, sx, sy){{
+  {JS_SET_VALUE}
   var out = {{ ok: true, restored_inputs: 0, missing_inputs: 0, skipped_file_inputs: 0, errors: [] }};
   function restoreStore(name, data) {{
     data = data || {{}};
@@ -5693,9 +5715,9 @@ impl BrowserBackend for CdpBackend {
       if (item.tag === 'select') {{
         if (item.selected_index >= 0) el.selectedIndex = item.selected_index;
       }} else if (item.input_type === 'checkbox' || item.input_type === 'radio') {{
-        el.checked = !!item.checked;
+        __setChecked(el, !!item.checked);
       }} else if (item.value !== undefined && item.value !== null) {{
-        el.value = typeof item.value === 'string' ? item.value : JSON.stringify(item.value);
+        __setValue(el, typeof item.value === 'string' ? item.value : JSON.stringify(item.value));
       }}
       el.dispatchEvent(new Event('input', {{ bubbles: true }}));
       el.dispatchEvent(new Event('change', {{ bubbles: true }}));
