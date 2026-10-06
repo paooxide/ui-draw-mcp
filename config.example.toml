@@ -142,6 +142,8 @@ human_override_grace_ms = 1500
 # Directories the filesystem engine may touch. Paths are fully resolved and
 # checked against these roots, so `..` and symlinks cannot escape.
 # Credential stores (~/.ssh, keychains, .netrc, ...) are denied even inside a root.
+# `browser_upload` (dangerous tier, so it also needs `policy.enable`) attaches only files inside
+# these roots, through the same jail; with no roots it refuses. A page can read what is attached.
 roots = []
 
 [terminal]
