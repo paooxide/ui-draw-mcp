@@ -665,7 +665,17 @@ async fn recorder_redaction_matches_rust_rule_and_never_captures_value() {
     }
     let raw = recorded_events(&b, &t).await;
     let events = raw["events"].as_array().expect("events");
-    assert_eq!(events.len(), cases.len() * 2, "one input + one change each");
+    // `type` is a real insertion, so the browser itself adds a `change` when
+    // the next field takes focus; the recorder coalesces the repeats.
+    for kind in ["input", "change"] {
+        let n = events.iter().filter(|e| e["kind"] == kind).count();
+        assert!(n >= cases.len(), "an {kind} for each field, got {n}");
+    }
+    assert!(
+        events.len() <= cases.len() * 3,
+        "at most input + change + a blur change each, got {}",
+        events.len()
+    );
     // The decision must actually split both ways, or the table proves nothing.
     assert!(events.iter().any(|e| e["secret"] == true));
     assert!(events.iter().any(|e| e["secret"] == false));

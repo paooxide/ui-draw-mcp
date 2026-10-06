@@ -2317,6 +2317,35 @@ const JS_SET_VALUE: &str = r#"function __nativeSet(el, prop, v){
   function __setValue(el, v){ __nativeSet(el, 'value', v); }
   function __setChecked(el, v){ __nativeSet(el, 'checked', v); }"#;
 
+/// What a `type` left in the field, for the result. A secret (an explicit
+/// `secret`, a password or one-time-code field, a card field; the same test the
+/// showcase typing HUD uses) is reported by length only. Also the test for
+/// whether a real `Input.insertText` can go into an element: a plain text
+/// input, a textarea or a contenteditable that is enabled and not read-only.
+const JS_TYPE_HELPERS: &str = r#"function __readback(el, secret){
+    var v = ('value' in el) ? el.value : el.textContent;
+    v = v == null ? '' : String(v);
+    var hide = !!secret;
+    try {
+      var t = String(el.getAttribute('type') || '').toLowerCase();
+      var ac = String(el.getAttribute('autocomplete') || '').toLowerCase();
+      if(t === 'password' || ac.indexOf('password') >= 0 || ac.indexOf('one-time-code') >= 0 || ac.indexOf('cc-') >= 0) hide = true;
+    } catch(e) {}
+    return hide ? {value_length: v.length} : {value_after: v};
+  }
+  function __canInsert(el){
+    if(el.ownerDocument !== document || el.disabled || el.readOnly) return false;
+    var tag = (el.tagName || '').toLowerCase();
+    if(tag === 'textarea') return true;
+    if(tag === 'input') return ['', 'text', 'search', 'url', 'tel', 'email', 'password', 'number'].indexOf(String(el.getAttribute('type') || '').toLowerCase()) >= 0;
+    return !!el.isContentEditable;
+  }
+  function __selectContents(el){
+    if('value' in el){ try { el.select(); return; } catch(e) {} }
+    var r = document.createRange(); r.selectNodeContents(el);
+    var sel = window.getSelection(); sel.removeAllRanges(); sel.addRange(r);
+  }"#;
+
 /// Lets the act scripts tell the recorder "the next `type` event on `el` is
 /// mine". Only meaningful in the recorder's isolated world, where
 /// `window.__agentctl_recorder` is the recorder's own; elsewhere (`__ISO__`
@@ -3382,6 +3411,7 @@ impl BrowserBackend for CdpBackend {
         };
         let act = serde_json::to_string(action).unwrap_or_else(|_| "\"click\"".into());
         let val = serde_json::to_string(&value).unwrap_or_else(|_| "null".into());
+        let real_input = !is_safari;
 
         // A click, submit or key press may start a navigation. Mark the
         // document it happens on, so a following `wait navigation` can tell
@@ -3551,8 +3581,10 @@ impl BrowserBackend for CdpBackend {
   {JS_FIND}
   {js_arm}
   {JS_SET_VALUE}
+  {JS_TYPE_HELPERS}
   {showcase_init}
-  var el, action={act}, value={val}, realMove={real_move};
+  var el, action={act}, value={val}, realMove={real_move}, realInput={real_input};
+  var inputKind = null, inputReason = null, clickAt = null, insertText = false, readback = null;
   try {{ el = {resolve}; }} catch(e) {{ return {{ok:false,error:String(e && e.message ? e.message : e)}}; }}
   if(!el) return {{ok:false,error:'element not found'}};
   if(el.__is_canvas_target){{
@@ -3580,7 +3612,37 @@ impl BrowserBackend for CdpBackend {
   {nav_mark_in_script}
   try {{
   switch(action){{
-    case 'click': __arm(el, 'click'); el.click(); break;
+    case 'click': {{
+      // A real click (Rust sends it once this script returns) fires the whole
+      // pointer sequence, which `el.click()` does not: react-select opens its
+      // menu on mousedown. It is only safe where the pointer would land on
+      // this element, so it stays synthetic for Safari, native popups
+      // (<select>, <option>), the file chooser, a child frame, an element with
+      // no size or off screen, and one something else covers.
+      var why = null, cpt = null;
+      var ctag = (el.tagName || '').toLowerCase();
+      if(!realInput) why = 'the Safari engine cannot send real pointer input';
+      else if(ctag === 'option' || ctag === 'select') why = 'a native ' + ctag + ' control opens an OS popup';
+      else if(ctag === 'input' && String(el.type).toLowerCase() === 'file') why = 'a real click on a file input opens the OS file chooser';
+      else if(el.ownerDocument !== document) why = 'the element is inside a child frame';
+      else {{
+        var cb = el.getBoundingClientRect();
+        var cx = cb.left + cb.width / 2, cy = cb.top + cb.height / 2;
+        var cvw = document.documentElement.clientWidth, cvh = document.documentElement.clientHeight;
+        if(!(cb.width > 0 && cb.height > 0)) why = 'the element has no size';
+        else if(!(cx >= 0 && cy >= 0 && cx < cvw && cy < cvh)) why = 'the element centre is outside the viewport';
+        else {{
+          var croot = el.getRootNode ? el.getRootNode() : document;
+          var ctop = (croot.elementFromPoint ? croot : document).elementFromPoint(cx, cy);
+          if(!ctop) why = 'nothing is rendered at the element centre';
+          else if(ctop === el || el.contains(ctop)) cpt = {{x: cx, y: cy}};
+          else why = 'covered by <' + String(ctop.tagName || '?').toLowerCase() + '>';
+        }}
+      }}
+      if(cpt){{ clickAt = cpt; inputKind = 'cdp'; }}
+      else {{ inputKind = 'synthetic'; inputReason = why; __arm(el, 'click'); el.click(); }}
+      break;
+    }}
     case 'focus': el.focus({{preventScroll:true}}); break;
     case 'press': el.focus({{preventScroll:true}}); break;
     case 'hover': {{
@@ -3602,16 +3664,29 @@ impl BrowserBackend for CdpBackend {
       __setValue(el, value); __arm(el, 'change'); el.dispatchEvent(new Event('change',{{bubbles:true}})); break;
     case 'type':
       if(el.focus) el.focus({{preventScroll:true}});
+      // A real, trusted insertion (Rust sends it once this script returns):
+      // beforeinput and input fire as for a person typing, which React,
+      // Lexical, ProseMirror and the like all take notice of. Empty text,
+      // other element kinds and Safari set the value instead.
+      if(realInput && value != null && String(value) !== '' && __canInsert(el)){{
+        __selectContents(el);
+        Object.defineProperty(window, '__agentctl_type_el', {{value: el, configurable: true, writable: true}});
+        insertText = true;
+        inputKind = 'cdp';
+        break;
+      }}
       if('value' in el){{ __setValue(el, value == null ? '' : String(value)); }} else {{ el.textContent=value; }}
       __arm(el, 'input');
       el.dispatchEvent(new Event('input',{{bubbles:true}}));
       __arm(el, 'change');
       el.dispatchEvent(new Event('change',{{bubbles:true}}));
+      inputKind = 'synthetic';
+      readback = __readback(el, {secret});
       break;
     default: return {{ok:false,error:'unknown action '+action}};
   }}
   }} finally {{ __disarm(); }}
-  return {{ok:true,action:action,showcase:{}{showcase_rendered}}};
+  return {{ok:true,action:action,showcase:{}{showcase_rendered},input:inputKind,input_reason:inputReason,click_at:clickAt,type_insert:insertText,readback:readback}};
 }})()"#,
             showcase_cfg.enabled,
             showcase_rendered = if showcase_cfg.enabled {
@@ -3650,6 +3725,22 @@ impl BrowserBackend for CdpBackend {
             // *might* navigate, so the wait for it is bounded (NAV_EXPECT_MS).
             self.set_nav_pending(target, token.clone(), false);
         }
+        if let Some(at) = v.get("click_at").filter(|a| a.is_object()).cloned() {
+            // The page found the element's centre uncovered: click it with
+            // real, trusted pointer input. A dialog the click raises is
+            // answered by the connection while it waits for the reply.
+            if let Some(c) = c_opt.as_mut() {
+                let (x, y) = (
+                    at.get("x").and_then(Value::as_f64).unwrap_or(0.0),
+                    at.get("y").and_then(Value::as_f64).unwrap_or(0.0),
+                );
+                Self::cdp_mouse(c, x, y, true).await?;
+                self.cursor_pos
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(target.to_string(), (x, y));
+            }
+        }
         if v.get("canvas_point").and_then(Value::as_bool) == Some(true) {
             // A canvas region is only pixels: the click must be a real,
             // trusted pointer input at the computed point.
@@ -3665,6 +3756,47 @@ impl BrowserBackend for CdpBackend {
             Self::cdp_mouse(c, x, y, action == "click").await?;
             if let Some(map) = v.as_object_mut() {
                 map.insert("input".into(), json!("cdp"));
+            }
+        }
+        if v.get("type_insert").and_then(Value::as_bool) == Some(true) {
+            // The field is focused with its content selected; insert as real
+            // input, then fire `change` (what leaving the field would do) and
+            // read the field back.
+            if let Some(c) = c_opt.as_mut() {
+                c.call("Input.insertText", json!({ "text": value.unwrap_or("") }))
+                    .await?;
+                let finish = format!(
+                    r#"(function(){{
+  {js_arm}
+  {JS_TYPE_HELPERS}
+  var el = window.__agentctl_type_el;
+  try {{ delete window.__agentctl_type_el; }} catch(e) {{}}
+  if(!el) return null;
+  try {{
+    __arm(el, 'change');
+    el.dispatchEvent(new Event('change', {{bubbles:true}}));
+  }} finally {{ __disarm(); }}
+  return __readback(el, {secret});
+}})()"#
+                );
+                let after = Self::eval_value_in(c, &finish, iso).await?;
+                if let Some(map) = v.as_object_mut() {
+                    map.insert("readback".into(), after);
+                }
+            }
+        }
+        // Fold the page's report of how the input went into the result.
+        if let Some(map) = v.as_object_mut() {
+            map.remove("type_insert");
+            map.remove("click_at");
+            if map.get("input_reason").is_some_and(Value::is_null) {
+                map.remove("input_reason");
+            }
+            if let Some(Value::Object(rb)) = map.remove("readback") {
+                map.extend(rb);
+            }
+            if map.get("input").is_some_and(Value::is_null) {
+                map.remove("input");
             }
         }
         if let (Some(spec), Some(c)) = (press_key, c_opt.as_mut()) {
@@ -6932,7 +7064,11 @@ mod tests {
             ("Delete", 46),
         ] {
             let k = key_event_spec(name).unwrap_or_else(|| panic!("{name} unsupported"));
-            assert_eq!((k.key, k.code, k.vk, k.text), (name, name, vk, None), "{name}");
+            assert_eq!(
+                (k.key, k.code, k.vk, k.text),
+                (name, name, vk, None),
+                "{name}"
+            );
         }
         // Space is the one new key that types: both spellings name it.
         for name in ["Space", " "] {
