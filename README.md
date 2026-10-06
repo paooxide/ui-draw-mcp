@@ -55,7 +55,7 @@ heuristic.
 
 ## What it does
 
-123 tools across 12 categories. The full reference, generated from the server's own descriptors, is
+124 tools across 12 categories. The full reference, generated from the server's own descriptors, is
 [`docs/tools.md`](docs/tools.md).
 
 | Category | Tools | Names | Dangerous |

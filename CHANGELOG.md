@@ -28,6 +28,15 @@ HTMX app, where several browser tools answered before the page had done what the
   `htmx_settled` when the page has htmx, then the network going quiet, all bounded by `timeout_ms`. The
   result adds `navigated`, `requests_started` and `settled` (plus `settle_error` when the wait ran out; the
   action itself still counts as done). A click that starts nothing costs about 2 s here. Chrome only.
+- **`browser_upload`**, files into a page's `<input type=file>`. A real click opens the OS file chooser,
+  which agentctl cannot drive, so a CV or any other attachment could not be sent; `browser_fill_form` treated
+  the input as text and profile restore skipped it. It takes the same locator as `browser_act` plus `paths`
+  (1 to 10 files, 50 MiB each), follows a `<label>` to its input (or takes the one file input inside an
+  element), refuses several files for an input without `multiple`, and sets the files with
+  `DOM.setFileInputFiles`, so Chrome fires trusted `input` and `change` events. It returns names and sizes,
+  never contents. Dangerous tier, because a page can read whatever is attached: every path goes through the
+  fs engine's jail (`fs.roots`, with credential stores refused) and only the resolved path is used, so with
+  no `fs.roots` it refuses. Chrome only; the Safari engine returns Unsupported.
 - **`browser_act` `scroll: "none" | "nearest" | "center"`**, default `nearest`.
 - **`browser_eval` `timeout_ms`** (default 10000, 100 to 60000) and **`detached`**. On a timeout Chrome is
   told to terminate the script, and the error says that timers and promises it already scheduled may still
@@ -37,7 +46,7 @@ HTMX app, where several browser tools answered before the page had done what the
 - **`browser_connect` `launch.args`** (an allowlist of display, language and pacing flags; anything else is
   refused with the list) and **`launch.background_throttling`**.
 - **Built-in `browser` role** (`--role browser`, `AGENTCTL_ROLE=browser`, `policy.role`): only the browser
-  tools are advertised, 26 instead of 123. `access` turns every category on, so before this the only way to
+  tools are advertised, 27 instead of 124. `access` turns every category on, so before this the only way to
   get a browser-only list with `access` set was a custom role.
 
 ### Changed
