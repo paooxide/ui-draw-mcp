@@ -1694,6 +1694,73 @@ pub(crate) fn key_event_spec(name: &str) -> Option<KeySpec> {
             vk: 9,
             text: None,
         }),
+        "ArrowDown" => Some(KeySpec {
+            key: "ArrowDown",
+            code: "ArrowDown",
+            vk: 40,
+            text: None,
+        }),
+        "ArrowUp" => Some(KeySpec {
+            key: "ArrowUp",
+            code: "ArrowUp",
+            vk: 38,
+            text: None,
+        }),
+        "ArrowLeft" => Some(KeySpec {
+            key: "ArrowLeft",
+            code: "ArrowLeft",
+            vk: 37,
+            text: None,
+        }),
+        "ArrowRight" => Some(KeySpec {
+            key: "ArrowRight",
+            code: "ArrowRight",
+            vk: 39,
+            text: None,
+        }),
+        "Home" => Some(KeySpec {
+            key: "Home",
+            code: "Home",
+            vk: 36,
+            text: None,
+        }),
+        "End" => Some(KeySpec {
+            key: "End",
+            code: "End",
+            vk: 35,
+            text: None,
+        }),
+        "PageUp" => Some(KeySpec {
+            key: "PageUp",
+            code: "PageUp",
+            vk: 33,
+            text: None,
+        }),
+        "PageDown" => Some(KeySpec {
+            key: "PageDown",
+            code: "PageDown",
+            vk: 34,
+            text: None,
+        }),
+        "Backspace" => Some(KeySpec {
+            key: "Backspace",
+            code: "Backspace",
+            vk: 8,
+            text: None,
+        }),
+        "Delete" => Some(KeySpec {
+            key: "Delete",
+            code: "Delete",
+            vk: 46,
+            text: None,
+        }),
+        // The space bar types a character, so unlike the others it carries text.
+        "Space" | " " => Some(KeySpec {
+            key: " ",
+            code: "Space",
+            vk: 32,
+            text: Some(" "),
+        }),
         _ => None,
     }
 }
@@ -3240,7 +3307,7 @@ impl BrowserBackend for CdpBackend {
             }
             Some(key_event_spec(value.unwrap_or("")).ok_or_else(|| {
                 BrowserError::Failed(format!(
-                    "act 'press' needs a supported key in 'value' (Enter, Escape, Tab), got '{}'",
+                    "act 'press' needs a supported key in 'value' (Enter, Escape, Tab, ArrowDown, ArrowUp, ArrowLeft, ArrowRight, Home, End, PageUp, PageDown, Backspace, Delete, Space), got '{}'",
                     value.unwrap_or("")
                 ))
             })?)
@@ -6830,6 +6897,26 @@ mod tests {
         assert_eq!(key_event_spec("Enter").unwrap().text, Some("\r"));
         assert_eq!(key_event_spec("Escape").unwrap().vk, 27);
         assert_eq!(key_event_spec("Tab").unwrap().vk, 9);
+        for (name, vk) in [
+            ("ArrowLeft", 37),
+            ("ArrowUp", 38),
+            ("ArrowRight", 39),
+            ("ArrowDown", 40),
+            ("PageUp", 33),
+            ("PageDown", 34),
+            ("End", 35),
+            ("Home", 36),
+            ("Backspace", 8),
+            ("Delete", 46),
+        ] {
+            let k = key_event_spec(name).unwrap_or_else(|| panic!("{name} unsupported"));
+            assert_eq!((k.key, k.code, k.vk, k.text), (name, name, vk, None), "{name}");
+        }
+        // Space is the one new key that types: both spellings name it.
+        for name in ["Space", " "] {
+            let k = key_event_spec(name).unwrap();
+            assert_eq!((k.key, k.code, k.vk, k.text), (" ", "Space", 32, Some(" ")));
+        }
         assert!(key_event_spec("F13").is_none());
         assert!(key_event_spec("").is_none());
     }

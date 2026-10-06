@@ -51,7 +51,7 @@ enabled category, while a `dangerous` tool additionally has to be named in
 | [`power_control`](#power-control) | desktop | dangerous | Sleep, log out, restart or shut down. |
 | [`speak`](#speak) | desktop | standard | Speak text through the speakers. |
 | [`system_settings`](#system-settings) | desktop | standard | Read or change a desktop setting. |
-| [`browser_act`](#browser-act) | browser | standard | Act on a DOM node: click, type, select, hover, focus, scroll_into_view, submit, press (value Enter, Escape or Tab, sent as a real key event to the focused node; Chrome only). |
+| [`browser_act`](#browser-act) | browser | standard | Act on a DOM node: click, type, select, hover, focus, scroll_into_view, submit, press (value Enter, Escape, Tab, ArrowDown, ArrowUp, ArrowLeft, ArrowRight, Home, End, PageUp, PageDown, Backspace, Delete or Space, sent as a real key event to the focused node; Chrome only). |
 | [`browser_assert`](#browser-assert) | browser | read | Settle (optional) then check the page in one call; returns {passed, checks} and errors when it fails. |
 | [`browser_branch`](#browser-branch) | browser | standard | Speculative browser context branching: fork an isolated background context from a tab ('create'), run trials without affecting the visible tab, commit winning state ('commit'), discard failed branches ('discard'), switch focus ('switch'), or list branches ('list'). |
 | [`browser_capture`](#browser-capture) | browser | dangerous | Regression-test capture. |
@@ -687,7 +687,7 @@ Read or change a desktop setting. Settings the platform does not expose return U
 
 `browser_act` · standard tier
 
-Act on a DOM node: click, type, select, hover, focus, scroll_into_view, submit, press (value Enter, Escape or Tab, sent as a real key event to the focused node; Chrome only). A page-published canvas region (a canvas-child ref from browser_snapshot) supports only click and hover, sent as real mouse input at the region centre; other actions on it return Unsupported. Target it with 'ref' (from browser_query/snapshot) or, in one call, with 'query' plus optional 'by' (css/xpath/text), 'within' (scoped container), 'text' (substring filter), and 'index'.
+Act on a DOM node: click, type, select, hover, focus, scroll_into_view, submit, press (value Enter, Escape, Tab, ArrowDown, ArrowUp, ArrowLeft, ArrowRight, Home, End, PageUp, PageDown, Backspace, Delete or Space, sent as a real key event to the focused node; Chrome only). A page-published canvas region (a canvas-child ref from browser_snapshot) supports only click and hover, sent as real mouse input at the region centre; other actions on it return Unsupported. Target it with 'ref' (from browser_query/snapshot) or, in one call, with 'query' plus optional 'by' (css/xpath/text), 'within' (scoped container), 'text' (substring filter), and 'index'.
 
 | Argument | Type | Required | Description |
 |---|---|---|---|
@@ -701,7 +701,7 @@ Act on a DOM node: click, type, select, hover, focus, scroll_into_view, submit, 
 | `target_id` | string | yes |  |
 | `text` | string |  | optional text substring filter to narrow matches |
 | `timeout_ms` | integer |  | wait_after settle only: bound for the whole settle wait (default 10000); when it runs out the action still succeeded and the result has settled:false and settle_error |
-| `value` | string |  | text for type, option for select, or key name for press (Enter, Escape, Tab) |
+| `value` | string |  | text for type, option for select, or key name for press (Enter, Escape, Tab, ArrowDown, ArrowUp, ArrowLeft, ArrowRight, Home, End, PageUp, PageDown, Backspace, Delete, Space) |
 | `wait_after` | one of: none, settle |  | none (default) returns as soon as the action ran, when a click's request or navigation has usually not begun yet. settle then waits for a navigation it started to load, for htmx_settled if the page has htmx, and for the network to go quiet, and adds navigated, requests_started (fetch/XHR/htmx begun on the page since the action) and settled to the result. A click that starts no request and no navigation costs about 2s here; Chrome only |
 | `within` | string |  | optional CSS/XPath root selector to scope query search |
 
