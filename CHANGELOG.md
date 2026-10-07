@@ -107,7 +107,7 @@ operated.
   first element whose text held the query, so `next` clicked the instruction; `ok` hit an `okay` button, and
   `Next` did not match `next`. Matching is now case-insensitive over whitespace-collapsed text (also a
   button input's value and `aria-label`), takes the innermost element holding the query and lifts it to the
-  control around it, and ranks exact before substring, clickable before not, then document order. When any
+  control around it, and ranks exact before substring, visible before hidden, clickable before not, then document order. When any
   match is exact the substring ones are dropped. `browser_act`, `browser_query` and `browser_upload` share it.
 - **`browser_act` now says what it hit:** the result has `target {tag, text}` (a field is named by its
   label, `aria-label`, placeholder or name, never its value) and, for a `query` locator, `matches`, the size of

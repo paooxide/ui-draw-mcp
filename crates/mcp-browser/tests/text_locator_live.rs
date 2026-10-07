@@ -55,12 +55,15 @@ const PAGE: &str = r#"<!doctype html><body style="margin:20px">
 <button id="b-next"><span>Next</span></button>
 <input id="send" type="submit" value="Send">
 <input id="pw" type="password" name="password" value="s3cret-pw-value">
+<div style="display:none"><button id="b-later-hidden">Later</button></div>
+<button id="b-later">Later</button>
+<button id="b-two">Go<br>on</button>
 <div id="counts"></div>
 <script>
 var counts = {};
 function hit(name){ counts[name] = (counts[name] || 0) + 1;
   document.getElementById('counts').textContent = Object.keys(counts).map(function(k){ return k + '=' + counts[k]; }).join(','); }
-[['query','query'],['b-okay','okay'],['b-ok','ok'],['b-prev','previous'],['b-next','Next'],['send','send']].forEach(function(p){
+[['query','query'],['b-okay','okay'],['b-ok','ok'],['b-prev','previous'],['b-next','Next'],['send','send'],['b-later-hidden','later-hidden'],['b-later','later'],['b-two','go-on']].forEach(function(p){
   document.getElementById(p[0]).addEventListener('click', function(){ hit(p[1]); });
 });
 </script></body>"#;
@@ -213,6 +216,26 @@ async fn text_finds_input_captions_and_target_never_shows_values() {
     assert_eq!(d["target"]["text"], "password", "{d}");
     assert_eq!(d["matches"], 1, "{d}");
     assert!(!d.to_string().contains("s3cret"), "{d}");
+    let _ = stop.send(());
+    let _ = b.disconnect(1, true).await;
+}
+
+/// A hidden copy of a control (a closed menu) does not outrank the one on
+/// screen, and text broken by `<br>` matches with a space where the break is.
+#[tokio::test(flavor = "multi_thread")]
+async fn text_prefers_visible_and_reads_line_breaks_as_spaces() {
+    let Some((b, t, m, stop)) = setup().await else {
+        return;
+    };
+    let c = act(&m, &t, "text", "later", json!({})).await;
+    assert!(c.ok, "{c:?}");
+    let d = c.data.as_ref().unwrap();
+    assert_eq!(d["matches"], 2, "{d}");
+    assert_eq!(counts(&b, &t).await, "later=1");
+
+    let c = act(&m, &t, "text", "go on", json!({})).await;
+    assert!(c.ok, "{c:?}");
+    assert_eq!(counts(&b, &t).await, "later=1,go-on=1");
     let _ = stop.send(());
     let _ = b.disconnect(1, true).await;
 }

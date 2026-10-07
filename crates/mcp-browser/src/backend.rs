@@ -2035,10 +2035,16 @@ function __resolve(xp){
 const JS_FIND: &str = r#"
 function __norm(s){ return String(s == null ? '' : s).replace(/\s+/g, ' ').trim().toLowerCase(); }
 // The strings an element answers to: its text, a button input's value, its aria-label.
-function __texts(el){
-  var t = el.innerText;
-  if(t == null || t === '') t = el.textContent;
-  var out = [__norm(t)];
+function __texts(el, q){
+  // textContent is cheap and holds everything innerText shows, so only an
+  // element whose textContent could match pays for innerText (which lays out).
+  // Compared without whitespace: innerText adds breaks at <br> and block
+  // edges that textContent lacks, so "Next<br>step" still matches "next step".
+  var tc = __norm(el.textContent), out = [tc];
+  if(q != null && tc.replace(/ /g, '').indexOf(q.replace(/ /g, '')) >= 0){
+    var t = el.innerText;
+    if(t != null && t !== '') out[0] = __norm(t);
+  }
   if(el.tagName === 'INPUT'){
     var ty = String(el.type).toLowerCase();
     if(ty === 'button' || ty === 'submit' || ty === 'reset') out.push(__norm(el.value));
@@ -2047,9 +2053,17 @@ function __texts(el){
   if(al) out.push(__norm(al));
   return out;
 }
+// Rendered with a box: a hidden copy of a control (a closed menu, a template)
+// must not outrank the one on screen. innerText does not tell them apart, since
+// it falls back to textContent for an element that is not rendered.
+function __visible(el){
+  if(el.checkVisibility) return el.checkVisibility();
+  return !!(el.getClientRects && el.getClientRects().length);
+}
 var __ACTIONABLE = 'button, a[href], input:not([type=hidden]), select, textarea, summary, label, [role=button], [role=link], [role=menuitem], [role=option], [role=tab], [role=checkbox], [role=radio], [role=switch], [role=treeitem], [onclick], [contenteditable=true]';
 // Text matches, best first: exact before substring (and when any is exact the
-// substring ones are dropped), clickable before not, then document order. A
+// substring ones are dropped), visible before hidden, clickable before not,
+// then document order. A
 // candidate is the innermost element whose text holds the query, lifted to the
 // control around it, so `<button><span>Next</span></button>` is the button and
 // the sentence `Click on "next"` only ranks as a last resort.
@@ -2060,7 +2074,7 @@ function __text_matches(root, q){
   var pos = new Map();
   for(var i=0; i<n; i++){
     pos.set(all[i], i);
-    tx[i] = skip.test(all[i].tagName) ? [] : __texts(all[i]);
+    tx[i] = skip.test(all[i].tagName) ? [] : __texts(all[i], q);
     has[i] = tx[i].some(function(t){ return t.indexOf(q) >= 0; });
   }
   var best = new Map();
@@ -2078,12 +2092,12 @@ function __text_matches(root, q){
       exact = li !== undefined && tx[li].indexOf(q) >= 0;
     }
     var prev = best.get(lifted);
-    if(!prev) best.set(lifted, {el: lifted, exact: exact, act: act, ord: j});
+    if(!prev) best.set(lifted, {el: lifted, exact: exact, act: act, vis: __visible(lifted), ord: j});
     else if(exact) prev.exact = true;
   }
   var list = Array.from(best.values());
   if(list.some(function(m){ return m.exact; })) list = list.filter(function(m){ return m.exact; });
-  list.sort(function(a, b){ return (b.act - a.act) || (a.ord - b.ord); });
+  list.sort(function(a, b){ return (b.vis - a.vis) || (b.act - a.act) || (a.ord - b.ord); });
   return list.map(function(m){ return m.el; });
 }
 // What `browser_act` reports it acted on: tag and a short name. A field is named
