@@ -2538,6 +2538,55 @@ const JS_SET_VALUE: &str = r#"function __nativeSet(el, prop, v){
   function __setValue(el, v){ __nativeSet(el, 'value', v); }
   function __setChecked(el, v){ __nativeSet(el, 'checked', v); }"#;
 
+/// Choosing an option of a native `<select>`, for `select`, a click on an
+/// `<option>` and `fill_form`. Setting `value` on an `<option>` rewrites its
+/// value attribute and `click()` on one does nothing, so both used to report ok
+/// with the list unchanged; an option now stands for its select. The wanted
+/// option is matched by value, then by its text (whitespace collapsed), then
+/// either one ignoring case. `__chooseOption` sets the index through the native
+/// setter, fires input and change, and reads the list back: the result says
+/// what is selected, or `error` when nothing matched or the page put it back.
+/// Needs `JS_SET_VALUE` and `JS_ARM` in scope.
+const JS_SELECT: &str = r#"function __optText(o){ return String(o.label || o.text || '').replace(/\s+/g, ' ').trim(); }
+  function __selectOf(el){
+    var t = (el.tagName || '').toLowerCase();
+    if(t === 'select') return el;
+    if((t === 'option' || t === 'optgroup') && el.closest) return el.closest('select');
+    return null;
+  }
+  function __pickOption(sel, want){
+    var o = sel.options, w = String(want == null ? '' : want), n = w.replace(/\s+/g, ' ').trim(), lo = n.toLowerCase(), i;
+    for(i = 0; i < o.length; i++) if(o[i].value === w) return o[i];
+    for(i = 0; i < o.length; i++) if(__optText(o[i]) === n) return o[i];
+    for(i = 0; i < o.length; i++) if(__optText(o[i]).toLowerCase() === lo || String(o[i].value).toLowerCase() === lo) return o[i];
+    return null;
+  }
+  function __optionList(sel){
+    var a = [], o = sel.options, cap = 25;
+    for(var i = 0; i < o.length && i < cap; i++) a.push(__optText(o[i]));
+    if(o.length > cap) a.push('... ' + (o.length - cap) + ' more');
+    return a;
+  }
+  function __selectedText(sel){
+    var a = [];
+    for(var i = 0; i < sel.options.length; i++) if(sel.options[i].selected) a.push(__optText(sel.options[i]));
+    return sel.multiple ? a : (a[0] == null ? null : a[0]);
+  }
+  function __chooseOption(sel, opt){
+    if(sel.disabled) return {error: 'the <select> is disabled'};
+    if(opt.disabled) return {error: "option '" + __optText(opt) + "' is disabled"};
+    var was = opt.selected && (sel.multiple || sel.selectedIndex === opt.index);
+    if(sel.multiple) __nativeSet(opt, 'selected', true);
+    else __nativeSet(sel, 'selectedIndex', opt.index);
+    __arm(sel, 'input'); sel.dispatchEvent(new Event('input', {bubbles: true}));
+    __arm(sel, 'change'); sel.dispatchEvent(new Event('change', {bubbles: true}));
+    if(!opt.selected) return {error: "the page reset the <select> after option '" + __optText(opt) + "' was chosen; it now shows " + JSON.stringify(__selectedText(sel))};
+    return {selected: __selectedText(sel), changed: !was};
+  }
+  function __noOption(sel, want){
+    return "no option of the <select> matches " + JSON.stringify(String(want == null ? '' : want)) + " by value or text; its options: " + JSON.stringify(__optionList(sel));
+  }"#;
+
 /// What a `type` left in the field, for the result. A secret (an explicit
 /// `secret`, a password or one-time-code field, a card field; the same test the
 /// showcase typing HUD uses) is reported by length only. Also the test for
@@ -2591,6 +2640,7 @@ const JS_FILL_FORM: &str = r##"(async function(){
   {JS_FIND}
   {JS_ARM}
   {JS_SET_VALUE}
+  {JS_SELECT}
   {JS_SHOWCASE_INIT}
   var fields = __FIELDS__;
   var submit = __SUBMIT__;
@@ -2631,13 +2681,19 @@ const JS_FILL_FORM: &str = r##"(async function(){
       var tag = (el.tagName || '').toLowerCase();
       var inputType = (el.getAttribute('type') || '').toLowerCase();
       var fType = (f.type || '').toLowerCase();
-      if(tag === 'select' || fType === 'select'){
-        __setValue(el, String(val == null ? '' : val));
-        __arm(el, 'input');
-        el.dispatchEvent(new Event('input', {bubbles: true}));
-        __arm(el, 'change');
-        el.dispatchEvent(new Event('change', {bubbles: true}));
+      var sel = __selectOf(el);
+      if(sel){
+        var opt = (tag === 'option' && (val == null || val === '')) ? el : __pickOption(sel, val);
+        if(!opt && tag === 'option') opt = el;
+        var ch = opt ? __chooseOption(sel, opt) : {error: __noOption(sel, val)};
+        if(ch.error){
+          errors.push({field: f.selector || f.ref || ('index_' + i), error: ch.error});
+          continue;
+        }
         filled++;
+      } else if(fType === 'select'){
+        errors.push({field: f.selector || f.ref || ('index_' + i), error: 'type select needs a native <select> (or one of its options); this is a <' + tag + '>'});
+        continue;
       } else if(inputType === 'checkbox' || inputType === 'radio' || fType === 'checkbox' || fType === 'radio'){
         var shouldCheck = Boolean(val);
         if(el.checked !== shouldCheck){
@@ -3490,11 +3546,30 @@ impl BrowserBackend for CdpBackend {
 
     var name = (el.getAttribute ? (el.getAttribute('aria-label') || el.getAttribute('placeholder') || el.value || el.innerText || el.getAttribute('title') || '') : '').trim().slice(0, 120);
     var isEnabled = el.disabled !== true && (!el.getAttribute || el.getAttribute('aria-disabled') !== 'true');
+    // A native <select> is named by its label, not by the value it holds, and
+    // carries its option texts (the first 25) and the selected one, so the
+    // option to pass to action select is in the snapshot itself.
+    var selected = null, options = null;
+    if(tag === 'SELECT'){{
+      var lab = el.labels && el.labels.length ? (el.labels[0].innerText || '') : '';
+      name = (el.getAttribute('aria-label') || lab || el.getAttribute('name') || '').replace(/\s+/g, ' ').trim().slice(0, 120);
+      var ot = function(o){{ return String(o.label || o.text || '').replace(/\s+/g, ' ').trim().slice(0, 60); }};
+      options = [];
+      var picked = [];
+      for(var oi = 0; oi < el.options.length; oi++){{
+        if(oi < 25) options.push(ot(el.options[oi]));
+        if(el.options[oi].selected) picked.push(ot(el.options[oi]));
+      }}
+      if(el.options.length > 25) options.push('... ' + (el.options.length - 25) + ' more');
+      selected = el.multiple ? picked : (picked[0] == null ? null : picked[0]);
+    }}
     out.push({{
       ref: __xp(el),
       tag: tag.toLowerCase(),
       role: role || null,
       name: name,
+      selected: selected,
+      options: options,
       x: Math.round(rect.x),
       y: Math.round(rect.y),
       w: Math.round(rect.width),
@@ -3885,10 +3960,11 @@ impl BrowserBackend for CdpBackend {
   {JS_FIND}
   {js_arm}
   {JS_SET_VALUE}
+  {JS_SELECT}
   {JS_TYPE_HELPERS}
   {showcase_init}
   var el, action={act}, value={val}, realMove={real_move}, realInput={real_input};
-  var inputKind = null, inputReason = null, clickAt = null, insertText = false, readback = null;
+  var inputKind = null, inputReason = null, clickAt = null, insertText = false, readback = null, selected, changed, options;
   try {{ el = {resolve}; }} catch(e) {{ return {{ok:false,error:String(e && e.message ? e.message : e)}}; }}
   if(!el) return {{ok:false,error:'element not found'}};
   if(el.__is_canvas_target){{
@@ -3926,8 +4002,26 @@ impl BrowserBackend for CdpBackend {
       // no size or off screen, and one something else covers.
       var why = null, cpt = null;
       var ctag = (el.tagName || '').toLowerCase();
+      // A native list opens an OS popup no input can reach, and `click()` on
+      // an <option> selects nothing: an option is chosen through its select,
+      // and a click on the select itself says how to choose one.
+      if(ctag === 'option'){{
+        var osel = __selectOf(el);
+        if(!osel) return {{ok:false,kind:'failed',error:'this <option> is not in a <select> (a <datalist> suggestion?); type the value into its input instead'}};
+        var och = __chooseOption(osel, el);
+        if(och.error) return {{ok:false,kind:'failed',error:och.error}};
+        inputKind = 'synthetic'; inputReason = 'an <option> is chosen through its <select>';
+        selected = och.selected; changed = och.changed;
+        break;
+      }}
+      if(ctag === 'select'){{
+        inputKind = 'synthetic';
+        inputReason = 'a native <select> opens an OS popup, so nothing was chosen; use action select on it with the option text or value';
+        __arm(el, 'click'); el.click();
+        selected = __selectedText(el); options = __optionList(el);
+        break;
+      }}
       if(!realInput) why = 'the Safari engine cannot send real pointer input';
-      else if(ctag === 'option' || ctag === 'select') why = 'a native ' + ctag + ' control opens an OS popup';
       else if(ctag === 'input' && String(el.type).toLowerCase() === 'file') why = 'a real click on a file input opens the OS file chooser';
       else if(el.ownerDocument !== document) why = 'the element is inside a child frame';
       else {{
@@ -3965,8 +4059,27 @@ impl BrowserBackend for CdpBackend {
       else if(typeof el.submit==='function'){{ el.submit(); }}
       else return {{ok:false,error:'element has no form to submit'}};
       break;
-    case 'select':
-      __setValue(el, value); __arm(el, 'change'); el.dispatchEvent(new Event('change',{{bubbles:true}})); break;
+    case 'select': {{
+      var ssel = __selectOf(el), stag = (el.tagName || '').toLowerCase();
+      if(!ssel){{
+        // A text field with a <datalist> takes the value as typed text.
+        if(stag === 'input' || stag === 'textarea'){{
+          __setValue(el, value == null ? '' : String(value));
+          __arm(el, 'input'); el.dispatchEvent(new Event('input',{{bubbles:true}}));
+          __arm(el, 'change'); el.dispatchEvent(new Event('change',{{bubbles:true}}));
+          readback = __readback(el, {secret});
+          break;
+        }}
+        return {{ok:false,kind:'unsupported',error:'select works on a native <select> or one of its options, not a <' + stag + '>; for a custom dropdown click it open, then click the option'}};
+      }}
+      var sopt = (stag === 'option' && (value == null || value === '')) ? el : __pickOption(ssel, value);
+      if(!sopt && stag === 'option') sopt = el;
+      if(!sopt) return {{ok:false,kind:'failed',error:__noOption(ssel, value)}};
+      var sch = __chooseOption(ssel, sopt);
+      if(sch.error) return {{ok:false,kind:'failed',error:sch.error}};
+      selected = sch.selected; changed = sch.changed;
+      break;
+    }}
     case 'type':
       if(el.focus) el.focus({{preventScroll:true}});
       // A real, trusted insertion (Rust sends it once this script returns):
@@ -3991,7 +4104,7 @@ impl BrowserBackend for CdpBackend {
     default: return {{ok:false,error:'unknown action '+action}};
   }}
   }} finally {{ __disarm(); }}
-  return {{ok:true,action:action,showcase:{}{showcase_rendered},input:inputKind,input_reason:inputReason,click_at:clickAt,type_insert:insertText,readback:readback,target:tgt,matches:found}};
+  return {{ok:true,action:action,showcase:{}{showcase_rendered},input:inputKind,input_reason:inputReason,click_at:clickAt,type_insert:insertText,readback:readback,selected:selected,changed:changed,options:options,target:tgt,matches:found}};
 }})()"#,
             showcase_cfg.enabled,
             found = if is_selector { "__find.count" } else { "null" },
@@ -4104,8 +4217,10 @@ impl BrowserBackend for CdpBackend {
             if map.get("input").is_some_and(Value::is_null) {
                 map.remove("input");
             }
-            if map.get("matches").is_some_and(Value::is_null) {
-                map.remove("matches");
+            for key in ["matches", "selected", "changed", "options"] {
+                if map.get(key).is_some_and(Value::is_null) {
+                    map.remove(key);
+                }
             }
         }
         if let (Some(spec), Some(c)) = (press_key, c_opt.as_mut()) {
@@ -5432,6 +5547,7 @@ impl BrowserBackend for CdpBackend {
                 &JS_ARM.replace("__ISO__", if iso.is_some() { "true" } else { "false" }),
             )
             .replace("{JS_SET_VALUE}", JS_SET_VALUE)
+            .replace("{JS_SELECT}", JS_SELECT)
             .replace("{JS_SHOWCASE_INIT}", &showcase_init)
             .replace("{JS_SHOWCASE_FIELD}", &showcase_field)
             .replace("{JS_SHOWCASE_SUBMIT}", &showcase_submit)
