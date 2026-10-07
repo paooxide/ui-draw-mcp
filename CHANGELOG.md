@@ -149,6 +149,16 @@ operated.
   button input's value and `aria-label`), takes the innermost element holding the query and lifts it to the
   control around it, and ranks exact before substring, visible before hidden, clickable before not, then document order. When any
   match is exact the substring ones are dropped. `browser_act`, `browser_query` and `browser_upload` share it.
+- **Choosing from a native `<select>` reported ok and chose nothing.** In the MiniWoB++ choose-list task
+  the model clicked an `<option>` ref, or called `select` on one; `click()` on an option selects nothing and
+  setting `value` on one rewrites its value attribute, so 3 of the 4 agentctl failures in the second dry run
+  were a list still showing its first name. An option now stands for its select: a click on it, or `select`
+  on it, chooses it there and fires `input` and `change`. `select` on the list matches the option's value,
+  then its text, then either ignoring case, and `browser_fill_form` does the same. The result says
+  `selected` and `changed`; no match, a disabled option, or a page that puts the list back is an error, the
+  first listing the options. A click on the `<select>` itself chooses nothing and its `input_reason` says to
+  use `select`. `browser_snapshot` names a select by its label (it showed the current value) and adds
+  `options` (the first 25) and `selected`.
 - **`browser_act` now says what it hit:** the result has `target {tag, text}` (a field is named by its
   label, `aria-label`, placeholder or name, never its value) and, for a `query` locator, `matches`, the size of
   the ranked list, so a wrong target shows instead of a silent ok.

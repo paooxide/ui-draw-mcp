@@ -2482,7 +2482,7 @@ impl ToolModule for BrowserModule {
                         "text": { "type": "string", "description": "substring filter on the matches" },
                         "index": { "type": "integer", "description": "0-based match index (default 0)" },
                         "action": { "type": "string", "enum": ["click", "type", "select", "hover", "focus", "scroll_into_view", "submit", "press"] },
-                        "value": { "type": "string", "description": "text for type, option for select, key for press: Enter, Escape, Tab, ArrowDown/Up/Left/Right, Home, End, PageUp, PageDown, Backspace, Delete, Space" },
+                        "value": { "type": "string", "description": "text for type, option text or value for select (on the <select> or an option), key for press: Enter, Escape, Tab, ArrowDown/Up/Left/Right, Home, End, PageUp, PageDown, Backspace, Delete, Space" },
                         "secret": { "type": "boolean", "description": "value is a secret: kept out of the audit log and the showcase HUD" },
                         "scroll": { "type": "string", "enum": ["none", "nearest", "center"], "description": "bring the element into view first (default nearest)" },
                         "wait_after": { "type": "string", "enum": ["none", "settle"], "description": "settle waits for a started navigation, htmx and quiet network, and adds navigated, requests_started and settled to the result (Chrome; about 2s when nothing starts). Default none" },
@@ -2497,7 +2497,9 @@ impl ToolModule for BrowserModule {
                  insertion that replaces the field's content, so React-style controlled fields and menus that open on \
                  mousedown work; the result reports input 'cdp', or 'synthetic' with input_reason when the element is \
                  covered, off screen, in a frame, a select/option or a file input. type reports value_after (value_length \
-                 for a password or secret field). A page-published canvas region (a canvas-child ref from browser_snapshot) \
+                 for a password or secret field). A native <select> is set with select (on the list or one of its \
+                 options) or a click on an <option>; both report selected and changed, and an option that is missing, \
+                 disabled or undone by the page is an error. A page-published canvas region (a canvas-child ref from browser_snapshot) \
                  supports only click and hover, sent as real mouse input at the region centre; other actions on it return \
                  Unsupported.\n\n\
                  Query targeting: 'by' is css, xpath or text (default css; used when no 'ref'); text is case-insensitive, \
