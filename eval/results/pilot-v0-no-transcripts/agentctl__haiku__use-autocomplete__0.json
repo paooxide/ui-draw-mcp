@@ -1,0 +1,81 @@
+{
+ "task": "use-autocomplete",
+ "seed": 0,
+ "model": "haiku",
+ "arm": "agentctl",
+ "max_turns": 25,
+ "goal": "Enter an item that starts with \"Ecu\".",
+ "wall_s": 25.4,
+ "claude": {
+  "is_error": false,
+  "subtype": "success",
+  "num_turns": 13,
+  "total_cost_usd": 0.055497599999999994,
+  "usage": {
+   "input_tokens": 106,
+   "cache_creation_input_tokens": 12184,
+   "cache_read_input_tokens": 209936,
+   "output_tokens": 2006,
+   "output_tokens_details": {
+    "thinking_tokens": 810
+   },
+   "server_tool_use": {
+    "web_search_requests": 0,
+    "web_fetch_requests": 0
+   },
+   "service_tier": "standard",
+   "cache_creation": {
+    "ephemeral_1h_input_tokens": 12184,
+    "ephemeral_5m_input_tokens": 0
+   },
+   "inference_geo": "not_available",
+   "iterations": [
+    {
+     "input_tokens": 8,
+     "output_tokens": 148,
+     "cache_read_input_tokens": 20079,
+     "cache_creation_input_tokens": 1041,
+     "cache_creation": {
+      "ephemeral_5m_input_tokens": 0,
+      "ephemeral_1h_input_tokens": 1041
+     },
+     "type": "message"
+    }
+   ],
+   "speed": "standard",
+   "fallback_credit": null
+  },
+  "modelUsage": {
+   "claude-haiku-4-5-20251001": {
+    "inputTokens": 106,
+    "outputTokens": 2006,
+    "cacheReadInputTokens": 209936,
+    "cacheCreationInputTokens": 12184,
+    "webSearchRequests": 0,
+    "costUSD": 0.055497599999999994,
+    "contextWindow": 200000,
+    "maxOutputTokens": 32000,
+    "thinkingTokens": 810,
+    "canonicalModel": "claude-haiku-4-5",
+    "provider": "firstParty",
+    "costBasis": "list"
+   }
+  },
+  "duration_ms": 24041,
+  "duration_api_ms": 23741,
+  "terminal_reason": "completed",
+  "permission_denials": [],
+  "result": "DONE"
+ },
+ "state": {
+  "done": true,
+  "raw": 1,
+  "reward": 0.9651633333333334,
+  "reason": null
+ },
+ "success": true,
+ "audit_files": [
+  "/var/folders/dd/_2wx23y55n7fh4n6v24fw5280000gn/T/wob-e3t05m07/audit/sess-60733-1791358277029.pub.key",
+  "/var/folders/dd/_2wx23y55n7fh4n6v24fw5280000gn/T/wob-e3t05m07/audit/sess-60733-1791358277029.jsonl"
+ ]
+}

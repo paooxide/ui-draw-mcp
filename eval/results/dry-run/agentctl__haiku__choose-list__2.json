@@ -1,0 +1,81 @@
+{
+ "task": "choose-list",
+ "seed": 2,
+ "model": "haiku",
+ "arm": "agentctl",
+ "max_turns": 25,
+ "goal": "Select Tonga from the list and click Submit.",
+ "wall_s": 17.8,
+ "claude": {
+  "is_error": false,
+  "subtype": "success",
+  "num_turns": 10,
+  "total_cost_usd": 0.038088199999999996,
+  "usage": {
+   "input_tokens": 82,
+   "cache_creation_input_tokens": 8017,
+   "cache_read_input_tokens": 146522,
+   "output_tokens": 1464,
+   "output_tokens_details": {
+    "thinking_tokens": 432
+   },
+   "server_tool_use": {
+    "web_search_requests": 0,
+    "web_fetch_requests": 0
+   },
+   "service_tier": "standard",
+   "cache_creation": {
+    "ephemeral_1h_input_tokens": 8017,
+    "ephemeral_5m_input_tokens": 0
+   },
+   "inference_geo": "not_available",
+   "iterations": [
+    {
+     "input_tokens": 8,
+     "output_tokens": 65,
+     "cache_read_input_tokens": 16678,
+     "cache_creation_input_tokens": 275,
+     "cache_creation": {
+      "ephemeral_5m_input_tokens": 0,
+      "ephemeral_1h_input_tokens": 275
+     },
+     "type": "message"
+    }
+   ],
+   "speed": "standard",
+   "fallback_credit": null
+  },
+  "modelUsage": {
+   "claude-haiku-4-5-20251001": {
+    "inputTokens": 82,
+    "outputTokens": 1464,
+    "cacheReadInputTokens": 146522,
+    "cacheCreationInputTokens": 8017,
+    "webSearchRequests": 0,
+    "costUSD": 0.038088199999999996,
+    "contextWindow": 200000,
+    "maxOutputTokens": 32000,
+    "thinkingTokens": 432,
+    "canonicalModel": "claude-haiku-4-5",
+    "provider": "firstParty",
+    "costBasis": "list"
+   }
+  },
+  "duration_ms": 16423,
+  "duration_api_ms": 16278,
+  "terminal_reason": "completed",
+  "permission_denials": [],
+  "result": "DONE"
+ },
+ "state": {
+  "done": false,
+  "raw": 0,
+  "reward": 0,
+  "reason": null
+ },
+ "success": false,
+ "audit_files": [
+  "/var/folders/dd/_2wx23y55n7fh4n6v24fw5280000gn/T/wob-sscvqs07/audit/sess-62944-1791358726193.pub.key",
+  "/var/folders/dd/_2wx23y55n7fh4n6v24fw5280000gn/T/wob-sscvqs07/audit/sess-62944-1791358726193.jsonl"
+ ]
+}

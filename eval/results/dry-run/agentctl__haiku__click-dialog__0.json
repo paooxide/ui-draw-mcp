@@ -1,0 +1,81 @@
+{
+ "task": "click-dialog",
+ "seed": 0,
+ "model": "haiku",
+ "arm": "agentctl",
+ "max_turns": 25,
+ "goal": "Close the dialog box by clicking the \"x\".",
+ "wall_s": 15.4,
+ "claude": {
+  "is_error": false,
+  "subtype": "success",
+  "num_turns": 7,
+  "total_cost_usd": 0.033090400000000006,
+  "usage": {
+   "input_tokens": 58,
+   "cache_creation_input_tokens": 8818,
+   "cache_read_input_tokens": 100064,
+   "output_tokens": 1078,
+   "output_tokens_details": {
+    "thinking_tokens": 527
+   },
+   "server_tool_use": {
+    "web_search_requests": 0,
+    "web_fetch_requests": 0
+   },
+   "service_tier": "standard",
+   "cache_creation": {
+    "ephemeral_1h_input_tokens": 8818,
+    "ephemeral_5m_input_tokens": 0
+   },
+   "inference_geo": "not_available",
+   "iterations": [
+    {
+     "input_tokens": 8,
+     "output_tokens": 146,
+     "cache_read_input_tokens": 16716,
+     "cache_creation_input_tokens": 1038,
+     "cache_creation": {
+      "ephemeral_5m_input_tokens": 0,
+      "ephemeral_1h_input_tokens": 1038
+     },
+     "type": "message"
+    }
+   ],
+   "speed": "standard",
+   "fallback_credit": null
+  },
+  "modelUsage": {
+   "claude-haiku-4-5-20251001": {
+    "inputTokens": 58,
+    "outputTokens": 1078,
+    "cacheReadInputTokens": 100064,
+    "cacheCreationInputTokens": 8818,
+    "webSearchRequests": 0,
+    "costUSD": 0.033090400000000006,
+    "contextWindow": 200000,
+    "maxOutputTokens": 32000,
+    "thinkingTokens": 527,
+    "canonicalModel": "claude-haiku-4-5",
+    "provider": "firstParty",
+    "costBasis": "list"
+   }
+  },
+  "duration_ms": 13722,
+  "duration_api_ms": 13406,
+  "terminal_reason": "completed",
+  "permission_denials": [],
+  "result": "DONE"
+ },
+ "state": {
+  "done": true,
+  "raw": 1,
+  "reward": 0.9826133333333333,
+  "reason": null
+ },
+ "success": true,
+ "audit_files": [
+  "/var/folders/dd/_2wx23y55n7fh4n6v24fw5280000gn/T/wob-mmzky0jz/audit/sess-63099-1791358756203.jsonl",
+  "/var/folders/dd/_2wx23y55n7fh4n6v24fw5280000gn/T/wob-mmzky0jz/audit/sess-63099-1791358756203.pub.key"
+ ]
+}

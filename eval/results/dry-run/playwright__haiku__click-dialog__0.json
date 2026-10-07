@@ -1,0 +1,77 @@
+{
+ "task": "click-dialog",
+ "seed": 0,
+ "model": "haiku",
+ "arm": "playwright",
+ "max_turns": 25,
+ "goal": "Close the dialog box by clicking the \"x\".",
+ "wall_s": 10.3,
+ "claude": {
+  "is_error": false,
+  "subtype": "success",
+  "num_turns": 4,
+  "total_cost_usd": 0.019549499999999997,
+  "usage": {
+   "input_tokens": 34,
+   "cache_creation_input_tokens": 6162,
+   "cache_read_input_tokens": 46465,
+   "output_tokens": 509,
+   "output_tokens_details": {
+    "thinking_tokens": 301
+   },
+   "server_tool_use": {
+    "web_search_requests": 0,
+    "web_fetch_requests": 0
+   },
+   "service_tier": "standard",
+   "cache_creation": {
+    "ephemeral_1h_input_tokens": 6162,
+    "ephemeral_5m_input_tokens": 0
+   },
+   "inference_geo": "not_available",
+   "iterations": [
+    {
+     "input_tokens": 8,
+     "output_tokens": 101,
+     "cache_read_input_tokens": 13408,
+     "cache_creation_input_tokens": 362,
+     "cache_creation": {
+      "ephemeral_5m_input_tokens": 0,
+      "ephemeral_1h_input_tokens": 362
+     },
+     "type": "message"
+    }
+   ],
+   "speed": "standard",
+   "fallback_credit": null
+  },
+  "modelUsage": {
+   "claude-haiku-4-5-20251001": {
+    "inputTokens": 34,
+    "outputTokens": 509,
+    "cacheReadInputTokens": 46465,
+    "cacheCreationInputTokens": 6162,
+    "webSearchRequests": 0,
+    "costUSD": 0.019549499999999997,
+    "contextWindow": 200000,
+    "maxOutputTokens": 32000,
+    "thinkingTokens": 301,
+    "canonicalModel": "claude-haiku-4-5",
+    "provider": "firstParty",
+    "costBasis": "list"
+   }
+  },
+  "duration_ms": 8876,
+  "duration_api_ms": 7639,
+  "terminal_reason": "completed",
+  "permission_denials": [],
+  "result": "DONE"
+ },
+ "state": {
+  "done": true,
+  "raw": 1,
+  "reward": 0.9901433333333334,
+  "reason": null
+ },
+ "success": true
+}

@@ -1,0 +1,77 @@
+{
+ "task": "enter-text",
+ "seed": 0,
+ "model": "haiku",
+ "arm": "playwright",
+ "max_turns": 25,
+ "goal": "Enter \"Cristin\" into the text field and press Submit.",
+ "wall_s": 7.8,
+ "claude": {
+  "is_error": false,
+  "subtype": "success",
+  "num_turns": 4,
+  "total_cost_usd": 0.017685600000000003,
+  "usage": {
+   "input_tokens": 26,
+   "cache_creation_input_tokens": 5934,
+   "cache_read_input_tokens": 33066,
+   "output_tokens": 497,
+   "output_tokens_details": {
+    "thinking_tokens": 273
+   },
+   "server_tool_use": {
+    "web_search_requests": 0,
+    "web_fetch_requests": 0
+   },
+   "service_tier": "standard",
+   "cache_creation": {
+    "ephemeral_1h_input_tokens": 5934,
+    "ephemeral_5m_input_tokens": 0
+   },
+   "inference_geo": "not_available",
+   "iterations": [
+    {
+     "input_tokens": 8,
+     "output_tokens": 122,
+     "cache_read_input_tokens": 12989,
+     "cache_creation_input_tokens": 553,
+     "cache_creation": {
+      "ephemeral_5m_input_tokens": 0,
+      "ephemeral_1h_input_tokens": 553
+     },
+     "type": "message"
+    }
+   ],
+   "speed": "standard",
+   "fallback_credit": null
+  },
+  "modelUsage": {
+   "claude-haiku-4-5-20251001": {
+    "inputTokens": 26,
+    "outputTokens": 497,
+    "cacheReadInputTokens": 33066,
+    "cacheCreationInputTokens": 5934,
+    "webSearchRequests": 0,
+    "costUSD": 0.017685600000000003,
+    "contextWindow": 200000,
+    "maxOutputTokens": 32000,
+    "thinkingTokens": 273,
+    "canonicalModel": "claude-haiku-4-5",
+    "provider": "firstParty",
+    "costBasis": "list"
+   }
+  },
+  "duration_ms": 6372,
+  "duration_api_ms": 5679,
+  "terminal_reason": "completed",
+  "permission_denials": [],
+  "result": "DONE"
+ },
+ "state": {
+  "done": true,
+  "raw": 1,
+  "reward": 0.9912866666666666,
+  "reason": null
+ },
+ "success": true
+}

@@ -30,3 +30,8 @@ dist/
 
 # Agent worktrees created by Claude Code.
 .claude/worktrees/
+
+# eval harness
+/eval/.venv/
+/eval/results/traces/
+/eval/__pycache__/

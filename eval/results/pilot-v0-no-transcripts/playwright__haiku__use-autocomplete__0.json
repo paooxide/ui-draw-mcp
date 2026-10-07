@@ -1,0 +1,77 @@
+{
+ "task": "use-autocomplete",
+ "seed": 0,
+ "model": "haiku",
+ "arm": "playwright",
+ "max_turns": 25,
+ "goal": "Enter an item that starts with \"Ecu\".",
+ "wall_s": 16.3,
+ "claude": {
+  "is_error": false,
+  "subtype": "success",
+  "num_turns": 9,
+  "total_cost_usd": 0.03305,
+  "usage": {
+   "input_tokens": 74,
+   "cache_creation_input_tokens": 8036,
+   "cache_read_input_tokens": 118390,
+   "output_tokens": 1013,
+   "output_tokens_details": {
+    "thinking_tokens": 506
+   },
+   "server_tool_use": {
+    "web_search_requests": 0,
+    "web_fetch_requests": 0
+   },
+   "service_tier": "standard",
+   "cache_creation": {
+    "ephemeral_1h_input_tokens": 8036,
+    "ephemeral_5m_input_tokens": 0
+   },
+   "inference_geo": "not_available",
+   "iterations": [
+    {
+     "input_tokens": 8,
+     "output_tokens": 114,
+     "cache_read_input_tokens": 15203,
+     "cache_creation_input_tokens": 441,
+     "cache_creation": {
+      "ephemeral_5m_input_tokens": 0,
+      "ephemeral_1h_input_tokens": 441
+     },
+     "type": "message"
+    }
+   ],
+   "speed": "standard",
+   "fallback_credit": null
+  },
+  "modelUsage": {
+   "claude-haiku-4-5-20251001": {
+    "inputTokens": 74,
+    "outputTokens": 1013,
+    "cacheReadInputTokens": 118390,
+    "cacheCreationInputTokens": 8036,
+    "webSearchRequests": 0,
+    "costUSD": 0.03305,
+    "contextWindow": 200000,
+    "maxOutputTokens": 32000,
+    "thinkingTokens": 506,
+    "canonicalModel": "claude-haiku-4-5",
+    "provider": "firstParty",
+    "costBasis": "list"
+   }
+  },
+  "duration_ms": 15052,
+  "duration_api_ms": 13163,
+  "terminal_reason": "completed",
+  "permission_denials": [],
+  "result": "DONE"
+ },
+ "state": {
+  "done": true,
+  "raw": 1,
+  "reward": 0.9787166666666667,
+  "reason": null
+ },
+ "success": true
+}

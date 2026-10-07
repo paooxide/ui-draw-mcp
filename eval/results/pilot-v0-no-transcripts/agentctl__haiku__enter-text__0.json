@@ -1,0 +1,81 @@
+{
+ "task": "enter-text",
+ "seed": 0,
+ "model": "haiku",
+ "arm": "agentctl",
+ "max_turns": 25,
+ "goal": "Enter \"Cristin\" into the text field and press Submit.",
+ "wall_s": 13.1,
+ "claude": {
+  "is_error": false,
+  "subtype": "success",
+  "num_turns": 7,
+  "total_cost_usd": 0.0294713,
+  "usage": {
+   "input_tokens": 58,
+   "cache_creation_input_tokens": 7191,
+   "cache_read_input_tokens": 98163,
+   "output_tokens": 1043,
+   "output_tokens_details": {
+    "thinking_tokens": 396
+   },
+   "server_tool_use": {
+    "web_search_requests": 0,
+    "web_fetch_requests": 0
+   },
+   "service_tier": "standard",
+   "cache_creation": {
+    "ephemeral_1h_input_tokens": 7191,
+    "ephemeral_5m_input_tokens": 0
+   },
+   "inference_geo": "not_available",
+   "iterations": [
+    {
+     "input_tokens": 8,
+     "output_tokens": 70,
+     "cache_read_input_tokens": 15858,
+     "cache_creation_input_tokens": 269,
+     "cache_creation": {
+      "ephemeral_5m_input_tokens": 0,
+      "ephemeral_1h_input_tokens": 269
+     },
+     "type": "message"
+    }
+   ],
+   "speed": "standard",
+   "fallback_credit": null
+  },
+  "modelUsage": {
+   "claude-haiku-4-5-20251001": {
+    "inputTokens": 58,
+    "outputTokens": 1043,
+    "cacheReadInputTokens": 98163,
+    "cacheCreationInputTokens": 7191,
+    "webSearchRequests": 0,
+    "costUSD": 0.0294713,
+    "contextWindow": 200000,
+    "maxOutputTokens": 32000,
+    "thinkingTokens": 396,
+    "canonicalModel": "claude-haiku-4-5",
+    "provider": "firstParty",
+    "costBasis": "list"
+   }
+  },
+  "duration_ms": 11478,
+  "duration_api_ms": 11338,
+  "terminal_reason": "completed",
+  "permission_denials": [],
+  "result": "DONE"
+ },
+ "state": {
+  "done": true,
+  "raw": -1,
+  "reward": -1,
+  "reason": null
+ },
+ "success": false,
+ "audit_files": [
+  "/var/folders/dd/_2wx23y55n7fh4n6v24fw5280000gn/T/wob-38j8nvee/audit/sess-59756-1791358099583.jsonl",
+  "/var/folders/dd/_2wx23y55n7fh4n6v24fw5280000gn/T/wob-38j8nvee/audit/sess-59756-1791358099583.pub.key"
+ ]
+}

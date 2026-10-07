@@ -1,0 +1,81 @@
+{
+ "task": "choose-list",
+ "seed": 1,
+ "model": "haiku",
+ "arm": "agentctl",
+ "max_turns": 25,
+ "goal": "Select Margret from the list and click Submit.",
+ "wall_s": 21.2,
+ "claude": {
+  "is_error": false,
+  "subtype": "success",
+  "num_turns": 11,
+  "total_cost_usd": 0.0432946,
+  "usage": {
+   "input_tokens": 90,
+   "cache_creation_input_tokens": 9020,
+   "cache_read_input_tokens": 165996,
+   "output_tokens": 1713,
+   "output_tokens_details": {
+    "thinking_tokens": 622
+   },
+   "server_tool_use": {
+    "web_search_requests": 0,
+    "web_fetch_requests": 0
+   },
+   "service_tier": "standard",
+   "cache_creation": {
+    "ephemeral_1h_input_tokens": 9020,
+    "ephemeral_5m_input_tokens": 0
+   },
+   "inference_geo": "not_available",
+   "iterations": [
+    {
+     "input_tokens": 8,
+     "output_tokens": 113,
+     "cache_read_input_tokens": 17589,
+     "cache_creation_input_tokens": 367,
+     "cache_creation": {
+      "ephemeral_5m_input_tokens": 0,
+      "ephemeral_1h_input_tokens": 367
+     },
+     "type": "message"
+    }
+   ],
+   "speed": "standard",
+   "fallback_credit": null
+  },
+  "modelUsage": {
+   "claude-haiku-4-5-20251001": {
+    "inputTokens": 90,
+    "outputTokens": 1713,
+    "cacheReadInputTokens": 165996,
+    "cacheCreationInputTokens": 9020,
+    "webSearchRequests": 0,
+    "costUSD": 0.0432946,
+    "contextWindow": 200000,
+    "maxOutputTokens": 32000,
+    "thinkingTokens": 622,
+    "canonicalModel": "claude-haiku-4-5",
+    "provider": "firstParty",
+    "costBasis": "list"
+   }
+  },
+  "duration_ms": 19744,
+  "duration_api_ms": 19574,
+  "terminal_reason": "completed",
+  "permission_denials": [],
+  "result": "DONE"
+ },
+ "state": {
+  "done": true,
+  "raw": 1,
+  "reward": 0.9713283333333333,
+  "reason": null
+ },
+ "success": true,
+ "audit_files": [
+  "/var/folders/dd/_2wx23y55n7fh4n6v24fw5280000gn/T/wob-y8ynbjvf/audit/sess-62767-1791358692659.jsonl",
+  "/var/folders/dd/_2wx23y55n7fh4n6v24fw5280000gn/T/wob-y8ynbjvf/audit/sess-62767-1791358692659.pub.key"
+ ]
+}

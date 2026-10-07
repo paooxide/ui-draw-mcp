@@ -1,0 +1,77 @@
+{
+ "task": "choose-list",
+ "seed": 1,
+ "model": "haiku",
+ "arm": "playwright",
+ "max_turns": 25,
+ "goal": "Select Margret from the list and click Submit.",
+ "wall_s": 69.7,
+ "claude": {
+  "is_error": false,
+  "subtype": "success",
+  "num_turns": 13,
+  "total_cost_usd": 0.0716638,
+  "usage": {
+   "input_tokens": 98,
+   "cache_creation_input_tokens": 13059,
+   "cache_read_input_tokens": 179478,
+   "output_tokens": 5500,
+   "output_tokens_details": {
+    "thinking_tokens": 4539
+   },
+   "server_tool_use": {
+    "web_search_requests": 0,
+    "web_fetch_requests": 0
+   },
+   "service_tier": "standard",
+   "cache_creation": {
+    "ephemeral_1h_input_tokens": 13059,
+    "ephemeral_5m_input_tokens": 0
+   },
+   "inference_geo": "not_available",
+   "iterations": [
+    {
+     "input_tokens": 8,
+     "output_tokens": 926,
+     "cache_read_input_tokens": 20203,
+     "cache_creation_input_tokens": 464,
+     "cache_creation": {
+      "ephemeral_5m_input_tokens": 0,
+      "ephemeral_1h_input_tokens": 464
+     },
+     "type": "message"
+    }
+   ],
+   "speed": "standard",
+   "fallback_credit": null
+  },
+  "modelUsage": {
+   "claude-haiku-4-5-20251001": {
+    "inputTokens": 98,
+    "outputTokens": 5500,
+    "cacheReadInputTokens": 179478,
+    "cacheCreationInputTokens": 13059,
+    "webSearchRequests": 0,
+    "costUSD": 0.0716638,
+    "contextWindow": 200000,
+    "maxOutputTokens": 32000,
+    "thinkingTokens": 4539,
+    "canonicalModel": "claude-haiku-4-5",
+    "provider": "firstParty",
+    "costBasis": "list"
+   }
+  },
+  "duration_ms": 68131,
+  "duration_api_ms": 61169,
+  "terminal_reason": "completed",
+  "permission_denials": [],
+  "result": "DONE"
+ },
+ "state": {
+  "done": true,
+  "raw": 1,
+  "reward": 0.9414783333333333,
+  "reason": null
+ },
+ "success": true
+}

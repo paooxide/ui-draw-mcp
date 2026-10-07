@@ -1,0 +1,77 @@
+{
+ "task": "use-autocomplete",
+ "seed": 1,
+ "model": "haiku",
+ "arm": "playwright",
+ "max_turns": 25,
+ "goal": "Enter an item that starts with \"Be\" and ends with \"nin\".",
+ "wall_s": 29.6,
+ "claude": {
+  "is_error": false,
+  "subtype": "success",
+  "num_turns": 11,
+  "total_cost_usd": 0.043946900000000004,
+  "usage": {
+   "input_tokens": 90,
+   "cache_creation_input_tokens": 9708,
+   "cache_read_input_tokens": 156009,
+   "output_tokens": 1768,
+   "output_tokens_details": {
+    "thinking_tokens": 1063
+   },
+   "server_tool_use": {
+    "web_search_requests": 0,
+    "web_fetch_requests": 0
+   },
+   "service_tier": "standard",
+   "cache_creation": {
+    "ephemeral_1h_input_tokens": 9708,
+    "ephemeral_5m_input_tokens": 0
+   },
+   "inference_geo": "not_available",
+   "iterations": [
+    {
+     "input_tokens": 8,
+     "output_tokens": 152,
+     "cache_read_input_tokens": 16864,
+     "cache_creation_input_tokens": 452,
+     "cache_creation": {
+      "ephemeral_5m_input_tokens": 0,
+      "ephemeral_1h_input_tokens": 452
+     },
+     "type": "message"
+    }
+   ],
+   "speed": "standard",
+   "fallback_credit": null
+  },
+  "modelUsage": {
+   "claude-haiku-4-5-20251001": {
+    "inputTokens": 90,
+    "outputTokens": 1768,
+    "cacheReadInputTokens": 156009,
+    "cacheCreationInputTokens": 9708,
+    "webSearchRequests": 0,
+    "costUSD": 0.043946900000000004,
+    "contextWindow": 200000,
+    "maxOutputTokens": 32000,
+    "thinkingTokens": 1063,
+    "canonicalModel": "claude-haiku-4-5",
+    "provider": "firstParty",
+    "costBasis": "list"
+   }
+  },
+  "duration_ms": 28159,
+  "duration_api_ms": 20653,
+  "terminal_reason": "completed",
+  "permission_denials": [],
+  "result": "DONE"
+ },
+ "state": {
+  "done": true,
+  "raw": 1,
+  "reward": 0.9572283333333333,
+  "reason": null
+ },
+ "success": true
+}
