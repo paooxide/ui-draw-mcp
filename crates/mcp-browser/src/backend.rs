@@ -634,6 +634,20 @@ fn sanitize_snapshot_semantics(snap: &mut Value) {
         if let Some(b) = obj.get_mut("bound_state") {
             *b = cap_bound_state(b.take());
         }
+        compact_node(obj);
+    }
+}
+
+/// Drop what a node says by default: null and empty-string fields, and
+/// `is_enabled: true`. A disabled node says so as `disabled: true`, the word
+/// `component` assertions use. A snapshot lists hundreds of nodes, so every
+/// absent key is tokens the agent does not read; a missing key means null.
+fn compact_node(obj: &mut serde_json::Map<String, Value>) {
+    obj.retain(|_, v| !(v.is_null() || v.as_str() == Some("")));
+    if let Some(enabled) = obj.remove("is_enabled") {
+        if enabled == json!(false) {
+            obj.insert("disabled".into(), json!(true));
+        }
     }
 }
 
@@ -1916,9 +1930,13 @@ function __xp(el){
     var parts = [];
     var node = curr;
     while(node && node.nodeType === 1 && node.tagName !== 'HTML'){
-      var ix = 1, sib = node.previousElementSibling;
-      while(sib){ if(sib.tagName === node.tagName) ix++; sib = sib.previousElementSibling; }
-      parts.unshift(node.tagName.toLowerCase() + '[' + ix + ']');
+      var ix = 1, only = true, sib = node.previousElementSibling;
+      while(sib){ if(sib.tagName === node.tagName){ ix++; only = false; } sib = sib.previousElementSibling; }
+      sib = node.nextElementSibling;
+      while(only && sib){ if(sib.tagName === node.tagName) only = false; sib = sib.nextElementSibling; }
+      // `tag` and `tag[1]` select the same node when it has no same-tag
+      // sibling, so the index is left off (shorter refs, fewer tokens).
+      parts.unshift(node.tagName.toLowerCase() + (only ? '' : '[' + ix + ']'));
       var p = node.parentElement;
       if(!p && node.parentNode && node.parentNode.host){
         break;
@@ -1969,6 +1987,23 @@ function __canvas_box(canvas, reg){
   var w = (reg.w || 40) * sx, h = (reg.h || 40) * sy;
   return { x: left + (reg.x || 0) * sx, y: top + (reg.y || 0) * sy, w: w, h: h };
 }
+// Walk `tag[n]/tag` steps down from a shadow root, one level per step. `tag`
+// and `tag[1]` both mean the first child of that tag, so refs from before the
+// short form (every step indexed) and after it resolve alike.
+function __walk_steps(root, seg){
+  var cur = root, steps = seg.split('/');
+  for(var i = 0; i < steps.length; i++){
+    var m = /^([^\[]+)(?:\[(\d+)\])?$/.exec(steps[i]);
+    if(!m) return null;
+    var want = m[1].toLowerCase(), n = m[2] ? +m[2] : 1, seen = 0, next = null;
+    for(var k = 0; k < cur.children.length; k++){
+      if(cur.children[k].tagName.toLowerCase() === want && ++seen === n){ next = cur.children[k]; break; }
+    }
+    if(!next) return null;
+    cur = next;
+  }
+  return cur;
+}
 function __resolve(xp){
   if(!xp) return null;
   if(xp.indexOf('::canvas[') >= 0){
@@ -1999,18 +2034,7 @@ function __resolve(xp){
         if(!host.shadowRoot) return null;
         curr = host.shadowRoot;
       } else {
-        var found = null;
-        try {
-          var selector = seg.replace(/\[(\d+)\]/g, ':nth-of-type($1)').replace(/\//g, ' > ');
-          if(selector.startsWith(' > ')) selector = selector.slice(3);
-          found = curr.querySelector(selector);
-        } catch(e){}
-        if(!found){
-          try {
-            var r = document.evaluate('.//' + seg, curr, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null);
-            found = r.singleNodeValue;
-          } catch(e){}
-        }
+        var found = __walk_steps(curr, seg);
         if(!found) return null;
         if(i === parts.length - 1) return found;
         if(!found.shadowRoot) return null;
@@ -7107,6 +7131,26 @@ mod tests {
         let mut text = json!({ "text": "hi" });
         sanitize_snapshot_semantics(&mut text);
         assert_eq!(text, json!({ "text": "hi" }));
+    }
+
+    #[test]
+    fn snapshot_nodes_drop_empty_fields_and_default_enabled() {
+        let mut snap = json!({ "nodes": [
+            { "ref": "/html/body/input", "tag": "input", "role": null, "name": "", "x": 0,
+              "semantic_intent": null, "bound_state": null, "is_enabled": true },
+            { "ref": "/html/body/button", "tag": "button", "role": "tab", "name": "Go",
+              "bound_state": { "n": 0 }, "is_enabled": false },
+        ]});
+        sanitize_snapshot_semantics(&mut snap);
+        assert_eq!(
+            snap["nodes"][0],
+            json!({ "ref": "/html/body/input", "tag": "input", "x": 0 })
+        );
+        assert_eq!(
+            snap["nodes"][1],
+            json!({ "ref": "/html/body/button", "tag": "button", "role": "tab",
+                    "name": "Go", "bound_state": { "n": 0 }, "disabled": true })
+        );
     }
 
     #[test]
