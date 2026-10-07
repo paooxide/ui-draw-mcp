@@ -159,6 +159,9 @@ pub fn render_markdown(tools: &[ToolDescriptor]) -> String {
         s.push_str(&format!("\n### {}\n\n", d.name.replace('_', "-")));
         s.push_str(&format!("`{}` · {} tier\n\n", d.name, tier_str(d)));
         s.push_str(&format!("{}\n\n", d.description));
+        if let Some(details) = &d.details {
+            s.push_str(&format!("{details}\n\n"));
+        }
 
         let required: Vec<String> = d
             .input_schema
@@ -222,7 +225,8 @@ mod tests {
                     "region": {"type":"object","properties":{"x":{"type":"number"}}},
                     "mode": {"type":"string","enum":["a","b"],"description":"which | mode"}
                 },"required":["mode"]}),
-            ),
+            )
+            .details("Docs-only caveat for the reference."),
             ToolDescriptor::new(
                 "aaa_danger",
                 Category::Credentials,
@@ -249,6 +253,18 @@ mod tests {
         assert!(md.contains("| `region.x` | number |"));
         // A pipe inside a description must not break the table.
         assert!(md.contains("which \\| mode"));
+    }
+
+    #[test]
+    fn details_render_after_the_description_and_only_there() {
+        let md = render_markdown(&fixture());
+        let desc = md.find("Look at something. Extra detail").unwrap();
+        let details = md.find("Docs-only caveat for the reference.").unwrap();
+        let table = md.find("| Argument |").unwrap();
+        assert!(desc < details && details < table);
+        // The one-line summary table stays a summary.
+        assert_eq!(md.matches("Docs-only caveat").count(), 1);
+        assert!(!render_json(&fixture()).contains("Docs-only caveat"));
     }
 
     #[test]

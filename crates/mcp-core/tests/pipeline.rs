@@ -31,7 +31,8 @@ impl ToolModule for MockModule {
                 Tier::Read,
                 "read-tier vision tool",
                 json!({ "type": "object", "properties": {}, "required": [] }),
-            ),
+            )
+            .details("docs-only text, never sent to the model"),
             ToolDescriptor::new(
                 "term_run",
                 Category::Terminal,
@@ -164,6 +165,17 @@ async fn tools_list_only_shows_enabled_categories() {
     assert!(names.contains(&"vision_probe"));
     assert!(names.contains(&"danger_op"));
     assert!(!names.contains(&"term_run"));
+}
+
+#[tokio::test]
+async fn tools_list_leaves_out_docs_only_details() {
+    let (server, _, _) = server_with(vision_only());
+    let out = server
+        .handle_line(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#)
+        .await
+        .unwrap();
+    assert!(!out.contains("docs-only"), "details leaked into tools/list");
+    assert!(out.contains("read-tier vision tool"));
 }
 
 #[tokio::test]

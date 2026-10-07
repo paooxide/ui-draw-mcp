@@ -55,9 +55,24 @@ operated.
 - **Built-in `browser` role** (`--role browser`, `AGENTCTL_ROLE=browser`, `policy.role`): only the browser
   tools are advertised, 27 instead of 124. `access` turns every category on, so before this the only way to
   get a browser-only list with `access` set was a custom role.
+- **Built-in `browser-core` role** (`--role browser-core`, `AGENTCTL_ROLE=browser-core`): the 12 browser
+  tools a page task needs (`browser_connect`, `browser_tabs`, `browser_navigate`, `browser_snapshot`,
+  `browser_query`, `browser_act`, `browser_fill_form`, `browser_wait`, `browser_screenshot`,
+  `browser_extract`, `browser_dialog`, `browser_upload`). The tool list is re-sent every turn, so a smaller
+  one is cheaper on every call: about 3.0k tokens against 6.5k for `browser` (4.5k before the descriptions
+  below were shortened). `browser_upload` stays dangerous-tier; listing it only lets an operator enable it.
+- **`ToolDescriptor::details`**, docs-only text that `tools/list` does not send and
+  `agentctl tools --markdown` prints after the description.
 
 ### Changed
 
+- **Shorter browser tool list.** The MiniWoB++ dry run (`eval/README.md`) found Claude Haiku 4.5 using about
+  twice the input tokens with agentctl's browser tools than with Playwright MCP, and the tool list is part of
+  every turn. The wire descriptions and schema property descriptions of the browser tools now say what a model
+  needs to call them (what the tool does, non-obvious arguments, result fields to read); engine caveats,
+  rationale and long enumerations moved to `details` and are in `docs/tools.md`, nothing was dropped. The
+  `browser` role's list went from about 9.7k to 6.5k tokens (-33%), measured as the JSON of `tools/list`
+  at 4 characters a token.
 - **`browser_snapshot` nodes are compact.** Null and empty fields are left out (a missing `role`, `name`,
   `semantic_intent` or `bound_state` means none), `is_enabled: true` is gone and a disabled node says
   `disabled: true`, and an XPath ref drops `[1]` on a tag with no same-tag sibling (`/html/body/form/input`,
