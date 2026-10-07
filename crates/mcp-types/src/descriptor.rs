@@ -99,6 +99,11 @@ pub struct ToolDescriptor {
     /// are an injection surface. Engines set this because engines know what
     /// their output contains; the core marks the result centrally.
     pub untrusted_output: bool,
+    /// Documentation that is not sent to the model: engine caveats, rationale,
+    /// long enumerations. `tools/list` omits it; `agentctl tools --markdown`
+    /// renders it after the description. Keeps the wire description short
+    /// without losing what a person reading the reference needs.
+    pub details: Option<String>,
 }
 
 impl ToolDescriptor {
@@ -119,6 +124,7 @@ impl ToolDescriptor {
             idempotent: None,
             open_world: None,
             untrusted_output: false,
+            details: None,
         }
     }
 
@@ -144,6 +150,12 @@ impl ToolDescriptor {
     /// boundary.
     pub fn untrusted_output(mut self) -> Self {
         self.untrusted_output = true;
+        self
+    }
+
+    /// Attach docs-only text (see [`ToolDescriptor::details`]).
+    pub fn details(mut self, text: impl Into<String>) -> Self {
+        self.details = Some(text.into());
         self
     }
 

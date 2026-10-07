@@ -86,6 +86,55 @@ fn test_builtin_browser_role() {
 }
 
 #[test]
+fn test_builtin_browser_core_role() {
+    let role = RoleProfile::browser_core();
+    assert_eq!(role.name, "browser-core");
+
+    let core = [
+        "browser_connect",
+        "browser_tabs",
+        "browser_navigate",
+        "browser_snapshot",
+        "browser_query",
+        "browser_act",
+        "browser_fill_form",
+        "browser_wait",
+        "browser_screenshot",
+        "browser_extract",
+        "browser_dialog",
+        "browser_upload",
+    ];
+    for name in core {
+        // browser_upload is dangerous-tier: the role lists it so an operator
+        // can enable it, and the policy still decides whether it runs.
+        let tier = if name == "browser_upload" {
+            Tier::Dangerous
+        } else {
+            Tier::Standard
+        };
+        assert!(
+            role.allows_tool(&make_tool(name, Category::Browser, tier)),
+            "{name} should be advertised"
+        );
+    }
+    for name in [
+        "browser_eval",
+        "browser_flow",
+        "browser_showcase",
+        "browser_cookies",
+    ] {
+        assert!(
+            !role.allows_tool(&make_tool(name, Category::Browser, Tier::Standard)),
+            "{name} should not be advertised"
+        );
+    }
+    assert!(!role.allows_tool(&make_tool("fs_read", Category::Filesystem, Tier::Read)));
+
+    let resolved = mcp_policy::resolve_role_profile("browser-core", &Default::default());
+    assert_eq!(resolved, Some(role));
+}
+
+#[test]
 fn test_builtin_operator_role_requires_consent() {
     let role = RoleProfile::operator();
     let dangerous_tool = make_tool("format_disk", Category::System, Tier::Dangerous);

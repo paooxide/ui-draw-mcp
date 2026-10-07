@@ -2349,43 +2349,67 @@ impl ToolModule for BrowserModule {
                 "browser_connect",
                 Category::Browser,
                 Tier::Standard,
-                "Attach to a Chromium browser started with --remote-debugging-port, or launch a dedicated instance. The result lists the open tabs (active first) and the active target_id. Optionally auto-restores a saved profile. The browser's active tab is brought to the front on connect (result 'foregrounded'). launch.browser='safari' drives Safari through safaridriver (macOS only, experimental: needs `safaridriver --enable` once, and a Safari that was already open when automation was enabled must be quit first; opens a visible window). On Safari, browser_network, browser_dialog, browser_viewport, browser_record, browser_branch, browser_checkpoint and browser_act 'press' return Unsupported.",
+                "Attach to a Chromium started with --remote-debugging-port, or launch one. Returns the open tabs (active first) and the active target_id.",
                 obj(
                     json!({
                         "attach": { "type": "object", "properties": { "port": { "type": "integer" } } },
                         "launch": { "type": "object", "properties": {
-                            "browser": { "type": "string", "enum": ["chromium", "safari"], "description": "chromium (default) launches an auto-discovered Chrome/Chromium; safari launches experimental Safari via safaridriver (macOS only)" },
-                            "url": { "type": "string", "description": "first page to open; Safari only (Chromium: use browser_navigate); checked against the navigation policy" },
-                            "port": { "type": "integer", "description": "remote-debugging port; omit or 0 to let Chrome pick a free one (the connect result reports it)" },
+                            "browser": { "type": "string", "enum": ["chromium", "safari"], "description": "default chromium; safari is experimental (macOS)" },
+                            "url": { "type": "string", "description": "Safari only: first page to open" },
+                            "port": { "type": "integer", "description": "omit or 0 to pick a free port" },
                             "headless": { "type": "boolean" },
-                            "args": { "type": "array", "items": { "type": "string" }, "description": "Chromium only: extra command-line flags, each one entry written --name or --name=value (no spaces; at most 32). Only these are accepted: --window-size, --window-position, --start-maximized, --start-fullscreen, --force-device-scale-factor, --hide-scrollbars, --force-dark-mode, --lang, --accept-lang, --user-agent, --mute-audio, --autoplay-policy, --disable-gpu, --disable-extensions, --disable-notifications, --disable-default-apps, --disable-sync, --disable-search-engine-choice-screen, --use-fake-device-for-media-stream, --auto-open-devtools-for-tabs, --incognito, the three --disable-*background* flags, and --disable-features naming CalculateNativeWinOcclusion, Translate, MediaRouter, OptimizationHints, AutofillServerCommunication or PaintHolding (merged with agentctl's own)" },
-                            "background_throttling": { "type": "boolean", "description": "Chromium only. A visible (headless=false) browser is started with flags that stop Chrome throttling timers, rendering and screen recording when its window is behind another or covered. Set true to leave Chrome's normal throttling on. Default false" },
+                            "args": { "type": "array", "items": { "type": "string" }, "description": "Chromium only: extra flags as --name or --name=value; an allowlist, anything else is refused with the list" },
+                            "background_throttling": { "type": "boolean", "description": "Chromium only: true keeps Chrome's throttling when the window is covered (default false)" },
                             "user_data_dir": { "type": "string" },
-                            "profile": { "type": "string", "description": "saved profile name to auto-restore upon connecting" }
+                            "profile": { "type": "string", "description": "saved profile to restore" }
                         } },
-                        "profile": { "type": "string", "description": "saved profile name to auto-restore upon connecting" }
+                        "profile": { "type": "string", "description": "saved profile to restore" }
                     }),
                     json!([]),
                 ),
+            ).details(
+                "Optionally auto-restores a saved profile. The browser's active tab is brought to the front on connect \
+                 (result 'foregrounded'). `launch.browser='safari'` drives Safari through safaridriver (macOS only, \
+                 experimental: needs `safaridriver --enable` once, and a Safari that was already open when automation was \
+                 enabled must be quit first; opens a visible window). On Safari, browser_network, browser_dialog, \
+                 browser_viewport, browser_record, browser_branch, browser_checkpoint and browser_act 'press' return \
+                 Unsupported.\n\n\
+                 `launch.url` is Safari only (on Chromium use browser_navigate) and is checked against the navigation \
+                 policy. `launch.port` omitted or 0 lets Chrome pick a free one; the connect result reports it. \
+                 `launch.args` are Chromium only, each one entry written --name or --name=value (no spaces; at most 32). \
+                 Only these are accepted: --window-size, --window-position, --start-maximized, --start-fullscreen, \
+                 --force-device-scale-factor, --hide-scrollbars, --force-dark-mode, --lang, --accept-lang, --user-agent, \
+                 --mute-audio, --autoplay-policy, --disable-gpu, --disable-extensions, --disable-notifications, \
+                 --disable-default-apps, --disable-sync, --disable-search-engine-choice-screen, \
+                 --use-fake-device-for-media-stream, --auto-open-devtools-for-tabs, --incognito, the three \
+                 --disable-*background* flags, and --disable-features naming CalculateNativeWinOcclusion, Translate, \
+                 MediaRouter, OptimizationHints, AutofillServerCommunication or PaintHolding (merged with agentctl's own).\n\n\
+                 `launch.background_throttling`: a visible (headless=false) browser is started with flags that stop Chrome \
+                 throttling timers, rendering and screen recording when its window is behind another or covered. Set true \
+                 to leave Chrome's normal throttling on. Default false. `profile` (top level or under `launch`) is the \
+                 saved profile name to auto-restore upon connecting.",
             ).untrusted_output(),
             ToolDescriptor::new(
                 "browser_disconnect",
                 Category::Browser,
                 Tier::Standard,
-                "Disconnect from a browser. With kill=true, also stop a browser this session launched and delete the temporary profile it created (attached browsers are never killed).",
+                "Disconnect from a browser. kill=true also stops one agentctl launched (an attached browser is never killed).",
                 obj(
                     json!({
                         "browser_id": { "type": "integer" },
-                        "kill": { "type": "boolean", "description": "stop the process; only valid for a browser agentctl launched" }
+                        "kill": { "type": "boolean" }
                     }),
                     json!(["browser_id"]),
                 ),
+            ).details(
+                "With kill=true, also stop a browser this session launched and delete the temporary profile it created \
+                 (attached browsers are never killed). `kill` is only valid for a browser agentctl launched.",
             ),
             ToolDescriptor::new(
                 "browser_tabs",
                 Category::Browser,
                 Tier::Standard,
-                "List/open/activate/close tabs (targets) of a connected browser.",
+                "List, open (url), activate or close (target_id) tabs of a connected browser.",
                 obj(
                     json!({
                         "browser_id": { "type": "integer" },
@@ -2400,10 +2424,10 @@ impl ToolModule for BrowserModule {
                 "browser_navigate",
                 Category::Browser,
                 Tier::Standard,
-                "Navigate a tab: goto a url, or go back/forward/reload.",
+                "Navigate a tab: goto a url, or go back, forward or reload.",
                 obj(
                     json!({
-                        "target_id": { "type": "string", "description": "the tab id; defaults to the active tab" },
+                        "target_id": { "type": "string", "description": "tab id (default: active tab)" },
                         "action": { "type": "string", "enum": ["goto", "back", "forward", "reload"] },
                         "url": { "type": "string" }
                     }),
@@ -2414,26 +2438,28 @@ impl ToolModule for BrowserModule {
                 "browser_snapshot",
                 Category::Browser,
                 Tier::Read,
-                "Flatten a page into interactable node refs (dom/accessibility) or raw text. The web equivalent of get_ui_tree. \
-                 A <canvas> gets child nodes (tag canvas-child) only if the page itself publishes its interactive regions \
-                 via canvas.__agentctl_regions or a data-canvas-regions JSON attribute; any other canvas is an opaque node.",
+                "Flatten a page into interactable node refs (dom or accessibility mode) or raw text. Pass the refs to browser_act.",
                 obj(
                     json!({
-                        "target_id": { "type": "string", "description": "the tab id; defaults to the active tab" },
+                        "target_id": { "type": "string", "description": "tab id (default: active tab)" },
                         "mode": { "type": "string", "enum": ["dom", "accessibility", "text"] },
-                        "root_selector": { "type": "string" }
+                        "root_selector": { "type": "string", "description": "limit the snapshot to this subtree" }
                     }),
                     json!([]),
                 ),
+            ).details(
+                "The web equivalent of get_ui_tree. A <canvas> gets child nodes (tag canvas-child) only if the page itself \
+                 publishes its interactive regions via canvas.__agentctl_regions or a data-canvas-regions JSON attribute; \
+                 any other canvas is an opaque node.",
             ).untrusted_output(),
             ToolDescriptor::new(
                 "browser_query",
                 Category::Browser,
                 Tier::Read,
-                "Resolve node ref(s) by css selector, xpath, or text (case-insensitive, exact matches first, clickable elements preferred).",
+                "Resolve node refs by css selector, xpath or text (case-insensitive; exact matches first, clickable elements preferred). all=true returns every match.",
                 obj(
                     json!({
-                        "target_id": { "type": "string", "description": "the tab id; defaults to the active tab" },
+                        "target_id": { "type": "string", "description": "tab id (default: active tab)" },
                         "by": { "type": "string", "enum": ["css", "xpath", "text"] },
                         "query": { "type": "string" },
                         "all": { "type": "boolean" }
@@ -2445,330 +2471,415 @@ impl ToolModule for BrowserModule {
                 "browser_act",
                 Category::Browser,
                 Tier::Standard,
-                "Act on a DOM node: click, type, select, hover, focus, scroll_into_view, submit, press \
-                 (value Enter, Escape, Tab, ArrowDown, ArrowUp, ArrowLeft, ArrowRight, Home, End, PageUp, PageDown, Backspace, Delete or Space, sent as a real key event to the focused node; Chrome only). \
-                 On Chrome a click is real pointer input (mousedown, mouseup, click, as a person's) and type is a real insertion that replaces the field's content, so React-style controlled fields and menus that open on mousedown work; the result reports input 'cdp', or 'synthetic' with input_reason when the element is covered, off screen, in a frame, a select/option or a file input. type reports value_after (value_length for a password or secret field). A page-published canvas region (a canvas-child ref from browser_snapshot) supports only click and hover, \
-                 sent as real mouse input at the region centre; other actions on it return Unsupported. \
-                 Target it with 'ref' (from browser_query/snapshot) or, in one call, with \
-                 'query' plus optional 'by' (css/xpath/text; text is case-insensitive, exact matches first, clickable elements preferred), 'within' (scoped container), 'text' (substring filter), and 'index'.",
+                "Act on a DOM node: click, type, select, hover, focus, scroll_into_view, submit or press. Target it with 'ref' (from browser_query/snapshot) or with 'query' plus optional by, within, text, index. type replaces the field's content and reports value_after. A click returns at once, before its request or navigation has begun: use wait_after='settle' or browser_wait.",
                 obj(
                     json!({
-                        "target_id": { "type": "string", "description": "the tab id; defaults to the active tab" },
+                        "target_id": { "type": "string", "description": "tab id (default: active tab)" },
                         "ref": { "type": "string", "description": "a ref from browser_query/snapshot" },
-                        "by": { "type": "string", "enum": ["css", "xpath", "text"], "description": "how to read 'query' (default css); used when no 'ref'" },
-                        "query": { "type": "string", "description": "selector to resolve and act on in one call, instead of 'ref'. type and press with neither ref nor query act on the focused element" },
-                        "within": { "type": "string", "description": "optional CSS/XPath root selector to scope query search" },
-                        "text": { "type": "string", "description": "optional text substring filter to narrow matches" },
-                        "index": { "type": "integer", "description": "optional 0-based match index if query matches multiple elements (default 0)" },
+                        "by": { "type": "string", "enum": ["css", "xpath", "text"], "description": "how to read 'query' (default css)" },
+                        "query": { "type": "string", "description": "selector to resolve and act on in one call, instead of 'ref'; type and press with neither act on the focused element" },
+                        "within": { "type": "string", "description": "root selector scoping the query" },
+                        "text": { "type": "string", "description": "substring filter on the matches" },
+                        "index": { "type": "integer", "description": "0-based match index (default 0)" },
                         "action": { "type": "string", "enum": ["click", "type", "select", "hover", "focus", "scroll_into_view", "submit", "press"] },
-                        "value": { "type": "string", "description": "text for type, option for select, or key name for press (Enter, Escape, Tab, ArrowDown, ArrowUp, ArrowLeft, ArrowRight, Home, End, PageUp, PageDown, Backspace, Delete, Space)" },
-                        "secret": { "type": "boolean", "description": "the value is a secret: keep it out of the audit log and never show it in the showcase typing HUD (password and one-time-code fields are masked automatically)" },
-                        "scroll": { "type": "string", "enum": ["none", "nearest", "center"], "description": "how to bring the element into view first: nearest (default) moves the page only as far as needed and not at all when it is visible, center centres it (can scroll a wide page sideways), none does not scroll. scroll_into_view always scrolls" },
-                        "wait_after": { "type": "string", "enum": ["none", "settle"], "description": "none (default) returns as soon as the action ran, when a click's request or navigation has usually not begun yet. settle then waits for a navigation it started to load, for htmx_settled if the page has htmx, and for the network to go quiet, and adds navigated, requests_started (fetch/XHR/htmx begun on the page since the action) and settled to the result. A click that starts no request and no navigation costs about 2s here; Chrome only" },
-                        "timeout_ms": { "type": "integer", "description": "wait_after settle only: bound for the whole settle wait (default 10000); when it runs out the action still succeeded and the result has settled:false and settle_error" }
+                        "value": { "type": "string", "description": "text for type, option for select, key for press: Enter, Escape, Tab, ArrowDown/Up/Left/Right, Home, End, PageUp, PageDown, Backspace, Delete, Space" },
+                        "secret": { "type": "boolean", "description": "value is a secret: kept out of the audit log and the showcase HUD" },
+                        "scroll": { "type": "string", "enum": ["none", "nearest", "center"], "description": "bring the element into view first (default nearest)" },
+                        "wait_after": { "type": "string", "enum": ["none", "settle"], "description": "settle waits for a started navigation, htmx and quiet network, and adds navigated, requests_started and settled to the result (Chrome; about 2s when nothing starts). Default none" },
+                        "timeout_ms": { "type": "integer", "description": "settle bound (default 10000); on expiry the action still succeeded and the result has settled:false" }
                     }),
                     json!(["action"]),
                 ),
+            ).details(
+                "`press` takes a key name in `value` (Enter, Escape, Tab, ArrowDown, ArrowUp, ArrowLeft, ArrowRight, Home, \
+                 End, PageUp, PageDown, Backspace, Delete or Space), sent as a real key event to the focused node; Chrome \
+                 only. On Chrome a click is real pointer input (mousedown, mouseup, click, as a person's) and type is a real \
+                 insertion that replaces the field's content, so React-style controlled fields and menus that open on \
+                 mousedown work; the result reports input 'cdp', or 'synthetic' with input_reason when the element is \
+                 covered, off screen, in a frame, a select/option or a file input. type reports value_after (value_length \
+                 for a password or secret field). A page-published canvas region (a canvas-child ref from browser_snapshot) \
+                 supports only click and hover, sent as real mouse input at the region centre; other actions on it return \
+                 Unsupported.\n\n\
+                 Query targeting: 'by' is css, xpath or text (default css; used when no 'ref'); text is case-insensitive, \
+                 exact matches first, clickable elements preferred. 'within' is an optional CSS/XPath root selector scoping \
+                 the search, 'text' an optional substring filter to narrow matches, 'index' an optional 0-based match index \
+                 when the query matches several elements (default 0).\n\n\
+                 `secret`: the value is a secret, so it stays out of the audit log and is never shown in the showcase \
+                 typing HUD (password and one-time-code fields are masked automatically).\n\n\
+                 `scroll` brings the element into view first: nearest (default) moves the page only as far as needed and \
+                 not at all when it is visible, center centres it (can scroll a wide page sideways), none does not scroll. \
+                 scroll_into_view always scrolls.\n\n\
+                 `wait_after`: none (default) returns as soon as the action ran, when a click's request or navigation has \
+                 usually not begun yet. settle then waits for a navigation it started to load, for htmx_settled if the page \
+                 has htmx, and for the network to go quiet, and adds navigated, requests_started (fetch/XHR/htmx begun on \
+                 the page since the action) and settled to the result. A click that starts no request and no navigation \
+                 costs about 2s here; Chrome only. `timeout_ms` (wait_after settle only) bounds the whole settle wait \
+                 (default 10000); when it runs out the action still succeeded and the result has settled:false and \
+                 settle_error.",
             ).untrusted_output(),
             ToolDescriptor::new(
                 "browser_upload",
                 Category::Browser,
                 Tier::Dangerous,
-                "Attach local files to a file input (type=file; a click would open the OS file chooser, which agentctl cannot drive). \
-                 Target the input like browser_act: 'ref' or 'query' (plus optional 'by', 'within', 'text', 'index'). A label is followed to its input, \
-                 and an element holding exactly one file input uses that one; otherwise the error says what was found (target a hidden input directly). \
-                 'paths' holds 1 to 10 files, each at most 50 MiB, and more than one needs the input's multiple attribute. \
-                 Only files inside the configured fs.roots can be attached (credential stores are always refused): a page can read what is attached, \
-                 so this is how local files leave the machine. Chrome fires trusted input and change events. Returns {ok, files:[{name, bytes}], count, input_multiple}, \
-                 never file contents. Chrome only.",
+                "Attach local files to a file input (type=file). Target it like browser_act ('ref' or 'query'); 'paths' holds 1 to 10 absolute paths inside fs.roots. Returns {files:[{name, bytes}], count}, never file contents. Chrome only.",
                 obj(
                     json!({
-                        "target_id": { "type": "string", "description": "the tab id; defaults to the active tab" },
+                        "target_id": { "type": "string", "description": "tab id (default: active tab)" },
                         "ref": { "type": "string", "description": "a ref from browser_query/snapshot" },
-                        "by": { "type": "string", "enum": ["css", "xpath", "text"], "description": "how to read 'query' (default css); used when no 'ref'" },
-                        "query": { "type": "string", "description": "selector to resolve in one call, instead of 'ref'" },
-                        "within": { "type": "string", "description": "optional CSS/XPath root selector to scope query search" },
-                        "text": { "type": "string", "description": "optional text substring filter to narrow matches" },
-                        "index": { "type": "integer", "description": "optional 0-based match index if query matches multiple elements (default 0)" },
+                        "by": { "type": "string", "enum": ["css", "xpath", "text"] },
+                        "query": { "type": "string", "description": "selector, instead of 'ref'" },
+                        "within": { "type": "string" },
+                        "text": { "type": "string" },
+                        "index": { "type": "integer" },
                         "paths": {
                             "type": "array",
                             "items": { "type": "string" },
-                            "description": "absolute paths of the files to attach (1 to 10), inside fs.roots"
+                            "description": "absolute paths of the files to attach (1 to 10)"
                         }
                     }),
                     json!(["paths"]),
                 ),
+            ).details(
+                "Attach local files to a file input (type=file; a click would open the OS file chooser, which agentctl cannot \
+                 drive). Target the input like browser_act: 'ref' or 'query' (plus optional 'by', 'within', 'text', 'index'; \
+                 'by' defaults to css and is used when there is no 'ref'; 'within' is an optional CSS/XPath root selector, \
+                 'text' a substring filter, 'index' a 0-based match index, default 0). A label is followed to its input, and \
+                 an element holding exactly one file input uses that one; otherwise the error says what was found (target a \
+                 hidden input directly). 'paths' holds 1 to 10 files, each at most 50 MiB, and more than one needs the \
+                 input's multiple attribute. Only files inside the configured fs.roots can be attached (credential stores \
+                 are always refused): a page can read what is attached, so this is how local files leave the machine. \
+                 Chrome fires trusted input and change events. Returns {ok, files:[{name, bytes}], count, input_multiple}, \
+                 never file contents. Chrome only.",
             ),
             ToolDescriptor::new(
                 "browser_fill_form",
                 Category::Browser,
                 Tier::Standard,
-                "Fill multiple form fields (input, select, checkbox, radio) in one call and \
-                 optionally submit. Eliminates round-trips for registration or checkout forms.",
+                "Fill several form fields (input, select, checkbox, radio) in one call and optionally submit.",
                 obj(
                     json!({
-                        "target_id": { "type": "string", "description": "the tab id; defaults to the active tab" },
+                        "target_id": { "type": "string", "description": "tab id (default: active tab)" },
                         "fields": {
                             "type": "array",
                             "items": { "type": "object", "properties": {
                                 "ref": { "type": "string" },
                                 "selector": { "type": "string" },
-                                "by": { "type": "string", "enum": ["css", "xpath", "text"], "description": "how to read 'selector' (default css; a selector starting with / or ( is xpath)" }
+                                "by": { "type": "string", "enum": ["css", "xpath", "text"], "description": "how to read 'selector' (default css; a leading / or ( means xpath)" }
                             } },
-                            "description": "Array of fields: [{ref or selector, by, value, type, secret}]"
+                            "description": "[{ref or selector, by, value, type, secret}]"
                         },
                         "submit": {
                             "type": "object",
-                            "description": "Optional submit trigger: {ref or selector}"
+                            "description": "{ref or selector} of the submit control"
                         }
                     }),
                     json!(["fields"]),
                 ),
+            ).details(
+                "Eliminates round-trips for registration or checkout forms. `fields` is an array of \
+                 [{ref or selector, by, value, type, secret}]; `submit` is an optional submit trigger: {ref or selector}.",
             ),
             ToolDescriptor::new(
                 "browser_extract",
                 Category::Browser,
                 Tier::Read,
-                "Extract structured data directly from the page using a CSS/attribute schema \
-                 (e.g. text values, lists, tables). Offloads extraction parsing from the LLM.",
+                "Extract structured data (text, attributes, lists, tables) from the page with a schema of CSS rules.",
                 obj(
                     json!({
-                        "target_id": { "type": "string", "description": "the tab id; defaults to the active tab" },
+                        "target_id": { "type": "string", "description": "tab id (default: active tab)" },
                         "schema": {
                             "type": "object",
-                            "description": "Extraction schema mapping field names to rules {selector, attr, regex, multiple, fields}"
+                            "description": "field name to rule {selector, attr, regex, multiple, fields}"
                         },
                         "within": {
                             "type": "string",
-                            "description": "Optional CSS root selector to scope extraction"
+                            "description": "CSS root selector to scope extraction"
                         }
                     }),
                     json!(["schema"]),
                 ),
+            ).details(
+                "Offloads extraction parsing from the LLM. The schema maps field names to rules \
+                 {selector, attr, regex, multiple, fields}.",
             ).untrusted_output(),
             ToolDescriptor::new(
                 "browser_profile",
                 Category::Browser,
                 Tier::Standard,
-                "Save, restore, list, or delete browser session profiles (cookies, localStorage, \
-                 sessionStorage) for instant user or auth state swapping without re-logging in.",
+                "Save, restore, list or delete session profiles (cookies, localStorage, sessionStorage) to swap user or auth state without logging in again.",
                 obj(
                     json!({
                         "action": { "type": "string", "enum": ["save", "restore", "list", "delete"] },
-                        "target_id": { "type": "string", "description": "save/restore: the tab to snapshot or populate (default: the active tab)" },
-                        "name": { "type": "string", "description": "save/restore/delete: profile name" }
+                        "target_id": { "type": "string", "description": "save/restore: tab (default: active tab)" },
+                        "name": { "type": "string" }
                     }),
                     json!(["action"]),
                 ),
+            ).details(
+                "`target_id` (save/restore) is the tab to snapshot or populate; `name` (save/restore/delete) is the profile name.",
             ).untrusted_output(),
             ToolDescriptor::new(
                 "browser_branch",
                 Category::Browser,
                 Tier::Standard,
-                "Speculative browser context branching: fork an isolated background context from a \
-                 tab ('create'), run trials without affecting the visible tab, commit winning state \
-                 ('commit'), discard failed branches ('discard'), switch focus ('switch'), or list branches ('list'). \
-                 Branches run in a separate browser context and fail with an error if one cannot be created \
-                 (no silent fallback to the shared context). Commit and discard report an error unless the \
-                 work was done and the branch tab was really closed. At most 8 branches may be active at once \
-                 (AGENTCTL_MAX_BRANCHES). Chrome only: a Safari tab returns Unsupported.",
+                "Fork an isolated background context from a tab (create), try things without touching the visible tab, then commit the winning state, discard, switch or list branches. Chrome only.",
                 obj(
                     json!({
                         "action": { "type": "string", "enum": ["create", "commit", "discard", "switch", "list"] },
                         "target_id": { "type": "string", "description": "create: parent tab to fork from" },
-                        "branch_id": { "type": "string", "description": "create/commit/discard/switch: unique branch identifier" }
+                        "branch_id": { "type": "string", "description": "branch identifier" }
                     }),
                     json!(["action"]),
                 ),
+            ).details(
+                "Speculative browser context branching: fork an isolated background context from a tab ('create'), run \
+                 trials without affecting the visible tab, commit winning state ('commit'), discard failed branches \
+                 ('discard'), switch focus ('switch'), or list branches ('list'). Branches run in a separate browser \
+                 context and fail with an error if one cannot be created (no silent fallback to the shared context). \
+                 Commit and discard report an error unless the work was done and the branch tab was really closed. At \
+                 most 8 branches may be active at once (AGENTCTL_MAX_BRANCHES). Chrome only: a Safari tab returns \
+                 Unsupported. `branch_id` is the unique branch identifier for create/commit/discard/switch.",
             ).untrusted_output(),
             ToolDescriptor::new(
                 "browser_checkpoint",
                 Category::Browser,
                 Tier::Standard,
-                "In-memory state checkpointing and rollback (T-1) for browser tabs. 'save' captures \
-                 a deep copy of form state (input values, checks, select indexes, scroll), storage, \
-                 cookies and URL (not the DOM tree); 'rollback' navigates back if needed (loading \
-                 the page from the network with Chrome's HTTP cache bypassed, so a server that is \
-                 down is an error, not a stale cached page; the result says cache_bypassed), waits \
-                 for the page to load, restores that state and fails with the reason if any part \
-                 could not be restored; 'list'/'delete' manage checkpoints. Re-saving a tag makes it the \
-                 newest ('latest'). File inputs are skipped. Chrome only: a Safari tab returns Unsupported.",
+                "Save and roll back tab state (form values, storage, cookies, URL; not the DOM). save, rollback, list or delete by tag; re-saving a tag makes it 'latest'. Chrome only.",
                 obj(
                     json!({
                         "action": { "type": "string", "enum": ["save", "rollback", "list", "delete"] },
-                        "target_id": { "type": "string", "description": "target tab to checkpoint or restore (default: the active tab)" },
-                        "tag": { "type": "string", "description": "save/rollback/delete: tag name (e.g. 'step_2' or 'latest')" }
+                        "target_id": { "type": "string", "description": "tab (default: active tab)" },
+                        "tag": { "type": "string", "description": "checkpoint name, e.g. 'step_2' or 'latest'" }
                     }),
                     json!(["action"]),
                 ),
+            ).details(
+                "In-memory state checkpointing and rollback (T-1) for browser tabs. 'save' captures a deep copy of form \
+                 state (input values, checks, select indexes, scroll), storage, cookies and URL (not the DOM tree); \
+                 'rollback' navigates back if needed (loading the page from the network with Chrome's HTTP cache \
+                 bypassed, so a server that is down is an error, not a stale cached page; the result says \
+                 cache_bypassed), waits for the page to load, restores that state and fails with the reason if any part \
+                 could not be restored; 'list'/'delete' manage checkpoints. Re-saving a tag makes it the newest \
+                 ('latest'). File inputs are skipped. Chrome only: a Safari tab returns Unsupported.",
             ).untrusted_output(),
             ToolDescriptor::new(
                 "browser_wait",
                 Category::Browser,
                 Tier::Read,
-                "Wait for a settle signal: a selector to appear, dom_settled (no DOM mutation for \
-                 >=150ms; animation frames are not tracked), htmx_settled (HTMX requests and DOM swaps settled; right after a browser_act it also waits up to 1.5s for an htmx request to start; errors if htmx is not present on the page), navigation to complete (after a goto, reload, click, submit or key press in this session it waits for the NEW document, not the one being left; a click that starts no navigation within navigation_timeout_ms, default 2s, settles on the loaded page with navigated:false; raise it for a handler that navigates later than that), network_idle (fetch/XHR started after a browser_act are tracked; settled when none is in flight and none began or finished for 500ms, and not before a navigation that act may have started has happened), or verification challenge clearance. Prefer 'condition'; the other arguments are aliases.",
+                "Wait for one condition: selector, dom_settled, htmx_settled, navigation, network_idle or challenge_cleared. Use 'condition' ('selector' also needs the selector argument); the boolean arguments of the same names are aliases, and exactly one may be given. After a click or key press, navigation waits for the new document (navigated:false if none starts within navigation_timeout_ms).",
                 obj(
                     json!({
-                        "target_id": { "type": "string", "description": "the tab id; defaults to the active tab" },
-                        "condition": { "type": "string", "enum": ["selector", "dom_settled", "htmx_settled", "navigation", "network_idle", "challenge_cleared"], "description": "preferred way to choose what to wait for; 'selector' also needs the selector argument. Give exactly one condition: the aliases below conflict with it and with each other" },
-                        "selector": { "type": "string", "description": "alias for condition 'selector': the CSS selector to wait for" },
-                        "dom_settled": { "type": "boolean", "description": "alias for condition 'dom_settled'; only true selects it" },
-                        "htmx_settled": { "type": "boolean", "description": "alias for condition 'htmx_settled'; only true selects it" },
-                        "navigation": { "type": "boolean", "description": "alias for condition 'navigation'; only true selects it" },
-                        "network_idle": { "type": "boolean", "description": "alias for condition 'network_idle'; only true selects it" },
-                        "challenge_cleared": { "type": "boolean", "description": "alias for condition 'challenge_cleared'; only true selects it" },
+                        "target_id": { "type": "string", "description": "tab id (default: active tab)" },
+                        "condition": { "type": "string", "enum": ["selector", "dom_settled", "htmx_settled", "navigation", "network_idle", "challenge_cleared"] },
+                        "selector": { "type": "string", "description": "CSS selector to wait for (alias for condition 'selector')" },
+                        "dom_settled": { "type": "boolean" },
+                        "htmx_settled": { "type": "boolean" },
+                        "navigation": { "type": "boolean" },
+                        "network_idle": { "type": "boolean" },
+                        "challenge_cleared": { "type": "boolean" },
                         "timeout_ms": { "type": "integer" },
-                        "navigation_timeout_ms": { "type": "integer", "description": "navigation only: how long (ms, 0-30000, default 2000) to keep expecting a navigation that a click, submit or key press has not started yet, before settling on the loaded page with navigated:false. Does not apply after goto, reload, back or forward, which always navigate; timeout_ms still bounds the whole wait" }
+                        "navigation_timeout_ms": { "type": "integer", "description": "navigation only: how long to expect a navigation a click or key press has not started (0-30000, default 2000)" }
                     }),
                     json!([]),
                 ),
+            ).details(
+                "Wait for a settle signal: a selector to appear, dom_settled (no DOM mutation for >=150ms; animation frames \
+                 are not tracked), htmx_settled (HTMX requests and DOM swaps settled; right after a browser_act it also \
+                 waits up to 1.5s for an htmx request to start; errors if htmx is not present on the page), navigation to \
+                 complete (after a goto, reload, click, submit or key press in this session it waits for the NEW document, \
+                 not the one being left; a click that starts no navigation within navigation_timeout_ms, default 2s, settles \
+                 on the loaded page with navigated:false; raise it for a handler that navigates later than that), \
+                 network_idle (fetch/XHR started after a browser_act are tracked; settled when none is in flight and none \
+                 began or finished for 500ms, and not before a navigation that act may have started has happened), or \
+                 verification challenge clearance. Prefer 'condition'; the other arguments are aliases. Give exactly one \
+                 condition: the aliases conflict with it and with each other, and a boolean alias only selects its \
+                 condition when true.\n\n\
+                 `navigation_timeout_ms` (navigation only): how long (ms, 0-30000, default 2000) to keep expecting a \
+                 navigation that a click, submit or key press has not started yet, before settling on the loaded page with \
+                 navigated:false. Does not apply after goto, reload, back or forward, which always navigate; timeout_ms \
+                 still bounds the whole wait.",
             ).untrusted_output(),
             ToolDescriptor::new(
                 "browser_challenge",
                 Category::Browser,
                 Tier::Standard,
-                "Mixed-initiative CAPTCHA / 2FA detector and handshake. Pauses execution, shows a non-intrusive HUD in the browser informing the user to solve the verification, and auto-resumes in <=50ms upon clearance.",
+                "Detect or wait for a CAPTCHA or 2FA challenge that a person must solve. Shows a HUD in the page and resumes when it clears.",
                 obj(
                     json!({
-                        "target_id": { "type": "string", "description": "the tab id; defaults to the active tab" },
-                        "action": { "type": "string", "enum": ["detect", "wait", "hud_show", "hud_hide"], "description": "action to perform (default: detect)" },
-                        "timeout_ms": { "type": "integer", "description": "max wait time for human verification clearance in ms (default: 30000)" },
-                        "kind": { "type": "string", "description": "optional challenge kind override for hud_show" }
+                        "target_id": { "type": "string", "description": "tab id (default: active tab)" },
+                        "action": { "type": "string", "enum": ["detect", "wait", "hud_show", "hud_hide"], "description": "default detect" },
+                        "timeout_ms": { "type": "integer", "description": "max wait for clearance (default 30000)" },
+                        "kind": { "type": "string", "description": "challenge kind override for hud_show" }
                     }),
                     json!([]),
                 ),
+            ).details(
+                "Mixed-initiative CAPTCHA / 2FA detector and handshake. Pauses execution, shows a non-intrusive HUD in the \
+                 browser informing the user to solve the verification, and auto-resumes in <=50ms upon clearance.",
             ),
             ToolDescriptor::new(
                 "browser_record",
                 Category::Browser,
                 Tier::Standard,
-                "Shadow observation & macro learning mode (Ghost Mode). Observes interactions in a tab (a person's, and the agent's own browser_act and browser_fill_form actions; events the page's own script fakes, such as el.click() or dispatchEvent, are ignored), across page loads and navigations (a link or form post becomes a wait for the next page, a typed URL or reload a goto), debounces keystrokes and click bursts, strips noise, and synthesizes clean, deterministic browser_flow steps. Secret fields are never recorded: they become steps with a secret_ref, supplied as secrets when the flow runs. Chrome only. JavaScript dialogs raised while recording are answered as 'dialogs' says: by the person at a visible window by default (the recording keeps the answer as a dialog step the flow replays before the action that raised it; a prompt's typed text is not kept), by the recorder in a headless browser (dismiss unless browser_dialog says accept).",
+                "Observe a tab's interactions (a person's and the agent's) and turn them into browser_flow steps. start, stop (name saves the flow) or status. Secret fields become secret_ref steps. Chrome only.",
                 obj(
                     json!({
-                        "target_id": { "type": "string", "description": "the tab id; defaults to the active tab" },
-                        "action": { "type": "string", "enum": ["start", "stop", "status"], "description": "recording action (default: status)" },
-                        "name": { "type": "string", "description": "optional flow name to auto-save to flow store upon stop" },
-                        "dialogs": { "type": "string", "enum": ["human", "accept", "dismiss"], "description": "start: who answers the page's JavaScript dialogs (confirm/prompt/alert/beforeunload) while recording. human: nobody does, so the person at the browser window answers and the recording keeps how they did (needs a visible browser; the default there). accept / dismiss: the recorder answers (dismiss, or the tab's browser_dialog policy, is the default for a headless browser). Every confirm/prompt/beforeunload becomes a dialog step in the flow" }
+                        "target_id": { "type": "string", "description": "tab id (default: active tab)" },
+                        "action": { "type": "string", "enum": ["start", "stop", "status"], "description": "default status" },
+                        "name": { "type": "string", "description": "stop: flow name to save" },
+                        "dialogs": { "type": "string", "enum": ["human", "accept", "dismiss"], "description": "start: who answers JavaScript dialogs while recording. human needs a visible browser (its default); else dismiss" }
                     }),
                     json!([]),
                 ),
+            ).details(
+                "Shadow observation & macro learning mode (Ghost Mode). Observes interactions in a tab (a person's, and the \
+                 agent's own browser_act and browser_fill_form actions; events the page's own script fakes, such as \
+                 el.click() or dispatchEvent, are ignored), across page loads and navigations (a link or form post becomes \
+                 a wait for the next page, a typed URL or reload a goto), debounces keystrokes and click bursts, strips \
+                 noise, and synthesizes clean, deterministic browser_flow steps. Secret fields are never recorded: they \
+                 become steps with a secret_ref, supplied as secrets when the flow runs. Chrome only.\n\n\
+                 JavaScript dialogs raised while recording are answered as 'dialogs' says: by the person at a visible \
+                 window by default (the recording keeps the answer as a dialog step the flow replays before the action that \
+                 raised it; a prompt's typed text is not kept), by the recorder in a headless browser (dismiss unless \
+                 browser_dialog says accept). `dialogs` (start) is who answers the page's JavaScript dialogs \
+                 (confirm/prompt/alert/beforeunload) while recording. human: nobody does, so the person at the browser \
+                 window answers and the recording keeps how they did (needs a visible browser; the default there). accept / \
+                 dismiss: the recorder answers (dismiss, or the tab's browser_dialog policy, is the default for a headless \
+                 browser). Every confirm/prompt/beforeunload becomes a dialog step in the flow. `name` is an optional flow \
+                 name to auto-save to the flow store upon stop.",
             ),
             ToolDescriptor::new(
                 "browser_screenshot",
                 Category::Browser,
                 Tier::Read,
-                "Capture a PNG of the page (or a single element by ref). Returned inline as an image \
-                 by default. With save=true the PNG is written to agentctl's media directory \
-                 (screenshots/, a generated file name) and only {path, width, height, bytes} comes \
-                 back, with no image payload.",
+                "Capture a PNG of the page, or of one element by ref. Returned inline as an image; save=true writes it to agentctl's media directory and returns {path, width, height, bytes} instead.",
                 obj(
                     json!({
-                        "target_id": { "type": "string", "description": "the tab id; defaults to the active tab" },
-                        "ref": { "type": "string" },
-                        "save": { "type": "boolean", "description": "write the PNG under agentctl's own media directory and return {path, width, height, bytes} instead of the image (default false). The newest 200 saved screenshots are kept; older ones are deleted" }
+                        "target_id": { "type": "string", "description": "tab id (default: active tab)" },
+                        "ref": { "type": "string", "description": "element ref (default: whole page)" },
+                        "save": { "type": "boolean" }
                     }),
                     json!([]),
                 ),
+            ).details(
+                "With save=true the PNG is written to agentctl's media directory (screenshots/, a generated file name) and \
+                 only {path, width, height, bytes} comes back, with no image payload (default false). The newest 200 saved \
+                 screenshots are kept; older ones are deleted.",
             ),
             ToolDescriptor::new(
                 "browser_screencast",
                 Category::Browser,
                 Tier::Standard,
-                "Record a tab to an mp4 video (browser_record is something else: it learns a replayable \
-                 flow of steps, not video). start begins capturing the page at fps (default 15) on a \
-                 dedicated session that keeps the page rendering even if its window is hidden or \
-                 unfocused; stop ends it and encodes frames.ffconcat with ffmpeg (variable frame rate, \
-                 real timestamps, 30 fps H.264) when ffmpeg is on PATH, else it keeps the frames and \
-                 says how to encode them. Files land in agentctl's media directory under \
-                 screencasts/<recording_id>/; the result gives the path. One recording per tab, which \
-                 stops by itself at max_seconds. The showcase cursor and ripples are part of the page, \
-                 so they appear in the video. Not available on Safari.",
+                "Record a tab to an mp4 video (browser_record is different: it learns replayable flows). start, stop (returns the video path) or status. One recording per tab. Not on Safari.",
                 obj(
                     json!({
-                        "action": { "type": "string", "enum": ["start", "stop", "status"], "description": "default: status" },
-                        "target_id": { "type": "string", "description": "start: the tab to record (default: the active tab); stop: the tab whose recording to stop" },
-                        "recording_id": { "type": "string", "description": "stop: the recording to stop, instead of target_id" },
-                        "fps": { "type": "integer", "description": "start: frames per second to capture, 1 to 30 (default 15)" },
-                        "quality": { "type": "integer", "description": "start: JPEG quality, 30 to 95 (default 80)" },
-                        "max_seconds": { "type": "integer", "description": "start: stop automatically after this long, 1 to 1800 (default 300)" },
-                        "keep_frames": { "type": "boolean", "description": "stop: keep the JPEG frames and frames.ffconcat after a successful encode (default false)" }
+                        "action": { "type": "string", "enum": ["start", "stop", "status"], "description": "default status" },
+                        "target_id": { "type": "string", "description": "tab (default: active tab)" },
+                        "recording_id": { "type": "string", "description": "stop: instead of target_id" },
+                        "fps": { "type": "integer", "description": "start: 1 to 30 (default 15)" },
+                        "quality": { "type": "integer", "description": "start: JPEG quality 30 to 95 (default 80)" },
+                        "max_seconds": { "type": "integer", "description": "start: auto-stop after this long, 1 to 1800 (default 300)" },
+                        "keep_frames": { "type": "boolean", "description": "stop: keep the JPEG frames after encoding" }
                     }),
                     json!([]),
                 ),
+            ).details(
+                "Record a tab to an mp4 video (browser_record is something else: it learns a replayable flow of steps, not \
+                 video). start begins capturing the page at fps (default 15) on a dedicated session that keeps the page \
+                 rendering even if its window is hidden or unfocused; stop ends it and encodes frames.ffconcat with ffmpeg \
+                 (variable frame rate, real timestamps, 30 fps H.264) when ffmpeg is on PATH, else it keeps the frames and \
+                 says how to encode them. Files land in agentctl's media directory under screencasts/<recording_id>/; the \
+                 result gives the path. One recording per tab, which stops by itself at max_seconds. The showcase cursor and \
+                 ripples are part of the page, so they appear in the video. Not available on Safari.\n\n\
+                 `target_id`: start: the tab to record (default: the active tab); stop: the tab whose recording to stop. \
+                 `recording_id` (stop) names the recording to stop instead of target_id. `keep_frames` (stop) keeps the \
+                 JPEG frames and frames.ffconcat after a successful encode (default false).",
             ),
             ToolDescriptor::new(
                 "browser_viewport",
                 Category::Browser,
                 Tier::Standard,
-                "Emulate a viewport for responsive testing: override the page's device metrics \
-                 (width/height, optionally mobile and a device scale factor). Call with width=0 \
-                 (or omitted) to clear the override and restore the real window size.",
+                "Emulate a viewport for responsive testing (width, height, mobile, scale). width=0 or omitted clears the override.",
                 obj(
                     json!({
-                        "target_id": { "type": "string", "description": "the tab id; defaults to the active tab" },
-                        "width": { "type": "integer", "description": "css px; 0 clears the override" },
+                        "target_id": { "type": "string", "description": "tab id (default: active tab)" },
+                        "width": { "type": "integer", "description": "css px; 0 clears" },
                         "height": { "type": "integer", "description": "css px" },
-                        "mobile": { "type": "boolean", "description": "emulate a mobile device (touch, meta viewport)" },
+                        "mobile": { "type": "boolean", "description": "emulate a mobile device" },
                         "scale": { "type": "number", "description": "device scale factor (default 1)" }
                     }),
                     json!([]),
                 ),
+            ).details(
+                "Override the page's device metrics (width/height, optionally mobile and a device scale factor). Call with \
+                 width=0 (or omitted) to clear the override and restore the real window size. `mobile` emulates a mobile \
+                 device (touch, meta viewport).",
             ),
             ToolDescriptor::new(
                 "browser_eval",
                 Category::Browser,
                 Tier::Dangerous,
-                "Evaluate arbitrary JavaScript in the page context. The result is the value of the last statement (a returned promise is awaited), JSON-serialized. Arbitrary code execution. If the script navigates the page the result is {navigated:true, value:null} rather than an error. On Safari, a page whose CSP forbids eval gets the code run without eval: an expression works as usual, but statements need an explicit `return` to produce a result.",
+                "Run JavaScript in the page; returns the last statement's value, JSON-serialized (a returned promise is awaited). Arbitrary code execution. A script that navigates returns {navigated:true, value:null}.",
                 obj(
                     json!({
-                        "target_id": { "type": "string", "description": "the tab id; defaults to the active tab" },
+                        "target_id": { "type": "string", "description": "tab id (default: active tab)" },
                         "expression": { "type": "string" },
-                        "timeout_ms": { "type": "integer", "description": "stop waiting after this many ms (default 10000, clamped to 100-60000). Chrome stops script that is still running; a timeout is an error that says so. Async work already scheduled (timers, pending promises) can keep running in the page. Not enforced on Safari" },
-                        "detached": { "type": "boolean", "description": "start the script and return {started:true} without waiting for a promise it returns or for its result (Chrome only); its synchronous part still runs within the call and timeout_ms. A later rejection goes to the page console" }
+                        "timeout_ms": { "type": "integer", "description": "default 10000 (100 to 60000); a timeout is an error" },
+                        "detached": { "type": "boolean", "description": "return {started:true} without waiting for the result (Chrome)" }
                     }),
                     json!(["expression"]),
                 ),
+            ).details(
+                "On Safari, a page whose CSP forbids eval gets the code run without eval: an expression works as usual, but \
+                 statements need an explicit `return` to produce a result.\n\n\
+                 `timeout_ms`: stop waiting after this many ms (default 10000, clamped to 100-60000). Chrome stops script \
+                 that is still running; a timeout is an error that says so. Async work already scheduled (timers, pending \
+                 promises) can keep running in the page. Not enforced on Safari. `detached` starts the script and returns \
+                 {started:true} without waiting for a promise it returns or for its result (Chrome only); its synchronous \
+                 part still runs within the call and timeout_ms. A later rejection goes to the page console.",
             ).untrusted_output(),
             ToolDescriptor::new(
                 "browser_dialog",
                 Category::Browser,
                 Tier::Standard,
-                "Inspect and control how the page's JavaScript dialogs (alert/confirm/prompt/\
-                 beforeunload) are answered. They are answered automatically: an unanswered \
-                 dialog blocks the tab: and dismissed by default; call with policy='accept' \
-                 only when confirming is what you actually intend. Omit 'policy' to read the \
-                 current setting and the dialogs seen so far.",
+                "JavaScript dialogs (alert, confirm, prompt, beforeunload) are answered automatically and dismissed by default. Set policy='accept' only when confirming is what you intend. Omit policy to read the setting and the dialogs seen.",
                 json!({
                     "type": "object",
                     "properties": {
-                        "target_id": { "type": "string", "description": "the tab id; defaults to the active tab" },
+                        "target_id": { "type": "string", "description": "tab id (default: active tab)" },
                         "policy": { "type": "string", "enum": ["dismiss", "accept"] },
-                        "prompt_text": { "type": "string", "description": "text supplied to prompt() when accepting" }
+                        "prompt_text": { "type": "string", "description": "text for prompt() when accepting" }
                     },
                     "required": []
                 }),
+            ).details(
+                "Inspect and control how the page's JavaScript dialogs (alert/confirm/prompt/beforeunload) are answered. \
+                 They are answered automatically (an unanswered dialog blocks the tab) and dismissed by default; call with \
+                 policy='accept' only when confirming is what you actually intend. Omit 'policy' to read the current \
+                 setting and the dialogs seen so far.",
             ).untrusted_output(),
             ToolDescriptor::new(
                 "browser_network",
                 Category::Browser,
                 Tier::Dangerous,
-                "Network control. log: record requests and responses for a bounded window \
-                 (URLs, methods, statuses: header values and cookies are deliberately omitted). \
-                 intercept: block URL patterns via headers.block. set_headers: extra HTTP headers.",
+                "Network control: log (requests for a bounded window), intercept (headers: {block: [url patterns]}), set_headers (headers).",
                 obj(
                     json!({
-                        "target_id": { "type": "string", "description": "the tab id; defaults to the active tab" },
+                        "target_id": { "type": "string", "description": "tab id (default: active tab)" },
                         "action": { "type": "string", "enum": ["log", "intercept", "set_headers"] },
-                        "filter": { "type": "string", "description": "substring filter for log rows" },
-                        "duration_ms": { "type": "integer", "description": "log window, 100-30000" },
+                        "filter": { "type": "string", "description": "log: substring filter on rows" },
+                        "duration_ms": { "type": "integer", "description": "log window, 100 to 30000" },
                         "headers": {
                             "type": "object",
-                            "description": "set_headers: the headers. intercept: { block: [url patterns] }"
+                            "description": "set_headers: the headers. intercept: {block: [url patterns]}"
                         }
                     }),
                     json!(["action"]),
                 ),
+            ).details(
+                "Network control. log: record requests and responses for a bounded window (URLs, methods, statuses: header \
+                 values and cookies are deliberately omitted). intercept: block URL patterns via headers.block. \
+                 set_headers: extra HTTP headers.",
             ).untrusted_output(),
             ToolDescriptor::new(
                 "browser_cookies",
@@ -2777,7 +2888,7 @@ impl ToolModule for BrowserModule {
                 "Cookie access: get (values redacted), set, or clear.",
                 obj(
                     json!({
-                        "target_id": { "type": "string", "description": "the tab id; defaults to the active tab" },
+                        "target_id": { "type": "string", "description": "tab id (default: active tab)" },
                         "action": { "type": "string", "enum": ["get", "set", "clear"] },
                         "cookie": { "type": "object" }
                     }),
@@ -2788,103 +2899,128 @@ impl ToolModule for BrowserModule {
                 "browser_capture",
                 Category::Browser,
                 Tier::Dangerous,
-                "Regression-test capture. 'start' installs a page hook (persists across \
-                 navigations) that records fetch/XHR calls with request+response bodies and \
-                 console errors/uncaught exceptions. 'read' returns them ('only_errors' keeps \
-                 failed requests; 'filter' is a substring). 'clear' empties the buffers. Bodies \
-                 can contain secrets, so this is off unless enabled.",
+                "Capture fetch/XHR calls (with bodies) and console errors across navigations: start, read (only_errors, filter), clear. Bodies can hold secrets.",
                 obj(
                     json!({
-                        "target_id": { "type": "string", "description": "the tab id; defaults to the active tab" },
+                        "target_id": { "type": "string", "description": "tab id (default: active tab)" },
                         "action": { "type": "string", "enum": ["start", "read", "clear"] },
-                        "only_errors": { "type": "boolean", "description": "read: keep only non-2xx / failed requests" },
-                        "filter": { "type": "string", "description": "read: substring filter over rows" }
+                        "only_errors": { "type": "boolean", "description": "read: only non-2xx or failed requests" },
+                        "filter": { "type": "string", "description": "read: substring filter on rows" }
                     }),
                     json!([]),
                 ),
+            ).details(
+                "Regression-test capture. 'start' installs a page hook (persists across navigations) that records fetch/XHR \
+                 calls with request+response bodies and console errors/uncaught exceptions. 'read' returns them \
+                 ('only_errors' keeps failed requests; 'filter' is a substring). 'clear' empties the buffers. Bodies can \
+                 contain secrets, so this is off unless enabled.",
             ).untrusted_output(),
             ToolDescriptor::new(
                 "browser_assert",
                 Category::Browser,
                 Tier::Read,
-                "Settle (optional) then check the page in one call; returns {passed, checks} and \
-                 errors when it fails. Functional clauses: text/not_text (in page text), url \
-                 (substring), selector (+min_count), no_console_errors and no_failed_requests \
-                 (need browser_capture started). UX clauses: a11y (built-in WCAG rules: alt text, \
-                 form labels, control names, contrast, target size, positive tabindex, duplicate \
-                 ids, page lang), style (design-token conformance: colors/fonts/font_sizes/spacing \
-                 allow-lists), component (role/visible/states of one element), visual (screenshot vs a \
-                 saved baseline: first run saves it, later runs diff within tolerance), ux (judge-scored \
-                 heuristics: clarity/hierarchy/affordance/consistency; advisory unless gate=true). 'within' \
-                 scopes the DOM UX clauses to a component subtree. Settle first with wait_selector or \
-                 wait_network_idle.",
+                "Check the page in one call, optionally settling first; returns {passed, checks} and errors when it fails. Clauses: text, not_text, url, selector (+min_count), no_console_errors and no_failed_requests (need browser_capture), and the UX clauses a11y, style, component, visual, ux.",
                 obj(
                     json!({
-                        "target_id": { "type": "string", "description": "the tab id; defaults to the active tab" },
-                        "text": { "type": "string", "description": "assert this text is present" },
-                        "not_text": { "type": "string", "description": "assert this text is absent" },
-                        "url": { "type": "string", "description": "assert the URL contains this" },
-                        "selector": { "type": "string", "description": "assert this css selector matches" },
-                        "min_count": { "type": "integer", "description": "selector must match at least this many (default 1)" },
-                        "no_console_errors": { "type": "boolean", "description": "assert no captured console errors (needs browser_capture)" },
-                        "no_failed_requests": { "type": "boolean", "description": "assert no captured non-2xx/failed requests (needs browser_capture)" },
-                        "within": { "type": "string", "description": "scope a11y/style/component checks to this css root (component testing)" },
-                        "a11y": { "description": "true, or {ignore:[rules], contrast:false, target_size:false, contrast_sample:N} to run the built-in accessibility audit" },
-                        "style": { "type": "object", "description": "design-token conformance: {colors:[], fonts:[], font_sizes:[], spacing:[]} allow-lists; off-token values fail" },
-                        "component": { "type": "object", "description": "{selector, visible, role, states:{disabled,expanded,checked,...}} assertions on one element" },
-                        "visual": { "description": "baseline name, or {name, tolerance, ref}; first run saves the baseline, later runs diff the screenshot within tolerance (default 0.01)" },
-                        "ux": { "type": "object", "description": "judge-scored review: {dims:[clarity,hierarchy,affordance,consistency], gate:false, min:0.5}; advisory unless gate=true" },
-                        "wait_selector": { "type": "string", "description": "settle: wait for this selector first" },
-                        "wait_dom_settled": { "type": "boolean", "description": "settle: wait for DOM mutations to settle first" },
-                        "wait_network_idle": { "type": "boolean", "description": "settle: wait for network idle first" },
+                        "target_id": { "type": "string", "description": "tab id (default: active tab)" },
+                        "text": { "type": "string", "description": "text must be present" },
+                        "not_text": { "type": "string", "description": "text must be absent" },
+                        "url": { "type": "string", "description": "URL must contain this" },
+                        "selector": { "type": "string", "description": "css selector must match" },
+                        "min_count": { "type": "integer", "description": "selector match count at least this (default 1)" },
+                        "no_console_errors": { "type": "boolean" },
+                        "no_failed_requests": { "type": "boolean" },
+                        "within": { "type": "string", "description": "css root for the a11y, style and component checks" },
+                        "a11y": { "description": "true, or {ignore:[rules], contrast:false, target_size:false, contrast_sample:N}" },
+                        "style": { "type": "object", "description": "allow-lists {colors:[], fonts:[], font_sizes:[], spacing:[]}; off-token values fail" },
+                        "component": { "type": "object", "description": "{selector, visible, role, states:{disabled,expanded,checked,...}}" },
+                        "visual": { "description": "baseline name, or {name, tolerance, ref}" },
+                        "ux": { "type": "object", "description": "{dims:[clarity,hierarchy,affordance,consistency], gate:false, min:0.5}" },
+                        "wait_selector": { "type": "string", "description": "settle first: wait for this selector" },
+                        "wait_dom_settled": { "type": "boolean", "description": "settle first: DOM settled" },
+                        "wait_network_idle": { "type": "boolean", "description": "settle first: network idle" },
                         "timeout_ms": { "type": "integer", "description": "settle timeout (default 8000)" }
                     }),
                     json!([]),
                 ),
+            ).details(
+                "Settle (optional) then check the page in one call; returns {passed, checks} and errors when it fails. \
+                 Functional clauses: text/not_text (in page text), url (substring), selector (+min_count), \
+                 no_console_errors and no_failed_requests (need browser_capture started). UX clauses: a11y (built-in WCAG \
+                 rules: alt text, form labels, control names, contrast, target size, positive tabindex, duplicate ids, page \
+                 lang), style (design-token conformance: colors/fonts/font_sizes/spacing allow-lists), component \
+                 (role/visible/states of one element), visual (screenshot vs a saved baseline: first run saves it, later \
+                 runs diff within tolerance), ux (judge-scored heuristics: clarity/hierarchy/affordance/consistency; \
+                 advisory unless gate=true). 'within' scopes the DOM UX clauses to a component subtree. Settle first with \
+                 wait_selector or wait_network_idle.\n\n\
+                 `a11y`: true, or {ignore:[rules], contrast:false, target_size:false, contrast_sample:N} to run the \
+                 built-in accessibility audit. `style`: design-token conformance, {colors:[], fonts:[], font_sizes:[], \
+                 spacing:[]} allow-lists; off-token values fail. `component`: {selector, visible, role, \
+                 states:{disabled,expanded,checked,...}} assertions on one element. `visual`: baseline name, or {name, \
+                 tolerance, ref}; first run saves the baseline, later runs diff the screenshot within tolerance (default \
+                 0.01). `ux`: judge-scored review {dims:[clarity,hierarchy,affordance,consistency], gate:false, min:0.5}; \
+                 advisory unless gate=true. `within` scopes a11y/style/component checks to this css root (component \
+                 testing). `no_console_errors` asserts no captured console errors and `no_failed_requests` no captured \
+                 non-2xx/failed requests (both need browser_capture). `wait_selector`, `wait_dom_settled` and \
+                 `wait_network_idle` settle first; `timeout_ms` is the settle timeout (default 8000).",
             ).untrusted_output(),
             ToolDescriptor::new(
                 "browser_flow",
                 Category::Browser,
                 Tier::Standard,
-                "Save and replay a browser UI test. 'save' (name + steps) records a flow; 'run' \
-                 (name + target_id) replays it deterministically, stopping at the first failing \
-                 step (set continue_on_error to run all); 'list'/'get'/'delete' manage them. A \
-                 step is {op: navigate|act|wait|capture|assert|dialog, ...} using the same fields as \
-                 those tools (e.g. {op:'act',by:'text',query:'Login',action:'click'}, \
-                 {op:'assert',text:'Welcome'}). A secret step never holds its value: use \
-                 {op:'act',action:'type',query:'#pw',secret:true,secret_ref:'pw'} and pass \
-                 secrets:{pw:'...'} to 'run'; 'save' refuses a secret step with a literal value. \
-                 A green run never needs a model.",
+                "Save and replay a UI test: save (name + steps), run (name, target_id), list, get, delete. A step is {op: navigate|act|wait|capture|assert|dialog, ...} with the same fields as those tools, e.g. {op:'act',by:'text',query:'Login',action:'click'}. A secret step holds no value: {op:'act',action:'type',query:'#pw',secret:true,secret_ref:'pw'}, and run gets secrets:{pw:'...'}.",
                 obj(
                     json!({
                         "action": { "type": "string", "enum": ["save", "run", "list", "get", "delete"] },
                         "name": { "type": "string" },
-                        "target_id": { "type": "string", "description": "run: the tab to replay against (default: the active tab)" },
-                        "steps": { "type": "array", "items": { "type": "object" }, "description": "save: the ordered steps" },
+                        "target_id": { "type": "string", "description": "run: tab (default: active tab)" },
+                        "steps": { "type": "array", "items": { "type": "object" }, "description": "save: ordered steps" },
                         "continue_on_error": { "type": "boolean", "description": "run: keep going past a failed step" },
-                        "secrets": { "type": "object", "description": "run: values for the steps' secret_ref names, e.g. {pw: '...'}; used in memory for this run only, never stored, redacted from the audit log. A missing one fails the run before any step runs" }
+                        "secrets": { "type": "object", "description": "run: values for the steps' secret_ref names; never stored" }
                     }),
                     json!(["action"]),
                 ),
+            ).details(
+                "'save' (name + steps) records a flow; 'run' (name + target_id) replays it deterministically, stopping at \
+                 the first failing step (set continue_on_error to run all); 'list'/'get'/'delete' manage them. A step is \
+                 {op: navigate|act|wait|capture|assert|dialog, ...} using the same fields as those tools (e.g. \
+                 {op:'act',by:'text',query:'Login',action:'click'}, {op:'assert',text:'Welcome'}). A secret step never \
+                 holds its value: use {op:'act',action:'type',query:'#pw',secret:true,secret_ref:'pw'} and pass \
+                 secrets:{pw:'...'} to 'run'; 'save' refuses a secret step with a literal value. A green run never needs \
+                 a model.\n\n\
+                 `secrets` (run): values for the steps' secret_ref names, e.g. {pw: '...'}; used in memory for this run \
+                 only, never stored, redacted from the audit log. A missing one fails the run before any step runs. \
+                 `target_id` (run) is the tab to replay against (default: the active tab).",
             ).untrusted_output(),
             ToolDescriptor::new(
                 "browser_showcase",
                 Category::Browser,
                 Tier::Standard,
-                "Configure visual flair for demos, screencasts, and presentations: animated virtual SVG cursor, smooth cubic-bezier gliding, click ripples, and floating typing HUD, drawn inside the tab on Chrome and Safari. While on, a browser_act on Chrome also moves the real pointer (trusted mousemove events) so hover styles and mouse listeners fire. The result's `rendered` says whether the cursor really is on the page, with a `warning` when it is not. Decoration only: it never changes an action's result or error, and the typing HUD masks secrets and password/one-time-code fields.",
+                "Demo visuals drawn in the tab: animated cursor, click ripples, typing HUD. Decoration only. The result's `rendered` says whether the cursor is really on the page.",
                 obj(
                     json!({
-                        "target_id": { "type": "string", "description": "the tab to configure showcase overlays for (default: the active tab)" },
-                        "enabled": { "type": "boolean", "description": "enable or disable visual overlays" },
-                        "speed": { "type": "string", "enum": ["cinematic", "demo", "snappy", "off"], "description": "gliding speed preset" },
-                        "click_ripple": { "type": "boolean", "description": "expand glowing shockwave rings on click" },
-                        "typing_hud": { "type": "boolean", "description": "display floating action/typing badges next to cursor" },
-                        "cursor_style": { "type": "string", "enum": ["glow_arrow", "neon_cyan", "minimal_dot"], "description": "visual pointer style" },
-                        "glide_ms": { "type": "integer", "description": "custom glide duration in milliseconds, 0-3000 (larger values are capped)" },
-                        "cursor_size": { "type": "integer", "description": "pointer size in px, 16-96 (default 32; values outside are clamped)" }
+                        "target_id": { "type": "string", "description": "tab (default: active tab)" },
+                        "enabled": { "type": "boolean" },
+                        "speed": { "type": "string", "enum": ["cinematic", "demo", "snappy", "off"] },
+                        "click_ripple": { "type": "boolean" },
+                        "typing_hud": { "type": "boolean" },
+                        "cursor_style": { "type": "string", "enum": ["glow_arrow", "neon_cyan", "minimal_dot"] },
+                        "glide_ms": { "type": "integer", "description": "glide duration, 0 to 3000" },
+                        "cursor_size": { "type": "integer", "description": "px, 16 to 96 (default 32)" }
                     }),
                     json!([]),
                 ),
+            ).details(
+                "Configure visual flair for demos, screencasts, and presentations: animated virtual SVG cursor, smooth \
+                 cubic-bezier gliding, click ripples, and floating typing HUD, drawn inside the tab on Chrome and Safari. \
+                 While on, a browser_act on Chrome also moves the real pointer (trusted mousemove events) so hover styles \
+                 and mouse listeners fire. The result's `rendered` says whether the cursor really is on the page, with a \
+                 `warning` when it is not. Decoration only: it never changes an action's result or error, and the typing \
+                 HUD masks secrets and password/one-time-code fields.\n\n\
+                 `enabled` turns the visual overlays on or off; `speed` is the gliding speed preset; `click_ripple` expands \
+                 glowing shockwave rings on click; `typing_hud` displays floating action/typing badges next to the cursor; \
+                 `cursor_style` is the pointer style; `glide_ms` a custom glide duration in milliseconds, 0-3000 (larger \
+                 values are capped); `cursor_size` the pointer size in px, 16-96 (default 32; values outside are clamped).",
             ).idempotent(true),
         ]
     }
