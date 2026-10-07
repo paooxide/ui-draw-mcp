@@ -6,8 +6,12 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
-Most of this release comes from one field session: a QA run and a demo recording against a server-rendered
-HTMX app, where several browser tools answered before the page had done what the agent asked.
+## [0.2.1] - 2026-10-07
+
+Most of this release comes from two field sessions: a QA run and a demo recording against a server-rendered
+HTMX app, where several browser tools answered before the page had done what the agent asked, and a job
+application on a React site, where custom dropdowns, controlled text fields and the CV upload could not be
+operated.
 
 ### Added
 
@@ -633,6 +637,7 @@ Field bugs that only a run on real hardware could surface:
 - The destructive-command gate cannot see through shell expansion, and hard links are invisible to path
   resolution. Both are documented in [`SECURITY.md`](SECURITY.md) and asserted by tests.
 
-[Unreleased]: https://github.com/paooxide/ui-draw-mcp/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/paooxide/ui-draw-mcp/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/paooxide/ui-draw-mcp/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/paooxide/ui-draw-mcp/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/paooxide/ui-draw-mcp/tree/v0.1.0

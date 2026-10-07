@@ -95,10 +95,10 @@ glibc 2.28 or newer, so RHEL 8, Debian 10, Ubuntu 20.04 and later). Download the
 verify it, and unpack:
 
 ```sh
-curl -LO https://github.com/paooxide/ui-draw-mcp/releases/download/v0.2.0/agentctl-v0.2.0-aarch64-apple-darwin.tar.gz
-curl -LO https://github.com/paooxide/ui-draw-mcp/releases/download/v0.2.0/SHA256SUMS
+curl -LO https://github.com/paooxide/ui-draw-mcp/releases/download/v0.2.1/agentctl-v0.2.1-aarch64-apple-darwin.tar.gz
+curl -LO https://github.com/paooxide/ui-draw-mcp/releases/download/v0.2.1/SHA256SUMS
 shasum -a 256 -c SHA256SUMS --ignore-missing
-tar xzf agentctl-v0.2.0-aarch64-apple-darwin.tar.gz
+tar xzf agentctl-v0.2.1-aarch64-apple-darwin.tar.gz
 ```
 
 Release binaries are **not signed or notarized**. macOS quarantines anything a browser downloaded, so clear
