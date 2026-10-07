@@ -96,6 +96,9 @@ operated.
 
 ### Fixed
 
+- **`browser_screenshot` said `width: 0, height: 0` next to a whole-page image.** Only element captures
+  measured themselves, and a weak model in a benchmark run could read the zeros as a blank page. The inline
+  result now takes the size from the PNG header, as `save: true` already did.
 - **React-controlled fields ignored `browser_act type`, `select` and `browser_fill_form`.** React tracks
   each controlled input's value through an accessor it installs on the element and drops an `input` event
   when the tracked value already equals the new one; `el.value = x` goes through that accessor, so the page's state

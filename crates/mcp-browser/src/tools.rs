@@ -1094,14 +1094,24 @@ impl BrowserModule {
                     shot.height,
                 ),
             ),
-            Ok(shot) => Envelope::ok_image(
-                "browser_screenshot",
-                json!({ "width": shot.width, "height": shot.height }),
-                ImageContent {
-                    mime_type: "image/png".into(),
-                    base64: shot.base64,
-                },
-            ),
+            Ok(shot) => {
+                // A whole-page capture does not measure itself; a 0x0 next to
+                // the image reads as a blank page, so take the PNG's own size.
+                let (width, height) = match (shot.width, shot.height) {
+                    (0, _) | (_, 0) => {
+                        crate::screencast::png_b64_size(&shot.base64).unwrap_or((0, 0))
+                    }
+                    wh => wh,
+                };
+                Envelope::ok_image(
+                    "browser_screenshot",
+                    json!({ "width": width, "height": height }),
+                    ImageContent {
+                        mime_type: "image/png".into(),
+                        base64: shot.base64,
+                    },
+                )
+            }
             Err(e) => browser_err("browser_screenshot", e),
         }
     }
