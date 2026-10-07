@@ -257,8 +257,9 @@ async fn test_spa_state_and_shadow_dom_traversal() {
     assert_eq!(bound.get("count").and_then(|c| c.as_u64()), Some(3));
     assert_eq!(bound.get("total").and_then(|c| c.as_f64()), Some(89.97));
     assert_eq!(
-        checkout_node.get("is_enabled").and_then(|b| b.as_bool()),
-        Some(true)
+        checkout_node.get("disabled"),
+        None,
+        "an enabled node carries no flag"
     );
 
     // Shadow DOM button inspection

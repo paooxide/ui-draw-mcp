@@ -58,6 +58,12 @@ operated.
 
 ### Changed
 
+- **`browser_snapshot` nodes are compact.** Null and empty fields are left out (a missing `role`, `name`,
+  `semantic_intent` or `bound_state` means none), `is_enabled: true` is gone and a disabled node says
+  `disabled: true`, and an XPath ref drops `[1]` on a tag with no same-tag sibling (`/html/body/form/input`,
+  not `/html/body[1]/form[1]/input[1]`). Refs saved in flows and checkpoints still resolve. A 68-node form
+  page went from about 13.5 KB to 8 KB, which matters at 400 nodes a snapshot and with models that copy refs
+  back by hand.
 - **`browser_act click` and `type` are real input on Chrome.** A click was `el.click()`: no `pointerdown`,
   `mousedown`, `pointerup` or `mouseup`, so react-select (which opens its menu on `mousedown`) did nothing.
   It now scrolls the element into view, hit-tests its centre and, when the element is what sits there, sends
