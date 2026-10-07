@@ -124,6 +124,43 @@ impl RoleProfile {
         }
     }
 
+    /// Lean browser profile: the dozen tools a typical page task needs, so the
+    /// tool list the model re-reads every turn stays small. `browser_upload` is
+    /// listed so an operator can enable it (it stays dangerous-tier).
+    pub fn browser_core() -> Self {
+        RoleProfile {
+            name: "browser-core".to_string(),
+            description: "Lean browser automation: connect, navigate, snapshot, act (12 tools)"
+                .to_string(),
+            allowed_tiers: None,
+            allowed_categories: Some(vec![Category::Browser]),
+            denied_categories: Vec::new(),
+            allowed_tools: Some(
+                [
+                    "browser_connect",
+                    "browser_tabs",
+                    "browser_navigate",
+                    "browser_snapshot",
+                    "browser_query",
+                    "browser_act",
+                    "browser_fill_form",
+                    "browser_wait",
+                    "browser_screenshot",
+                    "browser_extract",
+                    "browser_dialog",
+                    "browser_upload",
+                ]
+                .iter()
+                .map(|t| t.to_string())
+                .collect(),
+            ),
+            denied_tools: Vec::new(),
+            require_consent_for_tiers: Vec::new(),
+            require_consent_for_tools: Vec::new(),
+            max_denials: None,
+        }
+    }
+
     /// Standard Human-in-the-Loop Operator profile.
     /// General operations permitted; dangerous actions require interactive consent.
     pub fn operator() -> Self {
@@ -473,6 +510,7 @@ pub fn resolve_role_profile(
         "readonly" | "auditor" => Some(RoleProfile::readonly()),
         "qa" | "tester" => Some(RoleProfile::qa()),
         "browser" => Some(RoleProfile::browser()),
+        "browser-core" => Some(RoleProfile::browser_core()),
         "operator" => Some(RoleProfile::operator()),
         "admin" | "superadmin" => Some(RoleProfile::admin()),
         _ => None,
