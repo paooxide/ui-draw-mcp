@@ -695,11 +695,11 @@ Act on a DOM node: click, type, select, hover, focus, scroll_into_view, submit, 
 | `action` | one of: click, type, select, hover, focus, scroll_into_view, submit, press | yes |  |
 | `by` | one of: css, xpath, text |  | how to read 'query' (default css); used when no 'ref' |
 | `index` | integer |  | optional 0-based match index if query matches multiple elements (default 0) |
-| `query` | string |  | selector to resolve and act on in one call, instead of 'ref' |
+| `query` | string |  | selector to resolve and act on in one call, instead of 'ref'. type and press with neither ref nor query act on the focused element |
 | `ref` | string |  | a ref from browser_query/snapshot |
 | `scroll` | one of: none, nearest, center |  | how to bring the element into view first: nearest (default) moves the page only as far as needed and not at all when it is visible, center centres it (can scroll a wide page sideways), none does not scroll. scroll_into_view always scrolls |
 | `secret` | boolean |  | the value is a secret: keep it out of the audit log and never show it in the showcase typing HUD (password and one-time-code fields are masked automatically) |
-| `target_id` | string | yes |  |
+| `target_id` | string |  | the tab id; defaults to the active tab |
 | `text` | string |  | optional text substring filter to narrow matches |
 | `timeout_ms` | integer |  | wait_after settle only: bound for the whole settle wait (default 10000); when it runs out the action still succeeded and the result has settled:false and settle_error |
 | `value` | string |  | text for type, option for select, or key name for press (Enter, Escape, Tab, ArrowDown, ArrowUp, ArrowLeft, ArrowRight, Home, End, PageUp, PageDown, Backspace, Delete, Space) |
@@ -722,7 +722,7 @@ Settle (optional) then check the page in one call; returns {passed, checks} and 
 | `not_text` | string |  | assert this text is absent |
 | `selector` | string |  | assert this css selector matches |
 | `style` | object |  | design-token conformance: {colors:[], fonts:[], font_sizes:[], spacing:[]} allow-lists; off-token values fail |
-| `target_id` | string | yes |  |
+| `target_id` | string |  | the tab id; defaults to the active tab |
 | `text` | string |  | assert this text is present |
 | `timeout_ms` | integer |  | settle timeout (default 8000) |
 | `url` | string |  | assert the URL contains this |
@@ -756,7 +756,7 @@ Regression-test capture. 'start' installs a page hook (persists across navigatio
 | `action` | one of: start, read, clear |  |  |
 | `filter` | string |  | read: substring filter over rows |
 | `only_errors` | boolean |  | read: keep only non-2xx / failed requests |
-| `target_id` | string | yes |  |
+| `target_id` | string |  | the tab id; defaults to the active tab |
 
 ### browser-challenge
 
@@ -768,7 +768,7 @@ Mixed-initiative CAPTCHA / 2FA detector and handshake. Pauses execution, shows a
 |---|---|---|---|
 | `action` | one of: detect, wait, hud_show, hud_hide |  | action to perform (default: detect) |
 | `kind` | string |  | optional challenge kind override for hud_show |
-| `target_id` | string | yes |  |
+| `target_id` | string |  | the tab id; defaults to the active tab |
 | `timeout_ms` | integer |  | max wait time for human verification clearance in ms (default: 30000) |
 
 ### browser-checkpoint
@@ -781,13 +781,13 @@ In-memory state checkpointing and rollback (T-1) for browser tabs. 'save' captur
 |---|---|---|---|
 | `action` | one of: save, rollback, list, delete | yes |  |
 | `tag` | string |  | save/rollback/delete: tag name (e.g. 'step_2' or 'latest') |
-| `target_id` | string |  | target tab to checkpoint or restore |
+| `target_id` | string |  | target tab to checkpoint or restore (default: the active tab) |
 
 ### browser-connect
 
 `browser_connect` · standard tier
 
-Attach to a Chromium browser started with --remote-debugging-port, or launch a dedicated instance. Optionally auto-restores a saved profile. The browser's active tab is brought to the front on connect (result 'foregrounded'). launch.browser='safari' drives Safari through safaridriver (macOS only, experimental: needs `safaridriver --enable` once, and a Safari that was already open when automation was enabled must be quit first; opens a visible window). On Safari, browser_network, browser_dialog, browser_viewport, browser_record, browser_branch, browser_checkpoint and browser_act 'press' return Unsupported.
+Attach to a Chromium browser started with --remote-debugging-port, or launch a dedicated instance. The result lists the open tabs (active first) and the active target_id. Optionally auto-restores a saved profile. The browser's active tab is brought to the front on connect (result 'foregrounded'). launch.browser='safari' drives Safari through safaridriver (macOS only, experimental: needs `safaridriver --enable` once, and a Safari that was already open when automation was enabled must be quit first; opens a visible window). On Safari, browser_network, browser_dialog, browser_viewport, browser_record, browser_branch, browser_checkpoint and browser_act 'press' return Unsupported.
 
 | Argument | Type | Required | Description |
 |---|---|---|---|
@@ -814,7 +814,7 @@ Cookie access: get (values redacted), set, or clear.
 |---|---|---|---|
 | `action` | one of: get, set, clear | yes |  |
 | `cookie` | object |  |  |
-| `target_id` | string | yes |  |
+| `target_id` | string |  | the tab id; defaults to the active tab |
 
 ### browser-dialog
 
@@ -826,7 +826,7 @@ Inspect and control how the page's JavaScript dialogs (alert/confirm/prompt/befo
 |---|---|---|---|
 | `policy` | one of: dismiss, accept |  |  |
 | `prompt_text` | string |  | text supplied to prompt() when accepting |
-| `target_id` | string | yes |  |
+| `target_id` | string |  | the tab id; defaults to the active tab |
 
 ### browser-disconnect
 
@@ -849,7 +849,7 @@ Evaluate arbitrary JavaScript in the page context. The result is the value of th
 |---|---|---|---|
 | `detached` | boolean |  | start the script and return {started:true} without waiting for a promise it returns or for its result (Chrome only); its synchronous part still runs within the call and timeout_ms. A later rejection goes to the page console |
 | `expression` | string | yes |  |
-| `target_id` | string | yes |  |
+| `target_id` | string |  | the tab id; defaults to the active tab |
 | `timeout_ms` | integer |  | stop waiting after this many ms (default 10000, clamped to 100-60000). Chrome stops script that is still running; a timeout is an error that says so. Async work already scheduled (timers, pending promises) can keep running in the page. Not enforced on Safari |
 
 ### browser-extract
@@ -861,7 +861,7 @@ Extract structured data directly from the page using a CSS/attribute schema (e.g
 | Argument | Type | Required | Description |
 |---|---|---|---|
 | `schema` | object | yes | Extraction schema mapping field names to rules {selector, attr, regex, multiple, fields} |
-| `target_id` | string | yes |  |
+| `target_id` | string |  | the tab id; defaults to the active tab |
 | `within` | string |  | Optional CSS root selector to scope extraction |
 
 ### browser-fill-form
@@ -872,9 +872,9 @@ Fill multiple form fields (input, select, checkbox, radio) in one call and optio
 
 | Argument | Type | Required | Description |
 |---|---|---|---|
-| `fields` | array&lt;object&gt; | yes | Array of fields: [{ref or selector, value, type, secret}] |
+| `fields` | array&lt;object&gt; | yes | Array of fields: [{ref or selector, by, value, type, secret}] |
 | `submit` | object |  | Optional submit trigger: {ref or selector} |
-| `target_id` | string | yes |  |
+| `target_id` | string |  | the tab id; defaults to the active tab |
 
 ### browser-flow
 
@@ -889,7 +889,7 @@ Save and replay a browser UI test. 'save' (name + steps) records a flow; 'run' (
 | `name` | string |  |  |
 | `secrets` | object |  | run: values for the steps' secret_ref names, e.g. {pw: '...'}; used in memory for this run only, never stored, redacted from the audit log. A missing one fails the run before any step runs |
 | `steps` | array&lt;object&gt; |  | save: the ordered steps |
-| `target_id` | string |  | run: the tab to replay against |
+| `target_id` | string |  | run: the tab to replay against (default: the active tab) |
 
 ### browser-navigate
 
@@ -900,7 +900,7 @@ Navigate a tab: goto a url, or go back/forward/reload.
 | Argument | Type | Required | Description |
 |---|---|---|---|
 | `action` | one of: goto, back, forward, reload | yes |  |
-| `target_id` | string | yes |  |
+| `target_id` | string |  | the tab id; defaults to the active tab |
 | `url` | string |  |  |
 
 ### browser-network
@@ -915,7 +915,7 @@ Network control. log: record requests and responses for a bounded window (URLs, 
 | `duration_ms` | integer |  | log window, 100-30000 |
 | `filter` | string |  | substring filter for log rows |
 | `headers` | object |  | set_headers: the headers. intercept: { block: [url patterns] } |
-| `target_id` | string | yes |  |
+| `target_id` | string |  | the tab id; defaults to the active tab |
 
 ### browser-profile
 
@@ -927,7 +927,7 @@ Save, restore, list, or delete browser session profiles (cookies, localStorage, 
 |---|---|---|---|
 | `action` | one of: save, restore, list, delete | yes |  |
 | `name` | string |  | save/restore/delete: profile name |
-| `target_id` | string |  | save/restore: the tab to snapshot or populate |
+| `target_id` | string |  | save/restore: the tab to snapshot or populate (default: the active tab) |
 
 ### browser-query
 
@@ -940,7 +940,7 @@ Resolve node ref(s) by css selector, xpath, or text (case-insensitive, exact mat
 | `all` | boolean |  |  |
 | `by` | one of: css, xpath, text |  |  |
 | `query` | string | yes |  |
-| `target_id` | string | yes |  |
+| `target_id` | string |  | the tab id; defaults to the active tab |
 
 ### browser-record
 
@@ -953,7 +953,7 @@ Shadow observation & macro learning mode (Ghost Mode). Observes interactions in 
 | `action` | one of: start, stop, status |  | recording action (default: status) |
 | `dialogs` | one of: human, accept, dismiss |  | start: who answers the page's JavaScript dialogs (confirm/prompt/alert/beforeunload) while recording. human: nobody does, so the person at the browser window answers and the recording keeps how they did (needs a visible browser; the default there). accept / dismiss: the recorder answers (dismiss, or the tab's browser_dialog policy, is the default for a headless browser). Every confirm/prompt/beforeunload becomes a dialog step in the flow |
 | `name` | string |  | optional flow name to auto-save to flow store upon stop |
-| `target_id` | string | yes |  |
+| `target_id` | string |  | the tab id; defaults to the active tab |
 
 ### browser-screencast
 
@@ -969,7 +969,7 @@ Record a tab to an mp4 video (browser_record is something else: it learns a repl
 | `max_seconds` | integer |  | start: stop automatically after this long, 1 to 1800 (default 300) |
 | `quality` | integer |  | start: JPEG quality, 30 to 95 (default 80) |
 | `recording_id` | string |  | stop: the recording to stop, instead of target_id |
-| `target_id` | string |  | start: the tab to record; stop: the tab whose recording to stop |
+| `target_id` | string |  | start: the tab to record (default: the active tab); stop: the tab whose recording to stop |
 
 ### browser-screenshot
 
@@ -981,7 +981,7 @@ Capture a PNG of the page (or a single element by ref). Returned inline as an im
 |---|---|---|---|
 | `ref` | string |  |  |
 | `save` | boolean |  | write the PNG under agentctl's own media directory and return {path, width, height, bytes} instead of the image (default false). The newest 200 saved screenshots are kept; older ones are deleted |
-| `target_id` | string | yes |  |
+| `target_id` | string |  | the tab id; defaults to the active tab |
 
 ### browser-showcase
 
@@ -997,7 +997,7 @@ Configure visual flair for demos, screencasts, and presentations: animated virtu
 | `enabled` | boolean |  | enable or disable visual overlays |
 | `glide_ms` | integer |  | custom glide duration in milliseconds, 0-3000 (larger values are capped) |
 | `speed` | one of: cinematic, demo, snappy, off |  | gliding speed preset |
-| `target_id` | string | yes | the tab to configure showcase overlays for |
+| `target_id` | string |  | the tab to configure showcase overlays for (default: the active tab) |
 | `typing_hud` | boolean |  | display floating action/typing badges next to cursor |
 
 ### browser-snapshot
@@ -1010,7 +1010,7 @@ Flatten a page into interactable node refs (dom/accessibility) or raw text. The 
 |---|---|---|---|
 | `mode` | one of: dom, accessibility, text |  |  |
 | `root_selector` | string |  |  |
-| `target_id` | string | yes |  |
+| `target_id` | string |  | the tab id; defaults to the active tab |
 
 ### browser-tabs
 
@@ -1038,7 +1038,7 @@ Attach local files to a file input (type=file; a click would open the OS file ch
 | `paths` | array&lt;string&gt; | yes | absolute paths of the files to attach (1 to 10), inside fs.roots |
 | `query` | string |  | selector to resolve in one call, instead of 'ref' |
 | `ref` | string |  | a ref from browser_query/snapshot |
-| `target_id` | string | yes |  |
+| `target_id` | string |  | the tab id; defaults to the active tab |
 | `text` | string |  | optional text substring filter to narrow matches |
 | `within` | string |  | optional CSS/XPath root selector to scope query search |
 
@@ -1053,7 +1053,7 @@ Emulate a viewport for responsive testing: override the page's device metrics (w
 | `height` | integer |  | css px |
 | `mobile` | boolean |  | emulate a mobile device (touch, meta viewport) |
 | `scale` | number |  | device scale factor (default 1) |
-| `target_id` | string | yes |  |
+| `target_id` | string |  | the tab id; defaults to the active tab |
 | `width` | integer |  | css px; 0 clears the override |
 
 ### browser-wait
@@ -1072,7 +1072,7 @@ Wait for a settle signal: a selector to appear, dom_settled (no DOM mutation for
 | `navigation_timeout_ms` | integer |  | navigation only: how long (ms, 0-30000, default 2000) to keep expecting a navigation that a click, submit or key press has not started yet, before settling on the loaded page with navigated:false. Does not apply after goto, reload, back or forward, which always navigate; timeout_ms still bounds the whole wait |
 | `network_idle` | boolean |  | alias for condition 'network_idle'; only true selects it |
 | `selector` | string |  | alias for condition 'selector': the CSS selector to wait for |
-| `target_id` | string | yes |  |
+| `target_id` | string |  | the tab id; defaults to the active tab |
 | `timeout_ms` | integer |  |  |
 
 ## terminal

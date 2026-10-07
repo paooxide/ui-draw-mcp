@@ -58,6 +58,9 @@ pub const EVAL_TIMEOUT_MAX_MS: u64 = 60_000;
 #[derive(Debug, Clone, Copy)]
 pub enum Locator<'a> {
     Ref(&'a str),
+    /// `document.activeElement`: for `type` and `press` with no `ref` or
+    /// `query`, i.e. "into whatever is focused".
+    Focused,
     Selector {
         by: &'a str,
         query: &'a str,
@@ -125,6 +128,10 @@ pub trait BrowserBackend: Send + Sync {
         attach_port: Option<u16>,
         launch: Option<Value>,
     ) -> Result<Value, BrowserError>;
+    /// The ids of the connected browsers, for resolving an omitted `target_id`.
+    async fn browser_ids(&self) -> Vec<u32> {
+        Vec::new()
+    }
     /// Forget a browser. `kill` additionally stops one *this process started*
     /// and removes the temporary profile created for it; an attached browser is
     /// someone else's process and is never killed.
@@ -1571,6 +1578,21 @@ impl CdpBackend {
         Ok(())
     }
 
+    /// Put the page tabs on a connect result, active first, with the active
+    /// one as `target_id`, so the first call after connecting needs no
+    /// `browser_tabs`. Best effort: a browser that cannot list leaves the
+    /// result as it was.
+    async fn report_tabs(&self, browser_id: u32, out: &mut Value) {
+        let Ok(list) = self.tabs(browser_id, "list", None, None).await else {
+            return;
+        };
+        let tabs = list.get("tabs").cloned().unwrap_or_else(|| json!([]));
+        if let Some(active) = tabs.get(0).and_then(|t| t.get("target_id")).cloned() {
+            out["target_id"] = active;
+        }
+        out["tabs"] = tabs;
+    }
+
     /// Bring the browser's active page (the first in `/json/list`, which Chrome
     /// keeps in most-recently-active order) to the front. Best effort; says
     /// whether it worked. The focus emulation set here ends with this
@@ -1696,6 +1718,7 @@ impl CdpBackend {
 /// `JS_FIND` in scope): a `ref` via XPath, or a selector via `__find`.
 fn locator_js(locator: Locator<'_>) -> String {
     match locator {
+        Locator::Focused => "__focused()".to_string(),
         Locator::Ref(r) => {
             format!(
                 "__resolve({})",
@@ -2150,6 +2173,14 @@ function __target(el){
   }
   return {tag: tag, text: String(t).replace(/\s+/g, ' ').trim().slice(0, 80)};
 }
+// The focused element (through open shadow roots), or a thrown explanation
+// when the page has no focus to speak of: `<body>` is what an unfocused page reports.
+function __focused(){
+  var a = document.activeElement;
+  while(a && a.shadowRoot && a.shadowRoot.activeElement) a = a.shadowRoot.activeElement;
+  if(!a || a === document.body || a === document.documentElement) throw new Error('nothing is focused; pass ref or query');
+  return a;
+}
 function __find(by, q, within, textFilter, index){
   var matches = __find_all(by, q, within, textFilter);
   __find.count = matches.length;
@@ -2557,22 +2588,37 @@ const JS_ARM: &str = r#"var __iso = __ISO__;
 /// In-page script that batches multiple form field updates and optional submit.
 const JS_FILL_FORM: &str = r##"(async function(){
   {JS_XPATH}
+  {JS_FIND}
   {JS_ARM}
   {JS_SET_VALUE}
   {JS_SHOWCASE_INIT}
   var fields = __FIELDS__;
   var submit = __SUBMIT__;
   var filled = 0, errors = [];
+  // `by` is css (the default), xpath or text, found as browser_act finds them;
+  // with no `by`, a selector that starts like an XPath is one. A label found by
+  // its text stands for the control it labels.
   function resolve(f){
     if(!f) return null;
     if(f.ref) return __resolve(f.ref);
-    if(f.selector) return document.querySelector(f.selector);
+    if(f.selector){
+      var s = String(f.selector), c = s.charAt(0);
+      var by = f.by || ((c === '/' || c === '(') ? 'xpath' : 'css');
+      if(by === 'css') return document.querySelector(s);
+      var found = __find_all(by, s, null, null)[0] || null;
+      if(found && by === 'text' && found.tagName === 'LABEL' && found.control) found = found.control;
+      return found;
+    }
     return null;
   }
   try {
   for(var i=0; i<fields.length; i++){
     var f = fields[i];
-    var el = resolve(f);
+    var el = null;
+    try { el = resolve(f); } catch(err){
+      errors.push({field: f.selector || f.ref || ('index_' + i), error: String(err && err.message ? err.message : err)});
+      continue;
+    }
     if(!el){
       errors.push({field: f.selector || f.ref || ('index_' + i), error: 'element not found'});
       continue;
@@ -2790,7 +2836,7 @@ impl BrowserBackend for CdpBackend {
                     .unwrap_or_else(|e| e.into_inner())
                     .insert(id, entry);
 
-                return Ok(json!({
+                let mut out = json!({
                     "browser_id": id,
                     "host": "127.0.0.1",
                     "port": driver_port,
@@ -2798,7 +2844,9 @@ impl BrowserBackend for CdpBackend {
                     "engine": "webkit",
                     "driver": "safaridriver",
                     "target_id": format!("safari-{id}"),
-                }));
+                });
+                self.report_tabs(id, &mut out).await;
+                return Ok(out);
             }
         }
 
@@ -2858,11 +2906,25 @@ impl BrowserBackend for CdpBackend {
             "protocol": ver.get("Protocol-Version"),
         });
         out["foregrounded"] = json!(self.foreground_active_page(id).await);
+        self.report_tabs(id, &mut out).await;
         // Only a profile we created (and will delete on disconnect) is reported.
         if let Some(dir) = owned_profile {
             out["owned_user_data_dir"] = json!(dir);
         }
         Ok(out)
+    }
+
+    async fn browser_ids(&self) -> Vec<u32> {
+        let mut ids: Vec<u32> = self.browsers().iter().map(|b| b.id).collect();
+        ids.extend(
+            self.safari_sessions
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .keys()
+                .copied(),
+        );
+        ids.sort_unstable();
+        ids
     }
 
     fn shutdown(&self) {
@@ -5364,6 +5426,7 @@ impl BrowserBackend for CdpBackend {
 
         let expr = JS_FILL_FORM
             .replace("{JS_XPATH}", JS_XPATH)
+            .replace("{JS_FIND}", JS_FIND)
             .replace(
                 "{JS_ARM}",
                 &JS_ARM.replace("__ISO__", if iso.is_some() { "true" } else { "false" }),
