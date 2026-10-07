@@ -141,8 +141,8 @@ pub fn get_prompt(name: &str, args: &Value) -> Result<Value, (i64, String)> {
             let fields = arg(args, "fields").ok_or_else(|| missing("fields"))?;
             format!(
                 "Open {url} and fill in: {fields}\n\n\
-                 1. `browser_connect` (attach to a running browser, or launch one), then \
-                 `browser_tabs` with action `list` to get a target_id.\n\
+                 1. `browser_connect` (attach to a running browser, or launch one); its result lists \
+                 the tabs, and later calls may leave out target_id to use the active tab.\n\
                  2. `browser_navigate` to the page, then `browser_wait` for it to settle.\n\
                  3. `browser_snapshot` in `dom` mode for the interactive nodes, or \
                  `browser_query` when you already know the selector.\n\

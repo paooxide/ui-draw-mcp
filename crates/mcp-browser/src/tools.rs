@@ -192,7 +192,295 @@ fn result(tool: &str, r: Result<Value, BrowserError>) -> Envelope {
     }
 }
 
+/// A connected browser and the ids of its page tabs, active one first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BrowserTabs {
+    pub id: u32,
+    pub tabs: Vec<String>,
+}
+
+/// What an omitted or browser-id `target_id` resolves to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TargetPick {
+    /// The caller named a tab; use it as given.
+    Given(String),
+    /// A default: the active tab of this browser.
+    Active { target: String, browser_id: u32 },
+}
+
+/// Why no tab could be chosen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TargetError {
+    NoBrowser,
+    Ambiguous(Vec<u32>),
+    NoTabs(u32),
+    Unknown(String, Vec<u32>),
+}
+
+impl TargetError {
+    fn into_envelope(self, tool: &str) -> Envelope {
+        let ids = |v: &[u32]| v.iter().map(u32::to_string).collect::<Vec<_>>().join(", ");
+        match self {
+            TargetError::NoBrowser => Envelope::fail_with(
+                tool,
+                ErrorCode::NotFound,
+                "no browser is connected, so there is no tab to use",
+                "call browser_connect first; its result lists the tabs",
+            ),
+            TargetError::Ambiguous(v) => Envelope::fail_with(
+                tool,
+                ErrorCode::InvalidArgs,
+                format!(
+                    "missing 'target_id', and several browsers are connected (browser_id {})",
+                    ids(&v)
+                ),
+                "pass target_id: a tab id from browser_tabs, or a browser_id to use that browser's active tab",
+            ),
+            TargetError::NoTabs(b) => Envelope::fail_with(
+                tool,
+                ErrorCode::NotFound,
+                format!("browser {b} has no open page tab"),
+                "open one with browser_tabs action 'open'",
+            ),
+            TargetError::Unknown(g, v) => Envelope::fail_with(
+                tool,
+                ErrorCode::NotFound,
+                format!(
+                    "target '{g}' is neither a tab id nor a connected browser_id (connected: {})",
+                    ids(&v)
+                ),
+                "pass a target_id from browser_connect or browser_tabs, or omit it to use the active tab",
+            ),
+        }
+    }
+}
+
+fn all_digits(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// The `target_id` argument as text. A model that has only seen
+/// `browser_id: 1` sends `1`, as a string or as a number; empty means omitted.
+fn target_arg(args: &Value) -> Option<String> {
+    match args.get("target_id")? {
+        Value::String(s) if !s.is_empty() => Some(s.clone()),
+        Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    }
+}
+
+/// Decide which tab a tab-scoped call acts on. A tab id is used as given (the
+/// backend says if it is wrong). All digits is a `browser_id` unless it really
+/// is a tab id: that browser's active tab. Omitted is the active tab of the
+/// only connected browser; with none or several there is nothing to guess.
+pub(crate) fn pick_target(
+    given: Option<&str>,
+    browsers: &[BrowserTabs],
+) -> Result<TargetPick, TargetError> {
+    let active = |b: &BrowserTabs| {
+        b.tabs
+            .first()
+            .map(|t| TargetPick::Active {
+                target: t.clone(),
+                browser_id: b.id,
+            })
+            .ok_or(TargetError::NoTabs(b.id))
+    };
+    let ids = || browsers.iter().map(|b| b.id).collect::<Vec<_>>();
+    match given {
+        Some(g) if !all_digits(g) => Ok(TargetPick::Given(g.to_string())),
+        Some(g) => {
+            if browsers.iter().any(|b| b.tabs.iter().any(|t| t == g)) {
+                return Ok(TargetPick::Given(g.to_string()));
+            }
+            match browsers.iter().find(|b| g.parse::<u32>() == Ok(b.id)) {
+                Some(b) => active(b),
+                None => Err(TargetError::Unknown(g.to_string(), ids())),
+            }
+        }
+        None => match browsers {
+            [] => Err(TargetError::NoBrowser),
+            [only] => active(only),
+            _ => Err(TargetError::Ambiguous(ids())),
+        },
+    }
+}
+
+/// Whether this call is one whose `target_id` may be left out. Tools that
+/// fork tabs (`browser_branch`), list across tabs, or stop by recording id
+/// keep their own rules.
+fn defaults_target(name: &str, args: &Value) -> bool {
+    let action = str_arg(args, "action");
+    match name {
+        "browser_navigate" | "browser_snapshot" | "browser_query" | "browser_act"
+        | "browser_upload" | "browser_fill_form" | "browser_extract" | "browser_wait"
+        | "browser_challenge" | "browser_record" | "browser_screenshot" | "browser_viewport"
+        | "browser_eval" | "browser_dialog" | "browser_network" | "browser_cookies"
+        | "browser_capture" | "browser_assert" | "browser_showcase" => true,
+        "browser_profile" => matches!(action, Some("save" | "restore")),
+        "browser_checkpoint" => matches!(action.unwrap_or("save"), "save" | "rollback" | "delete"),
+        "browser_flow" => action == Some("run"),
+        "browser_screencast" => action == Some("start"),
+        _ => false,
+    }
+}
+
+/// Drop the backslash an over-escaping caller left before a quote. `\"` and
+/// `\'` are never valid XPath (CSS does accept them, so selectors are not
+/// passed through this).
+pub(crate) fn unescape_xpath_quotes(s: &str) -> std::borrow::Cow<'_, str> {
+    if !s.contains("\\\"") && !s.contains("\\'") {
+        return std::borrow::Cow::Borrowed(s);
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' && matches!(chars.peek(), Some('"' | '\'')) {
+            continue;
+        }
+        out.push(c);
+    }
+    std::borrow::Cow::Owned(out)
+}
+
+/// A selector that starts like an XPath, the test `within` uses in the page.
+fn looks_like_xpath(s: &str) -> bool {
+    matches!(s.chars().next(), Some('/' | '('))
+}
+
+fn unescape_field(obj: &mut Value, key: &str) {
+    if let Some(Value::String(s)) = obj.get(key) {
+        if let std::borrow::Cow::Owned(fixed) = unescape_xpath_quotes(s) {
+            obj[key] = Value::String(fixed);
+        }
+    }
+}
+
+/// Apply [`unescape_xpath_quotes`] to every argument that is an XPath: a
+/// `ref`, a `query` with `by: "xpath"`, an XPath-looking `within`, and the
+/// same in `fill_form`'s fields and submit.
+fn fix_xpath_args(args: &mut Value) {
+    fn one(o: &mut Value, selector_key: &str) {
+        unescape_field(o, "ref");
+        let xpath = match (str_arg(o, "by"), str_arg(o, selector_key)) {
+            (Some(by), _) => by == "xpath",
+            (None, Some(s)) => selector_key == "selector" && looks_like_xpath(s),
+            _ => false,
+        };
+        if xpath {
+            unescape_field(o, selector_key);
+        }
+    }
+    if !args.is_object() {
+        return;
+    }
+    one(args, "query");
+    if str_arg(args, "within").is_some_and(looks_like_xpath) {
+        unescape_field(args, "within");
+    }
+    if let Some(fields) = args.get_mut("fields").and_then(Value::as_array_mut) {
+        for f in fields.iter_mut().filter(|f| f.is_object()) {
+            one(f, "selector");
+        }
+    }
+    if let Some(submit) = args.get_mut("submit").filter(|s| s.is_object()) {
+        one(submit, "selector");
+    }
+}
+
+/// The jQuery / Playwright pseudo-class a CSS selector uses, if any: none of
+/// these exist in CSS. `:first` and `:last` are not `:first-child` and friends.
+pub(crate) fn jquery_pseudo(selector: &str) -> Option<&'static str> {
+    const WITH_ARGS: [&str; 4] = [":contains(", ":has-text(", ":text(", ":eq("];
+    const BARE: [&str; 3] = [":visible", ":first", ":last"];
+    let word = |c: char| c.is_ascii_alphanumeric() || c == '-' || c == '_';
+    if let Some(p) = WITH_ARGS.into_iter().find(|p| selector.contains(p)) {
+        return Some(p);
+    }
+    BARE.into_iter().find(|p| {
+        selector
+            .match_indices(p)
+            .any(|(i, _)| !selector[i + p.len()..].chars().next().is_some_and(word))
+    })
+}
+
+/// A browser's complaint that a CSS selector does not parse.
+fn is_selector_syntax_error(msg: &str) -> bool {
+    msg.contains("valid selector") || msg.contains("SyntaxError")
+}
+
+/// [`result`], except that a CSS selector the browser could not parse, and
+/// that uses a jQuery or Playwright pseudo-class, says what to use instead.
+/// The browser's own text stays in the message.
+fn result_with_selector_hint(tool: &str, r: Result<Value, BrowserError>, css: &[&str]) -> Envelope {
+    if let Err(e) = &r {
+        let msg = browser_err_msg(e);
+        let pseudo = css.iter().find_map(|s| jquery_pseudo(s));
+        if let (true, Some(p)) = (is_selector_syntax_error(&msg), pseudo) {
+            return Envelope::fail_with(
+                tool,
+                ErrorCode::InvalidArgs,
+                msg,
+                format!(
+                    "'{p}' is a jQuery/Playwright pseudo-class, not CSS; to find an element by its text use by: \"text\" with the text as the query (browser_act also has a 'text' filter to narrow a CSS match)"
+                ),
+            );
+        }
+    }
+    result(tool, r)
+}
+
+/// The CSS selectors among `fill_form`'s fields and submit.
+fn fill_css_selectors(args: &Value) -> Vec<&str> {
+    fn css(f: &Value) -> Option<&str> {
+        let s = f.get("selector")?.as_str()?;
+        let is_css = match str_arg(f, "by") {
+            Some(b) => b == "css",
+            None => !looks_like_xpath(s),
+        };
+        is_css.then_some(s)
+    }
+    let mut out: Vec<&str> = args
+        .get("fields")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(css).collect())
+        .unwrap_or_default();
+    out.extend(args.get("submit").and_then(css));
+    out
+}
+
 impl BrowserModule {
+    /// Resolve a tab-scoped call's `target_id` (see [`pick_target`]). `None`
+    /// when the caller's tab id stands as it is; otherwise the tab to use and
+    /// whether it was a default.
+    async fn resolve_target(&self, args: &Value) -> Result<Option<(String, bool)>, TargetError> {
+        let given = target_arg(args);
+        if given.as_deref().is_some_and(|g| !all_digits(g)) {
+            return Ok(None);
+        }
+        let mut browsers = Vec::new();
+        for id in self.backend.browser_ids().await {
+            let tabs = match self.backend.tabs(id, "list", None, None).await {
+                Ok(v) => v
+                    .get("tabs")
+                    .and_then(Value::as_array)
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|t| t.get("target_id").and_then(Value::as_str))
+                            .map(str::to_string)
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                Err(_) => Vec::new(),
+            };
+            browsers.push(BrowserTabs { id, tabs });
+        }
+        match pick_target(given.as_deref(), &browsers)? {
+            TargetPick::Given(t) => Ok(Some((t, false))),
+            TargetPick::Active { target, .. } => Ok(Some((target, true))),
+        }
+    }
+
     async fn connect(&self, args: &Value) -> Envelope {
         let attach_port = args
             .get("attach")
@@ -434,9 +722,11 @@ impl BrowserModule {
             Err(e) => return e,
         };
         let all = args.get("all").and_then(Value::as_bool).unwrap_or(false);
-        result(
+        let css: &[&str] = if by == "css" { &[q] } else { &[] };
+        result_with_selector_hint(
             "browser_query",
             self.backend.query(target, by, q, all).await,
+            css,
         )
     }
 
@@ -447,21 +737,33 @@ impl BrowserModule {
         };
         // Either a ref from a prior snapshot/query, or a selector resolved in
         // the same call (one round trip instead of query-then-act).
-        let Some(locator) = parse_locator(args) else {
-            return Envelope::fail_with(
-                "browser_act",
-                ErrorCode::InvalidArgs,
-                "need 'ref' (from browser_query/snapshot) or 'query' (with optional 'by', 'within', 'text', 'index')",
-                "pass ref, or query plus by=css|xpath|text",
-            );
-        };
         let action = str_arg(args, "action").unwrap_or("click");
+        // Typing and key presses may go to whatever has focus.
+        let locator = match parse_locator(args) {
+            Some(l) => l,
+            None if matches!(action, "type" | "press") => crate::backend::Locator::Focused,
+            None => {
+                return Envelope::fail_with(
+                    "browser_act",
+                    ErrorCode::InvalidArgs,
+                    "need 'ref' (from browser_query/snapshot) or 'query' (with optional 'by', 'within', 'text', 'index')",
+                    "pass ref, or query plus by=css|xpath|text",
+                )
+            }
+        };
         let secret = args.get("secret").and_then(Value::as_bool) == Some(true);
         let opts = match parse_act_opts(args) {
             Ok(o) => o,
             Err(m) => return Envelope::fail("browser_act", ErrorCode::InvalidArgs, m),
         };
-        result(
+        let mut css = Vec::new();
+        if let Some(q) =
+            str_arg(args, "query").filter(|_| str_arg(args, "by").unwrap_or("css") == "css")
+        {
+            css.push(q);
+        }
+        css.extend(str_arg(args, "within").filter(|w| !looks_like_xpath(w)));
+        result_with_selector_hint(
             "browser_act",
             self.backend
                 .act_opts(
@@ -473,6 +775,7 @@ impl BrowserModule {
                     opts,
                 )
                 .await,
+            &css,
         )
     }
 
@@ -561,11 +864,12 @@ impl BrowserModule {
             );
         }
         let submit = args.get("submit");
-        result(
+        result_with_selector_hint(
             tool,
             self.backend
                 .fill_form(target, &Value::Array(fields.clone()), submit)
                 .await,
+            &fill_css_selectors(args),
         )
     }
 
@@ -2045,7 +2349,7 @@ impl ToolModule for BrowserModule {
                 "browser_connect",
                 Category::Browser,
                 Tier::Standard,
-                "Attach to a Chromium browser started with --remote-debugging-port, or launch a dedicated instance. Optionally auto-restores a saved profile. The browser's active tab is brought to the front on connect (result 'foregrounded'). launch.browser='safari' drives Safari through safaridriver (macOS only, experimental: needs `safaridriver --enable` once, and a Safari that was already open when automation was enabled must be quit first; opens a visible window). On Safari, browser_network, browser_dialog, browser_viewport, browser_record, browser_branch, browser_checkpoint and browser_act 'press' return Unsupported.",
+                "Attach to a Chromium browser started with --remote-debugging-port, or launch a dedicated instance. The result lists the open tabs (active first) and the active target_id. Optionally auto-restores a saved profile. The browser's active tab is brought to the front on connect (result 'foregrounded'). launch.browser='safari' drives Safari through safaridriver (macOS only, experimental: needs `safaridriver --enable` once, and a Safari that was already open when automation was enabled must be quit first; opens a visible window). On Safari, browser_network, browser_dialog, browser_viewport, browser_record, browser_branch, browser_checkpoint and browser_act 'press' return Unsupported.",
                 obj(
                     json!({
                         "attach": { "type": "object", "properties": { "port": { "type": "integer" } } },
@@ -2063,7 +2367,7 @@ impl ToolModule for BrowserModule {
                     }),
                     json!([]),
                 ),
-            ),
+            ).untrusted_output(),
             ToolDescriptor::new(
                 "browser_disconnect",
                 Category::Browser,
@@ -2099,11 +2403,11 @@ impl ToolModule for BrowserModule {
                 "Navigate a tab: goto a url, or go back/forward/reload.",
                 obj(
                     json!({
-                        "target_id": { "type": "string" },
+                        "target_id": { "type": "string", "description": "the tab id; defaults to the active tab" },
                         "action": { "type": "string", "enum": ["goto", "back", "forward", "reload"] },
                         "url": { "type": "string" }
                     }),
-                    json!(["target_id", "action"]),
+                    json!(["action"]),
                 ),
             ).untrusted_output(),
             ToolDescriptor::new(
@@ -2115,11 +2419,11 @@ impl ToolModule for BrowserModule {
                  via canvas.__agentctl_regions or a data-canvas-regions JSON attribute; any other canvas is an opaque node.",
                 obj(
                     json!({
-                        "target_id": { "type": "string" },
+                        "target_id": { "type": "string", "description": "the tab id; defaults to the active tab" },
                         "mode": { "type": "string", "enum": ["dom", "accessibility", "text"] },
                         "root_selector": { "type": "string" }
                     }),
-                    json!(["target_id"]),
+                    json!([]),
                 ),
             ).untrusted_output(),
             ToolDescriptor::new(
@@ -2129,12 +2433,12 @@ impl ToolModule for BrowserModule {
                 "Resolve node ref(s) by css selector, xpath, or text (case-insensitive, exact matches first, clickable elements preferred).",
                 obj(
                     json!({
-                        "target_id": { "type": "string" },
+                        "target_id": { "type": "string", "description": "the tab id; defaults to the active tab" },
                         "by": { "type": "string", "enum": ["css", "xpath", "text"] },
                         "query": { "type": "string" },
                         "all": { "type": "boolean" }
                     }),
-                    json!(["target_id", "query"]),
+                    json!(["query"]),
                 ),
             ).untrusted_output(),
             ToolDescriptor::new(
@@ -2149,10 +2453,10 @@ impl ToolModule for BrowserModule {
                  'query' plus optional 'by' (css/xpath/text; text is case-insensitive, exact matches first, clickable elements preferred), 'within' (scoped container), 'text' (substring filter), and 'index'.",
                 obj(
                     json!({
-                        "target_id": { "type": "string" },
+                        "target_id": { "type": "string", "description": "the tab id; defaults to the active tab" },
                         "ref": { "type": "string", "description": "a ref from browser_query/snapshot" },
                         "by": { "type": "string", "enum": ["css", "xpath", "text"], "description": "how to read 'query' (default css); used when no 'ref'" },
-                        "query": { "type": "string", "description": "selector to resolve and act on in one call, instead of 'ref'" },
+                        "query": { "type": "string", "description": "selector to resolve and act on in one call, instead of 'ref'. type and press with neither ref nor query act on the focused element" },
                         "within": { "type": "string", "description": "optional CSS/XPath root selector to scope query search" },
                         "text": { "type": "string", "description": "optional text substring filter to narrow matches" },
                         "index": { "type": "integer", "description": "optional 0-based match index if query matches multiple elements (default 0)" },
@@ -2163,7 +2467,7 @@ impl ToolModule for BrowserModule {
                         "wait_after": { "type": "string", "enum": ["none", "settle"], "description": "none (default) returns as soon as the action ran, when a click's request or navigation has usually not begun yet. settle then waits for a navigation it started to load, for htmx_settled if the page has htmx, and for the network to go quiet, and adds navigated, requests_started (fetch/XHR/htmx begun on the page since the action) and settled to the result. A click that starts no request and no navigation costs about 2s here; Chrome only" },
                         "timeout_ms": { "type": "integer", "description": "wait_after settle only: bound for the whole settle wait (default 10000); when it runs out the action still succeeded and the result has settled:false and settle_error" }
                     }),
-                    json!(["target_id", "action"]),
+                    json!(["action"]),
                 ),
             ).untrusted_output(),
             ToolDescriptor::new(
@@ -2179,7 +2483,7 @@ impl ToolModule for BrowserModule {
                  never file contents. Chrome only.",
                 obj(
                     json!({
-                        "target_id": { "type": "string" },
+                        "target_id": { "type": "string", "description": "the tab id; defaults to the active tab" },
                         "ref": { "type": "string", "description": "a ref from browser_query/snapshot" },
                         "by": { "type": "string", "enum": ["css", "xpath", "text"], "description": "how to read 'query' (default css); used when no 'ref'" },
                         "query": { "type": "string", "description": "selector to resolve in one call, instead of 'ref'" },
@@ -2192,7 +2496,7 @@ impl ToolModule for BrowserModule {
                             "description": "absolute paths of the files to attach (1 to 10), inside fs.roots"
                         }
                     }),
-                    json!(["target_id", "paths"]),
+                    json!(["paths"]),
                 ),
             ),
             ToolDescriptor::new(
@@ -2203,18 +2507,22 @@ impl ToolModule for BrowserModule {
                  optionally submit. Eliminates round-trips for registration or checkout forms.",
                 obj(
                     json!({
-                        "target_id": { "type": "string" },
+                        "target_id": { "type": "string", "description": "the tab id; defaults to the active tab" },
                         "fields": {
                             "type": "array",
-                            "items": { "type": "object" },
-                            "description": "Array of fields: [{ref or selector, value, type, secret}]"
+                            "items": { "type": "object", "properties": {
+                                "ref": { "type": "string" },
+                                "selector": { "type": "string" },
+                                "by": { "type": "string", "enum": ["css", "xpath", "text"], "description": "how to read 'selector' (default css; a selector starting with / or ( is xpath)" }
+                            } },
+                            "description": "Array of fields: [{ref or selector, by, value, type, secret}]"
                         },
                         "submit": {
                             "type": "object",
                             "description": "Optional submit trigger: {ref or selector}"
                         }
                     }),
-                    json!(["target_id", "fields"]),
+                    json!(["fields"]),
                 ),
             ),
             ToolDescriptor::new(
@@ -2225,7 +2533,7 @@ impl ToolModule for BrowserModule {
                  (e.g. text values, lists, tables). Offloads extraction parsing from the LLM.",
                 obj(
                     json!({
-                        "target_id": { "type": "string" },
+                        "target_id": { "type": "string", "description": "the tab id; defaults to the active tab" },
                         "schema": {
                             "type": "object",
                             "description": "Extraction schema mapping field names to rules {selector, attr, regex, multiple, fields}"
@@ -2235,7 +2543,7 @@ impl ToolModule for BrowserModule {
                             "description": "Optional CSS root selector to scope extraction"
                         }
                     }),
-                    json!(["target_id", "schema"]),
+                    json!(["schema"]),
                 ),
             ).untrusted_output(),
             ToolDescriptor::new(
@@ -2247,7 +2555,7 @@ impl ToolModule for BrowserModule {
                 obj(
                     json!({
                         "action": { "type": "string", "enum": ["save", "restore", "list", "delete"] },
-                        "target_id": { "type": "string", "description": "save/restore: the tab to snapshot or populate" },
+                        "target_id": { "type": "string", "description": "save/restore: the tab to snapshot or populate (default: the active tab)" },
                         "name": { "type": "string", "description": "save/restore/delete: profile name" }
                     }),
                     json!(["action"]),
@@ -2288,7 +2596,7 @@ impl ToolModule for BrowserModule {
                 obj(
                     json!({
                         "action": { "type": "string", "enum": ["save", "rollback", "list", "delete"] },
-                        "target_id": { "type": "string", "description": "target tab to checkpoint or restore" },
+                        "target_id": { "type": "string", "description": "target tab to checkpoint or restore (default: the active tab)" },
                         "tag": { "type": "string", "description": "save/rollback/delete: tag name (e.g. 'step_2' or 'latest')" }
                     }),
                     json!(["action"]),
@@ -2302,7 +2610,7 @@ impl ToolModule for BrowserModule {
                  >=150ms; animation frames are not tracked), htmx_settled (HTMX requests and DOM swaps settled; right after a browser_act it also waits up to 1.5s for an htmx request to start; errors if htmx is not present on the page), navigation to complete (after a goto, reload, click, submit or key press in this session it waits for the NEW document, not the one being left; a click that starts no navigation within navigation_timeout_ms, default 2s, settles on the loaded page with navigated:false; raise it for a handler that navigates later than that), network_idle (fetch/XHR started after a browser_act are tracked; settled when none is in flight and none began or finished for 500ms, and not before a navigation that act may have started has happened), or verification challenge clearance. Prefer 'condition'; the other arguments are aliases.",
                 obj(
                     json!({
-                        "target_id": { "type": "string" },
+                        "target_id": { "type": "string", "description": "the tab id; defaults to the active tab" },
                         "condition": { "type": "string", "enum": ["selector", "dom_settled", "htmx_settled", "navigation", "network_idle", "challenge_cleared"], "description": "preferred way to choose what to wait for; 'selector' also needs the selector argument. Give exactly one condition: the aliases below conflict with it and with each other" },
                         "selector": { "type": "string", "description": "alias for condition 'selector': the CSS selector to wait for" },
                         "dom_settled": { "type": "boolean", "description": "alias for condition 'dom_settled'; only true selects it" },
@@ -2313,7 +2621,7 @@ impl ToolModule for BrowserModule {
                         "timeout_ms": { "type": "integer" },
                         "navigation_timeout_ms": { "type": "integer", "description": "navigation only: how long (ms, 0-30000, default 2000) to keep expecting a navigation that a click, submit or key press has not started yet, before settling on the loaded page with navigated:false. Does not apply after goto, reload, back or forward, which always navigate; timeout_ms still bounds the whole wait" }
                     }),
-                    json!(["target_id"]),
+                    json!([]),
                 ),
             ).untrusted_output(),
             ToolDescriptor::new(
@@ -2323,12 +2631,12 @@ impl ToolModule for BrowserModule {
                 "Mixed-initiative CAPTCHA / 2FA detector and handshake. Pauses execution, shows a non-intrusive HUD in the browser informing the user to solve the verification, and auto-resumes in <=50ms upon clearance.",
                 obj(
                     json!({
-                        "target_id": { "type": "string" },
+                        "target_id": { "type": "string", "description": "the tab id; defaults to the active tab" },
                         "action": { "type": "string", "enum": ["detect", "wait", "hud_show", "hud_hide"], "description": "action to perform (default: detect)" },
                         "timeout_ms": { "type": "integer", "description": "max wait time for human verification clearance in ms (default: 30000)" },
                         "kind": { "type": "string", "description": "optional challenge kind override for hud_show" }
                     }),
-                    json!(["target_id"]),
+                    json!([]),
                 ),
             ),
             ToolDescriptor::new(
@@ -2338,12 +2646,12 @@ impl ToolModule for BrowserModule {
                 "Shadow observation & macro learning mode (Ghost Mode). Observes interactions in a tab (a person's, and the agent's own browser_act and browser_fill_form actions; events the page's own script fakes, such as el.click() or dispatchEvent, are ignored), across page loads and navigations (a link or form post becomes a wait for the next page, a typed URL or reload a goto), debounces keystrokes and click bursts, strips noise, and synthesizes clean, deterministic browser_flow steps. Secret fields are never recorded: they become steps with a secret_ref, supplied as secrets when the flow runs. Chrome only. JavaScript dialogs raised while recording are answered as 'dialogs' says: by the person at a visible window by default (the recording keeps the answer as a dialog step the flow replays before the action that raised it; a prompt's typed text is not kept), by the recorder in a headless browser (dismiss unless browser_dialog says accept).",
                 obj(
                     json!({
-                        "target_id": { "type": "string" },
+                        "target_id": { "type": "string", "description": "the tab id; defaults to the active tab" },
                         "action": { "type": "string", "enum": ["start", "stop", "status"], "description": "recording action (default: status)" },
                         "name": { "type": "string", "description": "optional flow name to auto-save to flow store upon stop" },
                         "dialogs": { "type": "string", "enum": ["human", "accept", "dismiss"], "description": "start: who answers the page's JavaScript dialogs (confirm/prompt/alert/beforeunload) while recording. human: nobody does, so the person at the browser window answers and the recording keeps how they did (needs a visible browser; the default there). accept / dismiss: the recorder answers (dismiss, or the tab's browser_dialog policy, is the default for a headless browser). Every confirm/prompt/beforeunload becomes a dialog step in the flow" }
                     }),
-                    json!(["target_id"]),
+                    json!([]),
                 ),
             ),
             ToolDescriptor::new(
@@ -2356,11 +2664,11 @@ impl ToolModule for BrowserModule {
                  back, with no image payload.",
                 obj(
                     json!({
-                        "target_id": { "type": "string" },
+                        "target_id": { "type": "string", "description": "the tab id; defaults to the active tab" },
                         "ref": { "type": "string" },
                         "save": { "type": "boolean", "description": "write the PNG under agentctl's own media directory and return {path, width, height, bytes} instead of the image (default false). The newest 200 saved screenshots are kept; older ones are deleted" }
                     }),
-                    json!(["target_id"]),
+                    json!([]),
                 ),
             ),
             ToolDescriptor::new(
@@ -2379,7 +2687,7 @@ impl ToolModule for BrowserModule {
                 obj(
                     json!({
                         "action": { "type": "string", "enum": ["start", "stop", "status"], "description": "default: status" },
-                        "target_id": { "type": "string", "description": "start: the tab to record; stop: the tab whose recording to stop" },
+                        "target_id": { "type": "string", "description": "start: the tab to record (default: the active tab); stop: the tab whose recording to stop" },
                         "recording_id": { "type": "string", "description": "stop: the recording to stop, instead of target_id" },
                         "fps": { "type": "integer", "description": "start: frames per second to capture, 1 to 30 (default 15)" },
                         "quality": { "type": "integer", "description": "start: JPEG quality, 30 to 95 (default 80)" },
@@ -2398,13 +2706,13 @@ impl ToolModule for BrowserModule {
                  (or omitted) to clear the override and restore the real window size.",
                 obj(
                     json!({
-                        "target_id": { "type": "string" },
+                        "target_id": { "type": "string", "description": "the tab id; defaults to the active tab" },
                         "width": { "type": "integer", "description": "css px; 0 clears the override" },
                         "height": { "type": "integer", "description": "css px" },
                         "mobile": { "type": "boolean", "description": "emulate a mobile device (touch, meta viewport)" },
                         "scale": { "type": "number", "description": "device scale factor (default 1)" }
                     }),
-                    json!(["target_id"]),
+                    json!([]),
                 ),
             ),
             ToolDescriptor::new(
@@ -2414,12 +2722,12 @@ impl ToolModule for BrowserModule {
                 "Evaluate arbitrary JavaScript in the page context. The result is the value of the last statement (a returned promise is awaited), JSON-serialized. Arbitrary code execution. If the script navigates the page the result is {navigated:true, value:null} rather than an error. On Safari, a page whose CSP forbids eval gets the code run without eval: an expression works as usual, but statements need an explicit `return` to produce a result.",
                 obj(
                     json!({
-                        "target_id": { "type": "string" },
+                        "target_id": { "type": "string", "description": "the tab id; defaults to the active tab" },
                         "expression": { "type": "string" },
                         "timeout_ms": { "type": "integer", "description": "stop waiting after this many ms (default 10000, clamped to 100-60000). Chrome stops script that is still running; a timeout is an error that says so. Async work already scheduled (timers, pending promises) can keep running in the page. Not enforced on Safari" },
                         "detached": { "type": "boolean", "description": "start the script and return {started:true} without waiting for a promise it returns or for its result (Chrome only); its synchronous part still runs within the call and timeout_ms. A later rejection goes to the page console" }
                     }),
-                    json!(["target_id", "expression"]),
+                    json!(["expression"]),
                 ),
             ).untrusted_output(),
             ToolDescriptor::new(
@@ -2434,11 +2742,11 @@ impl ToolModule for BrowserModule {
                 json!({
                     "type": "object",
                     "properties": {
-                        "target_id": { "type": "string" },
+                        "target_id": { "type": "string", "description": "the tab id; defaults to the active tab" },
                         "policy": { "type": "string", "enum": ["dismiss", "accept"] },
                         "prompt_text": { "type": "string", "description": "text supplied to prompt() when accepting" }
                     },
-                    "required": ["target_id"]
+                    "required": []
                 }),
             ).untrusted_output(),
             ToolDescriptor::new(
@@ -2450,7 +2758,7 @@ impl ToolModule for BrowserModule {
                  intercept: block URL patterns via headers.block. set_headers: extra HTTP headers.",
                 obj(
                     json!({
-                        "target_id": { "type": "string" },
+                        "target_id": { "type": "string", "description": "the tab id; defaults to the active tab" },
                         "action": { "type": "string", "enum": ["log", "intercept", "set_headers"] },
                         "filter": { "type": "string", "description": "substring filter for log rows" },
                         "duration_ms": { "type": "integer", "description": "log window, 100-30000" },
@@ -2459,7 +2767,7 @@ impl ToolModule for BrowserModule {
                             "description": "set_headers: the headers. intercept: { block: [url patterns] }"
                         }
                     }),
-                    json!(["target_id", "action"]),
+                    json!(["action"]),
                 ),
             ).untrusted_output(),
             ToolDescriptor::new(
@@ -2469,11 +2777,11 @@ impl ToolModule for BrowserModule {
                 "Cookie access: get (values redacted), set, or clear.",
                 obj(
                     json!({
-                        "target_id": { "type": "string" },
+                        "target_id": { "type": "string", "description": "the tab id; defaults to the active tab" },
                         "action": { "type": "string", "enum": ["get", "set", "clear"] },
                         "cookie": { "type": "object" }
                     }),
-                    json!(["target_id", "action"]),
+                    json!(["action"]),
                 ),
             ),
             ToolDescriptor::new(
@@ -2487,12 +2795,12 @@ impl ToolModule for BrowserModule {
                  can contain secrets, so this is off unless enabled.",
                 obj(
                     json!({
-                        "target_id": { "type": "string" },
+                        "target_id": { "type": "string", "description": "the tab id; defaults to the active tab" },
                         "action": { "type": "string", "enum": ["start", "read", "clear"] },
                         "only_errors": { "type": "boolean", "description": "read: keep only non-2xx / failed requests" },
                         "filter": { "type": "string", "description": "read: substring filter over rows" }
                     }),
-                    json!(["target_id"]),
+                    json!([]),
                 ),
             ).untrusted_output(),
             ToolDescriptor::new(
@@ -2512,7 +2820,7 @@ impl ToolModule for BrowserModule {
                  wait_network_idle.",
                 obj(
                     json!({
-                        "target_id": { "type": "string" },
+                        "target_id": { "type": "string", "description": "the tab id; defaults to the active tab" },
                         "text": { "type": "string", "description": "assert this text is present" },
                         "not_text": { "type": "string", "description": "assert this text is absent" },
                         "url": { "type": "string", "description": "assert the URL contains this" },
@@ -2531,7 +2839,7 @@ impl ToolModule for BrowserModule {
                         "wait_network_idle": { "type": "boolean", "description": "settle: wait for network idle first" },
                         "timeout_ms": { "type": "integer", "description": "settle timeout (default 8000)" }
                     }),
-                    json!(["target_id"]),
+                    json!([]),
                 ),
             ).untrusted_output(),
             ToolDescriptor::new(
@@ -2551,7 +2859,7 @@ impl ToolModule for BrowserModule {
                     json!({
                         "action": { "type": "string", "enum": ["save", "run", "list", "get", "delete"] },
                         "name": { "type": "string" },
-                        "target_id": { "type": "string", "description": "run: the tab to replay against" },
+                        "target_id": { "type": "string", "description": "run: the tab to replay against (default: the active tab)" },
                         "steps": { "type": "array", "items": { "type": "object" }, "description": "save: the ordered steps" },
                         "continue_on_error": { "type": "boolean", "description": "run: keep going past a failed step" },
                         "secrets": { "type": "object", "description": "run: values for the steps' secret_ref names, e.g. {pw: '...'}; used in memory for this run only, never stored, redacted from the audit log. A missing one fails the run before any step runs" }
@@ -2566,7 +2874,7 @@ impl ToolModule for BrowserModule {
                 "Configure visual flair for demos, screencasts, and presentations: animated virtual SVG cursor, smooth cubic-bezier gliding, click ripples, and floating typing HUD, drawn inside the tab on Chrome and Safari. While on, a browser_act on Chrome also moves the real pointer (trusted mousemove events) so hover styles and mouse listeners fire. The result's `rendered` says whether the cursor really is on the page, with a `warning` when it is not. Decoration only: it never changes an action's result or error, and the typing HUD masks secrets and password/one-time-code fields.",
                 obj(
                     json!({
-                        "target_id": { "type": "string", "description": "the tab to configure showcase overlays for" },
+                        "target_id": { "type": "string", "description": "the tab to configure showcase overlays for (default: the active tab)" },
                         "enabled": { "type": "boolean", "description": "enable or disable visual overlays" },
                         "speed": { "type": "string", "enum": ["cinematic", "demo", "snappy", "off"], "description": "gliding speed preset" },
                         "click_ripple": { "type": "boolean", "description": "expand glowing shockwave rings on click" },
@@ -2575,7 +2883,7 @@ impl ToolModule for BrowserModule {
                         "glide_ms": { "type": "integer", "description": "custom glide duration in milliseconds, 0-3000 (larger values are capped)" },
                         "cursor_size": { "type": "integer", "description": "pointer size in px, 16-96 (default 32; values outside are clamped)" }
                     }),
-                    json!(["target_id"]),
+                    json!([]),
                 ),
             ).idempotent(true),
         ]
@@ -2617,35 +2925,59 @@ impl ToolModule for BrowserModule {
         self.backend.shutdown();
     }
 
-    async fn call(&self, name: &str, args: Value, _ctx: &CallCtx) -> Envelope {
+    async fn call(&self, name: &str, mut args: Value, _ctx: &CallCtx) -> Envelope {
+        fix_xpath_args(&mut args);
+        // One place gives every tab-scoped tool its `target_id`, so the tools
+        // read it as they always did. A default is reported back.
+        let mut defaulted = None;
+        if defaults_target(name, &args) {
+            match self.resolve_target(&args).await {
+                Ok(Some((target, was_default))) => {
+                    args["target_id"] = json!(target);
+                    defaulted = was_default.then_some(target);
+                }
+                Ok(None) => {}
+                Err(e) => return e.into_envelope(name),
+            }
+        }
+        let mut env = self.dispatch(name, &args).await;
+        if let (Some(t), true, Some(Value::Object(m))) = (defaulted, env.ok, env.data.as_mut()) {
+            m.entry("target_id").or_insert(json!(t));
+        }
+        env
+    }
+}
+
+impl BrowserModule {
+    async fn dispatch(&self, name: &str, args: &Value) -> Envelope {
         match name {
-            "browser_connect" => self.connect(&args).await,
-            "browser_disconnect" => self.disconnect(&args).await,
-            "browser_tabs" => self.tabs(&args).await,
-            "browser_navigate" => self.navigate(&args).await,
-            "browser_snapshot" => self.snapshot(&args).await,
-            "browser_query" => self.query(&args).await,
-            "browser_act" => self.act(&args).await,
-            "browser_upload" => self.upload(&args).await,
-            "browser_fill_form" => self.fill_form(&args).await,
-            "browser_extract" => self.extract(&args).await,
-            "browser_profile" => self.profile(&args).await,
-            "browser_wait" => self.wait(&args).await,
-            "browser_challenge" => self.challenge(&args).await,
-            "browser_record" => self.record(&args).await,
-            "browser_showcase" => self.showcase(&args).await,
-            "browser_screenshot" => self.screenshot(&args).await,
-            "browser_screencast" => self.screencast(&args).await,
-            "browser_viewport" => self.viewport(&args).await,
-            "browser_eval" => self.eval(&args).await,
-            "browser_dialog" => self.dialog(&args).await,
-            "browser_network" => self.network(&args).await,
-            "browser_cookies" => self.cookies(&args).await,
-            "browser_capture" => self.capture(&args).await,
-            "browser_assert" => self.assert(&args).await,
-            "browser_flow" => self.flow(&args).await,
-            "browser_branch" => self.branch(&args).await,
-            "browser_checkpoint" => self.checkpoint(&args).await,
+            "browser_connect" => self.connect(args).await,
+            "browser_disconnect" => self.disconnect(args).await,
+            "browser_tabs" => self.tabs(args).await,
+            "browser_navigate" => self.navigate(args).await,
+            "browser_snapshot" => self.snapshot(args).await,
+            "browser_query" => self.query(args).await,
+            "browser_act" => self.act(args).await,
+            "browser_upload" => self.upload(args).await,
+            "browser_fill_form" => self.fill_form(args).await,
+            "browser_extract" => self.extract(args).await,
+            "browser_profile" => self.profile(args).await,
+            "browser_wait" => self.wait(args).await,
+            "browser_challenge" => self.challenge(args).await,
+            "browser_record" => self.record(args).await,
+            "browser_showcase" => self.showcase(args).await,
+            "browser_screenshot" => self.screenshot(args).await,
+            "browser_screencast" => self.screencast(args).await,
+            "browser_viewport" => self.viewport(args).await,
+            "browser_eval" => self.eval(args).await,
+            "browser_dialog" => self.dialog(args).await,
+            "browser_network" => self.network(args).await,
+            "browser_cookies" => self.cookies(args).await,
+            "browser_capture" => self.capture(args).await,
+            "browser_assert" => self.assert(args).await,
+            "browser_flow" => self.flow(args).await,
+            "browser_branch" => self.branch(args).await,
+            "browser_checkpoint" => self.checkpoint(args).await,
             other => Envelope::fail(other, ErrorCode::InvalidArgs, "unknown tool"),
         }
     }
@@ -2680,6 +3012,9 @@ mod act_tests {
             self.connects
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(json!({ "browser_id": 1 }))
+        }
+        async fn browser_ids(&self) -> Vec<u32> {
+            vec![1]
         }
         async fn disconnect(&self, _b: u32, _k: bool) -> Result<Value, BrowserError> {
             Err(BrowserError::Failed("n/a".into()))
@@ -2729,6 +3064,7 @@ mod act_tests {
             _v: Option<&str>,
         ) -> Result<Value, BrowserError> {
             let desc = match locator {
+                Locator::Focused => "focused".to_string(),
                 Locator::Ref(r) => format!("ref:{r}"),
                 Locator::Selector {
                     by,
@@ -3813,6 +4149,69 @@ mod act_tests {
         assert_eq!(rec.uploads.lock().unwrap().len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[tokio::test]
+    async fn type_and_press_without_a_locator_go_to_the_focused_element() {
+        let rec = Arc::new(Recorder::default());
+        let m = BrowserModule::new(rec.clone());
+        assert!(
+            m.act(&json!({"target_id":"T","action":"type","value":"x"}))
+                .await
+                .ok
+        );
+        assert!(
+            m.act(&json!({"target_id":"T","action":"press","value":"Enter"}))
+                .await
+                .ok
+        );
+        assert_eq!(*rec.acts.lock().unwrap(), vec!["focused", "focused"]);
+    }
+
+    #[tokio::test]
+    async fn a_default_target_is_used_and_reported() {
+        let rec = Arc::new(Recorder::default());
+        let m = BrowserModule::new(rec.clone());
+        let ctx = CallCtx::new("test", mcp_types::CancelToken::new());
+        let e = m
+            .call("browser_act", json!({"action":"click","query":"#a"}), &ctx)
+            .await;
+        assert!(e.ok, "{e:?}");
+        assert_eq!(e.data.unwrap()["target_id"], "T");
+        // The browser id stands for its active tab; a given tab id is not echoed.
+        let given = json!({"target_id":1,"action":"click","query":"#a"});
+        let e = m.call("browser_act", given, &ctx).await;
+        assert_eq!(e.data.unwrap()["target_id"], "T");
+        let given = json!({"target_id":"T","action":"click","query":"#a"});
+        let e = m.call("browser_act", given, &ctx).await;
+        assert!(e.data.unwrap().get("target_id").is_none());
+        // Forking a tab keeps its target_id required.
+        let e = m
+            .call(
+                "browser_branch",
+                json!({"action":"create","branch_id":"b"}),
+                &ctx,
+            )
+            .await;
+        assert!(!e.ok);
+    }
+
+    #[tokio::test]
+    async fn escaped_quotes_are_removed_from_xpath_args_before_dispatch() {
+        let rec = Arc::new(Recorder::default());
+        let m = BrowserModule::new(rec.clone());
+        let ctx = CallCtx::new("test", mcp_types::CancelToken::new());
+        let xpath = json!({"action":"click","ref":r#"//*[@id=\"tt\"]"#});
+        m.call("browser_act", xpath, &ctx).await;
+        let css = json!({"action":"click","query":r#"a[title=\"x\"]"#});
+        m.call("browser_act", css, &ctx).await;
+        assert_eq!(
+            *rec.acts.lock().unwrap(),
+            vec![
+                r#"ref://*[@id="tt"]"#.to_string(),
+                r#"sel:css:a[title=\"x\"]"#.to_string()
+            ]
+        );
+    }
 }
 
 #[cfg(test)]
@@ -3933,5 +4332,235 @@ mod arg_tests {
             .unwrap_err()
             .contains("wait_after"));
         assert!(parse_act_opts(&json!({ "timeout_ms": "soon" })).is_err());
+    }
+}
+
+#[cfg(test)]
+mod forgiving_args_tests {
+    use super::*;
+
+    fn b(id: u32, tabs: &[&str]) -> BrowserTabs {
+        BrowserTabs {
+            id,
+            tabs: tabs.iter().map(|t| t.to_string()).collect(),
+        }
+    }
+
+    fn active(target: &str, browser_id: u32) -> Result<TargetPick, TargetError> {
+        Ok(TargetPick::Active {
+            target: target.into(),
+            browser_id,
+        })
+    }
+
+    #[test]
+    fn a_tab_id_is_used_as_given() {
+        let bs = [b(1, &["AAA"]), b(2, &["BBB"])];
+        assert_eq!(
+            pick_target(Some("BBB"), &bs),
+            Ok(TargetPick::Given("BBB".into()))
+        );
+        // Not checked here: the backend answers for a tab that does not exist.
+        assert_eq!(
+            pick_target(Some("ZZZ"), &[]),
+            Ok(TargetPick::Given("ZZZ".into()))
+        );
+    }
+
+    #[test]
+    fn a_browser_id_means_its_active_tab() {
+        let bs = [b(1, &["AAA", "A2"]), b(2, &["BBB"])];
+        assert_eq!(pick_target(Some("1"), &bs), active("AAA", 1));
+        assert_eq!(pick_target(Some("2"), &bs), active("BBB", 2));
+        assert_eq!(
+            pick_target(Some("3"), &bs),
+            Err(TargetError::Unknown("3".into(), vec![1, 2]))
+        );
+        assert_eq!(
+            pick_target(Some("2"), &[b(2, &[])]),
+            Err(TargetError::NoTabs(2))
+        );
+        // An all-digit string that really is a tab id stays a tab id.
+        assert_eq!(
+            pick_target(Some("1"), &[b(2, &["1"]), b(1, &["x"])]),
+            Ok(TargetPick::Given("1".into()))
+        );
+    }
+
+    #[test]
+    fn an_omitted_target_needs_exactly_one_browser() {
+        assert_eq!(pick_target(None, &[b(4, &["T1", "T2"])]), active("T1", 4));
+        assert_eq!(pick_target(None, &[]), Err(TargetError::NoBrowser));
+        assert_eq!(pick_target(None, &[b(1, &[])]), Err(TargetError::NoTabs(1)));
+        assert_eq!(
+            pick_target(None, &[b(1, &["a"]), b(2, &["b"])]),
+            Err(TargetError::Ambiguous(vec![1, 2]))
+        );
+    }
+
+    #[test]
+    fn target_errors_say_what_to_pass() {
+        let e = TargetError::Ambiguous(vec![1, 2]).into_envelope("browser_act");
+        let err = e.error.unwrap();
+        assert_eq!(err.code, ErrorCode::InvalidArgs);
+        assert!(err.message.contains("1, 2"), "{}", err.message);
+        let e = TargetError::NoBrowser.into_envelope("browser_act");
+        assert!(e
+            .error
+            .unwrap()
+            .suggestion
+            .unwrap()
+            .contains("browser_connect"));
+    }
+
+    #[test]
+    fn target_arg_accepts_a_number_and_ignores_empty() {
+        assert_eq!(target_arg(&json!({"target_id": 1})).as_deref(), Some("1"));
+        assert_eq!(target_arg(&json!({"target_id": "1"})).as_deref(), Some("1"));
+        assert_eq!(target_arg(&json!({"target_id": ""})), None);
+        assert_eq!(target_arg(&json!({})), None);
+    }
+
+    #[test]
+    fn only_the_safe_calls_default_their_target() {
+        assert!(defaults_target("browser_act", &json!({})));
+        assert!(defaults_target(
+            "browser_profile",
+            &json!({"action":"save"})
+        ));
+        assert!(!defaults_target(
+            "browser_profile",
+            &json!({"action":"list"})
+        ));
+        assert!(defaults_target("browser_checkpoint", &json!({})));
+        assert!(!defaults_target(
+            "browser_checkpoint",
+            &json!({"action":"list"})
+        ));
+        assert!(defaults_target("browser_flow", &json!({"action":"run"})));
+        assert!(!defaults_target("browser_flow", &json!({"action":"list"})));
+        assert!(defaults_target(
+            "browser_screencast",
+            &json!({"action":"start"})
+        ));
+        assert!(!defaults_target(
+            "browser_screencast",
+            &json!({"action":"stop"})
+        ));
+        assert!(!defaults_target(
+            "browser_branch",
+            &json!({"action":"create"})
+        ));
+        assert!(!defaults_target("browser_tabs", &json!({})));
+    }
+
+    #[test]
+    fn escaped_quotes_are_dropped_from_xpath() {
+        assert_eq!(
+            unescape_xpath_quotes(r#"//*[@id=\"tt\"]"#),
+            r#"//*[@id="tt"]"#
+        );
+        assert_eq!(
+            unescape_xpath_quotes(r"//a[text()=\'x\']"),
+            "//a[text()='x']"
+        );
+        // Nothing to fix: borrowed, and other backslashes stay.
+        assert!(matches!(
+            unescape_xpath_quotes(r"//a[contains(., 'a\b')]"),
+            std::borrow::Cow::Borrowed(_)
+        ));
+    }
+
+    #[test]
+    fn only_xpath_arguments_are_unescaped() {
+        let mut a = json!({
+            "ref": r#"//*[@id=\"a\"]"#,
+            "by": "xpath", "query": r#"//*[@id=\"b\"]"#,
+            "within": r#"//*[@id=\"c\"]"#,
+            "fields": [
+                {"selector": r#"//*[@id=\"d\"]"#},
+                {"selector": r#"//*[@id=\"e\"]"#, "by": "xpath"},
+                {"selector": r#"a[title=\"f\"]"#},
+                {"selector": r#"//*[@id=\"g\"]"#, "by": "css"}
+            ],
+            "submit": {"selector": r#"(//button)[@id=\"h\"]"#}
+        });
+        fix_xpath_args(&mut a);
+        assert_eq!(a["ref"], r#"//*[@id="a"]"#);
+        assert_eq!(a["query"], r#"//*[@id="b"]"#);
+        assert_eq!(a["within"], r#"//*[@id="c"]"#);
+        assert_eq!(a["fields"][0]["selector"], r#"//*[@id="d"]"#);
+        assert_eq!(a["fields"][1]["selector"], r#"//*[@id="e"]"#);
+        // CSS accepts \" as an escape, so it is left alone.
+        assert_eq!(a["fields"][2]["selector"], r#"a[title=\"f\"]"#);
+        assert_eq!(a["fields"][3]["selector"], r#"//*[@id=\"g\"]"#);
+        assert_eq!(a["submit"]["selector"], r#"(//button)[@id="h"]"#);
+        let mut css = json!({"query": r#"a[title=\"x\"]"#});
+        fix_xpath_args(&mut css);
+        assert_eq!(css["query"], r#"a[title=\"x\"]"#);
+    }
+
+    #[test]
+    fn jquery_pseudo_classes_are_recognised_and_css_ones_are_not() {
+        for (sel, want) in [
+            ("button:contains('x')", ":contains("),
+            (r#"a:has-text("Go")"#, ":has-text("),
+            ("li:text(Go)", ":text("),
+            ("li:eq(2)", ":eq("),
+            ("div.row:visible", ":visible"),
+            ("li:first", ":first"),
+            ("li:last > a", ":last"),
+        ] {
+            assert_eq!(jquery_pseudo(sel), Some(want), "{sel}");
+        }
+        for sel in [
+            "li:first-child",
+            "li:last-of-type",
+            "a:not(.x)",
+            "p:has(b)",
+            "input:focus-visible",
+            "#a .b",
+        ] {
+            assert_eq!(jquery_pseudo(sel), None, "{sel}");
+        }
+    }
+
+    #[test]
+    fn a_jquery_selector_that_fails_to_parse_gets_the_text_suggestion() {
+        let bad = Err(BrowserError::Failed(
+            "eval: SyntaxError: Failed to execute 'querySelectorAll' on 'Document': 'button:contains('x')' is not a valid selector.".into(),
+        ));
+        let e = result_with_selector_hint("browser_query", bad, &["button:contains('x')"]);
+        let err = e.error.unwrap();
+        assert_eq!(err.code, ErrorCode::InvalidArgs);
+        assert!(err.message.contains("not a valid selector"));
+        assert!(err.suggestion.unwrap().contains(r#"by: "text""#));
+        // A failure for another reason, or a selector with no pseudo, is left as it was.
+        let other = Err(BrowserError::NotFound("element not found".into()));
+        let e = result_with_selector_hint("browser_act", other, &["a:contains(x)"]);
+        assert_eq!(e.error.unwrap().code, ErrorCode::NotFound);
+        let bad = Err(BrowserError::Failed(
+            "SyntaxError: not a valid selector".into(),
+        ));
+        let e = result_with_selector_hint("browser_act", bad, &["a["]);
+        assert_eq!(e.error.unwrap().code, ErrorCode::ActionFailed);
+    }
+
+    #[test]
+    fn fill_form_css_selectors_skip_xpath_and_text_fields() {
+        let a = json!({
+            "fields": [
+                {"selector": "#a"},
+                {"selector": "//input"},
+                {"selector": "b", "by": "text"},
+                {"selector": "li:eq(1)", "by": "css"},
+                {"ref": "/html/body[1]"}
+            ],
+            "submit": {"selector": "button:visible"}
+        });
+        assert_eq!(
+            fill_css_selectors(&a),
+            vec!["#a", "li:eq(1)", "button:visible"]
+        );
     }
 }

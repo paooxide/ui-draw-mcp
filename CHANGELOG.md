@@ -93,6 +93,22 @@ operated.
   `navigation: false` no longer selects a navigation wait; `condition: "selector"` without `selector` says
   so. `condition` is the documented form and the booleans are aliases.
 - **The default `browser_eval` time limit is 10 s**, down from the 20 s transport timeout.
+- **`browser_connect` returns the tabs.** `tabs` (`target_id`, `title`, `url`; page targets, most recently
+  active first) and `target_id` (the active one), for an attach and a launch. In a MiniWoB++ dry run every
+  run spent a call on `browser_tabs` right after connecting, because the result had a `browser_id` and no
+  tab id. Titles and URLs come from the page, so the result is marked untrusted like `browser_tabs`.
+- **`target_id` is optional on the tab-scoped browser tools.** Left out, it is the active tab of the only
+  connected browser; with none or several connected the error says to connect or which browser ids to pass.
+  A `browser_id` (`"1"` or `1`) means that browser's active tab: the dry run's model passed it for
+  `target_id` five times and got `NOT_FOUND`. A default is reported as `target_id` in the result.
+  `browser_tabs`, `browser_branch create`, the list actions and `browser_screencast stop` still name their
+  tab.
+- **`browser_act` `type` and `press` with no `ref` or `query` act on the focused element.** The dry run's
+  model wanted to type into the field it had just clicked and got `INVALID_ARGS`. With nothing focused
+  (`<body>`) it says so.
+- **`browser_fill_form` fields take `by`** (`css`, `xpath`, `text`), found as `browser_act` finds them, and
+  a selector starting with `/` or `(` is XPath without it. Every selector used to be CSS, so an XPath one
+  was a `SyntaxError`. A label found by text fills the control it labels.
 
 ### Fixed
 
@@ -135,6 +151,14 @@ operated.
   act the wait gives a request up to 1.5 s to start.
 - **`dom_settled`'s description claimed animation frames were tracked.** They are not; the description
   says so now.
+- **A backslash left before a quote in an XPath broke the lookup.** `//*[@id=\"tt\"]` as a `ref`, a
+  `by: "xpath"` query, an XPath `within` or an XPath fill_form selector failed with "not a valid XPath
+  expression" (seen in the MiniWoB++ dry run, where the model copied refs with the escapes). `\"` and `\'`
+  are never valid XPath, so they are now dropped; CSS selectors, where they are valid, are untouched.
+- **A jQuery or Playwright pseudo-class in a CSS selector gave a raw `DOMException`.** `:contains(`,
+  `:has-text(`, `:text(`, `:visible`, `:eq(`, `:first` and `:last` are not CSS. `browser_act`,
+  `browser_query` and `browser_fill_form` now answer `INVALID_ARGS` with the browser's message and a
+  suggestion to use `by: "text"` (or act's `text` filter).
 
 ## [0.2.0] - 2026-10-04
 
