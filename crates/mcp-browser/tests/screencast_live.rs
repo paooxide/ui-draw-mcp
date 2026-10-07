@@ -197,6 +197,10 @@ async fn screenshot_save_writes_a_png_under_media_and_returns_no_image() {
         .call("browser_screenshot", json!({ "target_id": t }))
         .await;
     assert!(e.ok && e.image.is_some(), "{e:?}");
+    // The inline result carries the image's real size, never 0x0.
+    let d = e.data.clone().unwrap();
+    assert_eq!(d["width"].as_u64(), Some(w as u64), "{d}");
+    assert_eq!(d["height"].as_u64(), Some(h as u64), "{d}");
     let after = std::fs::read_dir(r.media.join("screenshots"))
         .unwrap()
         .count();

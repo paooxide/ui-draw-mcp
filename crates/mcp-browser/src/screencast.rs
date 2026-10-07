@@ -177,6 +177,16 @@ pub fn png_size(png: &[u8]) -> Option<(u32, u32)> {
     Some((w, h))
 }
 
+/// Width and height of a base64 PNG, decoding only the 24 header bytes.
+pub fn png_b64_size(b64: &str) -> Option<(u32, u32)> {
+    let head: String = b64
+        .chars()
+        .filter(|c| !c.is_ascii_whitespace())
+        .take(32)
+        .collect();
+    png_size(&b64_decode(&head)?)
+}
+
 fn err_text(e: &BrowserError) -> String {
     match e {
         BrowserError::PermissionDenied(m)
@@ -803,6 +813,12 @@ mod tests {
         png.extend_from_slice(&480u32.to_be_bytes());
         assert_eq!(png_size(&png), Some((640, 480)));
         assert_eq!(png_size(b"not a png at all, no"), None);
+        // A 3x2 header as base64, with a body after it that is never decoded.
+        assert_eq!(
+            png_b64_size("iVBORw0KGgoAAAANSUhEUgAAAAMAAAAC$$not-base64$$"),
+            Some((3, 2))
+        );
+        assert_eq!(png_b64_size("aGVsbG8="), None);
     }
 
     #[test]
