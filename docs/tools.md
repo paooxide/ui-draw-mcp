@@ -68,7 +68,7 @@ enabled category, while a `dangerous` tool additionally has to be named in
 | [`browser_navigate`](#browser-navigate) | browser | standard | Navigate a tab: goto a url, or go back/forward/reload. |
 | [`browser_network`](#browser-network) | browser | dangerous | Network control. |
 | [`browser_profile`](#browser-profile) | browser | standard | Save, restore, list, or delete browser session profiles (cookies, localStorage, sessionStorage) for instant user or auth state swapping with… |
-| [`browser_query`](#browser-query) | browser | read | Resolve node ref(s) by css selector, xpath, or visible text. |
+| [`browser_query`](#browser-query) | browser | read | Resolve node ref(s) by css selector, xpath, or text (case-insensitive, exact matches first, clickable elements preferred). |
 | [`browser_record`](#browser-record) | browser | standard | Shadow observation & macro learning mode (Ghost Mode). |
 | [`browser_screencast`](#browser-screencast) | browser | standard | Record a tab to an mp4 video (browser_record is something else: it learns a replayable flow of steps, not video). |
 | [`browser_screenshot`](#browser-screenshot) | browser | read | Capture a PNG of the page (or a single element by ref). |
@@ -688,7 +688,7 @@ Read or change a desktop setting. Settings the platform does not expose return U
 
 `browser_act` · standard tier
 
-Act on a DOM node: click, type, select, hover, focus, scroll_into_view, submit, press (value Enter, Escape, Tab, ArrowDown, ArrowUp, ArrowLeft, ArrowRight, Home, End, PageUp, PageDown, Backspace, Delete or Space, sent as a real key event to the focused node; Chrome only). On Chrome a click is real pointer input (mousedown, mouseup, click, as a person's) and type is a real insertion that replaces the field's content, so React-style controlled fields and menus that open on mousedown work; the result reports input 'cdp', or 'synthetic' with input_reason when the element is covered, off screen, in a frame, a select/option or a file input. type reports value_after (value_length for a password or secret field). A page-published canvas region (a canvas-child ref from browser_snapshot) supports only click and hover, sent as real mouse input at the region centre; other actions on it return Unsupported. Target it with 'ref' (from browser_query/snapshot) or, in one call, with 'query' plus optional 'by' (css/xpath/text), 'within' (scoped container), 'text' (substring filter), and 'index'.
+Act on a DOM node: click, type, select, hover, focus, scroll_into_view, submit, press (value Enter, Escape, Tab, ArrowDown, ArrowUp, ArrowLeft, ArrowRight, Home, End, PageUp, PageDown, Backspace, Delete or Space, sent as a real key event to the focused node; Chrome only). On Chrome a click is real pointer input (mousedown, mouseup, click, as a person's) and type is a real insertion that replaces the field's content, so React-style controlled fields and menus that open on mousedown work; the result reports input 'cdp', or 'synthetic' with input_reason when the element is covered, off screen, in a frame, a select/option or a file input. type reports value_after (value_length for a password or secret field). A page-published canvas region (a canvas-child ref from browser_snapshot) supports only click and hover, sent as real mouse input at the region centre; other actions on it return Unsupported. Target it with 'ref' (from browser_query/snapshot) or, in one call, with 'query' plus optional 'by' (css/xpath/text; text is case-insensitive, exact matches first, clickable elements preferred), 'within' (scoped container), 'text' (substring filter), and 'index'.
 
 | Argument | Type | Required | Description |
 |---|---|---|---|
@@ -933,7 +933,7 @@ Save, restore, list, or delete browser session profiles (cookies, localStorage, 
 
 `browser_query` · read tier
 
-Resolve node ref(s) by css selector, xpath, or visible text.
+Resolve node ref(s) by css selector, xpath, or text (case-insensitive, exact matches first, clickable elements preferred).
 
 | Argument | Type | Required | Description |
 |---|---|---|---|

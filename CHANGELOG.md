@@ -102,6 +102,16 @@ operated.
   never updated. Values (and `checked`) are now assigned through the native prototype setter, in `type`
   (Safari, and wherever a real insertion is not possible), `select`, `browser_fill_form` and the
   `browser_checkpoint` restore.
+- **`by: "text"` clicked the wrong element and reported ok.** On a MiniWoB++ click-button page the
+  instruction `Click on the "next" button.` comes before `<button>next</button>`, and the locator took the
+  first element whose text held the query, so `next` clicked the instruction; `ok` hit an `okay` button, and
+  `Next` did not match `next`. Matching is now case-insensitive over whitespace-collapsed text (also a
+  button input's value and `aria-label`), takes the innermost element holding the query and lifts it to the
+  control around it, and ranks exact before substring, clickable before not, then document order. When any
+  match is exact the substring ones are dropped. `browser_act`, `browser_query` and `browser_upload` share it.
+- **`browser_act` now says what it hit:** the result has `target {tag, text}` (a field is named by its
+  label, `aria-label`, placeholder or name, never its value) and, for a `query` locator, `matches`, the size of
+  the ranked list, so a wrong target shows instead of a silent ok.
 - **`cursor_style` did nothing**: every style drew the same arrow. Each now has its own look.
 - **`browser_showcase` reported `ok` for an overlay that was not drawn.** It was built with `innerHTML`,
   which throws on a page that requires Trusted Types, and the throw was swallowed. It is now built with DOM
