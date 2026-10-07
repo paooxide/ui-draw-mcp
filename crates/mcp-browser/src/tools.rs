@@ -22,7 +22,12 @@ pub struct BrowserModule {
     showcase: std::sync::Mutex<crate::showcase::ShowcaseConfig>,
     /// Where saved screenshots and screencasts are written; never caller-chosen.
     media_dir: Option<std::path::PathBuf>,
+    /// Jails a path `browser_upload` was asked to attach; `None` refuses uploads.
+    upload_resolver: Option<UploadResolver>,
 }
+
+/// Resolves a caller-supplied path to the real, contained one, or says why not.
+pub type UploadResolver = Arc<dyn Fn(&str) -> Result<std::path::PathBuf, String> + Send + Sync>;
 
 impl BrowserModule {
     pub fn new(backend: Arc<dyn BrowserBackend>) -> Self {
@@ -34,7 +39,16 @@ impl BrowserModule {
             judge: None,
             showcase: std::sync::Mutex::new(crate::showcase::ShowcaseConfig::default()),
             media_dir: None,
+            upload_resolver: None,
         }
+    }
+
+    /// Enable `browser_upload`. Every path goes through `resolve` (the
+    /// filesystem jail: `fs.roots` and the credential deny-list), and only the
+    /// path it returns is ever handed to the browser.
+    pub fn with_upload_resolver(mut self, resolve: UploadResolver) -> Self {
+        self.upload_resolver = Some(resolve);
+        self
     }
 
     /// Enable `browser_screenshot save` and `browser_screencast`: files are
@@ -433,20 +447,7 @@ impl BrowserModule {
         };
         // Either a ref from a prior snapshot/query, or a selector resolved in
         // the same call (one round trip instead of query-then-act).
-        let locator = if let Some(r) = str_arg(args, "ref") {
-            crate::backend::Locator::Ref(r)
-        } else if let Some(q) = str_arg(args, "query") {
-            crate::backend::Locator::Selector {
-                by: str_arg(args, "by").unwrap_or("css"),
-                query: q,
-                within: str_arg(args, "within"),
-                text: str_arg(args, "text"),
-                index: args
-                    .get("index")
-                    .and_then(Value::as_u64)
-                    .map(|n| n as usize),
-            }
-        } else {
+        let Some(locator) = parse_locator(args) else {
             return Envelope::fail_with(
                 "browser_act",
                 ErrorCode::InvalidArgs,
@@ -473,6 +474,74 @@ impl BrowserModule {
                 )
                 .await,
         )
+    }
+
+    async fn upload(&self, args: &Value) -> Envelope {
+        let tool = "browser_upload";
+        let target = match require(args, "target_id", tool) {
+            Ok(t) => t,
+            Err(e) => return e,
+        };
+        let Some(locator) = parse_locator(args) else {
+            return Envelope::fail_with(
+                tool,
+                ErrorCode::InvalidArgs,
+                "need 'ref' (from browser_query/snapshot) or 'query' (with optional 'by', 'within', 'text', 'index')",
+                "pass ref, or query plus by=css|xpath|text",
+            );
+        };
+        let paths = match upload_paths(args) {
+            Ok(p) => p,
+            Err(m) => return Envelope::fail(tool, ErrorCode::InvalidArgs, m),
+        };
+        let Some(resolve) = self.upload_resolver.as_ref() else {
+            return Envelope::fail_with(
+                tool,
+                ErrorCode::PermDenied,
+                "browser_upload reads local files, and no file roots are configured (fs.roots)",
+                "the operator must set fs.roots in config.toml to the directories whose files may be uploaded",
+            );
+        };
+        // Every path is resolved through the jail first, and only the
+        // resolved path is used from here on; the caller's string is not.
+        let mut files = Vec::with_capacity(paths.len());
+        let mut listed = Vec::with_capacity(paths.len());
+        for p in paths {
+            let resolved = match resolve(p) {
+                Ok(r) => r,
+                Err(m) => return Envelope::fail(tool, ErrorCode::PermDenied, m),
+            };
+            let meta = match std::fs::metadata(&resolved) {
+                Ok(m) => m,
+                Err(e) => {
+                    return Envelope::fail(
+                        tool,
+                        ErrorCode::NotFound,
+                        format!("cannot read '{p}': {e}"),
+                    )
+                }
+            };
+            if let Err(m) = check_upload_file(p, meta.is_file(), meta.len()) {
+                return Envelope::fail(tool, ErrorCode::InvalidArgs, m);
+            }
+            let name = resolved
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            listed.push(json!({ "name": name, "bytes": meta.len() }));
+            files.push(resolved.to_string_lossy().into_owned());
+        }
+        let r = self.backend.upload(target, locator, &files).await;
+        match r {
+            Ok(mut v) => {
+                if let Some(m) = v.as_object_mut() {
+                    m.insert("count".into(), json!(listed.len()));
+                    m.insert("files".into(), Value::Array(listed));
+                }
+                Envelope::ok(tool, v)
+            }
+            Err(e) => browser_err(tool, e),
+        }
     }
 
     async fn fill_form(&self, args: &Value) -> Envelope {
@@ -1808,6 +1877,64 @@ fn parse_wait_condition(args: &Value) -> Result<(&'static str, Option<&str>), St
     }
 }
 
+/// How the element is located: a `ref`, else a `query` (the `browser_act`
+/// arguments); `None` when neither is given.
+fn parse_locator(args: &Value) -> Option<crate::backend::Locator<'_>> {
+    if let Some(r) = str_arg(args, "ref") {
+        Some(crate::backend::Locator::Ref(r))
+    } else {
+        str_arg(args, "query").map(|q| crate::backend::Locator::Selector {
+            by: str_arg(args, "by").unwrap_or("css"),
+            query: q,
+            within: str_arg(args, "within"),
+            text: str_arg(args, "text"),
+            index: args
+                .get("index")
+                .and_then(Value::as_u64)
+                .map(|n| n as usize),
+        })
+    }
+}
+
+/// Most files one `browser_upload` may attach.
+const UPLOAD_MAX_FILES: usize = 10;
+/// Largest single file `browser_upload` will attach.
+const UPLOAD_MAX_BYTES: u64 = 50 * 1024 * 1024;
+
+/// The `paths` argument of `browser_upload`: 1 to [`UPLOAD_MAX_FILES`] non-empty strings.
+fn upload_paths(args: &Value) -> Result<Vec<&str>, String> {
+    let Some(list) = args.get("paths").and_then(Value::as_array) else {
+        return Err("missing 'paths': an array of 1 to 10 file paths".into());
+    };
+    if list.is_empty() || list.len() > UPLOAD_MAX_FILES {
+        return Err(format!(
+            "'paths' must hold 1 to {UPLOAD_MAX_FILES} files, got {}",
+            list.len()
+        ));
+    }
+    list.iter()
+        .map(|v| {
+            v.as_str()
+                .filter(|p| !p.is_empty())
+                .ok_or_else(|| "every entry of 'paths' must be a non-empty string".to_string())
+        })
+        .collect()
+}
+
+/// Whether a resolved path may be attached: a regular file (not a directory,
+/// socket or device) of at most [`UPLOAD_MAX_BYTES`].
+fn check_upload_file(path: &str, is_file: bool, bytes: u64) -> Result<(), String> {
+    if !is_file {
+        return Err(format!("'{path}' is not a regular file"));
+    }
+    if bytes > UPLOAD_MAX_BYTES {
+        return Err(format!(
+            "'{path}' is {bytes} bytes; the limit is {UPLOAD_MAX_BYTES} (50 MiB)"
+        ));
+    }
+    Ok(())
+}
+
 /// The `scroll`, `wait_after` and `timeout_ms` arguments of `browser_act`.
 fn parse_act_opts(args: &Value) -> Result<crate::backend::ActOpts, String> {
     use crate::backend::{ActOpts, ScrollMode};
@@ -2005,8 +2132,8 @@ impl ToolModule for BrowserModule {
                 Category::Browser,
                 Tier::Standard,
                 "Act on a DOM node: click, type, select, hover, focus, scroll_into_view, submit, press \
-                 (value Enter, Escape or Tab, sent as a real key event to the focused node; Chrome only). \
-                 A page-published canvas region (a canvas-child ref from browser_snapshot) supports only click and hover, \
+                 (value Enter, Escape, Tab, ArrowDown, ArrowUp, ArrowLeft, ArrowRight, Home, End, PageUp, PageDown, Backspace, Delete or Space, sent as a real key event to the focused node; Chrome only). \
+                 On Chrome a click is real pointer input (mousedown, mouseup, click, as a person's) and type is a real insertion that replaces the field's content, so React-style controlled fields and menus that open on mousedown work; the result reports input 'cdp', or 'synthetic' with input_reason when the element is covered, off screen, in a frame, a select/option or a file input. type reports value_after (value_length for a password or secret field). A page-published canvas region (a canvas-child ref from browser_snapshot) supports only click and hover, \
                  sent as real mouse input at the region centre; other actions on it return Unsupported. \
                  Target it with 'ref' (from browser_query/snapshot) or, in one call, with \
                  'query' plus optional 'by' (css/xpath/text), 'within' (scoped container), 'text' (substring filter), and 'index'.",
@@ -2020,7 +2147,7 @@ impl ToolModule for BrowserModule {
                         "text": { "type": "string", "description": "optional text substring filter to narrow matches" },
                         "index": { "type": "integer", "description": "optional 0-based match index if query matches multiple elements (default 0)" },
                         "action": { "type": "string", "enum": ["click", "type", "select", "hover", "focus", "scroll_into_view", "submit", "press"] },
-                        "value": { "type": "string", "description": "text for type, option for select, or key name for press (Enter, Escape, Tab)" },
+                        "value": { "type": "string", "description": "text for type, option for select, or key name for press (Enter, Escape, Tab, ArrowDown, ArrowUp, ArrowLeft, ArrowRight, Home, End, PageUp, PageDown, Backspace, Delete, Space)" },
                         "secret": { "type": "boolean", "description": "the value is a secret: keep it out of the audit log and never show it in the showcase typing HUD (password and one-time-code fields are masked automatically)" },
                         "scroll": { "type": "string", "enum": ["none", "nearest", "center"], "description": "how to bring the element into view first: nearest (default) moves the page only as far as needed and not at all when it is visible, center centres it (can scroll a wide page sideways), none does not scroll. scroll_into_view always scrolls" },
                         "wait_after": { "type": "string", "enum": ["none", "settle"], "description": "none (default) returns as soon as the action ran, when a click's request or navigation has usually not begun yet. settle then waits for a navigation it started to load, for htmx_settled if the page has htmx, and for the network to go quiet, and adds navigated, requests_started (fetch/XHR/htmx begun on the page since the action) and settled to the result. A click that starts no request and no navigation costs about 2s here; Chrome only" },
@@ -2029,6 +2156,35 @@ impl ToolModule for BrowserModule {
                     json!(["target_id", "action"]),
                 ),
             ).untrusted_output(),
+            ToolDescriptor::new(
+                "browser_upload",
+                Category::Browser,
+                Tier::Dangerous,
+                "Attach local files to a file input (type=file; a click would open the OS file chooser, which agentctl cannot drive). \
+                 Target the input like browser_act: 'ref' or 'query' (plus optional 'by', 'within', 'text', 'index'). A label is followed to its input, \
+                 and an element holding exactly one file input uses that one; otherwise the error says what was found (target a hidden input directly). \
+                 'paths' holds 1 to 10 files, each at most 50 MiB, and more than one needs the input's multiple attribute. \
+                 Only files inside the configured fs.roots can be attached (credential stores are always refused): a page can read what is attached, \
+                 so this is how local files leave the machine. Chrome fires trusted input and change events. Returns {ok, files:[{name, bytes}], count, input_multiple}, \
+                 never file contents. Chrome only.",
+                obj(
+                    json!({
+                        "target_id": { "type": "string" },
+                        "ref": { "type": "string", "description": "a ref from browser_query/snapshot" },
+                        "by": { "type": "string", "enum": ["css", "xpath", "text"], "description": "how to read 'query' (default css); used when no 'ref'" },
+                        "query": { "type": "string", "description": "selector to resolve in one call, instead of 'ref'" },
+                        "within": { "type": "string", "description": "optional CSS/XPath root selector to scope query search" },
+                        "text": { "type": "string", "description": "optional text substring filter to narrow matches" },
+                        "index": { "type": "integer", "description": "optional 0-based match index if query matches multiple elements (default 0)" },
+                        "paths": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "absolute paths of the files to attach (1 to 10), inside fs.roots"
+                        }
+                    }),
+                    json!(["target_id", "paths"]),
+                ),
+            ),
             ToolDescriptor::new(
                 "browser_fill_form",
                 Category::Browser,
@@ -2460,6 +2616,7 @@ impl ToolModule for BrowserModule {
             "browser_snapshot" => self.snapshot(&args).await,
             "browser_query" => self.query(&args).await,
             "browser_act" => self.act(&args).await,
+            "browser_upload" => self.upload(&args).await,
             "browser_fill_form" => self.fill_form(&args).await,
             "browser_extract" => self.extract(&args).await,
             "browser_profile" => self.profile(&args).await,
@@ -2498,6 +2655,7 @@ mod act_tests {
         captures: Mutex<Vec<String>>,
         viewports: Mutex<Vec<String>>,
         forms: Mutex<Vec<Value>>,
+        uploads: Mutex<Vec<Vec<String>>>,
         extracts: Mutex<Vec<Value>>,
         profiles: Mutex<Vec<String>>,
         /// `navigate` / `profile_restore` calls, in the order they happened.
@@ -2584,6 +2742,15 @@ mod act_tests {
             };
             self.acts.lock().unwrap().push(desc);
             Ok(json!({ "ok": true, "action": action }))
+        }
+        async fn upload(
+            &self,
+            _t: &str,
+            _l: Locator<'_>,
+            files: &[String],
+        ) -> Result<Value, BrowserError> {
+            self.uploads.lock().unwrap().push(files.to_vec());
+            Ok(json!({ "ok": true, "input_multiple": true }))
         }
         async fn wait(
             &self,
@@ -3522,6 +3689,119 @@ mod act_tests {
             .await;
         assert!(!res.ok);
         assert_eq!(res.error.unwrap().code, ErrorCode::InvalidArgs);
+    }
+
+    #[test]
+    fn upload_paths_must_be_one_to_ten_non_empty_strings() {
+        assert_eq!(
+            upload_paths(&json!({ "paths": ["/a", "/b"] })).unwrap(),
+            vec!["/a", "/b"]
+        );
+        assert!(upload_paths(&json!({})).is_err());
+        assert!(upload_paths(&json!({ "paths": [] })).is_err());
+        assert!(upload_paths(&json!({ "paths": ["/a", 3] })).is_err());
+        assert!(upload_paths(&json!({ "paths": [""] })).is_err());
+        let eleven: Vec<String> = (0..11).map(|i| format!("/f{i}")).collect();
+        assert!(upload_paths(&json!({ "paths": eleven })).is_err());
+        let ten: Vec<String> = (0..10).map(|i| format!("/f{i}")).collect();
+        assert_eq!(upload_paths(&json!({ "paths": ten })).unwrap().len(), 10);
+    }
+
+    #[test]
+    fn upload_file_must_be_a_regular_file_within_the_size_cap() {
+        assert!(check_upload_file("/a", true, 0).is_ok());
+        assert!(check_upload_file("/a", true, UPLOAD_MAX_BYTES).is_ok());
+        assert!(check_upload_file("/a", true, UPLOAD_MAX_BYTES + 1)
+            .unwrap_err()
+            .contains("50 MiB"));
+        assert!(check_upload_file("/dir", false, 0)
+            .unwrap_err()
+            .contains("regular file"));
+    }
+
+    #[tokio::test]
+    async fn upload_without_a_resolver_is_refused_before_the_backend() {
+        let (m, rec) = module();
+        let e = m
+            .upload(&json!({"target_id":"T","query":"input","paths":["/tmp/a"]}))
+            .await;
+        assert!(!e.ok);
+        let err = e.error.unwrap();
+        assert_eq!(err.code, ErrorCode::PermDenied);
+        assert!(err.message.contains("fs.roots"));
+        assert!(rec.uploads.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn upload_passes_only_the_resolved_path_and_refuses_what_the_jail_refuses() {
+        let dir = std::env::temp_dir().join(format!("agentctl-upload-unit-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("cv.txt");
+        std::fs::write(&file, b"hello").unwrap();
+        let ssh = dir.join(".ssh");
+        std::fs::create_dir_all(&ssh).unwrap();
+        std::fs::write(ssh.join("id_rsa"), b"secret").unwrap();
+
+        // A stand-in jail with the same shape as the real one: the module
+        // must use the path it returns, not the caller's string.
+        let root = std::fs::canonicalize(&dir).unwrap();
+        let real = root.join("cv.txt");
+        let resolver: UploadResolver = {
+            let root = root.clone();
+            Arc::new(move |p: &str| {
+                if p.to_lowercase().contains("/.ssh/") {
+                    return Err(format!("path '{p}' is denied by policy (fs.deny)"));
+                }
+                if p == "cv" {
+                    return Ok(root.join("cv.txt"));
+                }
+                Err(format!(
+                    "path '{p}' resolves outside the allowed roots (fs.roots)"
+                ))
+            })
+        };
+        let rec = Arc::new(Recorder::default());
+        let m = BrowserModule::new(rec.clone()).with_upload_resolver(resolver);
+
+        let ok = m
+            .upload(&json!({"target_id":"T","ref":"/html/body[1]/input[1]","paths":["cv"]}))
+            .await;
+        assert!(ok.ok, "{ok:?}");
+        let data = ok.data.unwrap();
+        assert_eq!(data["count"], 1);
+        assert_eq!(data["files"][0]["name"], "cv.txt");
+        assert_eq!(data["files"][0]["bytes"], 5);
+        assert_eq!(
+            rec.uploads.lock().unwrap()[0],
+            vec![real.to_string_lossy().into_owned()]
+        );
+
+        for bad in [
+            ssh.join("id_rsa").to_string_lossy().into_owned(),
+            "/etc/passwd".to_string(),
+        ] {
+            let e = m
+                .upload(&json!({"target_id":"T","query":"input","paths":["cv", bad]}))
+                .await;
+            assert!(!e.ok);
+            assert_eq!(e.error.unwrap().code, ErrorCode::PermDenied);
+        }
+        // Nothing past the first refused path reached the backend again.
+        assert_eq!(rec.uploads.lock().unwrap().len(), 1);
+
+        // A directory is not a file.
+        let dir_resolver: UploadResolver = {
+            let d = root.clone();
+            Arc::new(move |_p: &str| Ok(d.clone()))
+        };
+        let m2 = BrowserModule::new(rec.clone()).with_upload_resolver(dir_resolver);
+        let e = m2
+            .upload(&json!({"target_id":"T","query":"input","paths":["x"]}))
+            .await;
+        assert!(!e.ok);
+        assert!(e.error.unwrap().message.contains("regular file"));
+        assert_eq!(rec.uploads.lock().unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

@@ -242,7 +242,9 @@ async fn page_synthetic_events_are_not_recorded_but_agent_and_real_input_are() {
 
     // The agent's actions were recorded once each.
     assert_eq!(count("input:#name:Ada"), 1, "{seen:?}");
-    assert_eq!(count("change:#name:Ada"), 1, "{seen:?}");
+    // Typed for real, so the browser adds its own `change` when the real
+    // click on #go takes focus away: the armed one plus that one.
+    assert_eq!(count("change:#name:Ada"), 2, "{seen:?}");
     assert_eq!(count("change:#sel:b"), 1, "{seen:?}");
     assert_eq!(
         count("click:#go:"),
@@ -264,7 +266,7 @@ async fn page_synthetic_events_are_not_recorded_but_agent_and_real_input_are() {
     // Nothing else: none of the page's synthetic events got in.
     assert!(!seen.iter().any(|e| e.contains("#trap")), "{seen:?}");
     assert!(!seen.iter().any(|e| e.contains("evil")), "{seen:?}");
-    assert_eq!(seen.len(), 12, "exactly the expected events: {seen:?}");
+    assert_eq!(seen.len(), 13, "exactly the expected events: {seen:?}");
 
     let _ = stop.send(());
     let _ = b.disconnect(1, true).await;

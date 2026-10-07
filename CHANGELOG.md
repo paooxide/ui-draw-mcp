@@ -11,6 +11,9 @@ HTMX app, where several browser tools answered before the page had done what the
 
 ### Added
 
+- **More keys for `browser_act press`:** ArrowDown, ArrowUp, ArrowLeft, ArrowRight, Home, End, PageUp,
+  PageDown, Backspace, Delete and Space, sent as real key events, so a listbox or a react-select menu can be
+  driven from the keyboard. Before, only Enter, Escape and Tab worked.
 - **`browser_screencast`**, video of a tab: `start` polls `Page.captureScreenshot` (JPEG, 1 to 30 fps,
   default 15) on a session of its own that keeps focus emulation on, `stop` writes an ffconcat with the real
   frame timestamps and encodes an H.264 mp4 with ffmpeg, `status` lists what is running. Recordings survive
@@ -28,6 +31,15 @@ HTMX app, where several browser tools answered before the page had done what the
   `htmx_settled` when the page has htmx, then the network going quiet, all bounded by `timeout_ms`. The
   result adds `navigated`, `requests_started` and `settled` (plus `settle_error` when the wait ran out; the
   action itself still counts as done). A click that starts nothing costs about 2 s here. Chrome only.
+- **`browser_upload`**, files into a page's `<input type=file>`. A real click opens the OS file chooser,
+  which agentctl cannot drive, so a CV or any other attachment could not be sent; `browser_fill_form` treated
+  the input as text and profile restore skipped it. It takes the same locator as `browser_act` plus `paths`
+  (1 to 10 files, 50 MiB each), follows a `<label>` to its input (or takes the one file input inside an
+  element), refuses several files for an input without `multiple`, and sets the files with
+  `DOM.setFileInputFiles`, so Chrome fires trusted `input` and `change` events. It returns names and sizes,
+  never contents. Dangerous tier, because a page can read whatever is attached: every path goes through the
+  fs engine's jail (`fs.roots`, with credential stores refused) and only the resolved path is used, so with
+  no `fs.roots` it refuses. Chrome only; the Safari engine returns Unsupported.
 - **`browser_act` `scroll: "none" | "nearest" | "center"`**, default `nearest`.
 - **`browser_eval` `timeout_ms`** (default 10000, 100 to 60000) and **`detached`**. On a timeout Chrome is
   told to terminate the script, and the error says that timers and promises it already scheduled may still
@@ -37,16 +49,28 @@ HTMX app, where several browser tools answered before the page had done what the
 - **`browser_connect` `launch.args`** (an allowlist of display, language and pacing flags; anything else is
   refused with the list) and **`launch.background_throttling`**.
 - **Built-in `browser` role** (`--role browser`, `AGENTCTL_ROLE=browser`, `policy.role`): only the browser
-  tools are advertised, 26 instead of 123. `access` turns every category on, so before this the only way to
+  tools are advertised, 27 instead of 124. `access` turns every category on, so before this the only way to
   get a browser-only list with `access` set was a custom role.
 
 ### Changed
 
+- **`browser_act click` and `type` are real input on Chrome.** A click was `el.click()`: no `pointerdown`,
+  `mousedown`, `pointerup` or `mouseup`, so react-select (which opens its menu on `mousedown`) did nothing.
+  It now scrolls the element into view, hit-tests its centre and, when the element is what sits there, sends
+  a real mouse click at that point; the result says `input: "cdp"`. A click stays `el.click()`, with
+  `input: "synthetic"` and an `input_reason`, for the Safari engine, `<select>` and `<option>` (a real click
+  opens a native popup), file inputs (it would open the OS file chooser), elements in a child frame, ones
+  with no size or off screen, and ones something else covers. `type` focuses the field, selects what is in it
+  and sends `Input.insertText`, so `beforeinput` and `input` fire as for a person typing and React, Lexical
+  or ProseMirror state follows; empty text clears the field. The result carries `value_after` (only
+  `value_length` for a password, one-time-code or card field or a `secret` call). `type` into a field
+  something disables or marks read-only, and into other element kinds, still sets the value. A recording
+  now sees the browser's own `change` when focus leaves a field that was typed into, as with a person.
 - **The showcase pointer is real and visible.** With showcase on, Chrome gets eased `mouseMoved` events
   along the glide, so the page sees the pointer arrive (`mousemove`, `:hover`, tooltips), and the drawn
   cursor follows the same curve, starting where it last was even after a navigation. `hover` always moves
   the real pointer, showcase or not, so CSS `:hover` applies; the synthetic `mouseover` remains for an
-  element something else covers. Clicks are still `el.click()`. The cursor is 32 px by default with a
+  element something else covers. The cursor is 32 px by default with a
   coloured glow, the click ripple lasts 900 / 700 / 300 ms (cinematic / demo / snappy) and the click waits a
   beat after it starts, so it is on screen when the click lands. In the field the cursor was a 15 px dark
   arrow and a 400 ms ripple that a recording almost never caught.
@@ -68,6 +92,12 @@ HTMX app, where several browser tools answered before the page had done what the
 
 ### Fixed
 
+- **React-controlled fields ignored `browser_act type`, `select` and `browser_fill_form`.** React tracks
+  each controlled input's value through an accessor it installs on the element and drops an `input` event
+  when the tracked value already equals the new one; `el.value = x` goes through that accessor, so the page's state
+  never updated. Values (and `checked`) are now assigned through the native prototype setter, in `type`
+  (Safari, and wherever a real insertion is not possible), `select`, `browser_fill_form` and the
+  `browser_checkpoint` restore.
 - **`cursor_style` did nothing**: every style drew the same arrow. Each now has its own look.
 - **`browser_showcase` reported `ok` for an overlay that was not drawn.** It was built with `innerHTML`,
   which throws on a page that requires Trusted Types, and the throw was swallowed. It is now built with DOM

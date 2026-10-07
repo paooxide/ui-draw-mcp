@@ -8,7 +8,7 @@ Tiers gate what an agent may call: `read` and `standard` tools are available ins
 enabled category, while a `dangerous` tool additionally has to be named in
 `policy.enable`. Enabling a category never enables its dangerous tools.
 
-**123 tools across 12 categories.**
+**124 tools across 12 categories.**
 
 | Tool | Category | Tier | Summary |
 |---|---|---|---|
@@ -51,7 +51,7 @@ enabled category, while a `dangerous` tool additionally has to be named in
 | [`power_control`](#power-control) | desktop | dangerous | Sleep, log out, restart or shut down. |
 | [`speak`](#speak) | desktop | standard | Speak text through the speakers. |
 | [`system_settings`](#system-settings) | desktop | standard | Read or change a desktop setting. |
-| [`browser_act`](#browser-act) | browser | standard | Act on a DOM node: click, type, select, hover, focus, scroll_into_view, submit, press (value Enter, Escape or Tab, sent as a real key event to the focused node; Chrome only). |
+| [`browser_act`](#browser-act) | browser | standard | Act on a DOM node: click, type, select, hover, focus, scroll_into_view, submit, press (value Enter, Escape, Tab, ArrowDown, ArrowUp, ArrowLeft, ArrowRight, Home, End, PageUp, PageDown, Backspace, Delete or Space, sent as a real key event to the focused node; Chrome only). |
 | [`browser_assert`](#browser-assert) | browser | read | Settle (optional) then check the page in one call; returns {passed, checks} and errors when it fails. |
 | [`browser_branch`](#browser-branch) | browser | standard | Speculative browser context branching: fork an isolated background context from a tab ('create'), run trials without affecting the visible tab, commit winning state ('commit'), discard failed branches ('discard'), switch focus ('switch'), or list branches ('list'). |
 | [`browser_capture`](#browser-capture) | browser | dangerous | Regression-test capture. |
@@ -75,6 +75,7 @@ enabled category, while a `dangerous` tool additionally has to be named in
 | [`browser_showcase`](#browser-showcase) | browser | standard | Configure visual flair for demos, screencasts, and presentations: animated virtual SVG cursor, smooth cubic-bezier gliding, click ripples, and floating typing HUD, drawn inside the tab on Chrome and Safari. |
 | [`browser_snapshot`](#browser-snapshot) | browser | read | Flatten a page into interactable node refs (dom/accessibility) or raw text. |
 | [`browser_tabs`](#browser-tabs) | browser | standard | List/open/activate/close tabs (targets) of a connected browser. |
+| [`browser_upload`](#browser-upload) | browser | dangerous | Attach local files to a file input (type=file; a click would open the OS file chooser, which agentctl cannot drive). |
 | [`browser_viewport`](#browser-viewport) | browser | standard | Emulate a viewport for responsive testing: override the page's device metrics (width/height, optionally mobile and a device scale factor). |
 | [`browser_wait`](#browser-wait) | browser | read | Wait for a settle signal: a selector to appear, dom_settled (no DOM mutation for >=150ms; animation frames are not tracked), htmx_settled (HTMX requests and DOM swaps settled; right after a browser_act it also waits up to 1.5s for an htmx request to start; errors if htmx is not present on the page), navigation to complete (after a goto, reload, click, submit or key press in this session it waits for the NEW document, not the one being left; a click that starts no navigation within navigation_timeout_ms, default 2s, settles on the loaded page with navigated:false; raise it for a handler that navigates later than that), network_idle (fetch/XHR started after a browser_act are tracked; settled when none is in flight and none began or finished for 500ms, and not before a navigation that act may have started has happened), or verification challenge clearance. |
 | [`command_info`](#command-info) | terminal | read | Resolve a command and capture its own --help and --version. |
@@ -687,7 +688,7 @@ Read or change a desktop setting. Settings the platform does not expose return U
 
 `browser_act` · standard tier
 
-Act on a DOM node: click, type, select, hover, focus, scroll_into_view, submit, press (value Enter, Escape or Tab, sent as a real key event to the focused node; Chrome only). A page-published canvas region (a canvas-child ref from browser_snapshot) supports only click and hover, sent as real mouse input at the region centre; other actions on it return Unsupported. Target it with 'ref' (from browser_query/snapshot) or, in one call, with 'query' plus optional 'by' (css/xpath/text), 'within' (scoped container), 'text' (substring filter), and 'index'.
+Act on a DOM node: click, type, select, hover, focus, scroll_into_view, submit, press (value Enter, Escape, Tab, ArrowDown, ArrowUp, ArrowLeft, ArrowRight, Home, End, PageUp, PageDown, Backspace, Delete or Space, sent as a real key event to the focused node; Chrome only). On Chrome a click is real pointer input (mousedown, mouseup, click, as a person's) and type is a real insertion that replaces the field's content, so React-style controlled fields and menus that open on mousedown work; the result reports input 'cdp', or 'synthetic' with input_reason when the element is covered, off screen, in a frame, a select/option or a file input. type reports value_after (value_length for a password or secret field). A page-published canvas region (a canvas-child ref from browser_snapshot) supports only click and hover, sent as real mouse input at the region centre; other actions on it return Unsupported. Target it with 'ref' (from browser_query/snapshot) or, in one call, with 'query' plus optional 'by' (css/xpath/text), 'within' (scoped container), 'text' (substring filter), and 'index'.
 
 | Argument | Type | Required | Description |
 |---|---|---|---|
@@ -701,7 +702,7 @@ Act on a DOM node: click, type, select, hover, focus, scroll_into_view, submit, 
 | `target_id` | string | yes |  |
 | `text` | string |  | optional text substring filter to narrow matches |
 | `timeout_ms` | integer |  | wait_after settle only: bound for the whole settle wait (default 10000); when it runs out the action still succeeded and the result has settled:false and settle_error |
-| `value` | string |  | text for type, option for select, or key name for press (Enter, Escape, Tab) |
+| `value` | string |  | text for type, option for select, or key name for press (Enter, Escape, Tab, ArrowDown, ArrowUp, ArrowLeft, ArrowRight, Home, End, PageUp, PageDown, Backspace, Delete, Space) |
 | `wait_after` | one of: none, settle |  | none (default) returns as soon as the action ran, when a click's request or navigation has usually not begun yet. settle then waits for a navigation it started to load, for htmx_settled if the page has htmx, and for the network to go quiet, and adds navigated, requests_started (fetch/XHR/htmx begun on the page since the action) and settled to the result. A click that starts no request and no navigation costs about 2s here; Chrome only |
 | `within` | string |  | optional CSS/XPath root selector to scope query search |
 
@@ -1023,6 +1024,23 @@ List/open/activate/close tabs (targets) of a connected browser.
 | `browser_id` | integer | yes |  |
 | `target_id` | string |  |  |
 | `url` | string |  |  |
+
+### browser-upload
+
+`browser_upload` · dangerous tier
+
+Attach local files to a file input (type=file; a click would open the OS file chooser, which agentctl cannot drive). Target the input like browser_act: 'ref' or 'query' (plus optional 'by', 'within', 'text', 'index'). A label is followed to its input, and an element holding exactly one file input uses that one; otherwise the error says what was found (target a hidden input directly). 'paths' holds 1 to 10 files, each at most 50 MiB, and more than one needs the input's multiple attribute. Only files inside the configured fs.roots can be attached (credential stores are always refused): a page can read what is attached, so this is how local files leave the machine. Chrome fires trusted input and change events. Returns {ok, files:[{name, bytes}], count, input_multiple}, never file contents. Chrome only.
+
+| Argument | Type | Required | Description |
+|---|---|---|---|
+| `by` | one of: css, xpath, text |  | how to read 'query' (default css); used when no 'ref' |
+| `index` | integer |  | optional 0-based match index if query matches multiple elements (default 0) |
+| `paths` | array&lt;string&gt; | yes | absolute paths of the files to attach (1 to 10), inside fs.roots |
+| `query` | string |  | selector to resolve in one call, instead of 'ref' |
+| `ref` | string |  | a ref from browser_query/snapshot |
+| `target_id` | string | yes |  |
+| `text` | string |  | optional text substring filter to narrow matches |
+| `within` | string |  | optional CSS/XPath root selector to scope query search |
 
 ### browser-viewport
 
