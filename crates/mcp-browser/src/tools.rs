@@ -2116,7 +2116,7 @@ impl ToolModule for BrowserModule {
                 "browser_query",
                 Category::Browser,
                 Tier::Read,
-                "Resolve node ref(s) by css selector, xpath, or visible text.",
+                "Resolve node ref(s) by css selector, xpath, or text (case-insensitive, exact matches first, clickable elements preferred).",
                 obj(
                     json!({
                         "target_id": { "type": "string" },
@@ -2136,7 +2136,7 @@ impl ToolModule for BrowserModule {
                  On Chrome a click is real pointer input (mousedown, mouseup, click, as a person's) and type is a real insertion that replaces the field's content, so React-style controlled fields and menus that open on mousedown work; the result reports input 'cdp', or 'synthetic' with input_reason when the element is covered, off screen, in a frame, a select/option or a file input. type reports value_after (value_length for a password or secret field). A page-published canvas region (a canvas-child ref from browser_snapshot) supports only click and hover, \
                  sent as real mouse input at the region centre; other actions on it return Unsupported. \
                  Target it with 'ref' (from browser_query/snapshot) or, in one call, with \
-                 'query' plus optional 'by' (css/xpath/text), 'within' (scoped container), 'text' (substring filter), and 'index'.",
+                 'query' plus optional 'by' (css/xpath/text; text is case-insensitive, exact matches first, clickable elements preferred), 'within' (scoped container), 'text' (substring filter), and 'index'.",
                 obj(
                     json!({
                         "target_id": { "type": "string" },

@@ -2027,8 +2027,112 @@ function __resolve(xp){
 /// Resolve an element by selector, matching `browser_query`'s `by` values, for
 /// act-by-selector. Supports scoped container root (`within`), substring text filter (`textFilter`),
 /// and ordinal selection (`index`). Searches across open shadow roots.
+///
+/// `__find_all` returns the whole ranked list; `__find` picks one and leaves the
+/// size of the list in `__find.count`, which `browser_act` reports as `matches`.
+/// `by: text` is ranked (see `__text_matches`), so the first match is the one
+/// a person would mean, not the first element in the page that mentions it.
 const JS_FIND: &str = r#"
+function __norm(s){ return String(s == null ? '' : s).replace(/\s+/g, ' ').trim().toLowerCase(); }
+// The strings an element answers to: its text, a button input's value, its aria-label.
+function __texts(el, q){
+  // textContent is cheap and holds everything innerText shows, so only an
+  // element whose textContent could match pays for innerText (which lays out).
+  // Compared without whitespace: innerText adds breaks at <br> and block
+  // edges that textContent lacks, so "Next<br>step" still matches "next step".
+  var tc = __norm(el.textContent), out = [tc];
+  if(q != null && tc.replace(/ /g, '').indexOf(q.replace(/ /g, '')) >= 0){
+    var t = el.innerText;
+    if(t != null && t !== '') out[0] = __norm(t);
+  }
+  if(el.tagName === 'INPUT'){
+    var ty = String(el.type).toLowerCase();
+    if(ty === 'button' || ty === 'submit' || ty === 'reset') out.push(__norm(el.value));
+  }
+  var al = el.getAttribute && el.getAttribute('aria-label');
+  if(al) out.push(__norm(al));
+  return out;
+}
+// Rendered with a box: a hidden copy of a control (a closed menu, a template)
+// must not outrank the one on screen. innerText does not tell them apart, since
+// it falls back to textContent for an element that is not rendered.
+function __visible(el){
+  if(el.checkVisibility) return el.checkVisibility();
+  return !!(el.getClientRects && el.getClientRects().length);
+}
+var __ACTIONABLE = 'button, a[href], input:not([type=hidden]), select, textarea, summary, label, [role=button], [role=link], [role=menuitem], [role=option], [role=tab], [role=checkbox], [role=radio], [role=switch], [role=treeitem], [onclick], [contenteditable=true]';
+// Text matches, best first: exact before substring (and when any is exact the
+// substring ones are dropped), visible before hidden, clickable before not,
+// then document order. A
+// candidate is the innermost element whose text holds the query, lifted to the
+// control around it, so `<button><span>Next</span></button>` is the button and
+// the sentence `Click on "next"` only ranks as a last resort.
+function __text_matches(root, q){
+  q = __norm(q);
+  if(!q || !root.querySelectorAll) return [];
+  var all = root.querySelectorAll('*'), n = all.length, has = new Array(n), tx = new Array(n), skip = /^(SCRIPT|STYLE|NOSCRIPT|TEMPLATE|HEAD|TITLE|META|LINK)$/;
+  var pos = new Map();
+  for(var i=0; i<n; i++){
+    pos.set(all[i], i);
+    tx[i] = skip.test(all[i].tagName) ? [] : __texts(all[i], q);
+    has[i] = tx[i].some(function(t){ return t.indexOf(q) >= 0; });
+  }
+  var best = new Map();
+  for(var j=0; j<n; j++){
+    if(!has[j]) continue;
+    var kids = all[j].children, inner = true;
+    for(var k=0; k<kids.length; k++){ if(has[pos.get(kids[k])]){ inner = false; break; } }
+    if(!inner) continue;
+    var el = all[j], lifted = el.closest ? el.closest(__ACTIONABLE) : null;
+    var act = !!(lifted && (lifted === root || root.contains(lifted)));
+    if(!act) lifted = el;
+    var exact = tx[j].indexOf(q) >= 0;
+    if(!exact && act){
+      var li = pos.get(lifted);
+      exact = li !== undefined && tx[li].indexOf(q) >= 0;
+    }
+    var prev = best.get(lifted);
+    if(!prev) best.set(lifted, {el: lifted, exact: exact, act: act, vis: __visible(lifted), ord: j});
+    else if(exact) prev.exact = true;
+  }
+  var list = Array.from(best.values());
+  if(list.some(function(m){ return m.exact; })) list = list.filter(function(m){ return m.exact; });
+  list.sort(function(a, b){ return (b.vis - a.vis) || (b.act - a.act) || (a.ord - b.ord); });
+  return list.map(function(m){ return m.el; });
+}
+// What `browser_act` reports it acted on: tag and a short name. A field is named
+// by its label, never its value (a value can be a secret); a button-type input's
+// value is its caption, so that one is used.
+function __label_text(n){
+  if(n.nodeType === 3) return n.nodeValue;
+  if(n.nodeType !== 1 || /^(INPUT|SELECT|TEXTAREA|SCRIPT|STYLE)$/.test(n.tagName)) return '';
+  var s = '';
+  for(var c = n.firstChild; c; c = c.nextSibling) s += __label_text(c) + ' ';
+  return s;
+}
+function __target(el){
+  var tag = (el.tagName || '').toLowerCase(), t = '';
+  var ty = tag === 'input' ? String(el.type).toLowerCase() : '';
+  var btn = ty === 'button' || ty === 'submit' || ty === 'reset';
+  if((tag === 'input' || tag === 'select' || tag === 'textarea' || el.isContentEditable) && !btn){
+    var at = function(a){ return el.getAttribute ? el.getAttribute(a) : null; };
+    t = at('aria-label');
+    if(!t && el.labels && el.labels.length) t = __label_text(el.labels[0]);
+    t = t || at('placeholder') || at('name') || '';
+  } else if(btn){
+    t = el.value || el.getAttribute('aria-label') || '';
+  } else {
+    t = el.innerText || el.textContent || (el.getAttribute && el.getAttribute('aria-label')) || '';
+  }
+  return {tag: tag, text: String(t).replace(/\s+/g, ' ').trim().slice(0, 80)};
+}
 function __find(by, q, within, textFilter, index){
+  var matches = __find_all(by, q, within, textFilter);
+  __find.count = matches.length;
+  var idx = (typeof index === 'number' && index >= 0) ? index : 0;
+  return matches[idx] || null;
+}
+function __find_all(by, q, within, textFilter){
   var root = document;
   if(within) {
     // Decide XPath vs CSS first: an XPath string is a CSS syntax error, so
@@ -2082,13 +2186,7 @@ function __find(by, q, within, textFilter, index){
       for(var i=0; i<r.snapshotLength; i++) matches.push(r.snapshotItem(i));
     } catch(e){}
   } else { // text
-    var wAll = root.querySelectorAll ? root.querySelectorAll('*') : [];
-    for(var i=0; i<wAll.length; i++){
-      if(wAll[i].children.length===0 && (wAll[i].innerText||'').indexOf(q)>=0) matches.push(wAll[i]);
-    }
-    for(var j=0; j<wAll.length; j++){
-      if((wAll[j].textContent||'').trim()===q && matches.indexOf(wAll[j])===-1) matches.push(wAll[j]);
-    }
+    matches = __text_matches(root, q);
   }
 
   if(textFilter && typeof textFilter === 'string' && textFilter.length > 0) {
@@ -2098,10 +2196,7 @@ function __find(by, q, within, textFilter, index){
       return t.indexOf(tf) >= 0;
     });
   }
-
-  if(matches.length === 0) return null;
-  var idx = (typeof index === 'number' && index >= 0) ? index : 0;
-  return matches[idx] || null;
+  return matches;
 }
 "#;
 
@@ -3350,14 +3445,14 @@ impl BrowserBackend for CdpBackend {
         let expr = format!(
             r#"(function(){{
   {JS_XPATH}
+  {JS_FIND}
   var by={by_lit}, q={q}, all={all}, els=[];
   if(by==='css'){{ els=Array.from(document.querySelectorAll(q)); }}
   else if(by==='xpath'){{
     var r=document.evaluate(q,document,null,XPathResult.ORDERED_NODE_SNAPSHOT_TYPE,null);
     for(var i=0;i<r.snapshotLength;i++) els.push(r.snapshotItem(i));
-  }} else {{ // text
-    var w=document.querySelectorAll('*');
-    for(var i=0;i<w.length;i++){{ if((w[i].innerText||'').indexOf(q)>=0 && w[i].children.length===0) els.push(w[i]); }}
+  }} else {{ // text, ranked as browser_act's is
+    els=__text_matches(document,q);
   }}
   if(!all) els=els.slice(0,1);
   return els.slice(0,200).map(function(el){{
@@ -3531,6 +3626,7 @@ impl BrowserBackend for CdpBackend {
         // Resolve to an element in the same eval: a `ref` via XPath, or a
         // selector via `__find`, so a scripted action is one round trip.
         let resolve = locator_js(locator);
+        let is_selector = matches!(locator, Locator::Selector { .. });
         let act = serde_json::to_string(action).unwrap_or_else(|_| "\"click\"".into());
         let val = serde_json::to_string(&value).unwrap_or_else(|_| "null".into());
         let real_input = !is_safari;
@@ -3732,6 +3828,7 @@ impl BrowserBackend for CdpBackend {
   {el_scroll}
   {showcase_call}
   {nav_mark_in_script}
+  var tgt = __target(el), found = {found};
   try {{
   switch(action){{
     case 'click': {{
@@ -3808,9 +3905,10 @@ impl BrowserBackend for CdpBackend {
     default: return {{ok:false,error:'unknown action '+action}};
   }}
   }} finally {{ __disarm(); }}
-  return {{ok:true,action:action,showcase:{}{showcase_rendered},input:inputKind,input_reason:inputReason,click_at:clickAt,type_insert:insertText,readback:readback}};
+  return {{ok:true,action:action,showcase:{}{showcase_rendered},input:inputKind,input_reason:inputReason,click_at:clickAt,type_insert:insertText,readback:readback,target:tgt,matches:found}};
 }})()"#,
             showcase_cfg.enabled,
+            found = if is_selector { "__find.count" } else { "null" },
             showcase_rendered = if showcase_cfg.enabled {
                 format!(
                     ",showcase_rendered:{}",
@@ -3919,6 +4017,9 @@ impl BrowserBackend for CdpBackend {
             }
             if map.get("input").is_some_and(Value::is_null) {
                 map.remove("input");
+            }
+            if map.get("matches").is_some_and(Value::is_null) {
+                map.remove("matches");
             }
         }
         if let (Some(spec), Some(c)) = (press_key, c_opt.as_mut()) {
