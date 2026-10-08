@@ -51,7 +51,7 @@ enabled category, while a `dangerous` tool additionally has to be named in
 | [`power_control`](#power-control) | desktop | dangerous | Sleep, log out, restart or shut down. |
 | [`speak`](#speak) | desktop | standard | Speak text through the speakers. |
 | [`system_settings`](#system-settings) | desktop | standard | Read or change a desktop setting. |
-| [`browser_act`](#browser-act) | browser | standard | Act on a DOM node: click, double_click, triple_click, right_click, hover, mouse_move, mouse_down, mouse_up, drag, scroll, type, select, focus, scroll_into_view, submit or press. |
+| [`browser_act`](#browser-act) | browser | standard | Act on a DOM node. |
 | [`browser_assert`](#browser-assert) | browser | read | Check the page in one call, optionally settling first; returns {passed, checks} and errors when it fails. |
 | [`browser_branch`](#browser-branch) | browser | standard | Fork an isolated background context from a tab (create), try things without touching the visible tab, then commit the winning state, discard, switch or list branches. |
 | [`browser_capture`](#browser-capture) | browser | dangerous | Capture fetch/XHR calls (with bodies) and console errors across navigations: start, read (only_errors, filter), clear. |
@@ -765,7 +765,7 @@ Read or change a desktop setting. Settings the platform does not expose return U
 
 `browser_act` · standard tier
 
-Act on a DOM node: click, double_click, triple_click, right_click, hover, mouse_move, mouse_down, mouse_up, drag, scroll, type, select, focus, scroll_into_view, submit or press. Target it with 'ref' (from browser_query/snapshot) or with 'query' plus optional by, within, text, index. x and y act at a point (offsets inside the target, or viewport px without one) and the result's hit says what is there. type replaces the field's content and reports value_after. press takes a key or combo such as ctrl+a. hold_ms holds a click or key. The result's effects lists what the action changed (url, title, new_tab, dialog, appeared, disappeared, focus), so a snapshot is not needed to see it. A click returns at once, before its request or navigation has begun: use wait_after='settle' or browser_wait. Batch: steps=[{action, ref|query, value}, ...] runs up to 20 in one call and stops at the first failure; snapshot='diff' adds what the page changed.
+Act on a DOM node. Target it with 'ref' (from browser_snapshot/query) or 'query' (CSS, visible text, XPath or role=...) plus optional by, within, text, index. x and y act at a point (offsets in the target, else viewport px); the result's hit names what is there. type replaces the field's content. press takes a key or combo (ctrl+a). The result's effects says what changed (url, new_tab, dialog, appeared, disappeared, focus), so no snapshot is needed to see it. A click returns before any navigation it starts: use wait_after='settle'. steps=[{action, ref|query, value}, ...] runs up to 20 in one call.
 
 `press` takes a key or a combo in `value`: a named key (Enter, Escape, Tab, Arrow keys, Home, End, PageUp, PageDown, Backspace, Delete, Insert, Space, F1-F12), a character, or modifiers (ctrl, alt, shift, meta/cmd) joined by +, as in ctrl+a or Shift+ArrowDown. It is a real key event to the target, or to the focused node or page with no target; Chrome only. ctrl or cmd with a, c, x, v, z or y edits as a person's shortcut does, also on macOS.
 
@@ -792,30 +792,30 @@ Query targeting: 'by' is css, xpath, text or role (used when no 'ref'; role take
 | Argument | Type | Required | Description |
 |---|---|---|---|
 | `action` | one of: click, double_click, triple_click, right_click, hover, mouse_move, mouse_down, mouse_up, drag, scroll, type, select, focus, scroll_into_view, submit, press |  |  |
-| `button` | one of: left, right, middle |  | mouse_down / mouse_up: the button (default left) |
+| `button` | one of: left, right, middle |  | mouse_down/mouse_up button (default left) |
 | `by` | one of: css, xpath, text, role |  | how to read 'query' (default: CSS, else visible text) |
-| `dx` | number |  | drag: x distance from the start; scroll: horizontal distance in CSS px |
-| `dy` | number |  | drag: y distance from the start; scroll: vertical distance in CSS px (default one viewport down) |
-| `hold_ms` | number |  | click: hold the button this long before releasing; press: hold the key down this long (at most 10000) |
+| `dx` | number |  | drag or scroll: x distance in CSS px |
+| `dy` | number |  | drag or scroll: y distance (scroll default: one viewport down) |
+| `hold_ms` | number |  | hold a click's button or a press's key this long (max 10000) |
 | `index` | integer |  | 0-based match index (default 0) |
 | `name` | string |  | with by: role, the accessible name (case-insensitive substring) |
-| `query` | string |  | selector to resolve and act on in one call, instead of 'ref'; type and press with neither act on the focused element, scroll on the page; with by: role, the ARIA role |
+| `query` | string |  | selector or text to act on, instead of 'ref'; type and press with neither act on the focused element; with by: role, the ARIA role |
 | `ref` | string |  | a ref from browser_query/snapshot |
 | `scroll` | one of: none, nearest, center |  | bring the element into view first (default nearest) |
 | `secret` | boolean |  | value is a secret: kept out of the audit log and the showcase HUD |
-| `snapshot` | one of: none, diff, full |  | with steps: also return the page after the last step, as a snapshot diff against the last browser_snapshot or in full |
-| `steps` | array&lt;object&gt; |  | several actions in one call, run in order on target_id: each item takes the fields above (action, ref or query, value, ...) except target_id. Stops at the first failure. At most 20. Use instead of action/ref/query |
+| `snapshot` | one of: none, diff, full |  | with steps: the page after the last step, as a snapshot diff or in full |
+| `steps` | array&lt;object&gt; |  | batch: acts with the fields above, run in order, stopping at the first failure (max 20) |
 | `target_id` | string |  | tab id (default: active tab) |
 | `text` | string |  | substring filter on the matches |
-| `timeout_ms` | integer |  | settle bound (default 10000); on expiry the action still succeeded and the result has settled:false |
+| `timeout_ms` | integer |  | settle bound in ms (default 10000) |
 | `to_query` | string |  | drag destination element (a selector) |
 | `to_ref` | string |  | drag destination element (a ref) |
-| `to_x` | number |  | drag destination x: an offset inside to_ref/to_query, else a viewport point |
+| `to_x` | number |  | drag end x: offset in to_ref/to_query, else a viewport point |
 | `to_y` | number |  | drag destination y, as to_x |
-| `value` | string |  | text for type, option text or value for select (on the <select> or an option), key or combo for press (Enter, Escape, ArrowDown, a, ctrl+a, Shift+Tab), direction for scroll (up, down, left, right, top, bottom) |
-| `wait_after` | one of: none, settle |  | settle waits for a started navigation, htmx and quiet network, and adds navigated, requests_started and settled to the result (Chrome; about 2s when nothing starts). Default none |
+| `value` | string |  | type: the text; select: option text or value; press: key or combo (Enter, ctrl+a, Shift+Tab); scroll: up, down, left, right, top or bottom |
+| `wait_after` | one of: none, settle |  | settle: wait for a started navigation and quiet network (Chrome). Default none |
 | `within` | string |  | root selector scoping the query |
-| `x` | number |  | pointer x in CSS px: an offset from the target's top-left corner, or a viewport point without a target |
+| `x` | number |  | CSS px: offset from the target's top-left, or a viewport point without one |
 | `y` | number |  | pointer y, as x |
 
 ### browser-assert
