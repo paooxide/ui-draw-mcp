@@ -1082,22 +1082,52 @@ impl BrowserModule {
         };
         // Either a ref from a prior snapshot/query, or a selector resolved in
         // the same call (one round trip instead of query-then-act).
-        let action =
-            match crate::input::canonical_action(str_arg(args, "action").unwrap_or("click")) {
-                Ok(a) => a,
-                Err(m) => return Envelope::fail("browser_act", ErrorCode::InvalidArgs, m),
-            };
+        let raw_action = str_arg(args, "action").unwrap_or("click");
+        let action = match crate::input::canonical_action(raw_action) {
+            Ok(a) => a,
+            Err(m) => return Envelope::fail("browser_act", ErrorCode::InvalidArgs, m),
+        };
         let pointer = match pointer_args(args) {
             Ok(p) => p,
             Err(m) => return Envelope::fail("browser_act", ErrorCode::InvalidArgs, m),
         };
-        // Real pointer input: the multi-click, scroll and drag actions, and a
-        // click or hover given coordinates.
+        let mut opts = match parse_act_opts(args) {
+            Ok(o) => o,
+            Err(m) => return Envelope::fail("browser_act", ErrorCode::InvalidArgs, m),
+        };
+        // `press_and_hold` and `long_press` are a click that is held.
+        if opts.hold_ms == 0 && crate::input::implies_hold(raw_action) {
+            opts.hold_ms = crate::input::HOLD_DEFAULT_MS;
+        }
+        if opts.hold_ms > 0
+            && !matches!(
+                action,
+                "click" | "double_click" | "triple_click" | "right_click" | "press"
+            )
+        {
+            return Envelope::fail(
+                "browser_act",
+                ErrorCode::InvalidArgs,
+                format!(
+                    "hold_ms applies to click and press, not '{action}'; to hold a button across other steps use mouse_down and mouse_up"
+                ),
+            );
+        }
+        // Real pointer input: the multi-click, scroll, drag and bare mouse
+        // actions, a held click, and a click or hover given coordinates.
         let is_pointer = matches!(
             action,
-            "double_click" | "triple_click" | "right_click" | "scroll" | "drag"
+            "double_click"
+                | "triple_click"
+                | "right_click"
+                | "scroll"
+                | "drag"
+                | "mouse_move"
+                | "mouse_down"
+                | "mouse_up"
         ) || (matches!(action, "click" | "hover")
-            && (pointer.x.is_some() || pointer.y.is_some()));
+            && (pointer.x.is_some() || pointer.y.is_some()))
+            || (action == "click" && opts.hold_ms > 0);
         // Typing and key presses may go to whatever has focus.
         let found = parse_locator(args);
         let locator = match found {
@@ -1114,23 +1144,16 @@ impl BrowserModule {
             }
         };
         let secret = args.get("secret").and_then(Value::as_bool) == Some(true);
-        let opts = match parse_act_opts(args) {
-            Ok(o) => o,
-            Err(m) => return Envelope::fail("browser_act", ErrorCode::InvalidArgs, m),
-        };
         let mut css: Vec<&str> = css_candidate(args, "query").into_iter().collect();
         css.extend(str_arg(args, "within").filter(|w| !looks_like_xpath(w)));
-        if is_pointer {
-            return result_with_selector_hint(
-                "browser_act",
-                self.backend
-                    .act_pointer(target, found, action, pointer, opts)
-                    .await,
-                &css,
-            );
-        }
-        result_with_selector_hint(
-            "browser_act",
+        // What the page looked like before, so the result can say what the
+        // action changed and the next turn needs no snapshot to find out.
+        let probe = self.backend.act_probe(target, action).await;
+        let mut res = if is_pointer {
+            self.backend
+                .act_pointer(target, found, action, pointer, opts)
+                .await
+        } else {
             self.backend
                 .act_opts(
                     target,
@@ -1140,9 +1163,14 @@ impl BrowserModule {
                     secret,
                     opts,
                 )
-                .await,
-            &css,
-        )
+                .await
+        };
+        if let (Ok(out), Some(probe)) = (res.as_mut(), probe) {
+            self.backend
+                .act_effects(target, probe, opts.settle, out)
+                .await;
+        }
+        result_with_selector_hint("browser_act", res, &css)
     }
 
     /// `browser_act` with `steps`: each runs through [`Self::act_one`], the
@@ -2697,6 +2725,7 @@ fn pointer_args(args: &Value) -> Result<crate::backend::PointerArgs<'_>, String>
         dx: num("dx")?,
         dy: num("dy")?,
         value: str_arg(args, "value"),
+        button: crate::input::parse_button(str_arg(args, "button"))?,
     })
 }
 
@@ -2795,6 +2824,11 @@ fn parse_act_opts(args: &Value) -> Result<crate::backend::ActOpts, String> {
             Some(n) => opts.timeout_ms = n,
             None => return Err("timeout_ms must be a non-negative integer".into()),
         },
+    }
+    if let Some(v) = args.get("hold_ms").filter(|v| !v.is_null()) {
+        let ms = crate::input::coord(v)
+            .ok_or_else(|| format!("'hold_ms' must be a number of milliseconds, got {v}"))?;
+        opts.hold_ms = crate::input::hold_ms(Some(ms))?;
     }
     Ok(opts)
 }
@@ -3010,7 +3044,7 @@ impl ToolModule for BrowserModule {
                 "browser_act",
                 Category::Browser,
                 Tier::Standard,
-                "Act on a DOM node: click, double_click, triple_click, right_click, hover, drag, scroll, type, select, focus, scroll_into_view, submit or press. Target it with 'ref' (from browser_query/snapshot) or with 'query' plus optional by, within, text, index. x and y click or hover at a point (offsets inside the target, or viewport px without one). type replaces the field's content and reports value_after. press takes a key or combo such as ctrl+a. A click returns at once, before its request or navigation has begun: use wait_after='settle' or browser_wait. Batch: steps=[{action, ref|query, value}, ...] runs up to 20 in one call and stops at the first failure; snapshot='diff' adds what the page changed.",
+                "Act on a DOM node: click, double_click, triple_click, right_click, hover, mouse_move, mouse_down, mouse_up, drag, scroll, type, select, focus, scroll_into_view, submit or press. Target it with 'ref' (from browser_query/snapshot) or with 'query' plus optional by, within, text, index. x and y act at a point (offsets inside the target, or viewport px without one) and the result's hit says what is there. type replaces the field's content and reports value_after. press takes a key or combo such as ctrl+a. hold_ms holds a click or key. The result's effects lists what the action changed (url, title, new_tab, dialog, appeared, disappeared, focus), so a snapshot is not needed to see it. A click returns at once, before its request or navigation has begun: use wait_after='settle' or browser_wait. Batch: steps=[{action, ref|query, value}, ...] runs up to 20 in one call and stops at the first failure; snapshot='diff' adds what the page changed.",
                 obj(
                     json!({
                         "target_id": { "type": "string", "description": "tab id (default: active tab)" },
@@ -3020,7 +3054,7 @@ impl ToolModule for BrowserModule {
                         "within": { "type": "string", "description": "root selector scoping the query" },
                         "text": { "type": "string", "description": "substring filter on the matches" },
                         "index": { "type": "integer", "description": "0-based match index (default 0)" },
-                        "action": { "type": "string", "enum": ["click", "double_click", "triple_click", "right_click", "hover", "drag", "scroll", "type", "select", "focus", "scroll_into_view", "submit", "press"] },
+                        "action": { "type": "string", "enum": ["click", "double_click", "triple_click", "right_click", "hover", "mouse_move", "mouse_down", "mouse_up", "drag", "scroll", "type", "select", "focus", "scroll_into_view", "submit", "press"] },
                         "value": { "type": "string", "description": "text for type, option text or value for select (on the <select> or an option), key or combo for press (Enter, Escape, ArrowDown, a, ctrl+a, Shift+Tab), direction for scroll (up, down, left, right, top, bottom)" },
                         "x": { "type": "number", "description": "pointer x in CSS px: an offset from the target's top-left corner, or a viewport point without a target" },
                         "y": { "type": "number", "description": "pointer y, as x" },
@@ -3030,6 +3064,8 @@ impl ToolModule for BrowserModule {
                         "to_y": { "type": "number", "description": "drag destination y, as to_x" },
                         "dx": { "type": "number", "description": "drag: x distance from the start; scroll: horizontal distance in CSS px" },
                         "dy": { "type": "number", "description": "drag: y distance from the start; scroll: vertical distance in CSS px (default one viewport down)" },
+                        "hold_ms": { "type": "number", "description": "click: hold the button this long before releasing; press: hold the key down this long (at most 10000)" },
+                        "button": { "type": "string", "enum": ["left", "right", "middle"], "description": "mouse_down / mouse_up: the button (default left)" },
                         "secret": { "type": "boolean", "description": "value is a secret: kept out of the audit log and the showcase HUD" },
                         "scroll": { "type": "string", "enum": ["none", "nearest", "center"], "description": "bring the element into view first (default nearest)" },
                         "wait_after": { "type": "string", "enum": ["none", "settle"], "description": "settle waits for a started navigation, htmx and quiet network, and adds navigated, requests_started and settled to the result (Chrome; about 2s when nothing starts). Default none" },
@@ -3054,7 +3090,24 @@ impl ToolModule for BrowserModule {
                  to_ref or to_query element (its centre, or to_x and to_y inside it), else to_x and to_y as viewport \
                  points, else dx and dy from the start; the destination must be on screen. Mouse-event drags (sliders, \
                  sortable lists, selecting text) and HTML5 draggable elements both work; the result says html5_drag. \
-                 Spellings such as key, dblclick, triple-click, drag_and_drop are accepted.\n\n\
+                 `mouse_move` (also `hover` with x and y) moves the real pointer to the target or point without clicking, \
+                 so mouseover, mousemove and CSS :hover fire; `mouse_down` and `mouse_up` press and release a `button` \
+                 (left, right or middle) at the target or point, so a drag or hold the page implements itself can be \
+                 composed: mouse_down, then mouse_move to where it ends (moves in between carry the held button), then \
+                 mouse_up (with no target it releases where the pointer is). Use `drag` for a native draggable element. \
+                 `hold_ms` (at most 10000) makes a click wait that long between press and release, and a press that long \
+                 between key down and key up; press_and_hold and long_press are a click with hold_ms (default 800).\n\n\
+                 Every action given x and y returns `hit`: the element under that point (tag, id, short text or name, and \
+                 canvas). A point outside the viewport is an error naming the viewport size, and an input event the \
+                 browser does not accept makes the call fail rather than report ok.\n\n\
+                 Each result carries `effects` with only what the action changed, so the next call needs no snapshot to \
+                 learn it: `url` and `title` when they changed, `new_tab` ({target_id, url}) for a tab or popup it \
+                 opened, `dialog` ({type, message, answered}) for an alert, confirm or prompt it raised, `appeared` and \
+                 `disappeared` (up to 5 each, such as 'dialog \"Session expired\" ref=...': dialogs, menus, listboxes, \
+                 toasts, overlays and interactive elements that became visible or went away) and `focus` for the newly \
+                 focused element. A navigation reports url and title only. Chrome only; effects are read about 120 ms \
+                 after the action unless wait_after is settle.\n\n\
+                 Spellings such as key, dblclick, triple-click, drag_and_drop, move, mousedown are accepted.\n\n\
                  Batches: `steps` is a list of acts (each with its own action, ref or query, value, and so on; target_id \
                  comes from the call, and wait_after and timeout_ms are inherited when a step sets none; secret is not, so \
                  flag each step that types one). They run in order through the same code as a single act, so each step is \

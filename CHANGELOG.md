@@ -22,6 +22,25 @@ operated.
   steps, which covers sliders, sortable lists and selecting text, and plays native `draggable` elements back
   through Chrome's drag interception. In a MiniWoB++ run canvas, drag and slider tasks failed for want of
   these. Chrome only.
+- **`browser_act` effects:** every result now carries `effects`, holding only what the action changed, so the
+  model does not spend a turn on a snapshot to find out. `url` and `title` when they changed, `new_tab`
+  (`target_id`, `url`) for a tab or popup the action opened, `dialog` (`type`, `message`, `answered`) for an
+  alert, confirm or prompt, `appeared` and `disappeared` (at most 5 each, a short role, name and ref per
+  element) for dialogs, menus, listboxes, toasts, high z-index overlays and interactive elements that became
+  visible or went away, and `focus` for the newly focused element. It is one bounded page script before the
+  action and one after, read about 120 ms later (not at all extra when `wait_after` is `settle`); a navigation
+  reports `url` and `title` only, and an action that changed nothing has no `effects`. In a MiniWoB++ run
+  login-user-popup (a popup appears mid-task and must be dismissed) and email-inbox (clicking reply reveals a
+  form) cost an extra snapshot per step for want of it. Chrome only.
+- **`browser_act` `mouse_move`, `mouse_down`, `mouse_up` and `hold_ms`.** `mouse_move` (and `hover` with `x`
+  and `y`) moves the real pointer without clicking, so mouseover, mousemove and `:hover` fire. `mouse_down`
+  and `mouse_up` take an element or a point and a `button`; moves in between carry the held button, so a drag
+  or hold the page implements itself can be composed, and a bare `mouse_up` releases where the pointer is.
+  `hold_ms` (at most 10000, an error above) holds a click between press and release, or a key between down and
+  up. Spellings `move`, `mousemove`, `mousedown`, `mouseup`, `press_and_hold` and `long_press` (a click held
+  800 ms) are accepted. Chrome only; Safari says so.
+- **`browser_act` `hit`.** A pointer action given `x` and `y` answers with the element under the point
+  (`tag`, `id`, short `text`, `canvas`), so a click that landed on the wrong thing, or on a canvas, shows it.
 - **Desktop: choose from a popup button or combo box by its text.** `ui_action select` and `ui_fill_form`
   take `option`; on macOS the popup is opened and the matching menu item pressed, on Linux the AT-SPI combo
   box's item is invoked. Before, both backends dropped `option`, so a popup button only opened and the call
@@ -173,6 +192,9 @@ operated.
 
 ### Fixed
 
+- **A `browser_act` hover could report ok when the pointer never moved.** The real move was treated as
+  decoration and a failed dispatch was dropped. A move that is not delivered is now an error, like every other
+  pointer event.
 - **`browser_screenshot` said `width: 0, height: 0` next to a whole-page image.** Only element captures
   measured themselves, and a weak model in a benchmark run could read the zeros as a blank page. The inline
   result now takes the size from the PNG header, as `save: true` already did.
