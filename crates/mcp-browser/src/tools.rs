@@ -592,15 +592,339 @@ fn trailing_text_pseudo(q: &str) -> Option<(&str, String)> {
     Some((raw_base, x.to_string()))
 }
 
+/// Words a snapshot line starts with that `button "Save"` is read as a role
+/// query for; any other `word "text"` is left to be text.
+const ROLE_NAMES: &[&str] = &[
+    "alert",
+    "alertdialog",
+    "article",
+    "banner",
+    "button",
+    "cell",
+    "checkbox",
+    "columnheader",
+    "combobox",
+    "complementary",
+    "contentinfo",
+    "dialog",
+    "form",
+    "grid",
+    "gridcell",
+    "group",
+    "heading",
+    "img",
+    "link",
+    "list",
+    "listbox",
+    "listitem",
+    "main",
+    "menu",
+    "menubar",
+    "menuitem",
+    "navigation",
+    "option",
+    "paragraph",
+    "progressbar",
+    "radio",
+    "radiogroup",
+    "region",
+    "row",
+    "rowheader",
+    "searchbox",
+    "separator",
+    "slider",
+    "spinbutton",
+    "status",
+    "switch",
+    "tab",
+    "table",
+    "tablist",
+    "tabpanel",
+    "textbox",
+];
+
+/// What a role query's `name` is: text (a case-insensitive substring unless
+/// `exact`), or a `/regex/flags` literal kept as written.
+#[derive(Debug, PartialEq)]
+enum RoleName {
+    Text(String),
+    Regex(String),
+}
+
+/// A role query read out of one of its spellings (see [`role_spelling`]).
+#[derive(Debug, PartialEq)]
+struct RoleSpec {
+    role: String,
+    name: Option<RoleName>,
+    exact: bool,
+    level: Option<u32>,
+}
+
+/// A value in a role query's brackets or options object.
+enum RoleVal {
+    Text(String),
+    Regex(String),
+    Bare(String),
+}
+
+impl RoleSpec {
+    fn new(role: &str) -> Self {
+        RoleSpec {
+            role: role.trim().to_ascii_lowercase(),
+            name: None,
+            exact: false,
+            level: None,
+        }
+    }
+
+    /// Take one `key` / `value` pair; keys with no meaning here are dropped.
+    fn set(&mut self, key: &str, v: Option<RoleVal>) {
+        match (key, v) {
+            ("name", Some(RoleVal::Text(t) | RoleVal::Bare(t))) => {
+                self.name = Some(RoleName::Text(t));
+            }
+            ("name", Some(RoleVal::Regex(r))) => self.name = Some(RoleName::Regex(r)),
+            ("level", Some(RoleVal::Text(n) | RoleVal::Bare(n))) => self.level = n.parse().ok(),
+            ("exact", None) => self.exact = true,
+            ("exact", Some(RoleVal::Bare(b))) => self.exact = b == "true",
+            _ => {}
+        }
+    }
+
+    /// The one spelling the page script reads: `role=button[name="Save"]`.
+    fn canonical(&self) -> String {
+        let mut s = format!("role={}", self.role);
+        match &self.name {
+            Some(RoleName::Text(t)) => {
+                s += &format!(
+                    "[name=\"{}\"]",
+                    t.replace('\\', "\\\\").replace('"', "\\\"")
+                );
+            }
+            Some(RoleName::Regex(r)) => s += &format!("[name={r}]"),
+            None => {}
+        }
+        if self.exact {
+            s += "[exact]";
+        }
+        if let Some(l) = self.level {
+            s += &format!("[level={l}]");
+        }
+        s
+    }
+}
+
+/// A quoted string (either quote, backslash escapes) at the start of `s`, and
+/// what follows it.
+fn take_quoted(s: &str) -> Option<(String, &str)> {
+    let q = s.chars().next().filter(|c| matches!(c, '"' | '\''))?;
+    let mut out = String::new();
+    let mut chars = s[1..].char_indices();
+    while let Some((i, c)) = chars.next() {
+        match c {
+            '\\' => out.push(chars.next()?.1),
+            c if c == q => return Some((out, &s[i + 2..])),
+            c => out.push(c),
+        }
+    }
+    None
+}
+
+/// A `/body/flags` literal at the start of `s`, as written, and what follows it.
+fn take_regex(s: &str) -> Option<(String, &str)> {
+    let body = s.strip_prefix('/')?;
+    let mut escaped = false;
+    for (i, c) in body.char_indices() {
+        if escaped {
+            escaped = false;
+        } else if c == '\\' {
+            escaped = true;
+        } else if c == '/' && i > 0 {
+            let flags = body[i + 1..]
+                .chars()
+                .take_while(|c| c.is_ascii_lowercase())
+                .count();
+            let end = i + 1 + flags;
+            return Some((format!("/{}", &body[..end]), &body[end..]));
+        }
+    }
+    None
+}
+
+/// A value at the start of `s`: quoted, a regex literal, or bare text up to one
+/// of `stop`.
+fn take_role_value<'a>(s: &'a str, stop: &[char]) -> Option<(RoleVal, &'a str)> {
+    let s = s.trim_start();
+    if let Some((t, r)) = take_quoted(s) {
+        return Some((RoleVal::Text(t), r));
+    }
+    if let Some((x, r)) = take_regex(s) {
+        return Some((RoleVal::Regex(x), r));
+    }
+    let end = s.find(|c: char| stop.contains(&c)).unwrap_or(s.len());
+    let bare = s[..end].trim();
+    (!bare.is_empty()).then(|| (RoleVal::Bare(bare.to_string()), &s[end..]))
+}
+
+/// The `[key]`, `[key=value]` and `[key="value" i]` blocks at the start of `s`
+/// into `spec`; what follows them.
+fn take_role_attrs<'a>(mut s: &'a str, spec: &mut RoleSpec) -> Option<&'a str> {
+    let word = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '-';
+    loop {
+        let t = s.trim_start();
+        let Some(r) = t.strip_prefix('[') else {
+            return Some(t);
+        };
+        let r = r.trim_start();
+        let key_end = r.find(|c: char| !word(c)).unwrap_or(r.len());
+        if key_end == 0 {
+            return None;
+        }
+        let (key, r) = (&r[..key_end], r[key_end..].trim_start());
+        if let Some(r) = r.strip_prefix(']') {
+            spec.set(key, None);
+            s = r;
+            continue;
+        }
+        let (v, r) = take_role_value(r.strip_prefix('=')?, &[']'])?;
+        // Playwright's case flags after the value.
+        let r = r.trim_start();
+        let r = r.strip_prefix(['i', 's']).unwrap_or(r).trim_start();
+        spec.set(key, Some(v));
+        s = r.strip_prefix(']')?;
+    }
+}
+
+/// `role=button[name="Save"]`.
+fn parse_role_eq(q: &str) -> Option<RoleSpec> {
+    let r = q.strip_prefix("role=")?.trim_start();
+    let end = r
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '-'))
+        .unwrap_or(r.len());
+    if end == 0 {
+        return None;
+    }
+    let mut spec = RoleSpec::new(&r[..end]);
+    take_role_attrs(&r[end..], &mut spec)?
+        .is_empty()
+        .then_some(spec)
+}
+
+/// `getByRole('button', { name: 'Save' })`, with the `page.` / `screen.` in
+/// front, Testing Library's `getAllByRole` and friends, and a trailing `.first()`.
+fn parse_role_call(q: &str) -> Option<RoleSpec> {
+    const CALLS: [&str; 6] = [
+        "getByRole(",
+        "getAllByRole(",
+        "findByRole(",
+        "findAllByRole(",
+        "queryByRole(",
+        "queryAllByRole(",
+    ];
+    let q = q.trim();
+    let mut s = q.strip_prefix("await ").unwrap_or(q).trim_start();
+    let args = loop {
+        if let Some(a) = CALLS.iter().find_map(|c| s.strip_prefix(c)) {
+            break a;
+        }
+        let end = s.find(|c: char| !(c.is_alphanumeric() || c == '_' || c == '$'))?;
+        s = s[end..].strip_prefix('.')?;
+    };
+    let (role, rest) = take_quoted(args.trim_start())?;
+    if role.trim().is_empty() {
+        return None;
+    }
+    let mut spec = RoleSpec::new(&role);
+    let mut rest = rest.trim_start();
+    if let Some(r) = rest.strip_prefix(',') {
+        rest = r.trim_start();
+        if let Some(mut o) = rest.strip_prefix('{') {
+            loop {
+                o = o.trim_start();
+                if let Some(r) = o.strip_prefix('}') {
+                    rest = r;
+                    break;
+                }
+                let key_end = o
+                    .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                    .unwrap_or(o.len());
+                if key_end == 0 {
+                    return None;
+                }
+                let after = o[key_end..].trim_start().strip_prefix(':')?;
+                let (v, after) = take_role_value(after, &[',', '}'])?;
+                spec.set(&o[..key_end], Some(v));
+                o = after.trim_start();
+                o = o.strip_prefix(',').unwrap_or(o);
+            }
+        }
+    }
+    let rest = rest.trim_start().strip_prefix(')')?.trim();
+    (rest.is_empty() || rest == ".first()").then_some(spec)
+}
+
+/// `button "Save"`, as an accessibility snapshot prints it (also with a leading
+/// `- ` and trailing `[level=2]`, `[ref=e5]`); the word has to be a role.
+fn parse_role_snapshot(q: &str) -> Option<RoleSpec> {
+    let s = q.trim();
+    let s = s.strip_prefix("- ").unwrap_or(s).trim_start();
+    let end = s.find(|c: char| !c.is_ascii_lowercase())?;
+    let role = &s[..end];
+    let rest = &s[end..];
+    if !ROLE_NAMES.contains(&role) || !rest.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let (name, rest) = take_quoted(rest.trim_start())?;
+    let mut spec = RoleSpec::new(role);
+    spec.name = Some(RoleName::Text(name));
+    let rest = take_role_attrs(rest, &mut spec)?.trim();
+    (rest.is_empty() || rest == ":").then_some(spec)
+}
+
+/// A query that is a role in one of the spellings models copy from other
+/// tools: `role=button[name="Save"]`, `getByRole('button', { name: 'Save' })`
+/// or `button "Save"`.
+fn role_spelling(q: &str) -> Option<RoleSpec> {
+    let q = q.trim();
+    parse_role_eq(q)
+        .or_else(|| parse_role_call(q))
+        .or_else(|| parse_role_snapshot(q))
+}
+
+/// `query` with a separate `name` argument folded in (`None` when the query is
+/// not a role or already names one).
+fn fold_role_name(query: &str, name: &str) -> Option<String> {
+    let q = query.trim();
+    let mut spec = role_spelling(q).or_else(|| {
+        let bare = q.starts_with(|c: char| c.is_ascii_alphabetic())
+            && q.chars().all(|c| c.is_ascii_alphanumeric() || c == '-');
+        bare.then(|| RoleSpec::new(q))
+    })?;
+    if spec.name.is_some() || name.trim().is_empty() {
+        return None;
+    }
+    spec.name = Some(RoleName::Text(name.trim().to_string()));
+    Some(spec.canonical())
+}
+
 /// The other spellings of a locator that a model reaches for, as the `by` and
 /// `query` they mean (see [`Respelled`]); `None` when the query stands as it
-/// is. Only an unset `by` or `css` is respelled: `text` and `xpath` are taken
-/// at their word.
+/// is. Only an unset `by`, `css` or `role` is respelled: `text` and `xpath`
+/// are taken at their word.
 pub(crate) fn respell_locator(by: Option<&str>, query: &str) -> Option<Respelled> {
-    if !matches!(by, None | Some("css")) {
+    if !matches!(by, None | Some("css") | Some("role")) {
         return None;
     }
     let q = query.trim();
+    if by == Some("role") {
+        // A bare role (`button`) is already what `by: role` reads.
+        let canonical = role_spelling(q)?.canonical();
+        return (canonical != q).then_some(Respelled {
+            by: "role",
+            query: canonical,
+            text: None,
+        });
+    }
     let plain = |by: &'static str, query: &str| {
         Some(Respelled {
             by,
@@ -626,6 +950,9 @@ pub(crate) fn respell_locator(by: Option<&str>, query: &str) -> Option<Respelled
     if let Some(r) = q.strip_prefix("css=") {
         return css(r.trim()).or_else(|| plain("css", r.trim()));
     }
+    if let Some(spec) = role_spelling(q) {
+        return plain("role", &spec.canonical());
+    }
     if let Some(x) = text_spelling(q) {
         return plain("text", &x);
     }
@@ -645,6 +972,16 @@ pub(crate) fn respell_scope(s: &str) -> Option<String> {
 /// Respell the locators in a call's arguments (see [`respell_locator`]).
 fn respell_args(name: &str, args: &mut Value) {
     fn one(o: &mut Value, key: &str) {
+        // `by: role` takes the accessible name as `name`; the page reads it
+        // inside the query.
+        if str_arg(o, "by") == Some("role") {
+            let folded = str_arg(o, key)
+                .zip(str_arg(o, "name"))
+                .and_then(|(q, n)| fold_role_name(q, n));
+            if let Some(f) = folded {
+                o[key] = json!(f);
+            }
+        }
         let Some(q) = str_arg(o, key) else { return };
         let Some(r) = respell_locator(str_arg(o, "by"), q) else {
             return;
@@ -3025,8 +3362,9 @@ impl ToolModule for BrowserModule {
                 obj(
                     json!({
                         "target_id": { "type": "string", "description": "tab id (default: active tab)" },
-                        "by": { "type": "string", "enum": ["css", "xpath", "text"] },
-                        "query": { "type": "string" },
+                        "by": { "type": "string", "enum": ["css", "xpath", "text", "role"] },
+                        "query": { "type": "string", "description": "with by: role, the ARIA role (button, link, textbox, heading, ...)" },
+                        "name": { "type": "string", "description": "with by: role, the accessible name (case-insensitive substring)" },
                         "all": { "type": "boolean" }
                     }),
                     json!(["query"]),
@@ -3038,7 +3376,15 @@ impl ToolModule for BrowserModule {
                  name their kind; a trailing :has-text(\"X\"), :contains(\"X\"), :text(\"X\") or :text-is(\"X\") becomes a \
                  text filter on the CSS before it (or a text search when nothing precedes it); and a truncated snapshot ref \
                  such as div[1]/div[2] is the XPath /html/body/div[1]/div[2]. An explicit 'by' of text or xpath is taken \
-                 as given.",
+                 as given.\n\n\
+                 by: role finds elements by ARIA role, explicit or implied (button, link with href, textbox, checkbox, \
+                 radio, combobox, heading, img, list, listitem, tab, menuitem, option, dialog and so on), with 'name' the \
+                 accessible name (aria-labelledby, aria-label, <label>, alt, title, placeholder, then text; a case-insensitive \
+                 substring, exact matches first). The spellings role=button[name=\"Save\"] (name may be a /regex/i), \
+                 getByRole('button', { name: 'Save' }) and the snapshot's button \"Save\" are read as role queries, and \
+                 [level=2] picks a heading level. A miss lists the elements that do have the role. Queries of every kind \
+                 look inside open shadow roots and same-origin iframes; refs to such elements resolve again on later \
+                 calls. Cross-origin frames cannot be read and are skipped (browser_snapshot lists them as frames_skipped).",
             ).untrusted_output(),
             ToolDescriptor::new(
                 "browser_act",
@@ -3049,8 +3395,9 @@ impl ToolModule for BrowserModule {
                     json!({
                         "target_id": { "type": "string", "description": "tab id (default: active tab)" },
                         "ref": { "type": "string", "description": "a ref from browser_query/snapshot" },
-                        "by": { "type": "string", "enum": ["css", "xpath", "text"], "description": "how to read 'query' (default: CSS, else visible text)" },
-                        "query": { "type": "string", "description": "selector to resolve and act on in one call, instead of 'ref'; type and press with neither act on the focused element, scroll on the page" },
+                        "by": { "type": "string", "enum": ["css", "xpath", "text", "role"], "description": "how to read 'query' (default: CSS, else visible text)" },
+                        "query": { "type": "string", "description": "selector to resolve and act on in one call, instead of 'ref'; type and press with neither act on the focused element, scroll on the page; with by: role, the ARIA role" },
+                        "name": { "type": "string", "description": "with by: role, the accessible name (case-insensitive substring)" },
                         "within": { "type": "string", "description": "root selector scoping the query" },
                         "text": { "type": "string", "description": "substring filter on the matches" },
                         "index": { "type": "integer", "description": "0-based match index (default 0)" },
@@ -3121,13 +3468,13 @@ impl ToolModule for BrowserModule {
                  On Chrome a click is real pointer input (mousedown, mouseup, click, as a person's) and type is a real \
                  insertion that replaces the field's content, so React-style controlled fields and menus that open on \
                  mousedown work; the result reports input 'cdp', or 'synthetic' with input_reason when the element is \
-                 covered, off screen, in a frame, a select/option or a file input. type reports value_after (value_length \
+                 covered, off screen, a select/option or a file input. type reports value_after (value_length \
                  for a password or secret field). A native <select> is set with select (on the list or one of its \
                  options) or a click on an <option>; both report selected and changed, and an option that is missing, \
                  disabled or undone by the page is an error. A page-published canvas region (a canvas-child ref from browser_snapshot) \
                  supports only click and hover, sent as real mouse input at the region centre; other actions on it return \
                  Unsupported.\n\n\
-                 Query targeting: 'by' is css, xpath or text (used when no 'ref'); with none, the query is tried as CSS and, \
+                 Query targeting: 'by' is css, xpath, text or role (used when no 'ref'; role takes the role as the query and the accessible name as 'name', see browser_query); with none, the query is tried as CSS and, \
                  if it does not parse or matches nothing, as visible text (the result says matched_by), so a plain word \
                  such as \"Submit\" works. The spellings browser_query lists (/ or ( for XPath, text=..., :has-text(..) \
                  and so on) are read as what they mean here too, and in 'within', browser_upload and browser_fill_form. \
@@ -3158,7 +3505,7 @@ impl ToolModule for BrowserModule {
                     json!({
                         "target_id": { "type": "string", "description": "tab id (default: active tab)" },
                         "ref": { "type": "string", "description": "a ref from browser_query/snapshot" },
-                        "by": { "type": "string", "enum": ["css", "xpath", "text"] },
+                        "by": { "type": "string", "enum": ["css", "xpath", "text", "role"] },
                         "query": { "type": "string", "description": "selector, instead of 'ref'" },
                         "within": { "type": "string" },
                         "text": { "type": "string" },
@@ -3196,7 +3543,7 @@ impl ToolModule for BrowserModule {
                             "items": { "type": "object", "properties": {
                                 "ref": { "type": "string" },
                                 "selector": { "type": "string" },
-                                "by": { "type": "string", "enum": ["css", "xpath", "text"], "description": "how to read 'selector' (default: CSS, else visible text; a leading / or ( means xpath)" }
+                                "by": { "type": "string", "enum": ["css", "xpath", "text", "role"], "description": "how to read 'selector' (default: CSS, else visible text; a leading / or ( means xpath)" }
                             } },
                             "description": "[{ref or selector, by, value, type, secret}]"
                         },
@@ -5399,6 +5746,111 @@ mod forgiving_args_tests {
         text: Option<&str>,
     ) -> Option<(&'static str, String, Option<String>)> {
         Some((by, q.to_string(), text.map(String::from)))
+    }
+
+    #[test]
+    fn role_spellings_become_one_role_query() {
+        let named = r#"role=button[name="Submit"]"#;
+        for q in [
+            named,
+            "role=button[name=Submit]",
+            "role=button[name='Submit']",
+            r#"role=button[name="Submit" i]"#,
+            "getByRole('button', { name: 'Submit' })",
+            r#"page.getByRole("button",{name:"Submit"})"#,
+            "await page.getByRole('button', { name: 'Submit', })",
+            "screen.getByRole('button', { name: 'Submit' }).first()",
+            "getAllByRole('button', {name: 'Submit'})",
+            r#"button "Submit""#,
+            r#"- button "Submit" [ref=e12]"#,
+        ] {
+            for by in [None, Some("css"), Some("role")] {
+                if by == Some("role") && q == named {
+                    continue;
+                }
+                assert_eq!(respelled(by, q), rs("role", named, None), "{by:?} {q}");
+            }
+        }
+        // Already canonical under by: role, or a bare role: nothing to rewrite.
+        assert_eq!(respelled(Some("role"), named), None);
+        assert_eq!(respelled(Some("role"), "button"), None);
+        // `by: text` and `by: xpath` take the query at its word.
+        assert_eq!(respelled(Some("text"), named), None);
+    }
+
+    #[test]
+    fn role_spellings_keep_regex_level_and_exact() {
+        assert_eq!(
+            respelled(None, "role=button[name=/^sub/i]"),
+            rs("role", "role=button[name=/^sub/i]", None)
+        );
+        assert_eq!(
+            respelled(None, "getByRole('button', { name: /sub[a-z]+/i })"),
+            rs("role", "role=button[name=/sub[a-z]+/i]", None)
+        );
+        assert_eq!(
+            respelled(None, "getByRole('heading', { level: 2 })"),
+            rs("role", "role=heading[level=2]", None)
+        );
+        assert_eq!(
+            respelled(None, "role=heading[name=\"Intro\"][level=2]"),
+            rs("role", "role=heading[name=\"Intro\"][level=2]", None)
+        );
+        assert_eq!(
+            respelled(None, "getByRole('link', { name: 'Home', exact: true })"),
+            rs("role", "role=link[name=\"Home\"][exact]", None)
+        );
+        // A quote in the name is escaped for the page script.
+        assert_eq!(
+            respelled(None, r#"getByRole('button', { name: 'Say "hi"' })"#),
+            rs("role", r#"role=button[name="Say \"hi\""]"#, None)
+        );
+        assert_eq!(
+            respelled(None, "getByRole('Button')"),
+            rs("role", "role=button", None)
+        );
+    }
+
+    #[test]
+    fn things_that_only_look_like_roles_stay_as_they_were() {
+        // Not a role word, so quoted text after it is text.
+        assert_eq!(respelled(None, r#"click "Submit""#), None);
+        // A tag selector, valid CSS.
+        assert_eq!(respelled(None, "button"), None);
+        assert_eq!(respelled(None, "button.primary"), None);
+        // Other calls, unfinished calls, and calls with something after them.
+        assert_eq!(respelled(None, "getByText('Submit')"), None);
+        assert_eq!(respelled(None, "getByRole('button'"), None);
+        assert_eq!(respelled(None, "getByRole('button').last()"), None);
+        assert_eq!(respelled(None, "role=[name=x]"), None);
+    }
+
+    #[test]
+    fn a_name_argument_is_folded_into_a_role_query() {
+        let fold = |q: &str, name: &str| {
+            let mut a = json!({ "by": "role", "query": q, "name": name });
+            respell_args("browser_act", &mut a);
+            (a["by"].clone(), a["query"].clone())
+        };
+        assert_eq!(
+            fold("button", "Save"),
+            (json!("role"), json!(r#"role=button[name="Save"]"#))
+        );
+        assert_eq!(
+            fold("role=heading[level=2]", "Intro"),
+            (
+                json!("role"),
+                json!(r#"role=heading[name="Intro"][level=2]"#)
+            )
+        );
+        // A name already in the query wins; so does no name at all.
+        assert_eq!(
+            fold(r#"role=button[name="A"]"#, "B"),
+            (json!("role"), json!(r#"role=button[name="A"]"#))
+        );
+        let mut a = json!({ "query": "button", "name": "Save" });
+        respell_args("browser_act", &mut a);
+        assert_eq!(a["query"], "button");
     }
 
     #[test]
