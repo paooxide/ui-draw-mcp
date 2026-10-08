@@ -22,15 +22,15 @@ enabled category, while a `dangerous` tool additionally has to be named in
 | [`ui_extract`](#ui-extract) | vision | read | Extract structured data (tables, forms, lists, or custom schemas) directly from native accessibility trees into JSON without parsing raw tex… |
 | [`clipboard_read`](#clipboard-read) | input | standard | Read the clipboard. |
 | [`clipboard_write`](#clipboard-write) | input | standard | Write the clipboard. |
-| [`drag_drop`](#drag-drop) | input | standard | Press-move-release drag from one point/ref to another. |
-| [`hover`](#hover) | input | standard | Move the pointer over an element ref or point (reveals tooltips/hover menus). |
+| [`drag_drop`](#drag-drop) | input | standard | Press-move-release drag from one point/element to another. |
+| [`hover`](#hover) | input | standard | Move the pointer over an element (ref or name) or point (reveals tooltips/hover menus). |
 | [`input_showcase`](#input-showcase) | input | standard | Glide the real mouse pointer along a smooth Bezier curve to each point instead of jumping there, for demos, screencasts and presentations. |
 | [`keyboard_shortcut`](#keyboard-shortcut) | input | standard | Press a key or chord, e.g. |
 | [`keyboard_type`](#keyboard-type) | input | standard | Type Unicode text into the focused window. |
-| [`mouse_action`](#mouse-action) | input | standard | Coordinate pointer action (screen control). |
-| [`scroll`](#scroll) | input | standard | Scroll at an element ref or a point. |
-| [`set_value`](#set-value) | input | standard | Set the value of a text element by ref (accessibility SetValue). |
-| [`ui_action`](#ui-action) | input | standard | Perform a semantic action on an element by ref (accessibility action, no cursor). |
+| [`mouse_action`](#mouse-action) | input | standard | Coordinate pointer action. |
+| [`scroll`](#scroll) | input | standard | Scroll at an element (ref or name) or a point. |
+| [`set_value`](#set-value) | input | standard | Set the value of a text element by ref or name (accessibility SetValue). |
+| [`ui_action`](#ui-action) | input | standard | Perform a semantic action on an element by ref or name (accessibility action, no cursor). |
 | [`ui_fill_form`](#ui-fill-form) | input | standard | Fill multiple native UI fields (text fields, checkboxes, switches, popups, radios) in one call, and optionally submit and verify postconditions. |
 | [`close_app`](#close-app) | window | standard | Quit an application by name. |
 | [`control_window`](#control-window) | window | standard | Focus/move/resize/minimize/maximize/restore/close a window. |
@@ -51,7 +51,7 @@ enabled category, while a `dangerous` tool additionally has to be named in
 | [`power_control`](#power-control) | desktop | dangerous | Sleep, log out, restart or shut down. |
 | [`speak`](#speak) | desktop | standard | Speak text through the speakers. |
 | [`system_settings`](#system-settings) | desktop | standard | Read or change a desktop setting. |
-| [`browser_act`](#browser-act) | browser | standard | Act on a DOM node: click, type, select, hover, focus, scroll_into_view, submit or press. |
+| [`browser_act`](#browser-act) | browser | standard | Act on a DOM node: click, double_click, triple_click, right_click, hover, drag, scroll, type, select, focus, scroll_into_view, submit or press. |
 | [`browser_assert`](#browser-assert) | browser | read | Check the page in one call, optionally settling first; returns {passed, checks} and errors when it fails. |
 | [`browser_branch`](#browser-branch) | browser | standard | Fork an isolated background context from a tab (create), try things without touching the visible tab, then commit the winning state, discard, switch or list branches. |
 | [`browser_capture`](#browser-capture) | browser | dangerous | Capture fetch/XHR calls (with bodies) and console errors across navigations: start, read (only_errors, filter), clear. |
@@ -174,7 +174,9 @@ Capture a single window as a PNG image: prefer this over capture_screen when you
 
 `find_elements` · read tier
 
-Find elements without reading the whole UI. Filter by role and/or a case-insensitive substring of the name, or rank by distance from a screen point. With 'describe', say what you want in plain language ('the button that saves the document') and the candidates come back ranked, each with a probability, plus 'ranking.any_fits' for whether anything matched at all (needs the judge enabled). Much cheaper than get_ui_tree on a busy app. Takes a fresh snapshot, so the refs it returns are usable by ui_action until the next observation.
+Find elements without reading the whole UI. Filter by role and/or a case-insensitive name, or rank by distance from a screen point. With 'describe', say what you want in plain language ('the button that saves the document') and the candidates come back ranked, each with a probability, plus 'ranking.any_fits' for whether anything matched at all (needs the judge enabled). Much cheaper than get_ui_tree on a busy app. Takes a fresh snapshot, so the refs it returns are usable by ui_action until the next observation.
+
+`name` matches the element's name (its title, else its description) and its current value, ignoring case and extra whitespace. Matches come back best first: exact, then prefix, then substring, name before value, then document order; `ui_action` and the other input tools resolve a `name` with the same ranking. `role` accepts common synonyms: button/push button, popup button/combobox/menu button, text field/text area/entry/edit, check box, radio button/radio, link/hyperlink, menu item, slider, tab/page tab. A query with no match is still `ok` with `count: 0`, and carries a `hint` naming close candidates and the roles present.
 
 | Argument | Type | Required | Description |
 |---|---|---|---|
@@ -182,11 +184,11 @@ Find elements without reading the whole UI. Filter by role and/or a case-insensi
 | `describe` | string |  | plain-language description of the wanted element, e.g. 'the button that saves the document'; candidates are ranked by the judge and each carries a probability (needs the judge enabled) |
 | `interactive_only` | boolean |  | only elements ui_action can target (default true) |
 | `limit` | integer |  | max matches (default 20, cap 200) |
-| `name` | string |  | case-insensitive substring of the element name |
+| `name` | string |  | case-insensitive text of the element name or value; best match first (exact, prefix, substring) |
 | `near` | object |  | rank by distance from this screen point |
 | `near.x` | number |  |  |
 | `near.y` | number |  |  |
-| `role` | string |  | element role, e.g. button, textfield, checkbox |
+| `role` | string |  | element role, e.g. button, textfield, checkbox; common synonyms work (popup button = combobox, text field = textarea) |
 | `surface` | one of: window, focused, menu, menubar, sheet, popover, alert |  | which UI surface to search |
 
 ### get-element
@@ -285,29 +287,56 @@ Write the clipboard. For 'image', 'data' is a base64 PNG; for 'files', it is a n
 
 `drag_drop` · standard tier
 
-Press-move-release drag from one point/ref to another. The pointer travels in 'steps' intermediate moves so targets that track motion register the drag.
+Press-move-release drag from one point/element to another. The pointer travels in 'steps' intermediate moves so targets that track motion register the drag.
+
+Each end is `from`/`to` as an object (`{ref}`, `{name}` with an optional `role`, or `{x, y}`), or the flat `from_ref`/`from_x`/... spelling. With a ref or name, `x` and `y` are offsets in points from the element's top-left (default its centre); otherwise absolute screen coordinates. Both points are checked against the allowed window bounds. `hold_ms` keeps the button down before the first move, for drag sources (Finder icons, list rows) that wait to tell a drag from a click.
 
 | Argument | Type | Required | Description |
 |---|---|---|---|
-| `from` | object | yes |  |
+| `from` | object |  | where to press: {ref}, {name} or {x,y}; with ref/name, x/y offset from its top-left |
+| `from.name` | string |  | element name or label, instead of ref; best match wins |
+| `from.ref` | string |  | element ref @eN |
+| `from.role` | string |  | narrow a name by role, e.g. button, popup button, text field |
+| `from.x` | number |  |  |
+| `from.y` | number |  |  |
+| `from_name` | string |  |  |
+| `from_ref` | string |  |  |
+| `from_x` | number |  |  |
+| `from_y` | number |  |  |
+| `hold_ms` | integer |  | hold the button this long before moving, 0-2000 |
 | `modifiers` | array&lt;one of: cmd, shift, opt, alt, ctrl, fn&gt; |  |  |
 | `steps` | integer |  | intermediate moves, 2-100 (default 20) |
-| `to` | object | yes |  |
+| `to` | object |  | where to release: same forms as from |
+| `to.name` | string |  | element name or label, instead of ref; best match wins |
+| `to.ref` | string |  | element ref @eN |
+| `to.role` | string |  | narrow a name by role, e.g. button, popup button, text field |
+| `to.x` | number |  |  |
+| `to.y` | number |  |  |
+| `to_name` | string |  |  |
+| `to_ref` | string |  |  |
+| `to_x` | number |  |  |
+| `to_y` | number |  |  |
 
 ### hover
 
 `hover` · standard tier
 
-Move the pointer over an element ref or point (reveals tooltips/hover menus). Supports smooth gliding via 'glide' or 'speed'.
+Move the pointer over an element (ref or name) or point (reveals tooltips/hover menus). Supports smooth gliding via 'glide' or 'speed'.
+
+Target an element by `ref` (`@e12`; `e12` and `12` also work) or by `name`, with an optional `role` to narrow it. A name is matched against the latest snapshot (a fresh one is taken if there is none), ignoring case and extra whitespace: exact name first, then prefix, then substring; the name and the current value both count; controls come before other elements; ties go to document order. The result reports the `ref` it resolved to and, for a name, `matches`: how many elements matched as well as the one used. A name that matches nothing is NOT_FOUND, with up to five elements that share a word with it.
+
+With a target, `x` and `y` are offsets from the element's top-left (default its centre); without one they are absolute screen coordinates.
 
 | Argument | Type | Required | Description |
 |---|---|---|---|
 | `duration_ms` | integer |  | custom gliding duration in milliseconds, 0-2000 |
 | `glide` | boolean |  | smooth Bezier gliding to target coordinates |
-| `ref` | string |  |  |
+| `name` | string |  | element name or label, instead of ref; best match wins |
+| `ref` | string |  | element ref @eN |
+| `role` | string |  | narrow a name by role, e.g. button, popup button, text field |
 | `speed` | one of: cinematic, demo, snappy, instant |  | gliding speed preset |
-| `x` | number |  |  |
-| `y` | number |  |  |
+| `x` | number |  | screen x, or offset from the element's left |
+| `y` | number |  | screen y, or offset from the element's top |
 
 ### input-showcase
 
@@ -325,7 +354,9 @@ Glide the real mouse pointer along a smooth Bezier curve to each point instead o
 
 `keyboard_shortcut` · standard tier
 
-Press a key or chord, e.g. return, escape, cmd+s, cmd+shift+n.
+Press a key or chord, e.g. Return, Escape, cmd+s, Control+A, cmd+shift+z.
+
+Modifiers then exactly one key, joined by `+` (or `-` when there is no `+`). Case does not matter: `Control+A`, `ctrl-a` and `CTRL+a` are one chord. Modifiers: cmd/command, ctrl/control, shift, alt/opt/option, fn, super/meta/win; `mod` (also `cmdorctrl`, `primary`) is Command on macOS and Control on Linux, and on Linux `cmd` means Control. Keys: letters, digits, return/enter, tab, space, escape/esc, delete/backspace (erases backwards), forwarddelete/del, insert, home, end, pageup/page_up/pgup, pagedown/page_down/pgdn, up/down/left/right (also ArrowUp...), F1-F20, punctuation as the character or its name (minus, equal, plus, comma, period, slash, backslash, semicolon, quote, grave, leftbracket, rightbracket), and a literal `+` as `plus` or a trailing `cmd++`. More than one key is an error, never a silent drop. The result's `pressed` is the canonical chord that was sent.
 
 | Argument | Type | Required | Description |
 |---|---|---|---|
@@ -344,7 +375,11 @@ Press a key or chord, e.g. return, escape, cmd+s, cmd+shift+n.
 
 `keyboard_type` · standard tier
 
-Type Unicode text into the focused window. If 'ref' is given, focus it                  first. Does not press return. Set 'secret' when typing a password so it is                  kept out of the audit log and never sent to the judge.
+Type Unicode text into the focused window. If a target (ref or name) is given, focus it first and read its value back. Does not press return. Set 'secret' when typing a password so it is kept out of the audit log and never sent to the judge.
+
+Target an element by `ref` (`@e12`; `e12` and `12` also work) or by `name`, with an optional `role` to narrow it. A name is matched against the latest snapshot (a fresh one is taken if there is none), ignoring case and extra whitespace: exact name first, then prefix, then substring; the name and the current value both count; controls come before other elements; ties go to document order. The result reports the `ref` it resolved to and, for a name, `matches`: how many elements matched as well as the one used. A name that matches nothing is NOT_FOUND, with up to five elements that share a word with it.
+
+With a target, the element's value is read before and after. The result carries `value_after` (never for a `secret` or a password field) and `changed`; typing into a text field that then shows the same value is an error. Without a target, the keystrokes go wherever focus is and nothing is read back.
 
 | Argument | Type | Required | Description |
 |---|---|---|---|
@@ -357,7 +392,9 @@ Type Unicode text into the focused window. If 'ref' is given, focus it          
 | `expect.text` | string |  | wait until this text appears in the UI |
 | `expect.timeout_ms` | integer |  | give up after this long (max 30000) |
 | `expect.window` | string |  | wait until a window with this title exists |
-| `ref` | string |  | optional element to focus first |
+| `name` | string |  | element name or label, instead of ref; best match wins |
+| `ref` | string |  | element ref @eN |
+| `role` | string |  | narrow a name by role, e.g. button, popup button, text field |
 | `secret` | boolean |  | the text is a password or other secret: keep it out of the audit log and never send it to the judge |
 | `text` | string | yes |  |
 
@@ -365,7 +402,11 @@ Type Unicode text into the focused window. If 'ref' is given, focus it          
 
 `mouse_action` · standard tier
 
-Coordinate pointer action (screen control). 'modifiers' holds keys down for the click, e.g. ["cmd"] to open in a new tab or ["shift"] to extend a selection. Set 'glide: true' or 'speed' to smoothly glide the pointer along a Bezier curve for demos.
+Coordinate pointer action. With a ref or name, x/y are offsets in points from the element's top-left (default: its centre); without one they are absolute screen coordinates. 'modifiers' holds keys down for the click, e.g. ["cmd"] or ["shift"].
+
+Target an element by `ref` (`@e12`; `e12` and `12` also work) or by `name`, with an optional `role` to narrow it. A name is matched against the latest snapshot (a fresh one is taken if there is none), ignoring case and extra whitespace: exact name first, then prefix, then substring; the name and the current value both count; controls come before other elements; ties go to document order. The result reports the `ref` it resolved to and, for a name, `matches`: how many elements matched as well as the one used. A name that matches nothing is NOT_FOUND, with up to five elements that share a word with it.
+
+`x` and `y` may be numbers or numeric strings. Every point, absolute or element-relative, is checked against the allowed window bounds when `clamp_input_to_allowed` is on. The result's `at` is the screen point that was used. Set `glide: true` or `speed` to glide the pointer along a Bezier curve for demos.
 
 | Argument | Type | Required | Description |
 |---|---|---|---|
@@ -382,30 +423,43 @@ Coordinate pointer action (screen control). 'modifiers' holds keys down for the 
 | `expect.window` | string |  | wait until a window with this title exists |
 | `glide` | boolean |  | smooth Bezier gliding to target coordinates |
 | `modifiers` | array&lt;one of: cmd, shift, opt, alt, ctrl, fn&gt; |  |  |
+| `name` | string |  | element name or label, instead of ref; best match wins |
+| `ref` | string |  | element ref @eN |
+| `role` | string |  | narrow a name by role, e.g. button, popup button, text field |
 | `speed` | one of: cinematic, demo, snappy, instant |  | gliding speed preset |
 | `type` | one of: move, click, double, triple, right_click, down, up | yes |  |
-| `x` | number | yes |  |
-| `y` | number | yes |  |
+| `x` | number |  | screen x, or offset from the element's left |
+| `y` | number |  | screen y, or offset from the element's top |
 
 ### scroll
 
 `scroll` · standard tier
 
-Scroll at an element ref or a point.
+Scroll at an element (ref or name) or a point.
+
+Target an element by `ref` (`@e12`; `e12` and `12` also work) or by `name`, with an optional `role` to narrow it. A name is matched against the latest snapshot (a fresh one is taken if there is none), ignoring case and extra whitespace: exact name first, then prefix, then substring; the name and the current value both count; controls come before other elements; ties go to document order. The result reports the `ref` it resolved to and, for a name, `matches`: how many elements matched as well as the one used. A name that matches nothing is NOT_FOUND, with up to five elements that share a word with it.
+
+With a target, `x` and `y` are offsets from the element's top-left (default its centre); without one they are absolute screen coordinates.
 
 | Argument | Type | Required | Description |
 |---|---|---|---|
 | `amount` | integer |  |  |
 | `direction` | one of: up, down, left, right, page_up, page_down | yes |  |
-| `ref` | string |  |  |
-| `x` | number |  |  |
-| `y` | number |  |  |
+| `name` | string |  | element name or label, instead of ref; best match wins |
+| `ref` | string |  | element ref @eN |
+| `role` | string |  | narrow a name by role, e.g. button, popup button, text field |
+| `x` | number |  | screen x, or offset from the element's left |
+| `y` | number |  | screen y, or offset from the element's top |
 
 ### set-value
 
 `set_value` · standard tier
 
-Set the value of a text element by ref (accessibility SetValue). This works                  on a background window and needs no focus. Set 'secret' for a password.
+Set the value of a text element by ref or name (accessibility SetValue). This works on a background window and needs no focus. Set 'secret' for a password.
+
+Target an element by `ref` (`@e12`; `e12` and `12` also work) or by `name`, with an optional `role` to narrow it. A name is matched against the latest snapshot (a fresh one is taken if there is none), ignoring case and extra whitespace: exact name first, then prefix, then substring; the name and the current value both count; controls come before other elements; ties go to document order. The result reports the `ref` it resolved to and, for a name, `matches`: how many elements matched as well as the one used. A name that matches nothing is NOT_FOUND, with up to five elements that share a word with it.
+
+The element is read before and after the write. The result carries `value_after` (never for a `secret` or a password field), `changed`, and `reformatted` when the field shows something other than what was written (a number field turning 1000 into 1,000 is fine). A field that keeps its old value and does not show the new text is an error, not an `ok`. `verified: false` means the platform could not read the value back.
 
 | Argument | Type | Required | Description |
 |---|---|---|---|
@@ -418,7 +472,9 @@ Set the value of a text element by ref (accessibility SetValue). This works     
 | `expect.text` | string |  | wait until this text appears in the UI |
 | `expect.timeout_ms` | integer |  | give up after this long (max 30000) |
 | `expect.window` | string |  | wait until a window with this title exists |
-| `ref` | string | yes |  |
+| `name` | string |  | element name or label, instead of ref; best match wins |
+| `ref` | string |  | element ref @eN |
+| `role` | string |  | narrow a name by role, e.g. button, popup button, text field |
 | `secret` | boolean |  | the text is a password or other secret: keep it out of the audit log and never send it to the judge |
 | `text` | string | yes |  |
 
@@ -426,7 +482,15 @@ Set the value of a text element by ref (accessibility SetValue). This works     
 
 `ui_action` · standard tier
 
-Perform a semantic action on an element by ref (accessibility action, no cursor).
+Perform a semantic action on an element by ref or name (accessibility action, no cursor). select with option chooses a popup or combo box entry by its text.
+
+Target an element by `ref` (`@e12`; `e12` and `12` also work) or by `name`, with an optional `role` to narrow it. A name is matched against the latest snapshot (a fresh one is taken if there is none), ignoring case and extra whitespace: exact name first, then prefix, then substring; the name and the current value both count; controls come before other elements; ties go to document order. The result reports the `ref` it resolved to and, for a name, `matches`: how many elements matched as well as the one used. A name that matches nothing is NOT_FOUND, with up to five elements that share a word with it.
+
+`select` with `option` opens a popup button or combo box, activates the entry whose text matches (exactly, then ignoring extra whitespace, then ignoring case), and reads back what the control shows: `selected` and `changed`. An option that does not exist is an error listing the options (25 at most); a disabled one is an error; and a control that shows something else afterwards fails the call with what it kept. Anything the call opened is closed again on failure. Pointing at a menu item or list entry chooses it through the popup it belongs to. Without `option`, `select` presses the element as before.
+
+`check`, `uncheck` and `toggle` read the state first (checking a checked box changes nothing) and again afterwards, and report `checked` and `changed`; a press that did not take is an error.
+
+macOS opens a popup button with the accessibility press and presses its menu item; a combo box takes the text. Linux invokes the combo box's menu or list item through AT-SPI.
 
 | Argument | Type | Required | Description |
 |---|---|---|---|
@@ -440,14 +504,20 @@ Perform a semantic action on an element by ref (accessibility action, no cursor)
 | `expect.text` | string |  | wait until this text appears in the UI |
 | `expect.timeout_ms` | integer |  | give up after this long (max 30000) |
 | `expect.window` | string |  | wait until a window with this title exists |
-| `option` | string |  | option label for select |
-| `ref` | string | yes | element ref @eN |
+| `name` | string |  | element name or label, instead of ref; best match wins |
+| `option` | string |  | entry text for select |
+| `ref` | string |  | element ref @eN |
+| `role` | string |  | narrow a name by role, e.g. button, popup button, text field |
 
 ### ui-fill-form
 
 `ui_fill_form` · standard tier
 
-Fill multiple native UI fields (text fields, checkboxes, switches, popups, radios) in one call, and optionally submit and verify postconditions. Target fields by element ref (@eN) or name/label.
+Fill multiple native UI fields (text fields, checkboxes, switches, popups, radios) in one call, and optionally submit and verify postconditions. Target fields by ref (@eN) or name/label.
+
+Target an element by `ref` (`@e12`; `e12` and `12` also work) or by `name`, with an optional `role` to narrow it. A name is matched against the latest snapshot (a fresh one is taken if there is none), ignoring case and extra whitespace: exact name first, then prefix, then substring; the name and the current value both count; controls come before other elements; ties go to document order. The result reports the `ref` it resolved to and, for a name, `matches`: how many elements matched as well as the one used. A name that matches nothing is NOT_FOUND, with up to five elements that share a word with it.
+
+Fields are applied in order and the call stops at the first failure, reporting `filled` and the `results` so far. Each result carries what that field's tool would: `value_after`, `selected`, `checked` and `changed`. A field named by `name` resolves with the same ranking as `ui_action`, so two fields with similar labels are told apart by exactness and then document order.
 
 | Argument | Type | Required | Description |
 |---|---|---|---|
@@ -461,10 +531,11 @@ Fill multiple native UI fields (text fields, checkboxes, switches, popups, radio
 | `expect.timeout_ms` | integer |  | give up after this long (max 30000) |
 | `expect.window` | string |  | wait until a window with this title exists |
 | `fields` | array&lt;object&gt; | yes | list of fields to set or toggle |
-| `submit` | object |  | optional submission button to click after filling fields |
+| `submit` | object |  |  |
 | `submit.action` | one of: click, toggle |  |  |
-| `submit.name` | string |  | submit button name to match if ref is omitted |
-| `submit.ref` | string |  | submit button ref @eN |
+| `submit.name` | string |  | element name or label, instead of ref; best match wins |
+| `submit.ref` | string |  | element ref @eN |
+| `submit.role` | string |  | narrow a name by role, e.g. button, popup button, text field |
 
 ## window
 
@@ -688,11 +759,15 @@ Read or change a desktop setting. Settings the platform does not expose return U
 
 `browser_act` · standard tier
 
-Act on a DOM node: click, type, select, hover, focus, scroll_into_view, submit or press. Target it with 'ref' (from browser_query/snapshot) or with 'query' plus optional by, within, text, index. type replaces the field's content and reports value_after. A click returns at once, before its request or navigation has begun: use wait_after='settle' or browser_wait.
+Act on a DOM node: click, double_click, triple_click, right_click, hover, drag, scroll, type, select, focus, scroll_into_view, submit or press. Target it with 'ref' (from browser_query/snapshot) or with 'query' plus optional by, within, text, index. x and y click or hover at a point (offsets inside the target, or viewport px without one). type replaces the field's content and reports value_after. press takes a key or combo such as ctrl+a. A click returns at once, before its request or navigation has begun: use wait_after='settle' or browser_wait.
 
-`press` takes a key name in `value` (Enter, Escape, Tab, ArrowDown, ArrowUp, ArrowLeft, ArrowRight, Home, End, PageUp, PageDown, Backspace, Delete or Space), sent as a real key event to the focused node; Chrome only. On Chrome a click is real pointer input (mousedown, mouseup, click, as a person's) and type is a real insertion that replaces the field's content, so React-style controlled fields and menus that open on mousedown work; the result reports input 'cdp', or 'synthetic' with input_reason when the element is covered, off screen, in a frame, a select/option or a file input. type reports value_after (value_length for a password or secret field). A native <select> is set with select (on the list or one of its options) or a click on an <option>; both report selected and changed, and an option that is missing, disabled or undone by the page is an error. A page-published canvas region (a canvas-child ref from browser_snapshot) supports only click and hover, sent as real mouse input at the region centre; other actions on it return Unsupported.
+`press` takes a key or a combo in `value`: a named key (Enter, Escape, Tab, Arrow keys, Home, End, PageUp, PageDown, Backspace, Delete, Insert, Space, F1-F12), a character, or modifiers (ctrl, alt, shift, meta/cmd) joined by +, as in ctrl+a or Shift+ArrowDown. It is a real key event to the target, or to the focused node or page with no target; Chrome only. ctrl or cmd with a, c, x, v, z or y edits as a person's shortcut does, also on macOS.
 
-Query targeting: 'by' is css, xpath or text (default css; used when no 'ref'); text is case-insensitive, exact matches first, clickable elements preferred. 'within' is an optional CSS/XPath root selector scoping the search, 'text' an optional substring filter to narrow matches, 'index' an optional 0-based match index when the query matches several elements (default 0).
+Pointer actions are real input (Chrome only): double_click, triple_click (selects a line), right_click (contextmenu) and hover, and click too, accept `x` and `y`: with a target they are offsets from its top-left corner (for a canvas, its pixel coordinates), without one viewport CSS px; the result's click_at is where it landed, and a point outside the viewport is an error. `scroll` turns the mouse wheel over the target (or the page) by dx and dy, by default one viewport down; `value` may be up, down, left, right, top or bottom. `drag` presses on the target (or at x and y), moves in steps and releases at the destination: the to_ref or to_query element (its centre, or to_x and to_y inside it), else to_x and to_y as viewport points, else dx and dy from the start; the destination must be on screen. Mouse-event drags (sliders, sortable lists, selecting text) and HTML5 draggable elements both work; the result says html5_drag. Spellings such as key, dblclick, triple-click, drag_and_drop are accepted.
+
+On Chrome a click is real pointer input (mousedown, mouseup, click, as a person's) and type is a real insertion that replaces the field's content, so React-style controlled fields and menus that open on mousedown work; the result reports input 'cdp', or 'synthetic' with input_reason when the element is covered, off screen, in a frame, a select/option or a file input. type reports value_after (value_length for a password or secret field). A native <select> is set with select (on the list or one of its options) or a click on an <option>; both report selected and changed, and an option that is missing, disabled or undone by the page is an error. A page-published canvas region (a canvas-child ref from browser_snapshot) supports only click and hover, sent as real mouse input at the region centre; other actions on it return Unsupported.
+
+Query targeting: 'by' is css, xpath or text (used when no 'ref'); with none, the query is tried as CSS and, if it does not parse or matches nothing, as visible text (the result says matched_by), so a plain word such as "Submit" works. The spellings browser_query lists (/ or ( for XPath, text=..., :has-text(..) and so on) are read as what they mean here too, and in 'within', browser_upload and browser_fill_form. Text is case-insensitive, exact matches first, clickable elements preferred. When nothing matches the error says what was tried and lists up to three elements whose text holds a word of the query. The check is made once: act does not wait for an element to appear (use browser_wait). 'within' is an optional CSS/XPath root selector scoping the search, 'text' an optional substring filter to narrow matches, 'index' an optional 0-based match index when the query matches several elements (default 0).
 
 `secret`: the value is a secret, so it stays out of the audit log and is never shown in the showcase typing HUD (password and one-time-code fields are masked automatically).
 
@@ -702,19 +777,27 @@ Query targeting: 'by' is css, xpath or text (default css; used when no 'ref'); t
 
 | Argument | Type | Required | Description |
 |---|---|---|---|
-| `action` | one of: click, type, select, hover, focus, scroll_into_view, submit, press | yes |  |
-| `by` | one of: css, xpath, text |  | how to read 'query' (default css) |
+| `action` | one of: click, double_click, triple_click, right_click, hover, drag, scroll, type, select, focus, scroll_into_view, submit, press | yes |  |
+| `by` | one of: css, xpath, text |  | how to read 'query' (default: CSS, else visible text) |
+| `dx` | number |  | drag: x distance from the start; scroll: horizontal distance in CSS px |
+| `dy` | number |  | drag: y distance from the start; scroll: vertical distance in CSS px (default one viewport down) |
 | `index` | integer |  | 0-based match index (default 0) |
-| `query` | string |  | selector to resolve and act on in one call, instead of 'ref'; type and press with neither act on the focused element |
+| `query` | string |  | selector to resolve and act on in one call, instead of 'ref'; type and press with neither act on the focused element, scroll on the page |
 | `ref` | string |  | a ref from browser_query/snapshot |
 | `scroll` | one of: none, nearest, center |  | bring the element into view first (default nearest) |
 | `secret` | boolean |  | value is a secret: kept out of the audit log and the showcase HUD |
 | `target_id` | string |  | tab id (default: active tab) |
 | `text` | string |  | substring filter on the matches |
 | `timeout_ms` | integer |  | settle bound (default 10000); on expiry the action still succeeded and the result has settled:false |
-| `value` | string |  | text for type, option text or value for select (on the <select> or an option), key for press: Enter, Escape, Tab, ArrowDown/Up/Left/Right, Home, End, PageUp, PageDown, Backspace, Delete, Space |
+| `to_query` | string |  | drag destination element (a selector) |
+| `to_ref` | string |  | drag destination element (a ref) |
+| `to_x` | number |  | drag destination x: an offset inside to_ref/to_query, else a viewport point |
+| `to_y` | number |  | drag destination y, as to_x |
+| `value` | string |  | text for type, option text or value for select (on the <select> or an option), key or combo for press (Enter, Escape, ArrowDown, a, ctrl+a, Shift+Tab), direction for scroll (up, down, left, right, top, bottom) |
 | `wait_after` | one of: none, settle |  | settle waits for a started navigation, htmx and quiet network, and adds navigated, requests_started and settled to the result (Chrome; about 2s when nothing starts). Default none |
 | `within` | string |  | root selector scoping the query |
+| `x` | number |  | pointer x in CSS px: an offset from the target's top-left corner, or a viewport point without a target |
+| `y` | number |  | pointer y, as x |
 
 ### browser-assert
 
@@ -983,6 +1066,8 @@ Save, restore, list or delete session profiles (cookies, localStorage, sessionSt
 
 Resolve node refs by css selector, xpath or text (case-insensitive; exact matches first, clickable elements preferred). all=true returns every match.
 
+Resolve node refs. With no 'by' the query is tried as CSS and, if it does not parse or matches nothing, as visible text; the result then says matched_by (css or text). Common spellings are read as what they mean: a query starting with / or ( is an XPath; xpath=..., css=..., text=..., text:..., text("..") and text ".." name their kind; a trailing :has-text("X"), :contains("X"), :text("X") or :text-is("X") becomes a text filter on the CSS before it (or a text search when nothing precedes it); and a truncated snapshot ref such as div[1]/div[2] is the XPath /html/body/div[1]/div[2]. An explicit 'by' of text or xpath is taken as given.
+
 | Argument | Type | Required | Description |
 |---|---|---|---|
 | `all` | boolean |  |  |
@@ -1068,7 +1153,7 @@ Configure visual flair for demos, screencasts, and presentations: animated virtu
 
 Flatten a page into interactable node refs (dom or accessibility mode) or raw text. Pass the refs to browser_act.
 
-The web equivalent of get_ui_tree. A <canvas> gets child nodes (tag canvas-child) only if the page itself publishes its interactive regions via canvas.__agentctl_regions or a data-canvas-regions JSON attribute; any other canvas is an opaque node.
+The web equivalent of get_ui_tree. A <canvas> gets child nodes (tag canvas-child) only if the page itself publishes its interactive regions via canvas.__agentctl_regions or a data-canvas-regions JSON attribute; any other canvas is an opaque node. Besides controls and roles, an element a page makes clickable with a pointer cursor is listed (the outermost one, not each span inside it); one with no text is named by its aria-label, title or alt, the file name of the icon it draws, or its id or class words, and that name works as a by=text query. 'root_selector' is a CSS selector or an XPath (a ref from an earlier snapshot).
 
 | Argument | Type | Required | Description |
 |---|---|---|---|
@@ -1095,7 +1180,7 @@ List, open (url), activate or close (target_id) tabs of a connected browser.
 
 Attach local files to a file input (type=file). Target it like browser_act ('ref' or 'query'); 'paths' holds 1 to 10 absolute paths inside fs.roots. Returns {files:[{name, bytes}], count}, never file contents. Chrome only.
 
-Attach local files to a file input (type=file; a click would open the OS file chooser, which agentctl cannot drive). Target the input like browser_act: 'ref' or 'query' (plus optional 'by', 'within', 'text', 'index'; 'by' defaults to css and is used when there is no 'ref'; 'within' is an optional CSS/XPath root selector, 'text' a substring filter, 'index' a 0-based match index, default 0). A label is followed to its input, and an element holding exactly one file input uses that one; otherwise the error says what was found (target a hidden input directly). 'paths' holds 1 to 10 files, each at most 50 MiB, and more than one needs the input's multiple attribute. Only files inside the configured fs.roots can be attached (credential stores are always refused): a page can read what is attached, so this is how local files leave the machine. Chrome fires trusted input and change events. Returns {ok, files:[{name, bytes}], count, input_multiple}, never file contents. Chrome only.
+Attach local files to a file input (type=file; a click would open the OS file chooser, which agentctl cannot drive). Target the input like browser_act: 'ref' or 'query' (plus optional 'by', 'within', 'text', 'index'; 'by' is read like browser_act's and used when there is no 'ref'; 'within' is an optional CSS/XPath root selector, 'text' a substring filter, 'index' a 0-based match index, default 0). A label is followed to its input, and an element holding exactly one file input uses that one; otherwise the error says what was found (target a hidden input directly). 'paths' holds 1 to 10 files, each at most 50 MiB, and more than one needs the input's multiple attribute. Only files inside the configured fs.roots can be attached (credential stores are always refused): a page can read what is attached, so this is how local files leave the machine. Chrome fires trusted input and change events. Returns {ok, files:[{name, bytes}], count, input_multiple}, never file contents. Chrome only.
 
 | Argument | Type | Required | Description |
 |---|---|---|---|
@@ -1128,7 +1213,7 @@ Override the page's device metrics (width/height, optionally mobile and a device
 
 `browser_wait` · read tier
 
-Wait for one condition: selector, dom_settled, htmx_settled, navigation, network_idle or challenge_cleared. Use 'condition' ('selector' also needs the selector argument); the boolean arguments of the same names are aliases, and exactly one may be given. After a click or key press, navigation waits for the new document (navigated:false if none starts within navigation_timeout_ms).
+Wait for one condition: selector, dom_settled, htmx_settled, navigation, network_idle or challenge_cleared. Use 'condition' ('selector' also needs the selector argument); the boolean arguments of the same names are aliases, and exactly one may be given. After a click or key press, navigation waits for the new document (navigated:false if none starts within navigation_timeout_ms). With only timeout_ms and no condition it sleeps that long (max 30000).
 
 Wait for a settle signal: a selector to appear, dom_settled (no DOM mutation for >=150ms; animation frames are not tracked), htmx_settled (HTMX requests and DOM swaps settled; right after a browser_act it also waits up to 1.5s for an htmx request to start; errors if htmx is not present on the page), navigation to complete (after a goto, reload, click, submit or key press in this session it waits for the NEW document, not the one being left; a click that starts no navigation within navigation_timeout_ms, default 2s, settles on the loaded page with navigated:false; raise it for a handler that navigates later than that), network_idle (fetch/XHR started after a browser_act are tracked; settled when none is in flight and none began or finished for 500ms, and not before a navigation that act may have started has happened), or verification challenge clearance. Prefer 'condition'; the other arguments are aliases. Give exactly one condition: the aliases conflict with it and with each other, and a boolean alias only selects its condition when true.
 

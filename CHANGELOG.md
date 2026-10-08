@@ -15,6 +15,25 @@ operated.
 
 ### Added
 
+- **`browser_act` pointer actions:** `double_click`, `triple_click`, `right_click`, `scroll` and `drag`, all
+  real CDP input. `x` and `y` place a click or hover at a point (offsets inside the target, so a canvas is
+  clicked at its own pixel coordinates; viewport px without one), and the result's `click_at` says where it
+  landed. `drag` goes from the target (or a point) to `to_ref`/`to_query`, `to_x`/`to_y` or `dx`/`dy` in held
+  steps, which covers sliders, sortable lists and selecting text, and plays native `draggable` elements back
+  through Chrome's drag interception. In a MiniWoB++ run canvas, drag and slider tasks failed for want of
+  these. Chrome only.
+- **Desktop: choose from a popup button or combo box by its text.** `ui_action select` and `ui_fill_form`
+  take `option`; on macOS the popup is opened and the matching menu item pressed, on Linux the AT-SPI combo
+  box's item is invoked. Before, both backends dropped `option`, so a popup button only opened and the call
+  said ok. The result reports `selected` and `changed`; no match lists the options, and a disabled item or a
+  control that shows something else afterwards is an error.
+- **Desktop: target by name.** `ui_action`, `set_value`, `keyboard_type`, `scroll`, `hover`, `drag_drop` and
+  `mouse_action` take `name` (with an optional `role`) besides `ref`, ranked exact, prefix, then substring,
+  controls first, in tree order; a miss lists the closest candidates. `find_elements` gained role synonyms
+  (popupbutton, combobox, textfield, and so on), matches values, and hints at close names when nothing
+  matches. `mouse_action` and `drag_drop` take a point relative to an element, and numeric arguments may be
+  given as strings.
+
 - **More keys for `browser_act press`:** ArrowDown, ArrowUp, ArrowLeft, ArrowRight, Home, End, PageUp,
   PageDown, Backspace, Delete and Space, sent as real key events, so a listbox or a react-select menu can be
   driven from the keyboard. Before, only Enter, Escape and Tab worked.
@@ -149,6 +168,35 @@ operated.
   button input's value and `aria-label`), takes the innermost element holding the query and lifts it to the
   control around it, and ranks exact before substring, visible before hidden, clickable before not, then document order. When any
   match is exact the substring ones are dropped. `browser_act`, `browser_query` and `browser_upload` share it.
+- **A plain word as a `browser_act` query found nothing.** `by` defaulted to css, so `"query": "Gilli"` was
+  the tag `<gilli>`, and `"Section #1"` did not parse: in a 130-task MiniWoB++ run these were the most
+  common tool error (174 "element not found"). With no `by` a query is now CSS when it parses and matches,
+  else visible text, and the result says `matched_by`. Spellings from other tools are read as what they mean
+  (`text=…`, `css=…`, `xpath=…`, a trailing `:has-text("…")`, an XPath or a cut-down snapshot ref passed as a
+  query), in `browser_query`, `browser_upload`, `browser_fill_form`, `within` and the snapshot's
+  `root_selector` too. A miss says what was tried and names up to three elements with a word of the query.
+- **`browser_snapshot` left out what a person clicks when the page gives it no role.** Rows and icon buttons
+  wired with jQuery or `addEventListener` (the email client's send, reply and trash icons) were missing, so
+  the model could not find them. An element with a pointer cursor is now listed (the outermost one), named
+  by its label, title, alt, icon file name or id, and that name works as a text query.
+- **`browser_act press` refused combos and errored with nothing focused.** `ctrl+a`, `Control+A`,
+  `cmd+shift+z`, `Shift+Tab`, single characters, F1-F12 and spellings like Esc or Return now work; ctrl or
+  cmd with a, c, x, v, z or y edits as a person's shortcut does, also on macOS where headless Chrome ignores
+  the key event's own editing. With no target and nothing focused the key goes to the page. Key events no
+  longer carry `nativeVirtualKeyCode`, which macOS Chrome read as a Mac key code (F5 arrived as PageUp).
+- **`browser_act` threw `el.click is not a function` on SVG shapes.** They are clicked with real input on a
+  point of the shape, or a dispatched pointer and mouse event sequence.
+- **`browser_act` action spellings** such as `key`, `dblclick`, `triple-click` and `drag_and_drop` are
+  accepted, and an unknown action lists the valid ones. `browser_wait` with only a duration sleeps (at most
+  30 s) instead of failing.
+- **Desktop tools said ok without checking.** `set_value` and `keyboard_type` read the field back and report
+  `value_after` and `changed`; a write the application ignored is an error. `check` and `uncheck` read the
+  state first and after on macOS too, so they are idempotent and a toggle that did not take is reported.
+- **`keyboard_shortcut` rejected `Control+A`, `Cmd+Shift+Z` and `Return`, and pressed only `b` for `a+b`.**
+  Combos are case-insensitive, accept `-` as a separator, named and literal punctuation, a `+` key,
+  `Insert`, forward delete and F-keys, and `mod` (Cmd on macOS, Ctrl on Linux); two non-modifier keys are an
+  error, and an unknown key's error lists the accepted names. `ui_fill_form` no longer picks among
+  same-named fields in hash order.
 - **Choosing from a native `<select>` reported ok and chose nothing.** In the MiniWoB++ choose-list task
   the model clicked an `<option>` ref, or called `select` on one; `click()` on an option selects nothing and
   setting `value` on one rewrites its value attribute, so 3 of the 4 agentctl failures in the second dry run
