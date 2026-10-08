@@ -6,12 +6,15 @@
 use crate::backend::key_event_spec;
 
 /// Every action `browser_act` takes, as it is spelled in the schema.
-pub(crate) const ACTIONS: [&str; 13] = [
+pub(crate) const ACTIONS: [&str; 16] = [
     "click",
     "double_click",
     "triple_click",
     "right_click",
     "hover",
+    "mouse_move",
+    "mouse_down",
+    "mouse_up",
     "drag",
     "scroll",
     "type",
@@ -47,6 +50,15 @@ pub(crate) fn canonical_action(raw: &str) -> Result<&'static str, String> {
         "tripleclick" | "tripleclk" => "triple_click",
         "rightclick" | "contextclick" | "contextmenu" => "right_click",
         "draganddrop" | "dragdrop" | "dragto" => "drag",
+        "move" | "mousemove" | "movemouse" | "pointermove" | "moveto" | "movepointer" => {
+            "mouse_move"
+        }
+        "mouseover" | "mouseenter" => "hover",
+        "mousedown" | "pointerdown" | "pressmouse" | "buttondown" => "mouse_down",
+        "mouseup" | "pointerup" | "releasemouse" | "release" | "buttonup" => "mouse_up",
+        "pressandhold" | "longpress" | "clickandhold" | "holdclick" | "presshold" | "hold" => {
+            "click"
+        }
         "scrollto" | "scrollintoview" => "scroll_into_view",
         _ => {
             return Err(format!(
@@ -56,6 +68,82 @@ pub(crate) fn canonical_action(raw: &str) -> Result<&'static str, String> {
         }
     };
     Ok(alias)
+}
+
+/// Whether the spelling of an action means a click that is held: models write
+/// `press_and_hold` or `long_press`, which [`canonical_action`] reads as `click`.
+pub(crate) fn implies_hold(raw: &str) -> bool {
+    let squashed: String = raw
+        .chars()
+        .filter(|c| !matches!(c, '-' | '_' | ' '))
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
+    matches!(
+        squashed.as_str(),
+        "pressandhold" | "longpress" | "clickandhold" | "holdclick" | "presshold" | "hold"
+    )
+}
+
+/// The longest a button or key may be held: a hold is a gesture, and the call
+/// waits it out.
+pub(crate) const HOLD_MAX_MS: u64 = 10_000;
+/// How long a hold lasts when the action only says "hold".
+pub(crate) const HOLD_DEFAULT_MS: u64 = 800;
+
+/// The `hold_ms` argument: whole milliseconds up to [`HOLD_MAX_MS`].
+pub(crate) fn hold_ms(v: Option<f64>) -> Result<u64, String> {
+    let Some(ms) = v else { return Ok(0) };
+    if ms < 0.0 {
+        return Err(format!("hold_ms must not be negative, got {ms}"));
+    }
+    if ms > HOLD_MAX_MS as f64 {
+        return Err(format!(
+            "hold_ms {ms} is over the {HOLD_MAX_MS} ms maximum; hold for less, or use mouse_down and mouse_up around your own wait"
+        ));
+    }
+    Ok(ms.round() as u64)
+}
+
+/// A mouse button.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Button {
+    #[default]
+    Left,
+    Right,
+    Middle,
+}
+
+impl Button {
+    /// The CDP `button` name.
+    pub fn name(self) -> &'static str {
+        match self {
+            Button::Left => "left",
+            Button::Right => "right",
+            Button::Middle => "middle",
+        }
+    }
+
+    /// The bit in CDP's `buttons` mask while it is held.
+    pub fn mask(self) -> u32 {
+        match self {
+            Button::Left => 1,
+            Button::Right => 2,
+            Button::Middle => 4,
+        }
+    }
+}
+
+/// The `button` argument of `mouse_down` and `mouse_up`.
+pub(crate) fn parse_button(raw: Option<&str>) -> Result<Option<Button>, String> {
+    match raw.map(|b| b.trim().to_ascii_lowercase()).as_deref() {
+        None | Some("") => Ok(None),
+        Some("left" | "primary") => Ok(Some(Button::Left)),
+        Some("right" | "secondary" | "context") => Ok(Some(Button::Right)),
+        Some("middle" | "wheel" | "auxiliary") => Ok(Some(Button::Middle)),
+        Some(other) => Err(format!(
+            "unknown button '{other}'; use left, right or middle"
+        )),
+    }
 }
 
 /// CDP `modifiers` bits.
@@ -422,6 +510,130 @@ pub(crate) fn scroll_delta(
     }
 }
 
+/// A page tab as `/json/list` shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Tab {
+    pub id: String,
+    pub url: String,
+    pub title: String,
+}
+
+/// At most this many appeared or disappeared elements are reported.
+pub(crate) const EFFECT_ITEMS: usize = 5;
+
+type Fx = serde_json::Map<String, serde_json::Value>;
+
+/// `(url, title)` of a tab.
+pub(crate) type Location = (String, String);
+
+/// The acting tab's `(url, title)` in a tab listing.
+pub(crate) fn location_of(tabs: &[Tab], target: &str) -> Option<Location> {
+    tabs.iter()
+        .find(|t| t.id == target)
+        .map(|t| (t.url.clone(), t.title.clone()))
+}
+
+/// `url` and `title`, for whichever of them differs between two readings.
+pub(crate) fn location_effects(before: &Location, after: &Location) -> Fx {
+    use serde_json::json;
+    let mut fx = Fx::new();
+    if after.0 != before.0 {
+        fx.insert("url".into(), json!(after.0));
+    }
+    if after.1 != before.1 {
+        fx.insert("title".into(), json!(after.1));
+    }
+    fx
+}
+
+/// `new_tab`: the tabs that were not there before the action.
+pub(crate) fn tab_effects(before: &[Tab], after: &[Tab]) -> Fx {
+    use serde_json::json;
+    let mut fx = Fx::new();
+    let opened: Vec<_> = after
+        .iter()
+        .filter(|t| !before.iter().any(|b| b.id == t.id))
+        .map(|t| json!({ "target_id": t.id, "url": t.url }))
+        .collect();
+    match opened.len() {
+        0 => {}
+        1 => {
+            fx.insert("new_tab".into(), opened[0].clone());
+        }
+        _ => {
+            fx.insert("new_tab".into(), json!(opened));
+        }
+    }
+    fx
+}
+
+/// Shorten `s` to `max` characters on one line.
+pub(crate) fn clip(s: &str, max: usize) -> String {
+    let one: String = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    if one.chars().count() <= max {
+        return one;
+    }
+    let mut out: String = one.chars().take(max.saturating_sub(1)).collect();
+    out.push('\u{2026}');
+    out
+}
+
+/// The dialog an action raised, from the connection's log of answered ones:
+/// the last, with its message kept short.
+pub(crate) fn dialog_effect(dialogs: &[serde_json::Value]) -> Option<serde_json::Value> {
+    use serde_json::{json, Value};
+    let d = dialogs.last()?;
+    let text = |k: &str| d.get(k).and_then(Value::as_str).unwrap_or("");
+    let mut out = json!({ "type": text("type"), "message": clip(text("message"), 120) });
+    if let Some(a) = d.get("answered").and_then(Value::as_str) {
+        out["answered"] = json!(a);
+    }
+    Some(out)
+}
+
+/// What the page script found changed (`JS_EFFECTS`): lists of descriptions
+/// with a total, and the focus. Returns the keys to add to the effects: none
+/// when nothing changed or the document was replaced (a navigation has its own
+/// url and title, and a whole new page to snapshot).
+pub(crate) fn page_effects(page: &serde_json::Value) -> Fx {
+    use serde_json::{json, Value};
+    let mut fx = Fx::new();
+    if page.get("navigated").and_then(Value::as_bool) == Some(true) {
+        return fx;
+    }
+    for key in ["appeared", "disappeared"] {
+        let items: Vec<&str> = page
+            .get(key)
+            .and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default();
+        if items.is_empty() {
+            continue;
+        }
+        let total = page
+            .get(format!("{key}_n"))
+            .and_then(Value::as_u64)
+            .unwrap_or(items.len() as u64) as usize;
+        let mut list: Vec<String> = items
+            .iter()
+            .take(EFFECT_ITEMS)
+            .map(|s| s.to_string())
+            .collect();
+        if total > list.len() {
+            list.push(format!("+{} more", total - list.len()));
+        }
+        fx.insert(key.into(), json!(list));
+    }
+    if let Some(f) = page
+        .get("focus")
+        .and_then(Value::as_str)
+        .filter(|f| !f.is_empty())
+    {
+        fx.insert("focus".into(), json!(f));
+    }
+    fx
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -635,5 +847,134 @@ mod tests {
             height: 10.0,
         };
         assert_eq!(visible_center(below, 800.0, 600.0), None);
+    }
+
+    #[test]
+    fn pointer_spellings_map_to_the_new_actions() {
+        for (raw, want) in [
+            ("mouse_move", "mouse_move"),
+            ("move", "mouse_move"),
+            ("mousemove", "mouse_move"),
+            ("Mouse-Move", "mouse_move"),
+            ("pointer_move", "mouse_move"),
+            ("mousedown", "mouse_down"),
+            ("mouse-down", "mouse_down"),
+            ("MouseDown", "mouse_down"),
+            ("mouseup", "mouse_up"),
+            ("release", "mouse_up"),
+            ("mouseover", "hover"),
+            ("press_and_hold", "click"),
+            ("long_press", "click"),
+            ("longpress", "click"),
+            ("click-and-hold", "click"),
+        ] {
+            assert_eq!(canonical_action(raw), Ok(want), "{raw}");
+        }
+        assert!(implies_hold("press_and_hold") && implies_hold("Long-Press"));
+        assert!(!implies_hold("click") && !implies_hold("press"));
+    }
+
+    #[test]
+    fn a_hold_is_bounded() {
+        assert_eq!(hold_ms(None), Ok(0));
+        assert_eq!(hold_ms(Some(250.0)), Ok(250));
+        assert_eq!(hold_ms(Some(10_000.0)), Ok(10_000));
+        let e = hold_ms(Some(10_001.0)).unwrap_err();
+        assert!(e.contains("10000"), "{e}");
+        assert!(hold_ms(Some(-1.0)).is_err());
+    }
+
+    #[test]
+    fn buttons_have_names_and_masks() {
+        assert_eq!(parse_button(None), Ok(None));
+        assert_eq!(parse_button(Some("Right")), Ok(Some(Button::Right)));
+        assert_eq!(parse_button(Some("middle")), Ok(Some(Button::Middle)));
+        assert_eq!(parse_button(Some(" left ")), Ok(Some(Button::Left)));
+        assert!(parse_button(Some("fourth"))
+            .unwrap_err()
+            .contains("left, right or middle"));
+        assert_eq!(
+            (
+                Button::Left.mask(),
+                Button::Right.mask(),
+                Button::Middle.mask()
+            ),
+            (1, 2, 4)
+        );
+        assert_eq!(Button::Middle.name(), "middle");
+    }
+
+    fn tab(id: &str, url: &str, title: &str) -> Tab {
+        Tab {
+            id: id.into(),
+            url: url.into(),
+            title: title.into(),
+        }
+    }
+
+    #[test]
+    fn tab_effects_name_what_changed_and_only_that() {
+        use serde_json::json;
+        let a = [tab("A", "http://x/", "Home")];
+        assert!(tab_effects(&a, &a).is_empty());
+        let popup = [a[0].clone(), tab("B", "http://x/pop", "Pop")];
+        assert_eq!(
+            serde_json::Value::Object(tab_effects(&a, &popup)),
+            json!({ "new_tab": { "target_id": "B", "url": "http://x/pop" } })
+        );
+        // Two popups are a list; a tab closing is not a new one.
+        let two = [a[0].clone(), tab("B", "u1", ""), tab("C", "u2", "")];
+        assert_eq!(
+            tab_effects(&a, &two)["new_tab"].as_array().unwrap().len(),
+            2
+        );
+        assert!(tab_effects(&a, &[]).is_empty());
+
+        let here = |u: &str, t: &str| (u.to_string(), t.to_string());
+        let home = here("http://x/", "Home");
+        assert!(location_effects(&home, &home).is_empty());
+        assert_eq!(
+            serde_json::Value::Object(location_effects(&home, &here("http://x/next", "Home"))),
+            json!({ "url": "http://x/next" })
+        );
+        assert_eq!(
+            location_effects(&home, &here("http://x/next", "Next")).len(),
+            2
+        );
+        assert_eq!(location_of(&a, "A"), Some(home));
+        assert_eq!(location_of(&a, "Z"), None);
+    }
+
+    #[test]
+    fn page_effects_cap_the_lists_and_skip_a_new_document() {
+        use serde_json::json;
+        let fx = page_effects(&json!({
+            "appeared": ["a", "b", "c", "d", "e", "f"], "appeared_n": 9,
+            "disappeared": ["x"], "focus": "input \"Email\""
+        }));
+        assert_eq!(fx["appeared"].as_array().unwrap().len(), 6);
+        assert_eq!(fx["appeared"][5], "+4 more");
+        assert_eq!(fx["disappeared"], json!(["x"]));
+        assert_eq!(fx["focus"], "input \"Email\"");
+        assert!(page_effects(&json!({ "appeared": [], "focus": "" })).is_empty());
+        assert!(page_effects(&json!({ "navigated": true, "appeared": ["a"] })).is_empty());
+        assert!(page_effects(&json!(null)).is_empty());
+    }
+
+    #[test]
+    fn a_dialog_is_reported_briefly() {
+        use serde_json::json;
+        assert_eq!(dialog_effect(&[]), None);
+        let long = "word ".repeat(100);
+        let d = dialog_effect(&[
+            json!({ "type": "alert", "message": "old", "answered": "dismissed" }),
+            json!({ "type": "confirm", "message": long, "answered": "accepted" }),
+        ])
+        .unwrap();
+        assert_eq!(d["type"], "confirm");
+        assert_eq!(d["answered"], "accepted");
+        assert!(d["message"].as_str().unwrap().chars().count() <= 120);
+        assert_eq!(clip("  a \n b  ", 10), "a b");
+        assert_eq!(clip("abcdef", 4), "abc\u{2026}");
     }
 }

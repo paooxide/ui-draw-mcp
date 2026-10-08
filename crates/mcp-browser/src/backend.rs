@@ -105,6 +105,9 @@ pub struct ActOpts {
     pub settle: bool,
     /// Bound for the settle wait.
     pub timeout_ms: u64,
+    /// How long a click holds the button, or a key press holds the key, in
+    /// ms (0: a plain click or press).
+    pub hold_ms: u64,
 }
 
 /// The `timeout_ms` default of a settle wait.
@@ -120,6 +123,7 @@ impl Default for ActOpts {
             scroll: ScrollMode::default(),
             settle: false,
             timeout_ms: ACT_SETTLE_TIMEOUT_MS,
+            hold_ms: 0,
         }
     }
 }
@@ -141,6 +145,19 @@ pub struct PointerArgs<'a> {
     pub dy: Option<f64>,
     /// A `scroll` direction.
     pub value: Option<&'a str>,
+    /// The button of `mouse_down` / `mouse_up`; left when absent.
+    pub button: Option<crate::input::Button>,
+}
+
+/// The state before an action that [`BrowserBackend::act_effects`] compares
+/// the state after it with.
+#[derive(Debug, Clone)]
+pub struct ActProbe {
+    tabs: Vec<crate::input::Tab>,
+    /// Where the page was, as it reports itself.
+    at: Option<crate::input::Location>,
+    /// The page's script ran: its visible dialogs and controls were noted.
+    page: bool,
 }
 
 #[async_trait]
@@ -245,6 +262,19 @@ pub trait BrowserBackend: Send + Sync {
         Err(BrowserError::Unsupported(format!(
             "act '{action}' needs the CDP (Chrome) engine; it sends real pointer input, which the WebKit engine cannot"
         )))
+    }
+    /// Note the state `act`'s effects are measured against (open tabs, the
+    /// page's visible dialogs and controls, the focus) just before the action,
+    /// or `None` when this backend or action reports no effects.
+    async fn act_probe(&self, target: &str, action: &str) -> Option<ActProbe> {
+        let _ = (target, action);
+        None
+    }
+    /// Add `effects` to the result `out` of an action: what changed since
+    /// [`BrowserBackend::act_probe`]. `settled` says the action already
+    /// waited for the page. Best effort; adds nothing when nothing changed.
+    async fn act_effects(&self, target: &str, probe: ActProbe, settled: bool, out: &mut Value) {
+        let _ = (target, probe, settled, out);
     }
     /// Set files on an `<input type=file>` located like `act` does. `files`
     /// are already-resolved absolute paths (the module layer jails and checks
@@ -605,6 +635,9 @@ pub struct CdpBackend {
     /// navigation resets the in-page cursor; this lets the next glide start
     /// where the viewer last saw it instead of off-screen.
     cursor_pos: Mutex<HashMap<String, (f64, f64)>>,
+    /// The mouse button a `mouse_down` left held, per tab, until its
+    /// `mouse_up`: a `mouse_move` in between is a drag, not a hover.
+    held_button: Mutex<HashMap<String, crate::input::Button>>,
     /// Per target: the document-identity marker planted on the document an
     /// action (goto, reload, click, submit, press) was about to leave. A
     /// `wait navigation` that finds one waits for a document without it.
@@ -1142,6 +1175,7 @@ impl CdpBackend {
             checkpoints: Mutex::new(crate::checkpoint::CheckpointStore::new()),
             showcase: Mutex::new(crate::showcase::ShowcaseConfig::default()),
             cursor_pos: Mutex::new(HashMap::new()),
+            held_button: Mutex::new(HashMap::new()),
             nav_pending: Mutex::new(HashMap::new()),
             observers: Mutex::new(HashMap::new()),
             screencasts: crate::screencast::ScreencastHub::default(),
@@ -1643,20 +1677,114 @@ impl CdpBackend {
 
     /// `count` real clicks in a row at a point with one button. Each is a
     /// press and a release with its own `clickCount`, so `dblclick` fires on
-    /// the second and a third selects the line or paragraph.
+    /// the second and a third selects the line or paragraph. `hold_ms` is how
+    /// long each press lasts before its release.
     async fn cdp_clicks(
         c: &mut CdpConn,
         at: (f64, f64),
-        right: bool,
+        button: crate::input::Button,
         count: u32,
+        hold_ms: u64,
     ) -> Result<(), BrowserError> {
-        let (button, held) = if right { ("right", 2) } else { ("left", 1) };
         Self::mouse_event(c, "mouseMoved", at, "none", 0, 0).await?;
         for n in 1..=count {
-            Self::mouse_event(c, "mousePressed", at, button, held, n).await?;
-            Self::mouse_event(c, "mouseReleased", at, button, 0, n).await?;
+            Self::mouse_event(c, "mousePressed", at, button.name(), button.mask(), n).await?;
+            if hold_ms > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(hold_ms)).await;
+            }
+            Self::mouse_event(c, "mouseReleased", at, button.name(), 0, n).await?;
         }
         Ok(())
+    }
+
+    fn held_button(&self, target: &str) -> Option<crate::input::Button> {
+        self.held_button
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(target)
+            .copied()
+    }
+
+    fn set_held_button(&self, target: &str, button: Option<crate::input::Button>) {
+        let mut m = self
+            .held_button
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match button {
+            Some(b) => m.insert(target.to_string(), b),
+            None => m.remove(target),
+        };
+    }
+
+    fn cursor_at(&self, target: &str) -> Option<(f64, f64)> {
+        self.cursor_pos
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(target)
+            .copied()
+    }
+
+    /// The element under a viewport point: tag, id, a short name or text, and
+    /// whether it is a canvas. A coordinate action reports it, so a click
+    /// that landed on nothing useful says so.
+    async fn hit_at(c: &mut CdpConn, (x, y): (f64, f64)) -> Option<Value> {
+        let expr = format!(
+            r#"(function(x, y){{
+  var el = document.elementFromPoint(x, y);
+  while(el && el.shadowRoot){{
+    var d = el.shadowRoot.elementFromPoint(x, y);
+    if(!d || d === el) break;
+    el = d;
+  }}
+  if(!el) return null;
+  var o = {{tag: el.tagName.toLowerCase(), canvas: el.tagName === 'CANVAS'}};
+  if(el.id) o.id = el.id;
+  var t = el.getAttribute('aria-label') || '';
+  if(!t && el.childElementCount <= 5) t = el.innerText || el.value || el.alt || el.title || '';
+  t = String(t).replace(/\s+/g, ' ').trim();
+  if(t) o.text = t.length > 40 ? t.slice(0, 39) + '…' : t;
+  return o;
+}})({x}, {y})"#
+        );
+        Self::eval_value(c, &expr)
+            .await
+            .ok()
+            .filter(Value::is_object)
+    }
+
+    /// The page tabs of the browser that owns `target`.
+    async fn page_tabs(&self, target: &str) -> Option<Vec<crate::input::Tab>> {
+        for b in self.browsers() {
+            let Ok(list) = http_json(&b.host, b.port, "GET", "/json/list").await else {
+                continue;
+            };
+            let Some(all) = list.as_array() else {
+                continue;
+            };
+            if !all
+                .iter()
+                .any(|t| t.get("id").and_then(Value::as_str) == Some(target))
+            {
+                continue;
+            }
+            let text = |t: &Value, k: &str| {
+                t.get(k)
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string()
+            };
+            return Some(
+                all.iter()
+                    .filter(|t| t.get("type").and_then(Value::as_str) == Some("page"))
+                    .map(|t| crate::input::Tab {
+                        id: text(t, "id"),
+                        url: text(t, "url"),
+                        title: text(t, "title"),
+                    })
+                    .collect(),
+            );
+        }
+        None
     }
 
     /// Where an element is, for a pointer action: resolves `locator`
@@ -1734,17 +1862,17 @@ impl CdpBackend {
         v.as_array()?.iter().map(Value::as_f64).collect()
     }
 
-    /// Move the real pointer to `to`. With the showcase on, its drawn cursor
-    /// glides along; the click ripple belongs to the element script of
-    /// `act_opts`, which these actions do not run, so they show the cursor
-    /// only.
+    /// Move the real pointer to `to`, and say whether the move reached the
+    /// page. With the showcase on, its drawn cursor glides along; the click
+    /// ripple belongs to the element script of `act_opts`, which these actions
+    /// do not run, so they show the cursor only.
     async fn pointer_glide(
         &self,
         c: &mut CdpConn,
         target: &str,
         to: (f64, f64),
         cfg: &crate::showcase::ShowcaseConfig,
-    ) {
+    ) -> bool {
         let last = self
             .cursor_pos
             .lock()
@@ -1765,12 +1893,14 @@ impl CdpBackend {
             );
             let _ = Self::eval_value(c, &kick).await;
         }
-        if Self::glide_mouse(c, from, to, glide_ms).await {
+        let delivered = Self::glide_mouse(c, from, to, glide_ms).await;
+        if delivered {
             self.cursor_pos
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .insert(target.to_string(), to);
         }
+        delivered
     }
 
     /// Press at `from`, move to `to` in small steps with the button held,
@@ -1868,13 +1998,14 @@ impl CdpBackend {
     }
 
     /// A real key press: the modifiers go down, the key goes down and up with
-    /// their bitmask, the modifiers come up. A browser that ignores the key
+    /// their bitmask (`hold_ms` apart), the modifiers come up. A browser that ignores the key
     /// event's own editing action (headless Chrome on macOS: select all,
     /// copy, cut, paste, undo) is also given the editing command; one that
     /// runs it itself must not get it twice, a paste would insert twice.
     async fn press_combo(
         c: &mut CdpConn,
         combo: &crate::input::KeyCombo,
+        hold_ms: u64,
     ) -> Result<(), BrowserError> {
         let bits = combo.bits();
         let command = match combo.edit_command() {
@@ -1910,6 +2041,9 @@ impl CdpBackend {
             }
         }
         c.call("Input.dispatchKeyEvent", down).await?;
+        if hold_ms > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(hold_ms)).await;
+        }
         c.call(
             "Input.dispatchKeyEvent",
             json!({
@@ -2821,6 +2955,154 @@ const NET_QUIET_MS: u64 = 500;
 
 /// Run right before an action: install both hooks, then record "an action
 /// happened now, with this many requests seen so far".
+/// How long after an action its effects are read, when it did not wait for
+/// the page itself.
+const EFFECT_SETTLE_MS: u64 = 120;
+
+/// The page script behind `effects`: `before` notes the visible dialogs,
+/// overlays and interactive elements by a key each (role, id, name) and the
+/// focused element in a page-side stash; `after` scans again and returns only
+/// the difference, with a ref for each new element. One bounded scan each.
+/// The stash lives on the document, so a navigation shows up as no stash.
+fn effects_js(before: bool) -> String {
+    EFFECTS_JS
+        .replace("__XPATH__", JS_XPATH)
+        .replace("__MODE__", if before { "before" } else { "after" })
+}
+
+/// `(url, title)` from what the effects script returned.
+fn page_location(v: &Value) -> Option<crate::input::Location> {
+    let text = |k: &str| v.get(k).and_then(Value::as_str).map(str::to_string);
+    Some((text("url")?, text("title")?))
+}
+
+const EFFECTS_JS: &str = r##"(function(mode){
+__XPATH__
+try {
+  var MAX = 1500;
+  var IROLE = {button:1,link:1,menuitem:1,menuitemcheckbox:1,menuitemradio:1,option:1,tab:1,checkbox:1,radio:1,'switch':1,textbox:1,combobox:1,searchbox:1,slider:1,spinbutton:1,treeitem:1};
+  var CROLE = {dialog:1,alertdialog:1,menu:1,listbox:1,tooltip:1,alert:1,status:1};
+  var BOXCLS = /(^|[\s_-])(modal|popup|popover|toast|snackbar|overlay|dialog|dropdown-menu)([\s_-]|$)/i;
+  var SEL = 'a[href],button,input,select,textarea,summary,dialog,[role],[tabindex],[onclick],[contenteditable],[aria-modal],[class*="modal"],[class*="popup"],[class*="popover"],[class*="toast"],[class*="snackbar"],[class*="overlay"],[class*="dialog"],[class*="dropdown-menu"]';
+  var SKIP = {HTML:1,BODY:1,HEAD:1,SCRIPT:1,STYLE:1,LINK:1,META:1,NOSCRIPT:1};
+  function clip(s, n){ s = String(s == null ? '' : s).replace(/\s+/g, ' ').trim(); return s.length > n ? s.slice(0, n - 1) + '…' : s; }
+  function shown(el){
+    var rs = el.getClientRects();
+    if(!rs.length || rs[0].width < 1 || rs[0].height < 1) return false;
+    var st = getComputedStyle(el);
+    return st.visibility !== 'hidden' && st.display !== 'none' && parseFloat(st.opacity) !== 0;
+  }
+  function roleOf(el){
+    var r = el.getAttribute('role');
+    if(r) return r.split(' ')[0].toLowerCase();
+    var t = el.tagName.toLowerCase();
+    if(t === 'a') return 'link';
+    if(t === 'textarea') return 'textbox';
+    if(t === 'select') return 'combobox';
+    if(t === 'input'){
+      var ty = (el.type || 'text').toLowerCase();
+      return ty === 'text' ? 'textbox' : (ty === 'submit' || ty === 'button' || ty === 'reset') ? 'button' : ty;
+    }
+    return t;
+  }
+  function nameOf(el, box){
+    var t = el.getAttribute('aria-label');
+    if(t) return clip(t, 50);
+    var tag = el.tagName;
+    if(tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT'){
+      var ty = (el.type || '').toLowerCase();
+      if(ty === 'submit' || ty === 'button' || ty === 'reset') return clip(el.value, 50);
+      if(el.labels && el.labels.length) return clip(el.labels[0].textContent, 50);
+      return clip(el.placeholder || el.getAttribute('name') || el.title || '', 50);
+    }
+    if(box){
+      var h = el.querySelector('h1,h2,h3,h4,h5,h6,[role="heading"],legend');
+      if(h && h.textContent.trim()) return clip(h.textContent, 50);
+    }
+    if(box || el.childElementCount <= 8){ t = el.innerText || el.textContent; if(t && t.trim()) return clip(t, 50); }
+    return clip(el.title || el.id || '', 50);
+  }
+  function kindOf(el){
+    var role = roleOf(el), tag = el.tagName.toLowerCase();
+    if(CROLE[role] || tag === 'dialog' || el.getAttribute('aria-modal') === 'true') return 'c';
+    if(tag === 'a' ? el.hasAttribute('href') : (tag === 'button' || tag === 'input' || tag === 'select' || tag === 'textarea' || tag === 'summary')) return 'i';
+    if(IROLE[role] || el.getAttribute('contenteditable') === 'true' || el.hasAttribute('onclick')) return 'i';
+    var ti = el.getAttribute('tabindex');
+    if(ti !== null && parseInt(ti, 10) >= 0) return 'i';
+    if(BOXCLS.test(el.getAttribute('class') || '')){
+      var r = el.getBoundingClientRect();
+      if(r.width >= 30 && r.height >= 15) return 'c';
+    }
+    return null;
+  }
+  function overlay(el){
+    var st = getComputedStyle(el);
+    if(!(st.position === 'fixed' || st.position === 'absolute' || st.position === 'sticky')) return false;
+    if(!(parseInt(st.zIndex, 10) >= 10)) return false;
+    var r = el.getBoundingClientRect();
+    return r.width >= 40 && r.height >= 20;
+  }
+  function scan(){
+    var map = new Map(), seen = new Set(), n = 0;
+    function take(el, extra){
+      if(seen.has(el) || n++ > MAX || SKIP[el.tagName]) return;
+      seen.add(el);
+      if(el.closest && el.closest('[id^="__agentctl"],[id^="agentctl_"]')) return;
+      var kind = kindOf(el);
+      if(!kind && extra && overlay(el)) kind = 'c';
+      if(!kind || !shown(el)) return;
+      var role = roleOf(el), name = nameOf(el, kind === 'c');
+      var key = kind + '|' + role + '|' + (el.id || '') + '|' + name;
+      var e = map.get(key);
+      if(e){ e.n++; e.el = el; }
+      else map.set(key, {n:1, kind:kind, desc: role + (name ? ' "' + name + '"' : ''), el:el});
+    }
+    var all = document.querySelectorAll(SEL);
+    for(var i = 0; i < all.length && n <= MAX; i++) take(all[i], false);
+    var kids = document.body ? document.body.children : [];
+    for(var j = 0; j < kids.length && j < 60; j++){
+      take(kids[j], true);
+      var gk = kids[j].children;
+      for(var k = 0; k < gk.length && k < 30; k++) take(gk[k], true);
+    }
+    return map;
+  }
+  function focused(){
+    var a = document.activeElement;
+    while(a && a.shadowRoot && a.shadowRoot.activeElement) a = a.shadowRoot.activeElement;
+    return (!a || a === document.body || a === document.documentElement) ? null : a;
+  }
+  function fkey(a){ return a ? roleOf(a) + '|' + (a.id || '') + '|' + nameOf(a, false) : ''; }
+  function fdesc(a){ var nm = nameOf(a, false); return roleOf(a) + (nm ? ' "' + nm + '"' : '') + ' ref=' + __xp(a); }
+  if(mode === 'before'){
+    var f = focused();
+    Object.defineProperty(window, '__agentctl_fx', {value: {map: scan(), focus: fkey(f)}, configurable: true, writable: true});
+    return {ok: true, url: location.href, title: document.title};
+  }
+  var prev = window.__agentctl_fx;
+  if(!prev) return {navigated: true, url: location.href, title: document.title};
+  try { delete window.__agentctl_fx; } catch(e) { window.__agentctl_fx = undefined; }
+  var cur = scan(), added = [], gone = [];
+  cur.forEach(function(e, k){ var p = prev.map.get(k); var d = e.n - (p ? p.n : 0); if(d > 0) added.push({e: e, d: d}); });
+  prev.map.forEach(function(p, k){ var c = cur.get(k); var d = p.n - (c ? c.n : 0); if(d > 0) gone.push({e: p, d: d}); });
+  function order(a, b){ return a.e.kind === b.e.kind ? 0 : a.e.kind === 'c' ? -1 : 1; }
+  added.sort(order); gone.sort(order);
+  var total = function(l){ return l.reduce(function(s, x){ return s + x.d; }, 0); };
+  var out = {url: location.href, title: document.title};
+  if(added.length){
+    out.appeared_n = total(added);
+    out.appeared = added.slice(0, 5).map(function(x){ return x.e.desc + (x.d > 1 ? ' x' + x.d : '') + ' ref=' + __xp(x.e.el); });
+  }
+  if(gone.length){
+    out.disappeared_n = total(gone);
+    out.disappeared = gone.slice(0, 5).map(function(x){ return x.e.desc + (x.d > 1 ? ' x' + x.d : ''); });
+  }
+  var f2 = focused();
+  if(f2 && fkey(f2) !== prev.focus) out.focus = fdesc(f2);
+  return out;
+} catch(e) { return {error: String(e && e.message ? e.message : e)}; }
+})('__MODE__')"##;
+
 fn act_arm_js() -> String {
     format!(
         r#"(function(){{
@@ -4786,7 +5068,7 @@ impl BrowserBackend for CdpBackend {
         if let (Some(combo), Some(c)) = (press_key, c_opt.as_mut()) {
             // The element is focused by the eval above; send a real key
             // press so default actions (implicit form submit, focus move) run.
-            Self::press_combo(c, &combo).await?;
+            Self::press_combo(c, &combo, opts.hold_ms).await?;
             if let Some(m) = v.as_object_mut() {
                 m.insert("key".into(), json!(combo.key.key));
                 if !combo.mods.is_empty() {
@@ -4836,7 +5118,7 @@ impl BrowserBackend for CdpBackend {
         // `act_opts` does, so a following `wait navigation` can tell.
         let clicks = matches!(
             action,
-            "click" | "double_click" | "triple_click" | "right_click"
+            "click" | "double_click" | "triple_click" | "right_click" | "mouse_up"
         );
         let nav_token = clicks.then(new_nav_token);
         if let Some(t) = &nav_token {
@@ -4875,6 +5157,9 @@ impl BrowserBackend for CdpBackend {
             m.insert("target".into(), t.clone());
         }
         let at_json = |(x, y): (f64, f64)| json!({ "x": x, "y": y });
+        // A point the caller named is answered with what is under it, so a
+        // click that landed on the wrong thing, or on nothing, says so.
+        let coords = p.x.is_some() || p.y.is_some();
 
         match action {
             "scroll" => {
@@ -4888,6 +5173,11 @@ impl BrowserBackend for CdpBackend {
                     _ => point_in(rect, p.x, p.y).map_err(failed)?,
                 };
                 check_in_viewport(at, vw, vh).map_err(failed)?;
+                if let (true, Some(h), Some(m)) =
+                    (coords, Self::hit_at(&mut c, at).await, out.as_object_mut())
+                {
+                    m.insert("hit".into(), h);
+                }
                 let (dx, dy) = scroll_delta(p.value, p.dx, p.dy, (vw, vh)).map_err(failed)?;
                 Self::mouse_event(&mut c, "mouseMoved", at, "none", 0, 0).await?;
                 c.call(
@@ -4922,26 +5212,96 @@ impl BrowserBackend for CdpBackend {
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .insert(target.to_string(), at);
             }
-            "hover" | "click" | "double_click" | "triple_click" | "right_click" => {
-                let at = point_in(rect, p.x, p.y).map_err(failed)?;
+            "hover" | "mouse_move" | "click" | "double_click" | "triple_click" | "right_click"
+            | "mouse_down" | "mouse_up" => {
+                // A button-up with no point lets go where the pointer is.
+                let at = if action == "mouse_up" && rect.is_none() && !coords {
+                    self.cursor_at(target).ok_or_else(|| {
+                        failed("mouse_up needs a point (ref or query, or x and y) when no mouse action has moved the pointer in this tab".into())
+                    })?
+                } else {
+                    point_in(rect, p.x, p.y).map_err(failed)?
+                };
                 check_in_viewport(at, vw, vh).map_err(failed)?;
-                if action == "hover" || showcase_cfg.enabled {
-                    self.pointer_glide(&mut c, target, at, &showcase_cfg).await;
+                if let (true, Some(h), Some(m)) =
+                    (coords, Self::hit_at(&mut c, at).await, out.as_object_mut())
+                {
+                    m.insert("hit".into(), h);
                 }
-                if action != "hover" {
-                    let count = match action {
-                        "double_click" => 2,
-                        "triple_click" => 3,
-                        _ => 1,
-                    };
-                    Self::cdp_clicks(&mut c, at, action == "right_click", count).await?;
-                    self.cursor_pos
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .insert(target.to_string(), at);
+                let held = self.held_button(target);
+                match action {
+                    "hover" | "mouse_move" => {
+                        if let Some(b) = held {
+                            // Moving with a button down is a drag in progress:
+                            // the page gets the steps a person's hand makes.
+                            let from = self.cursor_at(target).unwrap_or(at);
+                            for pt in crate::input::drag_path(from, at, DRAG_STEPS) {
+                                Self::mouse_event(&mut c, "mouseMoved", pt, b.name(), b.mask(), 0)
+                                    .await?;
+                                tokio::time::sleep(std::time::Duration::from_millis(DRAG_STEP_MS))
+                                    .await;
+                            }
+                        } else if !self.pointer_glide(&mut c, target, at, &showcase_cfg).await {
+                            return Err(failed(format!(
+                                "the pointer move to ({:.1}, {:.1}) was not delivered to the page; nothing happened",
+                                at.0, at.1
+                            )));
+                        }
+                    }
+                    "mouse_down" => {
+                        let b = p.button.unwrap_or_default();
+                        if showcase_cfg.enabled {
+                            self.pointer_glide(&mut c, target, at, &showcase_cfg).await;
+                        }
+                        let mask = held.map_or(0, |h| h.mask());
+                        Self::mouse_event(&mut c, "mouseMoved", at, "none", mask, 0).await?;
+                        Self::mouse_event(&mut c, "mousePressed", at, b.name(), b.mask(), 1)
+                            .await?;
+                        self.set_held_button(target, Some(b));
+                        if let Some(m) = out.as_object_mut() {
+                            m.insert("held".into(), json!(b.name()));
+                        }
+                    }
+                    "mouse_up" => {
+                        let b = p.button.or(held).unwrap_or_default();
+                        if held.is_some() {
+                            // Arrive with the button down, then let go.
+                            Self::mouse_event(&mut c, "mouseMoved", at, b.name(), b.mask(), 0)
+                                .await?;
+                        }
+                        Self::mouse_event(&mut c, "mouseReleased", at, b.name(), 0, 1).await?;
+                        self.set_held_button(target, None);
+                        if let Some(m) = out.as_object_mut() {
+                            m.insert("released".into(), json!(b.name()));
+                        }
+                    }
+                    _ => {
+                        if showcase_cfg.enabled {
+                            self.pointer_glide(&mut c, target, at, &showcase_cfg).await;
+                        }
+                        let (button, count) = match action {
+                            "double_click" => (crate::input::Button::Left, 2),
+                            "triple_click" => (crate::input::Button::Left, 3),
+                            "right_click" => (crate::input::Button::Right, 1),
+                            _ => (crate::input::Button::Left, 1),
+                        };
+                        Self::cdp_clicks(&mut c, at, button, count, opts.hold_ms).await?;
+                        if let (true, Some(m)) = (opts.hold_ms > 0, out.as_object_mut()) {
+                            m.insert("held_ms".into(), json!(opts.hold_ms));
+                        }
+                    }
                 }
+                self.cursor_pos
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(target.to_string(), at);
                 if let Some(m) = out.as_object_mut() {
-                    m.insert("click_at".into(), at_json(at));
+                    let key = if action.starts_with("mouse_") {
+                        "at"
+                    } else {
+                        "click_at"
+                    };
+                    m.insert(key.into(), at_json(at));
                 }
             }
             "drag" => {
@@ -4949,6 +5309,13 @@ impl BrowserBackend for CdpBackend {
                     failed("drag needs a source: ref or query, or x and y (viewport CSS px)".into())
                 })?;
                 check_in_viewport(from, vw, vh).map_err(failed)?;
+                if let (true, Some(h), Some(m)) = (
+                    coords,
+                    Self::hit_at(&mut c, from).await,
+                    out.as_object_mut(),
+                ) {
+                    m.insert("hit".into(), h);
+                }
                 let to = if let Some(dest) = p.to {
                     // The destination must already be on screen: scrolling to
                     // it would move the source.
@@ -5013,6 +5380,83 @@ impl BrowserBackend for CdpBackend {
             }
         }
         Ok(out)
+    }
+
+    async fn act_probe(&self, target: &str, action: &str) -> Option<ActProbe> {
+        if target.starts_with("safari-") || matches!(action, "scroll" | "scroll_into_view") {
+            return None;
+        }
+        let tabs = self.page_tabs(target).await?;
+        let (mut at, mut page) = (None, false);
+        if let Ok(mut c) = self.conn(target).await {
+            if let Ok(v) = Self::eval_value(&mut c, &effects_js(true)).await {
+                page = v.get("error").is_none();
+                at = page_location(&v);
+            }
+        }
+        // The tab listing can lag the page by a moment after a load, so the
+        // page's own word is preferred; the listing stands in for it.
+        let at = at.or_else(|| crate::input::location_of(&tabs, target));
+        Some(ActProbe { tabs, at, page })
+    }
+
+    async fn act_effects(&self, target: &str, probe: ActProbe, settled: bool, out: &mut Value) {
+        use crate::input::{
+            dialog_effect, location_effects, location_of, page_effects, tab_effects,
+        };
+        // A handler that opens a dialog or a popup does it a beat after the
+        // click returns; a settle wait has already given it that.
+        if !settled {
+            tokio::time::sleep(std::time::Duration::from_millis(EFFECT_SETTLE_MS)).await;
+        }
+        let mut tabs = self.page_tabs(target).await.unwrap_or_default();
+        // A popup is `about:blank` until its navigation commits.
+        for _ in 0..8 {
+            let pending = tabs.iter().any(|t| {
+                (t.url.is_empty() || t.url == "about:blank")
+                    && !probe.tabs.iter().any(|b| b.id == t.id)
+            });
+            if !pending {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            tabs = self.page_tabs(target).await.unwrap_or_default();
+        }
+        let mut fx = tab_effects(&probe.tabs, &tabs);
+        let mut at = None;
+        if probe.page {
+            if let Ok(mut c) = self.conn(target).await {
+                let page = Self::eval_value(&mut c, &effects_js(false)).await;
+                // A dialog the page raised on its own is answered by this
+                // connection; keep it with the ones the action's own saw.
+                let earlier = out.get("dialogs").and_then(Value::as_array).cloned();
+                self.note_dialogs(target, &mut c, out);
+                if let (Some(mut all), Some(Value::Array(late))) =
+                    (earlier, out.get("dialogs").cloned())
+                {
+                    all.extend(late);
+                    out["dialogs"] = json!(all);
+                }
+                if let Ok(page) = page {
+                    at = page_location(&page);
+                    fx.extend(page_effects(&page));
+                }
+            }
+        }
+        if let (Some(before), Some(after)) = (&probe.at, at.or_else(|| location_of(&tabs, target)))
+        {
+            fx.extend(location_effects(before, &after));
+        }
+        if let Some(d) = out
+            .get("dialogs")
+            .and_then(Value::as_array)
+            .and_then(|d| dialog_effect(d))
+        {
+            fx.insert("dialog".into(), d);
+        }
+        if !fx.is_empty() {
+            out["effects"] = Value::Object(fx);
+        }
     }
 
     async fn wait(
