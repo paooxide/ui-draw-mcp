@@ -21,7 +21,8 @@ use mcp_a11y::{
     is_interactive_role, A11yBackend, BackendError, Bounds, RawSnapshot, SnapshotRequest, UiNode,
 };
 use mcp_input::{
-    ClipData, ClipFormat, InputBackend, InputError, MouseKind, ScrollDir, SemanticAction,
+    Choice, ClipData, ClipFormat, InputBackend, InputError, MouseKind, Reading, ScrollDir,
+    SemanticAction,
 };
 use mcp_window::{
     DialogInfo, DialogScope, MenuItemInfo, Rect, WindowAction, WindowBackend, WindowError,
@@ -31,14 +32,14 @@ use mcp_window::{
 // ---- AXUIElement FFI (ApplicationServices framework) ------------------------
 
 type AXUIElementRef = CFTypeRef;
-type AXError = i32;
+pub(crate) type AXError = i32;
 
-const KAX_SUCCESS: AXError = 0;
-const KAX_ERROR_API_DISABLED: AXError = -25211;
-const KAX_ERROR_INVALID_ELEMENT: AXError = -25202;
-const KAX_ERROR_ATTRIBUTE_UNSUPPORTED: AXError = -25205;
-const KAX_ERROR_ACTION_UNSUPPORTED: AXError = -25206;
-const KAX_ERROR_CANNOT_COMPLETE: AXError = -25204;
+pub(crate) const KAX_SUCCESS: AXError = 0;
+pub(crate) const KAX_ERROR_API_DISABLED: AXError = -25211;
+pub(crate) const KAX_ERROR_INVALID_ELEMENT: AXError = -25202;
+pub(crate) const KAX_ERROR_ATTRIBUTE_UNSUPPORTED: AXError = -25205;
+pub(crate) const KAX_ERROR_ACTION_UNSUPPORTED: AXError = -25206;
+pub(crate) const KAX_ERROR_CANNOT_COMPLETE: AXError = -25204;
 
 #[link(name = "ApplicationServices", kind = "framework")]
 extern "C" {
@@ -49,12 +50,20 @@ extern "C" {
         attribute: CFStringRef,
         value: *mut CFTypeRef,
     ) -> AXError;
-    fn AXUIElementSetAttributeValue(
+    pub(crate) fn AXUIElementSetAttributeValue(
         element: AXUIElementRef,
         attribute: CFStringRef,
         value: CFTypeRef,
     ) -> AXError;
-    fn AXUIElementPerformAction(element: AXUIElementRef, action: CFStringRef) -> AXError;
+    pub(crate) fn AXUIElementPerformAction(element: AXUIElementRef, action: CFStringRef)
+        -> AXError;
+    /// Bound how long a request to the target app may take. Opening a popup
+    /// can run the app's menu tracking, and without a bound a stuck app would
+    /// hold this thread for the system default.
+    pub(crate) fn AXUIElementSetMessagingTimeout(
+        element: AXUIElementRef,
+        timeout_seconds: f32,
+    ) -> AXError;
     fn AXUIElementGetPid(element: AXUIElementRef, pid: *mut c_int) -> AXError;
     fn AXIsProcessTrusted() -> Boolean;
     fn AXValueGetValue(value: CFTypeRef, the_type: u32, value_ptr: *mut c_void) -> Boolean;
@@ -107,7 +116,7 @@ pub fn permissions() -> Permissions {
     }
 }
 
-unsafe fn copy_attr(elem: CFTypeRef, name: &str) -> Option<CFType> {
+pub(crate) unsafe fn copy_attr(elem: CFTypeRef, name: &str) -> Option<CFType> {
     let cfname = CFString::new(name);
     let mut out: CFTypeRef = ptr::null();
     let err = AXUIElementCopyAttributeValue(elem, cfname.as_concrete_TypeRef(), &mut out);
@@ -119,14 +128,14 @@ unsafe fn copy_attr(elem: CFTypeRef, name: &str) -> Option<CFType> {
 }
 
 /// Copy a string-valued attribute.
-unsafe fn copy_attr_string(elem: CFTypeRef, name: &str) -> Option<String> {
+pub(crate) unsafe fn copy_attr_string(elem: CFTypeRef, name: &str) -> Option<String> {
     copy_attr(elem, name)?
         .downcast::<CFString>()
         .map(|s| s.to_string())
 }
 
 /// Copy the children of an element as owned CF elements.
-unsafe fn copy_children(elem: CFTypeRef) -> Vec<CFType> {
+pub(crate) unsafe fn copy_children(elem: CFTypeRef) -> Vec<CFType> {
     let Some(value) = copy_attr(elem, "AXChildren") else {
         return Vec::new();
     };
@@ -188,7 +197,7 @@ pub(crate) unsafe fn read_bounds(elem: CFTypeRef) -> Option<Bounds> {
     Some(Bounds { x, y, w, h })
 }
 
-fn ax_result(err: AXError, what: &str) -> Result<(), InputError> {
+pub(crate) fn ax_result(err: AXError, what: &str) -> Result<(), InputError> {
     match err {
         KAX_SUCCESS => Ok(()),
         KAX_ERROR_API_DISABLED => Err(InputError::PermissionDenied(
@@ -481,7 +490,7 @@ impl MacosBackend {
     /// falls back to searching the app for a node with the same identity. Only
     /// a named element can be re-found this way — matching on role alone would
     /// risk acting on the wrong control.
-    unsafe fn element_for(&self, node_id: u64) -> Result<CFType, InputError> {
+    pub(crate) unsafe fn element_for(&self, node_id: u64) -> Result<CFType, InputError> {
         let (pid, nref) = {
             let st = self.state.lock().unwrap_or_else(|e| e.into_inner());
             let pid = st
@@ -670,6 +679,22 @@ impl InputBackend for MacosBackend {
         }
     }
 
+    async fn choose_option(&self, node_id: u64, option: &str) -> Result<Choice, InputError> {
+        // No await inside: the AX handles are not `Send`, and the run is short
+        // and bounded (see `popup::choose`).
+        unsafe {
+            let elem = self.element_for(node_id)?;
+            crate::popup::choose(&elem, option)
+        }
+    }
+
+    async fn read_element(&self, node_id: u64) -> Result<Reading, InputError> {
+        unsafe {
+            let elem = self.element_for(node_id)?;
+            Ok(crate::popup::read(elem.as_CFTypeRef()))
+        }
+    }
+
     async fn set_value(&self, node_id: u64, text: &str) -> Result<(), InputError> {
         unsafe {
             let elem = self.element_for(node_id)?;
@@ -749,13 +774,15 @@ impl InputBackend for MacosBackend {
         to: (f64, f64),
         modifiers: &[String],
         steps: u32,
+        hold_ms: u64,
         since_takeover: u64,
     ) -> Result<(), InputError> {
         use tokio::time::{sleep, Duration};
         crate::event::drag_begin(from, modifiers)?;
         // Let the press register before motion starts; a drag that begins in
-        // the same instant reads as a click to most targets.
-        sleep(Duration::from_millis(30)).await;
+        // the same instant reads as a click to most targets. `hold_ms` adds to
+        // that for sources that wait to tell a drag from a click.
+        sleep(Duration::from_millis(30 + hold_ms)).await;
         let mut last = from;
         for p in crate::event::drag_path(from, to, steps) {
             // A cancelled drag must release the button where it is. Returning
@@ -1157,7 +1184,7 @@ impl MacosBackend {
     }
 }
 
-unsafe fn copy_attr_bool(elem: CFTypeRef, name: &str) -> Option<bool> {
+pub(crate) unsafe fn copy_attr_bool(elem: CFTypeRef, name: &str) -> Option<bool> {
     let b = copy_attr(elem, name)?.downcast::<CFBoolean>()?;
     Some(b.as_concrete_TypeRef() == CFBoolean::true_value().as_concrete_TypeRef())
 }

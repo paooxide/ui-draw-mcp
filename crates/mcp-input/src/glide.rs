@@ -482,6 +482,7 @@ mod tests {
             _: &[String],
             _: u32,
             _: u64,
+            _: u64,
         ) -> Result<(), InputError> {
             Ok(())
         }

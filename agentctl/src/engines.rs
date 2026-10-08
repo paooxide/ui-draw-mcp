@@ -335,7 +335,10 @@ pub fn build_stack(cfg: &PolicyConfig) -> (Vec<Arc<dyn ToolModule>>, Wiring) {
         let glide_preset = demo_glide_preset(&engines.demo_speed);
         let mut input = InputModule::new(backend.clone(), arena, input_policy)
             .with_verifier(verifier)
-            .with_activity(activity.clone());
+            .with_activity(activity.clone())
+            // A call that names an element before anything was observed
+            // takes its own snapshot instead of asking for one.
+            .with_observer(backend.clone());
         if engines.demo {
             input = input.with_glide(glide_preset.into());
         }
@@ -395,7 +398,10 @@ pub fn build_stack(cfg: &PolicyConfig) -> (Vec<Arc<dyn ToolModule>>, Wiring) {
         let glide_preset = demo_glide_preset(&engines.demo_speed);
         let mut input = InputModule::new(backend.clone(), arena, input_policy)
             .with_verifier(verifier)
-            .with_activity(activity.clone());
+            .with_activity(activity.clone())
+            // A call that names an element before anything was observed
+            // takes its own snapshot instead of asking for one.
+            .with_observer(backend.clone());
         if engines.demo {
             input = input.with_glide(glide_preset.into());
         }

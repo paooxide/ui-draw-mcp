@@ -5,15 +5,19 @@
 //! the destructive-input gate and coordinate clamp.
 
 mod backend;
+mod choose;
+mod combo;
 pub mod glide;
 mod human_override;
 mod postcondition;
 mod tools;
 
 pub use backend::{
-    valid_combo, valid_modifier, ClipData, ClipFormat, InputBackend, InputError, MouseKind,
+    valid_modifier, Choice, ClipData, ClipFormat, InputBackend, InputError, MouseKind, Reading,
     ScrollDir, SemanticAction,
 };
+pub use choose::{list_options, missing_message, pick_option, same_option, OptionItem, Pick};
+pub use combo::{parse_combo, Combo, Os, KEY_NAMES};
 pub use glide::{bezier_interpolate, execute_glide, GlideConfig, GlidePreset};
 pub use human_override::{Activity, ActivityGuard, Detector, OverrideConfig, SetPoint, Verdict};
 pub use postcondition::Verifier;

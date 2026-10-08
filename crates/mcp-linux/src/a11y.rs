@@ -330,7 +330,7 @@ async fn text_value(p: &AccessibleProxy<'_>, tail: bool) -> Option<String> {
     }
 }
 
-async fn numeric_value(p: &AccessibleProxy<'_>) -> Option<String> {
+pub(crate) async fn numeric_value(p: &AccessibleProxy<'_>) -> Option<String> {
     let v = p.proxies().await.ok()?.value().await.ok()?;
     let cur = v.current_value().await.ok()?;
     if let Ok(text) = v.text().await {

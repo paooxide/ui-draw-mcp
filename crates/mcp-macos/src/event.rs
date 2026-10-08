@@ -138,10 +138,11 @@ pub fn type_chunk(chunk: &str) -> Result<(), InputError> {
     Ok(())
 }
 
-/// Press a chord like `cmd+shift+n`.
+/// Press a chord in the canonical form `mcp_input::parse_combo` produces:
+/// modifiers, then one key, joined by `+`.
 pub fn key_combo(combo: &str) -> Result<(), InputError> {
     let mut flags = CGEventFlags::empty();
-    let mut keycode: Option<CGKeyCode> = None;
+    let mut key: Option<(CGKeyCode, bool)> = None;
     for seg in combo.split('+') {
         match seg {
             "cmd" | "command" | "meta" | "super" => flags |= CGEventFlags::CGEventFlagCommand,
@@ -149,11 +150,26 @@ pub fn key_combo(combo: &str) -> Result<(), InputError> {
             "opt" | "option" | "alt" => flags |= CGEventFlags::CGEventFlagAlternate,
             "ctrl" | "control" => flags |= CGEventFlags::CGEventFlagControl,
             "fn" => flags |= CGEventFlags::CGEventFlagSecondaryFn,
-            key => keycode = keycode_for(key),
+            name => {
+                // Overwriting here is how `a+b` used to press only `b`.
+                if key.is_some() {
+                    return Err(InputError::InvalidArgs(format!(
+                        "combo '{combo}' has more than one key"
+                    )));
+                }
+                key = Some(keycode_for(name).ok_or_else(|| {
+                    InputError::Unsupported(format!(
+                        "no macOS keycode for '{name}' in combo '{combo}'"
+                    ))
+                })?);
+            }
         }
     }
-    let keycode = keycode
-        .ok_or_else(|| InputError::Unsupported(format!("no keycode for combo '{combo}'")))?;
+    let (keycode, needs_shift) =
+        key.ok_or_else(|| InputError::Unsupported(format!("no key in combo '{combo}' to press")))?;
+    if needs_shift {
+        flags |= CGEventFlags::CGEventFlagShift;
+    }
     let src = source()?;
     let down =
         CGEvent::new_keyboard_event(src.clone(), keycode, true).map_err(|_| fail("key down"))?;
@@ -388,8 +404,13 @@ pub fn clipboard_write_text(data: &str) -> Result<(), InputError> {
     Ok(())
 }
 
-/// US ANSI virtual keycodes for a key name (letters, digits, common named keys).
-fn keycode_for(key: &str) -> Option<CGKeyCode> {
+/// US ANSI virtual keycodes for a canonical key name, and whether the key
+/// needs Shift held to produce it (`plus` is Shift+`=`, `?` is Shift+`/`).
+///
+/// These are physical key positions, so punctuation follows the US layout:
+/// on another layout `cmd+[` presses whatever sits where the US `[` does,
+/// which is what a shortcut bound to a position wants anyway.
+fn keycode_for(key: &str) -> Option<(CGKeyCode, bool)> {
     let code: u16 = match key {
         "a" => 0x00,
         "b" => 0x0B,
@@ -431,6 +452,7 @@ fn keycode_for(key: &str) -> Option<CGKeyCode> {
         "tab" => 0x30,
         "space" => 0x31,
         "delete" | "backspace" => 0x33,
+        "forwarddelete" | "del" => 0x75,
         "escape" | "esc" => 0x35,
         "left" => 0x7B,
         "right" => 0x7C,
@@ -440,6 +462,11 @@ fn keycode_for(key: &str) -> Option<CGKeyCode> {
         "end" => 0x77,
         "pageup" | "page_up" => 0x74,
         "pagedown" | "page_down" => 0x79,
+        // A PC keyboard's Insert is the Mac's Help key.
+        "insert" | "help" => 0x72,
+        "capslock" => 0x39,
+        // Print Screen is where F13 is on an extended Apple keyboard.
+        "printscreen" => 0x69,
         "f1" => 0x7A,
         "f2" => 0x78,
         "f3" => 0x63,
@@ -452,9 +479,50 @@ fn keycode_for(key: &str) -> Option<CGKeyCode> {
         "f10" => 0x6D,
         "f11" => 0x67,
         "f12" => 0x6F,
+        "f13" => 0x69,
+        "f14" => 0x6B,
+        "f15" => 0x71,
+        "f16" => 0x6A,
+        "f17" => 0x40,
+        "f18" => 0x4F,
+        "f19" => 0x50,
+        "f20" => 0x5A,
+        "minus" => 0x1B,
+        "equal" => 0x18,
+        "leftbracket" => 0x21,
+        "rightbracket" => 0x1E,
+        "backslash" => 0x2A,
+        "semicolon" => 0x29,
+        "quote" => 0x27,
+        "comma" => 0x2B,
+        "period" => 0x2F,
+        "slash" => 0x2C,
+        "grave" => 0x32,
+        // Shifted positions: the symbol, then the key it shares.
+        "plus" => return Some((0x18, true)),
+        "!" => return Some((0x12, true)),
+        "@" => return Some((0x13, true)),
+        "#" => return Some((0x14, true)),
+        "$" => return Some((0x15, true)),
+        "%" => return Some((0x17, true)),
+        "^" => return Some((0x16, true)),
+        "&" => return Some((0x1A, true)),
+        "*" => return Some((0x1C, true)),
+        "(" => return Some((0x19, true)),
+        ")" => return Some((0x1D, true)),
+        "_" => return Some((0x1B, true)),
+        "{" => return Some((0x21, true)),
+        "}" => return Some((0x1E, true)),
+        "|" => return Some((0x2A, true)),
+        ":" => return Some((0x29, true)),
+        "\"" => return Some((0x27, true)),
+        "<" => return Some((0x2B, true)),
+        ">" => return Some((0x2F, true)),
+        "?" => return Some((0x2C, true)),
+        "~" => return Some((0x32, true)),
         _ => return None,
     };
-    Some(code)
+    Some((code, false))
 }
 
 #[cfg(test)]
@@ -507,6 +575,166 @@ mod tests {
         assert_eq!(path.len(), 4);
         assert!(path.iter().all(|p| *p == (5.0, 5.0)));
         assert_eq!(drag_path((0.0, 0.0), (1.0, 1.0), 0).len(), 1);
+    }
+
+    /// Every key the shared parser can emit must have a keycode here, or a
+    /// chord that parses cleanly dies at the last step with "no keycode".
+    #[test]
+    fn every_key_the_shared_parser_emits_has_a_keycode() {
+        use mcp_input::{parse_combo, Os};
+        let mut spellings: Vec<String> = ('a'..='z').map(|c| c.to_string()).collect();
+        spellings.extend(('0'..='9').map(|c| c.to_string()));
+        spellings.extend((1..=20).map(|n| format!("f{n}")));
+        for s in [
+            "return",
+            "enter",
+            "tab",
+            "space",
+            "delete",
+            "backspace",
+            "del",
+            "forwarddelete",
+            "esc",
+            "escape",
+            "left",
+            "right",
+            "up",
+            "down",
+            "home",
+            "end",
+            "pageup",
+            "pagedown",
+            "pgup",
+            "pgdn",
+            "insert",
+            "capslock",
+            "printscreen",
+            "minus",
+            "equal",
+            "plus",
+            "comma",
+            "period",
+            "slash",
+            "backslash",
+            "semicolon",
+            "quote",
+            "grave",
+            "leftbracket",
+            "rightbracket",
+            "-",
+            "=",
+            "+",
+            ",",
+            ".",
+            "/",
+            "\\",
+            ";",
+            "'",
+            "`",
+            "[",
+            "]",
+            "!",
+            "@",
+            "#",
+            "$",
+            "%",
+            "^",
+            "&",
+            "*",
+            "(",
+            ")",
+            "_",
+            "{",
+            "}",
+            "|",
+            ":",
+            "\"",
+            "<",
+            ">",
+            "?",
+            "~",
+        ] {
+            spellings.push(s.to_string());
+        }
+        for s in &spellings {
+            let combo = parse_combo(&format!("cmd+{s}"), Os::Mac)
+                .unwrap_or_else(|e| panic!("{s} does not parse: {e}"));
+            assert!(
+                keycode_for(&combo.key).is_some(),
+                "{s} parses to '{}', which has no keycode",
+                combo.key
+            );
+        }
+    }
+
+    #[test]
+    fn distinct_keys_do_not_share_a_keycode() {
+        let mut seen = std::collections::HashMap::new();
+        for k in ('a'..='z').chain('0'..='9') {
+            let k = k.to_string();
+            let code = keycode_for(&k).unwrap();
+            assert_eq!(seen.insert(code, k.clone()), None, "{k} collides");
+        }
+        for k in [
+            "return",
+            "tab",
+            "space",
+            "delete",
+            "forwarddelete",
+            "escape",
+            "left",
+            "right",
+            "up",
+            "down",
+            "home",
+            "end",
+            "pageup",
+            "pagedown",
+            "insert",
+            "minus",
+            "equal",
+            "comma",
+            "period",
+            "slash",
+            "backslash",
+            "semicolon",
+            "quote",
+            "grave",
+            "leftbracket",
+            "rightbracket",
+            "f1",
+            "f12",
+            "f13",
+            "f20",
+        ] {
+            let code = keycode_for(k).unwrap();
+            if let Some(other) = seen.insert(code, k.to_string()) {
+                panic!("{k} and {other} share {code:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn shifted_symbols_name_their_base_key_and_ask_for_shift() {
+        assert_eq!(keycode_for("plus"), Some((0x18, true)));
+        assert_eq!(keycode_for("equal"), Some((0x18, false)));
+        assert_eq!(keycode_for("?"), Some((0x2C, true)));
+        assert_eq!(keycode_for("slash"), Some((0x2C, false)));
+        assert_eq!(keycode_for("nosuchkey"), None);
+    }
+
+    #[test]
+    fn a_second_key_in_a_chord_is_refused_before_anything_is_posted() {
+        let e = key_combo("a+b").unwrap_err();
+        assert!(matches!(e, InputError::InvalidArgs(_)), "{e:?}");
+        assert!(matches!(
+            key_combo("cmd").unwrap_err(),
+            InputError::Unsupported(_)
+        ));
+        assert!(matches!(
+            key_combo("cmd+nosuchkey").unwrap_err(),
+            InputError::Unsupported(_)
+        ));
     }
 
     #[test]

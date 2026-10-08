@@ -14,9 +14,11 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use atspi::proxy::proxy_ext::ProxyExt;
-use atspi::{Interface, State};
+use atspi::{Interface, Role, State};
 use mcp_input::{
-    ClipData, ClipFormat, InputBackend, InputError, MouseKind, ScrollDir, SemanticAction, SetPoint,
+    list_options, missing_message, pick_option, same_option, Choice, ClipData, ClipFormat,
+    InputBackend, InputError, MouseKind, OptionItem, Pick, Reading, ScrollDir, SemanticAction,
+    SetPoint,
 };
 use tokio::time::sleep;
 use xkeysym::Keysym;
@@ -259,6 +261,133 @@ impl InputBackend for LinuxBackend {
         }
     }
 
+    async fn read_element(&self, node_id: u64) -> Result<Reading, InputError> {
+        let conn = self.conn().await.map_err(InputError::Failed)?;
+        let nref = self.node_ref(node_id)?;
+        let obj = a11y::relocate(&conn, &nref)
+            .await
+            .map_err(InputError::NotFound)?;
+        let p = a11y::proxy_for(&conn, &obj)
+            .await
+            .map_err(InputError::Failed)?;
+        let (role, states, interfaces) =
+            futures_util::try_join!(p.get_role(), p.get_state(), p.get_interfaces())
+                .map_err(|e| InputError::Failed(format!("read: {e}")))?;
+        if crate::roles::is_checkable(role, states) {
+            return Ok(Reading {
+                value: None,
+                checked: Some(states.contains(State::Checked)),
+            });
+        }
+        let value = if role == Role::PasswordText {
+            // Never read a password back; the tool says only that it changed.
+            None
+        } else if role == Role::ComboBox {
+            shown_by_combo(&conn, &obj).await
+        } else if interfaces.contains(Interface::Text) && crate::roles::has_text_value(role) {
+            read_text(&p).await
+        } else if crate::roles::has_numeric_value(role) && interfaces.contains(Interface::Value) {
+            a11y::numeric_value(&p).await
+        } else {
+            None
+        };
+        Ok(Reading {
+            value,
+            checked: None,
+        })
+    }
+
+    async fn choose_option(&self, node_id: u64, option: &str) -> Result<Choice, InputError> {
+        let conn = self.conn().await.map_err(InputError::Failed)?;
+        let nref = self.node_ref(node_id)?;
+        let start = a11y::relocate(&conn, &nref)
+            .await
+            .map_err(InputError::NotFound)?;
+        let combo = owning_combo(&conn, &start).await.ok_or_else(|| {
+            InputError::Unsupported(format!(
+                "'{}' ({}) is not a combo box, nor an item in one",
+                nref.name.as_deref().unwrap_or(""),
+                nref.role
+            ))
+        })?;
+        let cp = a11y::proxy_for(&conn, &combo)
+            .await
+            .map_err(InputError::Failed)?;
+        let previous = shown_by_combo(&conn, &combo).await;
+
+        // GTK3 keeps a closed combo's menu in the tree; other toolkits build
+        // it when it opens. Look first, and open it only if there is nothing.
+        let mut opened = false;
+        let mut items = combo_items(&conn, &combo).await;
+        if items.is_empty() {
+            let ifaces = cp
+                .get_interfaces()
+                .await
+                .map_err(|e| InputError::Failed(format!("interfaces: {e}")))?;
+            do_press(&cp, ifaces, "combo box").await?;
+            opened = true;
+            sleep(Duration::from_millis(250)).await;
+            items = combo_items(&conn, &combo).await;
+        }
+        if items.is_empty() {
+            close_combo(&cp, opened).await;
+            return Err(InputError::Failed(
+                "the combo box exposes no items to choose from".into(),
+            ));
+        }
+        let options: Vec<OptionItem> = items.iter().map(|i| i.option.clone()).collect();
+        let index = match pick_option(&options, option) {
+            Pick::Found(i) => i,
+            Pick::Disabled(i) => {
+                close_combo(&cp, opened).await;
+                return Err(InputError::Failed(format!(
+                    "option {:?} is disabled",
+                    options[i].title
+                )));
+            }
+            Pick::Missing => {
+                close_combo(&cp, opened).await;
+                return Err(InputError::InvalidArgs(missing_message(&options, option)));
+            }
+        };
+        let want = options[index].title.clone();
+        // An action menu keeps its own label; only a control that shows its
+        // choice can be failed for not showing the new one.
+        let shows_choice = previous
+            .as_deref()
+            .is_some_and(|p| options.iter().any(|o| same_option(&o.title, p)));
+
+        if let Err(e) = activate_item(&conn, &items[index].obj).await {
+            close_combo(&cp, opened).await;
+            return Err(e);
+        }
+        let mut now = None;
+        for _ in 0..15 {
+            sleep(Duration::from_millis(40)).await;
+            now = shown_by_combo(&conn, &combo).await;
+            if now.as_deref().is_some_and(|s| same_option(s, &want)) {
+                break;
+            }
+        }
+        match now {
+            Some(s) if same_option(&s, &want) => Ok(Choice {
+                changed: previous.as_deref().map_or(true, |p| !same_option(p, &s)),
+                item: want,
+                selected: Some(s),
+            }),
+            Some(s) if shows_choice => Err(InputError::Failed(format!(
+                "chose {want:?}, but the combo box still shows {s:?}: the app kept {s:?} \
+                 (options: {})",
+                list_options(&options)
+            ))),
+            _ => Ok(Choice {
+                item: want,
+                selected: None,
+                changed: true,
+            }),
+        }
+    }
+
     async fn set_value(&self, node_id: u64, text: &str) -> Result<(), InputError> {
         let conn = self.conn().await.map_err(InputError::Failed)?;
         let nref = self.node_ref(node_id)?;
@@ -421,6 +550,7 @@ impl InputBackend for LinuxBackend {
         to: (f64, f64),
         modifiers: &[String],
         steps: u32,
+        hold_ms: u64,
         since_takeover: u64,
     ) -> Result<(), InputError> {
         let mods = keys::pointer_modifiers(modifiers).map_err(InputError::Failed)?;
@@ -429,7 +559,8 @@ impl InputBackend for LinuxBackend {
         sleep(Duration::from_millis(20)).await;
         self.press_modifiers(&mods, true).await?;
         self.portal.button(0x110, true).await?;
-        sleep(Duration::from_millis(30)).await;
+        // `hold_ms` is for drag sources that wait to tell a drag from a click.
+        sleep(Duration::from_millis(30 + hold_ms)).await;
         let steps = steps.clamp(1, 200);
         let mut last = from;
         for i in 1..=steps {
@@ -699,6 +830,149 @@ async fn x11_write(format: ClipFormat, mime: &str, data: Vec<u8>) -> Result<(), 
         // that as success rather than killing it and dropping the clipboard.
         Err(_elapsed) => Ok(()),
     }
+}
+
+/// Close a list this call opened, so a failed choice does not leave one open.
+/// Best effort: the same press that opened it closes it.
+async fn close_combo(cp: &Acc<'_>, opened: bool) {
+    if opened {
+        if let Ok(i) = cp.get_interfaces().await {
+            let _ = do_press(cp, i, "combo box").await;
+        }
+    }
+}
+
+/// An entry of a combo box's list.
+struct ComboItem {
+    obj: atspi::ObjectRefOwned,
+    option: OptionItem,
+}
+
+/// The combo box an element is, or sits inside (item -> menu or list -> combo).
+async fn owning_combo(
+    conn: &atspi::AccessibilityConnection,
+    start: &atspi::ObjectRefOwned,
+) -> Option<atspi::ObjectRefOwned> {
+    let mut cur = start.clone();
+    for _ in 0..4 {
+        let p = a11y::proxy_for(conn, &cur).await.ok()?;
+        let role = p.get_role().await.ok()?;
+        match role {
+            Role::ComboBox => return Some(cur),
+            Role::MenuItem
+            | Role::CheckMenuItem
+            | Role::RadioMenuItem
+            | Role::ListItem
+            | Role::Menu
+            | Role::PopupMenu
+            | Role::List
+            | Role::ListBox => {
+                let parent = p.parent().await.ok()?;
+                if parent.is_null() {
+                    return None;
+                }
+                cur = parent;
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// The entries under a combo box: its menu items or list rows, in order.
+/// Separators and unnamed rows are not choices.
+async fn combo_items(
+    conn: &atspi::AccessibilityConnection,
+    combo: &atspi::ObjectRefOwned,
+) -> Vec<ComboItem> {
+    a11y::descendants(conn, combo, 3, 300)
+        .await
+        .into_iter()
+        .filter(|(_, role, name, _)| {
+            !name.is_empty()
+                && matches!(
+                    role,
+                    Role::MenuItem | Role::CheckMenuItem | Role::RadioMenuItem | Role::ListItem
+                )
+        })
+        .map(|(obj, _, title, states)| ComboItem {
+            obj,
+            option: OptionItem {
+                title,
+                enabled: states.contains(State::Sensitive) || states.contains(State::Enabled),
+            },
+        })
+        .collect()
+}
+
+/// Choose an item: through its container's Selection when it has one, else by
+/// pressing it.
+async fn activate_item(
+    conn: &atspi::AccessibilityConnection,
+    item: &atspi::ObjectRefOwned,
+) -> Result<(), InputError> {
+    let p = a11y::proxy_for(conn, item)
+        .await
+        .map_err(InputError::Failed)?;
+    if let (Ok(parent), Ok(idx)) = (p.parent().await, p.get_index_in_parent().await) {
+        if !parent.is_null() {
+            if let Ok(pp) = a11y::proxy_for(conn, &parent).await {
+                if let Ok(sel) = selection_iface(&pp).await {
+                    if sel.select_child(idx).await.unwrap_or(false) {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+    }
+    let interfaces = p
+        .get_interfaces()
+        .await
+        .map_err(|e| InputError::Failed(format!("interfaces: {e}")))?;
+    let label = p.name().await.unwrap_or_default();
+    do_press(&p, interfaces, &label).await
+}
+
+/// What a combo box shows as its choice: the selected child of its list or
+/// menu, else its own accessible name (GTK sets that to the selection).
+async fn shown_by_combo(
+    conn: &atspi::AccessibilityConnection,
+    combo: &atspi::ObjectRefOwned,
+) -> Option<String> {
+    let cp = a11y::proxy_for(conn, combo).await.ok()?;
+    let mut containers = vec![combo.clone()];
+    containers.extend(cp.get_children().await.unwrap_or_default());
+    for c in containers.into_iter().filter(|c| !c.is_null()) {
+        let Ok(p) = a11y::proxy_for(conn, &c).await else {
+            continue;
+        };
+        let Ok(sel) = selection_iface(&p).await else {
+            continue;
+        };
+        if sel.n_selected_children().await.unwrap_or(0) > 0 {
+            if let Ok(child) = sel.get_selected_child(0).await {
+                if let Ok(cpx) = a11y::proxy_for(conn, &child).await {
+                    if let Ok(name) = cpx.name().await {
+                        if !name.is_empty() {
+                            return Some(name);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    cp.name().await.ok().filter(|n| !n.is_empty())
+}
+
+/// A text widget's whole content. An empty widget reads as empty, not as
+/// unreadable: a write to it has to be checkable.
+async fn read_text(p: &Acc<'_>) -> Option<String> {
+    let t = text_iface(p).await.ok()?;
+    let count = t.character_count().await.ok()?;
+    if count <= 0 {
+        return Some(String::new());
+    }
+    t.get_text(0, count).await.ok()
 }
 
 /// Press a widget through its Action interface: the first action whose name

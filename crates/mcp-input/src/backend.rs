@@ -127,6 +127,31 @@ pub struct ClipData {
     pub data: Option<String>,
 }
 
+/// What the OS reports about an element right now: the facts a tool reads
+/// back after acting, so "ok" means the UI changed and not merely that a call
+/// returned.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Reading {
+    /// The text or value the control shows. `None` when the platform cannot
+    /// say, which callers treat as "unverifiable", never as "empty".
+    pub value: Option<String>,
+    /// Checked state for checkboxes, switches and radios. `None` when the
+    /// element has none or it cannot be read (a mixed checkbox included).
+    pub checked: Option<bool>,
+}
+
+/// The outcome of choosing an option from a popup button or combo box.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Choice {
+    /// The entry that was matched, as the control spells it.
+    pub item: String,
+    /// What the control shows after the choice, read back from the OS.
+    /// `None` when it could not be read, in which case the choice is unverified.
+    pub selected: Option<String>,
+    /// Whether the control showed something different before.
+    pub changed: bool,
+}
+
 /// Why an input action failed. Mapped to `ErrorCode` by the tool layer.
 #[derive(Debug, Clone)]
 pub enum InputError {
@@ -150,6 +175,23 @@ pub trait InputBackend: Send + Sync {
         action: SemanticAction,
         option: Option<&str>,
     ) -> Result<(), InputError>;
+    /// Choose the entry named `option` from a popup button or combo box, or
+    /// from the popup an entry belongs to when `node_id` is itself an entry.
+    ///
+    /// Opens the popup, finds the entry, activates it, reads back what the
+    /// control shows, and closes anything it opened if it fails. A backend
+    /// that cannot do this says `Unsupported`, and the caller falls back to a
+    /// plain `perform`.
+    async fn choose_option(&self, _node_id: u64, _option: &str) -> Result<Choice, InputError> {
+        Err(InputError::Unsupported(
+            "choosing an option by text is not supported on this platform".into(),
+        ))
+    }
+    /// Read an element's current value and checked state from the OS (not the
+    /// snapshot, which is as old as the last observation).
+    async fn read_element(&self, _node_id: u64) -> Result<Reading, InputError> {
+        Ok(Reading::default())
+    }
     async fn set_value(&self, node_id: u64, text: &str) -> Result<(), InputError>;
     async fn type_text(&self, text: &str) -> Result<(), InputError>;
     async fn key_combo(&self, combo: &str) -> Result<(), InputError>;
@@ -175,6 +217,10 @@ pub trait InputBackend: Send + Sync {
     /// the call started; the drag aborts (releasing the button) if it has
     /// moved on by any step.
     ///
+    /// `hold_ms` is how long the button stays down before the first move, on
+    /// top of the short settle every drag gets. Drag sources that wait to see
+    /// whether a press is a click (Finder icons, list rows) need it.
+    ///
     /// The steps are not decoration: a press followed by a single jump is what
     /// a teleport looks like, and drag targets that track motion — Finder
     /// drags, sliders, canvases, reorderable lists — ignore it.
@@ -184,6 +230,7 @@ pub trait InputBackend: Send + Sync {
         to: (f64, f64),
         modifiers: &[String],
         steps: u32,
+        hold_ms: u64,
         since_takeover: u64,
     ) -> Result<(), InputError>;
     async fn clipboard_read(&self, format: ClipFormat) -> Result<ClipData, InputError>;
@@ -260,20 +307,6 @@ pub fn valid_modifier(name: &str) -> bool {
     )
 }
 
-/// Validate a key combo like `cmd+shift+n`: `^([a-z0-9]+\+)*[a-z0-9]+$`
-/// (segments non-empty, ascii alphanumeric, `+`-separated). No regex dependency.
-pub fn valid_combo(combo: &str) -> bool {
-    if combo.is_empty() {
-        return false;
-    }
-    combo.split('+').all(|seg| {
-        !seg.is_empty()
-            && seg
-                .bytes()
-                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -288,7 +321,7 @@ mod tests {
         ] {
             assert!(valid_modifier(good), "{good} must be accepted");
             assert!(
-                valid_combo(&format!("{good}+a")),
+                crate::combo::parse_combo(&format!("{good}+a"), crate::combo::Os::Mac).is_ok(),
                 "{good} must parse in a combo"
             );
         }
@@ -306,16 +339,5 @@ mod tests {
         assert_eq!(ScrollDir::parse("page_down"), Some(ScrollDir::PageDown));
         assert_eq!(ScrollDir::parse("pagedown"), Some(ScrollDir::PageDown));
         assert_eq!(ScrollDir::parse("sideways"), None);
-    }
-
-    #[test]
-    fn combos_validate() {
-        assert!(valid_combo("cmd+shift+n"));
-        assert!(valid_combo("return"));
-        assert!(valid_combo("cmd+1"));
-        assert!(!valid_combo("cmd+"));
-        assert!(!valid_combo("+a"));
-        assert!(!valid_combo("Cmd+A")); // must be lowercase
-        assert!(!valid_combo(""));
     }
 }

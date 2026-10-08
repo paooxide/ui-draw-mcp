@@ -5,6 +5,7 @@
 //! This crate is the dependency root: engines and the core both depend on it,
 //! it depends on nothing in the workspace. See `docs/architecture.md` §4.
 
+pub mod args;
 mod context;
 mod descriptor;
 mod envelope;
