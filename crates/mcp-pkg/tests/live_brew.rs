@@ -74,7 +74,8 @@ async fn install_plan_is_a_dry_run_that_names_dependencies() {
         .as_array()
         .unwrap()
         .iter()
-        .any(|v| v.as_str() == Some("openssl@3")));
+        // Homebrew bumps the major (openssl@3 became openssl@4), so match the family.
+        .any(|v| v.as_str().is_some_and(|s| s.starts_with("openssl@"))));
     // And it changed nothing.
     assert_eq!(before, installed_ids().await, "a plan must not mutate");
 }
