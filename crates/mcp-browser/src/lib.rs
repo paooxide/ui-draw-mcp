@@ -9,6 +9,7 @@ mod cdp;
 pub mod challenge;
 mod checkpoint;
 pub mod flow;
+mod input;
 mod nav;
 mod profile;
 pub mod record;
@@ -19,8 +20,8 @@ mod tools;
 mod visual;
 
 pub use backend::{
-    ActOpts, BrowserBackend, BrowserError, CdpBackend, EvalOptions, Locator, ScrollMode, Shot,
-    CHROME_BINS,
+    ActOpts, BrowserBackend, BrowserError, CdpBackend, EvalOptions, Locator, PointerArgs,
+    ScrollMode, Shot, CHROME_BINS,
 };
 pub use branch::{Branch, BranchError, BranchManager, BranchStatus};
 pub use cdp::{DialogPolicy, RecordDialogs};
