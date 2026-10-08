@@ -388,6 +388,250 @@ fn fix_xpath_args(args: &mut Value) {
     }
 }
 
+/// A locator spelling that means something other than the field it was put in,
+/// rewritten to the `by` / `query` (and `text` filter) that mean what it meant.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Respelled {
+    pub by: &'static str,
+    pub query: String,
+    /// The text a trailing `:has-text("X")` and friends asked for.
+    pub text: Option<String>,
+}
+
+/// `s` without one pair of quotes around it.
+fn unquote(s: &str) -> &str {
+    let s = s.trim();
+    for q in ['"', '\''] {
+        if let Some(inner) = s.strip_prefix(q).and_then(|r| r.strip_suffix(q)) {
+            return inner;
+        }
+    }
+    s
+}
+
+/// Whether `s` is wholly one quoted string.
+fn is_quoted(s: &str) -> bool {
+    s.len() > 1 && unquote(s).len() + 2 == s.len()
+}
+
+/// Pseudo-classes that make `text:foo` a CSS selector for an SVG `<text>`.
+const REAL_PSEUDOS: [&str; 24] = [
+    "hover",
+    "focus",
+    "active",
+    "visited",
+    "link",
+    "checked",
+    "disabled",
+    "enabled",
+    "empty",
+    "root",
+    "target",
+    "required",
+    "optional",
+    "first-child",
+    "last-child",
+    "only-child",
+    "first-of-type",
+    "last-of-type",
+    "only-of-type",
+    "nth-child(",
+    "nth-of-type(",
+    "not(",
+    "is(",
+    "has(",
+];
+
+/// The text in `text=X`, `text:X`, `text("X")` and `text "X"`.
+fn text_spelling(q: &str) -> Option<String> {
+    let x = if let Some(r) = q.strip_prefix("text=") {
+        unquote(r)
+    } else if let Some(r) = q.strip_prefix("text:") {
+        let lower = r.trim_start().to_ascii_lowercase();
+        if REAL_PSEUDOS.iter().any(|p| lower.starts_with(p)) {
+            return None;
+        }
+        unquote(r)
+    } else if let Some(r) = q.strip_prefix("text(").and_then(|r| r.strip_suffix(')')) {
+        is_quoted(r.trim()).then(|| unquote(r))?
+    } else {
+        let r = q
+            .strip_prefix("text")
+            .filter(|r| r.starts_with(char::is_whitespace))?;
+        is_quoted(r.trim()).then(|| unquote(r))?
+    };
+    (!x.is_empty()).then(|| x.to_string())
+}
+
+/// `div[1]/div[2]/div[4]`: a snapshot ref (`/html/body/div[1]/...`) that lost
+/// its front, as the XPath it was cut from.
+fn ref_fragment(q: &str) -> Option<String> {
+    let step_ok = |s: &str| {
+        let (tag, idx) = match s.split_once('[') {
+            Some((t, i)) => (t, Some(i.strip_suffix(']').unwrap_or("x"))),
+            None => (s, None),
+        };
+        tag.starts_with(|c: char| c.is_ascii_alphabetic())
+            && tag.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+            && idx.map_or(true, |i| {
+                !i.is_empty() && i.chars().all(|c| c.is_ascii_digit())
+            })
+    };
+    let steps: Vec<&str> = q.split('/').collect();
+    if steps.len() < 2 || !steps.iter().all(|s| step_ok(s)) {
+        return None;
+    }
+    Some(match steps[0] {
+        "html" => format!("/{q}"),
+        "body" => format!("/html/{q}"),
+        _ => format!("/html/body/{q}"),
+    })
+}
+
+/// A CSS selector ending in `:has-text("X")`, `:contains("X")`, `:text("X")` or
+/// `:text-is("X")`, split into the CSS before it and X. `None` when the shape
+/// cannot be rewritten without changing what it selects: the pseudo is not
+/// last, there is a selector list, or the base ends in a combinator.
+fn trailing_text_pseudo(q: &str) -> Option<(&str, String)> {
+    const PSEUDOS: [&str; 4] = [":has-text(", ":contains(", ":text-is(", ":text("];
+    let body = q.strip_suffix(')')?;
+    let (at, p) = PSEUDOS
+        .iter()
+        .filter_map(|p| body.rfind(p).map(|i| (i, *p)))
+        .max_by_key(|(i, _)| *i)?;
+    let arg = body[at + p.len()..].trim();
+    let x = unquote(arg);
+    let bad_arg = if is_quoted(arg) {
+        x.contains(arg.chars().next()?)
+    } else {
+        x.contains(['(', ')', '"', '\''])
+    };
+    if x.is_empty() || bad_arg {
+        return None;
+    }
+    let raw_base = &body[..at];
+    // `div :contains(..)` filters div's descendants; the base alone would be div.
+    if raw_base.ends_with(char::is_whitespace) {
+        return None;
+    }
+    let (mut brackets, mut parens, mut quote) = (0i32, 0i32, None);
+    for c in raw_base.chars() {
+        match (quote, c) {
+            (Some(q), c) if c == q => quote = None,
+            (Some(_), _) => {}
+            (None, '"' | '\'') => quote = Some(c),
+            (None, '[') => brackets += 1,
+            (None, ']') => brackets -= 1,
+            (None, '(') => parens += 1,
+            (None, ')') => parens -= 1,
+            (None, ',') if brackets == 0 && parens == 0 => return None,
+            _ => {}
+        }
+    }
+    let open = quote.is_some() || brackets != 0 || parens != 0;
+    if open || raw_base.ends_with(['>', '+', '~']) || jquery_pseudo(raw_base).is_some() {
+        return None;
+    }
+    Some((raw_base, x.to_string()))
+}
+
+/// The other spellings of a locator that a model reaches for, as the `by` and
+/// `query` they mean (see [`Respelled`]); `None` when the query stands as it
+/// is. Only an unset `by` or `css` is respelled: `text` and `xpath` are taken
+/// at their word.
+pub(crate) fn respell_locator(by: Option<&str>, query: &str) -> Option<Respelled> {
+    if !matches!(by, None | Some("css")) {
+        return None;
+    }
+    let q = query.trim();
+    let plain = |by: &'static str, query: &str| {
+        Some(Respelled {
+            by,
+            query: query.to_string(),
+            text: None,
+        })
+    };
+    let css = |q: &str| match trailing_text_pseudo(q) {
+        Some(("", x)) => plain("text", &x),
+        Some((base, x)) => Some(Respelled {
+            by: "css",
+            query: base.to_string(),
+            text: Some(x),
+        }),
+        None => None,
+    };
+    if looks_like_xpath(q) {
+        return plain("xpath", q);
+    }
+    if let Some(r) = q.strip_prefix("xpath=") {
+        return plain("xpath", r.trim());
+    }
+    if let Some(r) = q.strip_prefix("css=") {
+        return css(r.trim()).or_else(|| plain("css", r.trim()));
+    }
+    if let Some(x) = text_spelling(q) {
+        return plain("text", &x);
+    }
+    if let Some(xp) = ref_fragment(q) {
+        return plain("xpath", &xp);
+    }
+    css(q)
+}
+
+/// [`respell_locator`] for a scope (`within`, a snapshot's `root_selector`),
+/// which is CSS or XPath and has no text filter.
+pub(crate) fn respell_scope(s: &str) -> Option<String> {
+    let r = respell_locator(None, s)?;
+    (r.text.is_none() && matches!(r.by, "css" | "xpath")).then_some(r.query)
+}
+
+/// Respell the locators in a call's arguments (see [`respell_locator`]).
+fn respell_args(name: &str, args: &mut Value) {
+    fn one(o: &mut Value, key: &str) {
+        let Some(q) = str_arg(o, key) else { return };
+        let Some(r) = respell_locator(str_arg(o, "by"), q) else {
+            return;
+        };
+        // A filter the caller already gave stays theirs; the pseudo is left for
+        // the selector hint to explain.
+        if r.text.is_some() && str_arg(o, "text").is_some() {
+            return;
+        }
+        o["by"] = json!(r.by);
+        o[key] = json!(r.query);
+        if let Some(t) = r.text {
+            o["text"] = json!(t);
+        }
+    }
+    if !args.is_object() {
+        return;
+    }
+    match name {
+        "browser_act" | "browser_query" | "browser_upload" => {
+            one(args, "query");
+            if let Some(w) = str_arg(args, "within").and_then(respell_scope) {
+                args["within"] = json!(w);
+            }
+        }
+        "browser_snapshot" => {
+            if let Some(r) = str_arg(args, "root_selector").and_then(respell_scope) {
+                args["root_selector"] = json!(r);
+            }
+        }
+        "browser_fill_form" => {
+            if let Some(fields) = args.get_mut("fields").and_then(Value::as_array_mut) {
+                for f in fields.iter_mut().filter(|f| f.is_object()) {
+                    one(f, "selector");
+                }
+            }
+            if let Some(submit) = args.get_mut("submit").filter(|s| s.is_object()) {
+                one(submit, "selector");
+            }
+        }
+        _ => {}
+    }
+}
+
 /// The jQuery / Playwright pseudo-class a CSS selector uses, if any: none of
 /// these exist in CSS. `:first` and `:last` are not `:first-child` and friends.
 pub(crate) fn jquery_pseudo(selector: &str) -> Option<&'static str> {
@@ -416,7 +660,10 @@ fn result_with_selector_hint(tool: &str, r: Result<Value, BrowserError>, css: &[
     if let Err(e) = &r {
         let msg = browser_err_msg(e);
         let pseudo = css.iter().find_map(|s| jquery_pseudo(s));
-        if let (true, Some(p)) = (is_selector_syntax_error(&msg), pseudo) {
+        // With no `by` a selector the browser cannot parse is not an error but a
+        // text search, so the pseudo-class shows up as a miss instead.
+        let unparsed = is_selector_syntax_error(&msg) || msg.starts_with("no element matches");
+        if let (true, Some(p)) = (unparsed, pseudo) {
             return Envelope::fail_with(
                 tool,
                 ErrorCode::InvalidArgs,
@@ -434,11 +681,7 @@ fn result_with_selector_hint(tool: &str, r: Result<Value, BrowserError>, css: &[
 fn fill_css_selectors(args: &Value) -> Vec<&str> {
     fn css(f: &Value) -> Option<&str> {
         let s = f.get("selector")?.as_str()?;
-        let is_css = match str_arg(f, "by") {
-            Some(b) => b == "css",
-            None => !looks_like_xpath(s),
-        };
-        is_css.then_some(s)
+        matches!(str_arg(f, "by"), None | Some("css")).then_some(s)
     }
     let mut out: Vec<&str> = args
         .get("fields")
@@ -716,17 +959,19 @@ impl BrowserModule {
             Ok(t) => t,
             Err(e) => return e,
         };
-        let by = str_arg(args, "by").unwrap_or("css");
+        let by = str_arg(args, "by").unwrap_or("auto");
         let q = match require(args, "query", "browser_query") {
             Ok(q) => q,
             Err(e) => return e,
         };
         let all = args.get("all").and_then(Value::as_bool).unwrap_or(false);
-        let css: &[&str] = if by == "css" { &[q] } else { &[] };
+        let css: Vec<&str> = css_candidate(args, "query").into_iter().collect();
         result_with_selector_hint(
             "browser_query",
-            self.backend.query(target, by, q, all).await,
-            css,
+            self.backend
+                .query(target, by, q, all, str_arg(args, "text"))
+                .await,
+            &css,
         )
     }
 
@@ -756,12 +1001,7 @@ impl BrowserModule {
             Ok(o) => o,
             Err(m) => return Envelope::fail("browser_act", ErrorCode::InvalidArgs, m),
         };
-        let mut css = Vec::new();
-        if let Some(q) =
-            str_arg(args, "query").filter(|_| str_arg(args, "by").unwrap_or("css") == "css")
-        {
-            css.push(q);
-        }
+        let mut css: Vec<&str> = css_candidate(args, "query").into_iter().collect();
         css.extend(str_arg(args, "within").filter(|w| !looks_like_xpath(w)));
         result_with_selector_hint(
             "browser_act",
@@ -2198,7 +2438,8 @@ fn parse_locator(args: &Value) -> Option<crate::backend::Locator<'_>> {
         Some(crate::backend::Locator::Ref(r))
     } else {
         str_arg(args, "query").map(|q| crate::backend::Locator::Selector {
-            by: str_arg(args, "by").unwrap_or("css"),
+            // No `by` is "auto": CSS, else visible text (see `__find_all`).
+            by: str_arg(args, "by").unwrap_or("auto"),
             query: q,
             within: str_arg(args, "within"),
             text: str_arg(args, "text"),
@@ -2208,6 +2449,12 @@ fn parse_locator(args: &Value) -> Option<crate::backend::Locator<'_>> {
                 .map(|n| n as usize),
         })
     }
+}
+
+/// The CSS among a call's `by` / `query` pairs, for the selector hint: with no
+/// `by` the query may be CSS (and then reads like it), so it counts too.
+fn css_candidate<'a>(o: &'a Value, key: &str) -> Option<&'a str> {
+    str_arg(o, key).filter(|_| matches!(str_arg(o, "by"), None | Some("css")))
 }
 
 /// Most files one `browser_upload` may attach.
@@ -2450,7 +2697,10 @@ impl ToolModule for BrowserModule {
             ).details(
                 "The web equivalent of get_ui_tree. A <canvas> gets child nodes (tag canvas-child) only if the page itself \
                  publishes its interactive regions via canvas.__agentctl_regions or a data-canvas-regions JSON attribute; \
-                 any other canvas is an opaque node.",
+                 any other canvas is an opaque node. Besides controls and roles, an element a page makes clickable with \
+                 a pointer cursor is listed (the outermost one, not each span inside it); one with no text is named by \
+                 its aria-label, title or alt, the file name of the icon it draws, or its id or class words, and that name \
+                 works as a by=text query. 'root_selector' is a CSS selector or an XPath (a ref from an earlier snapshot).",
             ).untrusted_output(),
             ToolDescriptor::new(
                 "browser_query",
@@ -2466,6 +2716,14 @@ impl ToolModule for BrowserModule {
                     }),
                     json!(["query"]),
                 ),
+            ).details(
+                "Resolve node refs. With no 'by' the query is tried as CSS and, if it does not parse or matches nothing, as \
+                 visible text; the result then says matched_by (css or text). Common spellings are read as what they mean: a \
+                 query starting with / or ( is an XPath; xpath=..., css=..., text=..., text:..., text(\"..\") and text \"..\" \
+                 name their kind; a trailing :has-text(\"X\"), :contains(\"X\"), :text(\"X\") or :text-is(\"X\") becomes a \
+                 text filter on the CSS before it (or a text search when nothing precedes it); and a truncated snapshot ref \
+                 such as div[1]/div[2] is the XPath /html/body/div[1]/div[2]. An explicit 'by' of text or xpath is taken \
+                 as given.",
             ).untrusted_output(),
             ToolDescriptor::new(
                 "browser_act",
@@ -2476,7 +2734,7 @@ impl ToolModule for BrowserModule {
                     json!({
                         "target_id": { "type": "string", "description": "tab id (default: active tab)" },
                         "ref": { "type": "string", "description": "a ref from browser_query/snapshot" },
-                        "by": { "type": "string", "enum": ["css", "xpath", "text"], "description": "how to read 'query' (default css)" },
+                        "by": { "type": "string", "enum": ["css", "xpath", "text"], "description": "how to read 'query' (default: CSS, else visible text)" },
                         "query": { "type": "string", "description": "selector to resolve and act on in one call, instead of 'ref'; type and press with neither act on the focused element" },
                         "within": { "type": "string", "description": "root selector scoping the query" },
                         "text": { "type": "string", "description": "substring filter on the matches" },
@@ -2502,8 +2760,13 @@ impl ToolModule for BrowserModule {
                  disabled or undone by the page is an error. A page-published canvas region (a canvas-child ref from browser_snapshot) \
                  supports only click and hover, sent as real mouse input at the region centre; other actions on it return \
                  Unsupported.\n\n\
-                 Query targeting: 'by' is css, xpath or text (default css; used when no 'ref'); text is case-insensitive, \
-                 exact matches first, clickable elements preferred. 'within' is an optional CSS/XPath root selector scoping \
+                 Query targeting: 'by' is css, xpath or text (used when no 'ref'); with none, the query is tried as CSS and, \
+                 if it does not parse or matches nothing, as visible text (the result says matched_by), so a plain word \
+                 such as \"Submit\" works. The spellings browser_query lists (/ or ( for XPath, text=..., :has-text(..) \
+                 and so on) are read as what they mean here too, and in 'within', browser_upload and browser_fill_form. \
+                 Text is case-insensitive, exact matches first, clickable elements preferred. When nothing matches the \
+                 error says what was tried and lists up to three elements whose text holds a word of the query. The check \
+                 is made once: act does not wait for an element to appear (use browser_wait). 'within' is an optional CSS/XPath root selector scoping \
                  the search, 'text' an optional substring filter to narrow matches, 'index' an optional 0-based match index \
                  when the query matches several elements (default 0).\n\n\
                  `secret`: the value is a secret, so it stays out of the audit log and is never shown in the showcase \
@@ -2544,7 +2807,7 @@ impl ToolModule for BrowserModule {
             ).details(
                 "Attach local files to a file input (type=file; a click would open the OS file chooser, which agentctl cannot \
                  drive). Target the input like browser_act: 'ref' or 'query' (plus optional 'by', 'within', 'text', 'index'; \
-                 'by' defaults to css and is used when there is no 'ref'; 'within' is an optional CSS/XPath root selector, \
+                 'by' is read like browser_act's and used when there is no 'ref'; 'within' is an optional CSS/XPath root selector, \
                  'text' a substring filter, 'index' a 0-based match index, default 0). A label is followed to its input, and \
                  an element holding exactly one file input uses that one; otherwise the error says what was found (target a \
                  hidden input directly). 'paths' holds 1 to 10 files, each at most 50 MiB, and more than one needs the \
@@ -2566,7 +2829,7 @@ impl ToolModule for BrowserModule {
                             "items": { "type": "object", "properties": {
                                 "ref": { "type": "string" },
                                 "selector": { "type": "string" },
-                                "by": { "type": "string", "enum": ["css", "xpath", "text"], "description": "how to read 'selector' (default css; a leading / or ( means xpath)" }
+                                "by": { "type": "string", "enum": ["css", "xpath", "text"], "description": "how to read 'selector' (default: CSS, else visible text; a leading / or ( means xpath)" }
                             } },
                             "description": "[{ref or selector, by, value, type, secret}]"
                         },
@@ -3064,6 +3327,7 @@ impl ToolModule for BrowserModule {
     }
 
     async fn call(&self, name: &str, mut args: Value, _ctx: &CallCtx) -> Envelope {
+        respell_args(name, &mut args);
         fix_xpath_args(&mut args);
         // One place gives every tab-scoped tool its `target_id`, so the tools
         // read it as they always did. A default is reported back.
@@ -3191,6 +3455,7 @@ mod act_tests {
             _by: &str,
             _q: &str,
             _a: bool,
+            _text: Option<&str>,
         ) -> Result<Value, BrowserError> {
             Err(BrowserError::Failed("n/a".into()))
         }
@@ -3463,13 +3728,13 @@ mod act_tests {
     }
 
     #[tokio::test]
-    async fn a_query_defaults_to_css_when_by_is_omitted() {
+    async fn a_query_defaults_to_auto_when_by_is_omitted() {
         let (m, rec) = module();
         let e = m
             .act(&json!({"target_id":"T","query":"#save","action":"click"}))
             .await;
         assert!(e.ok, "{e:?}");
-        assert_eq!(rec.acts.lock().unwrap()[0], "sel:css:#save");
+        assert_eq!(rec.acts.lock().unwrap()[0], "sel:auto:#save");
     }
 
     #[tokio::test]
@@ -4340,7 +4605,7 @@ mod act_tests {
         let ctx = CallCtx::new("test", mcp_types::CancelToken::new());
         let xpath = json!({"action":"click","ref":r#"//*[@id=\"tt\"]"#});
         m.call("browser_act", xpath, &ctx).await;
-        let css = json!({"action":"click","query":r#"a[title=\"x\"]"#});
+        let css = json!({"action":"click","by":"css","query":r#"a[title=\"x\"]"#});
         m.call("browser_act", css, &ctx).await;
         assert_eq!(
             *rec.acts.lock().unwrap(),
@@ -4686,7 +4951,7 @@ mod forgiving_args_tests {
 
     #[test]
     fn fill_form_css_selectors_skip_xpath_and_text_fields() {
-        let a = json!({
+        let mut a = json!({
             "fields": [
                 {"selector": "#a"},
                 {"selector": "//input"},
@@ -4696,9 +4961,232 @@ mod forgiving_args_tests {
             ],
             "submit": {"selector": "button:visible"}
         });
+        respell_args("browser_fill_form", &mut a);
         assert_eq!(
             fill_css_selectors(&a),
             vec!["#a", "li:eq(1)", "button:visible"]
         );
+    }
+
+    fn respelled(by: Option<&str>, q: &str) -> Option<(&'static str, String, Option<String>)> {
+        respell_locator(by, q).map(|r| (r.by, r.query, r.text))
+    }
+
+    fn rs(
+        by: &'static str,
+        q: &str,
+        text: Option<&str>,
+    ) -> Option<(&'static str, String, Option<String>)> {
+        Some((by, q.to_string(), text.map(String::from)))
+    }
+
+    #[test]
+    fn xpath_spellings_become_xpath_even_when_css_was_named() {
+        for by in [None, Some("css")] {
+            assert_eq!(
+                respelled(by, "//*[@id=\"cv\"]"),
+                rs("xpath", "//*[@id=\"cv\"]", None)
+            );
+            assert_eq!(respelled(by, "(//li)[2]"), rs("xpath", "(//li)[2]", None));
+            assert_eq!(respelled(by, "xpath=//b"), rs("xpath", "//b", None));
+            assert_eq!(
+                respelled(by, "/html/body/div[1]"),
+                rs("xpath", "/html/body/div[1]", None)
+            );
+        }
+    }
+
+    #[test]
+    fn engine_prefixes_name_their_kind() {
+        assert_eq!(
+            respelled(None, "css=.terminal"),
+            rs("css", ".terminal", None)
+        );
+        // A prefixed CSS selector is still respelled inside.
+        assert_eq!(
+            respelled(None, "css=button:has-text(\"Go\")"),
+            rs("css", "button", Some("Go"))
+        );
+    }
+
+    #[test]
+    fn text_spellings_search_the_unquoted_text() {
+        for q in [
+            "text=Alanna",
+            "text=\"Alanna\"",
+            "text='Alanna'",
+            "text:Alanna",
+            "text(\"Alanna\")",
+            "text('Alanna')",
+            "text \"Alanna\"",
+            "text 'Alanna'",
+        ] {
+            assert_eq!(respelled(None, q), rs("text", "Alanna", None), "{q}");
+        }
+        assert_eq!(respelled(Some("css"), "text=a b"), rs("text", "a b", None));
+        // `text` is also an SVG tag: these are CSS.
+        for q in [
+            "text:hover",
+            "text:first-child",
+            "text:not(.x)",
+            "text",
+            "text.big",
+            "text > tspan",
+        ] {
+            assert_eq!(respelled(None, q), None, "{q}");
+        }
+    }
+
+    #[test]
+    fn a_trailing_text_pseudo_becomes_the_text_filter() {
+        assert_eq!(
+            respelled(None, "button:has-text(\"Generate\")"),
+            rs("css", "button", Some("Generate"))
+        );
+        assert_eq!(
+            respelled(None, "button:contains('Submit')"),
+            rs("css", "button", Some("Submit"))
+        );
+        assert_eq!(
+            respelled(None, "button:text(\"Submit\")"),
+            rs("css", "button", Some("Submit"))
+        );
+        assert_eq!(
+            respelled(None, "li:has-text(-42)"),
+            rs("css", "li", Some("-42"))
+        );
+        assert_eq!(
+            respelled(None, "li:text-is(\"-42\")"),
+            rs("css", "li", Some("-42"))
+        );
+        assert_eq!(
+            respelled(Some("css"), "ul#l > li.x:contains(\"a b\")"),
+            rs("css", "ul#l > li.x", Some("a b"))
+        );
+        assert_eq!(
+            respelled(None, "a[href*=\"x)\"]:has-text(\"Go\")"),
+            rs("css", "a[href*=\"x)\"]", Some("Go"))
+        );
+        // Nothing before the pseudo: a text search.
+        assert_eq!(
+            respelled(None, ":contains(\"Dawn\")"),
+            rs("text", "Dawn", None)
+        );
+    }
+
+    #[test]
+    fn a_text_pseudo_in_a_shape_that_cannot_be_rewritten_is_left_alone() {
+        for q in [
+            "div :contains(\"x\")",
+            "a:contains(\"x\") b",
+            "a, b:has-text(\"x\")",
+            "div >:has-text(\"x\")",
+            "button:has-text(\"\")",
+            "button:has-text(\"a\"b\")",
+            "a:visible:contains(\"x\")",
+            "a[title=\"x:contains(\"y\")",
+        ] {
+            assert_eq!(respelled(None, q), None, "{q}");
+        }
+    }
+
+    #[test]
+    fn a_ref_without_its_front_is_a_body_path() {
+        assert_eq!(
+            respelled(None, "div[1]/div[2]/div[4]"),
+            rs("xpath", "/html/body/div[1]/div[2]/div[4]", None)
+        );
+        assert_eq!(
+            respelled(None, "body/div/span[3]"),
+            rs("xpath", "/html/body/div/span[3]", None)
+        );
+        assert_eq!(
+            respelled(None, "html/body/div[1]"),
+            rs("xpath", "/html/body/div[1]", None)
+        );
+        assert_eq!(
+            respelled(Some("css"), "ul/li[2]"),
+            rs("xpath", "/html/body/ul/li[2]", None)
+        );
+        for q in ["div[1]", "div[a]/p", "div[]/p", "a/", "div[1]x/p"] {
+            assert_eq!(respelled(None, q), None, "{q}");
+        }
+    }
+
+    #[test]
+    fn ordinary_selectors_and_explicit_kinds_are_not_respelled() {
+        for q in [
+            "Gilli",
+            "Section #1",
+            "5",
+            "a[href*=\"text=\"]",
+            "button.primary",
+            "#id > span",
+            "input[name='q']",
+            "li:nth-child(2)",
+            "div[data-x=\"a/b\"]",
+            "css",
+            "div.text",
+        ] {
+            assert_eq!(respelled(None, q), None, "{q}");
+            assert_eq!(respelled(Some("css"), q), None, "{q}");
+        }
+        // An explicit text or xpath is taken at its word.
+        assert_eq!(respelled(Some("text"), "text=Go"), None);
+        assert_eq!(respelled(Some("text"), "//b"), None);
+        assert_eq!(respelled(Some("xpath"), "css=.x"), None);
+    }
+
+    #[test]
+    fn scopes_take_xpath_and_prefixes_but_no_text() {
+        assert_eq!(respell_scope("xpath=//form").as_deref(), Some("//form"));
+        assert_eq!(respell_scope("css=#a").as_deref(), Some("#a"));
+        assert_eq!(
+            respell_scope("div[1]/form").as_deref(),
+            Some("/html/body/div[1]/form")
+        );
+        assert_eq!(respell_scope("//form").as_deref(), Some("//form"));
+        assert_eq!(respell_scope("#a"), None);
+        assert_eq!(respell_scope("text=Go"), None);
+        assert_eq!(respell_scope("form:has-text(\"Go\")"), None);
+    }
+
+    #[test]
+    fn call_arguments_are_respelled_per_tool() {
+        let mut a = json!({"query": "button:has-text(\"Go\")", "within": "div[1]/form"});
+        respell_args("browser_act", &mut a);
+        assert_eq!(
+            a,
+            json!({"query": "button", "by": "css", "text": "Go", "within": "/html/body/div[1]/form"})
+        );
+        // A text filter the caller gave is theirs; the pseudo stays for the hint.
+        let mut a = json!({"query": "button:has-text(\"Go\")", "text": "Stop"});
+        respell_args("browser_act", &mut a);
+        assert_eq!(
+            a,
+            json!({"query": "button:has-text(\"Go\")", "text": "Stop"})
+        );
+        let mut a = json!({"root_selector": "//main"});
+        respell_args("browser_snapshot", &mut a);
+        assert_eq!(a, json!({"root_selector": "//main"}));
+        let mut a = json!({
+            "fields": [{"selector": "text=Name", "value": "x"}, {"selector": "#e", "value": "y"}],
+            "submit": {"selector": "button:contains(\"Save\")"}
+        });
+        respell_args("browser_fill_form", &mut a);
+        assert_eq!(
+            a,
+            json!({
+                "fields": [
+                    {"selector": "Name", "by": "text", "value": "x"},
+                    {"selector": "#e", "value": "y"}
+                ],
+                "submit": {"selector": "button", "by": "css", "text": "Save"}
+            })
+        );
+        // Tools that do not locate this way are untouched.
+        let mut a = json!({"query": "text=Go"});
+        respell_args("browser_wait", &mut a);
+        assert_eq!(a, json!({"query": "text=Go"}));
     }
 }

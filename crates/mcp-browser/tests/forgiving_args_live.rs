@@ -305,7 +305,7 @@ async fn a_jquery_pseudo_class_is_explained() {
     let q = s
         .call(
             "browser_query",
-            json!({ "query": "button:contains('\u{d7}')", "by": "css" }),
+            json!({ "query": "button :contains('\u{d7}')", "by": "css" }),
         )
         .await;
     let err = q.error.expect("error");
@@ -320,7 +320,7 @@ async fn a_jquery_pseudo_class_is_explained() {
     let a = s
         .call(
             "browser_act",
-            json!({ "action": "click", "query": "button:has-text('close')" }),
+            json!({ "action": "click", "query": "button :has-text('close')" }),
         )
         .await;
     assert_eq!(a.error.expect("error").code, ErrorCode::InvalidArgs);
