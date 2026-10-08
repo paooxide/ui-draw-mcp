@@ -1034,9 +1034,12 @@ name = "mcp-browser"
 version = "0.2.1"
 dependencies = [
  "async-trait",
+ "base64",
  "mcp-judge",
  "mcp-ssrf",
  "mcp-types",
+ "mcp-vision",
+ "png",
  "serde",
  "serde_json",
  "tokio",
@@ -1281,7 +1284,9 @@ name = "mcp-vision"
 version = "0.2.1"
 dependencies = [
  "async-trait",
+ "base64",
  "mcp-types",
+ "png",
  "serde",
  "serde_json",
  "tokio",

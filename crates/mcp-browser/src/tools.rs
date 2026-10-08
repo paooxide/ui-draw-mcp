@@ -192,6 +192,13 @@ fn result(tool: &str, r: Result<Value, BrowserError>) -> Envelope {
     }
 }
 
+/// Copy every field of the object `extra` into the object `into`, `extra` winning.
+fn merge_into(into: &mut Value, extra: Value) {
+    if let (Some(dst), Value::Object(src)) = (into.as_object_mut(), extra) {
+        dst.extend(src);
+    }
+}
+
 /// A connected browser and the ids of its page tabs, active one first.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BrowserTabs {
@@ -1659,36 +1666,139 @@ impl BrowserModule {
         } else {
             None
         };
-        match self.backend.screenshot(target, str_arg(args, "ref")).await {
-            Ok(shot) if media.is_some() => result(
-                "browser_screenshot",
-                crate::screencast::save_screenshot(
-                    media.as_deref().unwrap_or(std::path::Path::new("")),
-                    &shot.base64,
-                    shot.width,
-                    shot.height,
-                ),
-            ),
-            Ok(shot) => {
-                // A whole-page capture does not measure itself; a 0x0 next to
-                // the image reads as a blank page, so take the PNG's own size.
-                let (width, height) = match (shot.width, shot.height) {
-                    (0, _) | (_, 0) => {
-                        crate::screencast::png_b64_size(&shot.base64).unwrap_or((0, 0))
-                    }
-                    wh => wh,
-                };
-                Envelope::ok_image(
-                    "browser_screenshot",
-                    json!({ "width": width, "height": height }),
-                    ImageContent {
-                        mime_type: "image/png".into(),
-                        base64: shot.base64,
-                    },
-                )
+        let node_ref = str_arg(args, "ref");
+        let mut shot = match self.backend.screenshot(target, node_ref).await {
+            Ok(s) => s,
+            Err(e) => return browser_err("browser_screenshot", e),
+        };
+        // What the grid adds to the result; empty without one.
+        let mut grid_info = json!({});
+        if let Some(step) = mcp_vision::grid::step_from_args(args) {
+            match self.draw_grid(target, node_ref, step, &mut shot).await {
+                Ok(info) => grid_info = info,
+                Err(e) => return browser_err("browser_screenshot", e),
             }
-            Err(e) => browser_err("browser_screenshot", e),
         }
+        if let Some(dir) = media {
+            return result(
+                "browser_screenshot",
+                crate::screencast::save_screenshot(&dir, &shot.base64, shot.width, shot.height)
+                    .map(|mut saved| {
+                        merge_into(&mut saved, grid_info);
+                        saved
+                    }),
+            );
+        }
+        // A whole-page capture does not measure itself; a 0x0 next to the
+        // image reads as a blank page, so take the PNG's own size.
+        let (width, height) = match (shot.width, shot.height) {
+            (0, _) | (_, 0) => crate::screencast::png_b64_size(&shot.base64).unwrap_or((0, 0)),
+            wh => wh,
+        };
+        let mut data = json!({ "width": width, "height": height });
+        merge_into(&mut data, grid_info);
+        Envelope::ok_image(
+            "browser_screenshot",
+            data,
+            ImageContent {
+                mime_type: "image/png".into(),
+                base64: shot.base64,
+            },
+        )
+    }
+
+    /// Draw the coordinate grid on `shot`, labelled in the CSS pixels
+    /// `browser_act` takes as `x`/`y` with no target (viewport points).
+    ///
+    /// Done on the decoded PNG, not by injecting an overlay: the page is left
+    /// exactly as it was, and the grid is on the picture only. The image is
+    /// `scale` device pixels per CSS pixel, so the lines are `step * scale`
+    /// apart and still labelled in CSS pixels. An element's shot starts at the
+    /// element, so its labels are offset by where the element sits in the
+    /// viewport rather than restarting at 0.
+    async fn draw_grid(
+        &self,
+        target: &str,
+        node_ref: Option<&str>,
+        step: u32,
+        shot: &mut crate::backend::Shot,
+    ) -> Result<Value, BrowserError> {
+        let (img_w, img_h) = crate::screencast::png_b64_size(&shot.base64).ok_or_else(|| {
+            BrowserError::Failed("screenshot is not a PNG; cannot draw a grid".into())
+        })?;
+        let xp = serde_json::to_string(&node_ref.unwrap_or("")).unwrap_or_else(|_| "\"\"".into());
+        let probe = format!(
+            r#"(function(){{
+  var rect = null, xp = {xp};
+  if (xp) {{
+    try {{
+      var el = document.evaluate(xp, document, null, 9, null).singleNodeValue;
+      if (el) {{ var b = el.getBoundingClientRect(); rect = {{x:b.x, y:b.y, w:b.width, h:b.height}}; }}
+    }} catch (e) {{}}
+  }}
+  return {{vw: window.innerWidth, vh: window.innerHeight, dpr: window.devicePixelRatio || 1, rect: rect}};
+}})()"#
+        );
+        let out = self.backend.eval(target, &probe).await?;
+        let facts = out.get("result").cloned().unwrap_or(Value::Null);
+        let num = |v: &Value, k: &str| v.get(k).and_then(Value::as_f64).unwrap_or(0.0);
+        let (vw, vh, dpr) = (num(&facts, "vw"), num(&facts, "vh"), num(&facts, "dpr"));
+        let rect = facts.get("rect").filter(|r| r.is_object());
+
+        // A viewport shot is the viewport at the device pixel ratio, so the
+        // image width over the viewport width is the scale. An element shot is
+        // clipped in CSS px at the same ratio.
+        let (scale, origin, space) = match (node_ref, rect) {
+            (Some(_), Some(r)) => (
+                if dpr > 0.0 { dpr } else { 1.0 },
+                (num(r, "x"), num(r, "y")),
+                "viewport",
+            ),
+            // The ref did not resolve to a rect: still draw, but say the
+            // numbers are offsets inside the element, which is what browser_act
+            // takes as x,y together with that ref.
+            (Some(_), None) => (if dpr > 0.0 { dpr } else { 1.0 }, (0.0, 0.0), "element"),
+            (None, _) => (
+                if vw > 0.0 {
+                    img_w as f64 / vw
+                } else {
+                    dpr.max(1.0)
+                },
+                (0.0, 0.0),
+                "viewport",
+            ),
+        };
+        let spec = mcp_vision::grid::GridSpec {
+            step,
+            px_per_unit: (scale, scale),
+            origin,
+        };
+        shot.base64 = mcp_vision::grid::draw_grid_b64(&shot.base64, &spec)
+            .map_err(|e| BrowserError::Failed(format!("grid: {e}")))?;
+        // The image's real pixel size: for an element the backend reports CSS
+        // px, which is not the picture's size on a 2x display.
+        shot.width = img_w;
+        shot.height = img_h;
+
+        let note = if space == "viewport" {
+            "grid labels are CSS pixels from the viewport's top-left, the x,y browser_act takes \
+             with no ref or query (scale is image pixels per CSS pixel; the image is width x \
+             height pixels)"
+        } else {
+            "grid labels are CSS pixels from the element's top-left corner (its position in the \
+             viewport could not be read): pass them as x,y together with the same ref"
+        };
+        Ok(json!({
+            "width": img_w,
+            "height": img_h,
+            "grid": true,
+            "grid_step": step,
+            "scale": scale,
+            "coordinate_space": space,
+            "origin": { "x": origin.0, "y": origin.1 },
+            "viewport": { "w": vw, "h": vh },
+            "grid_note": note,
+        }))
     }
 
     #[allow(clippy::result_large_err)]
@@ -3122,17 +3232,24 @@ impl ToolModule for BrowserModule {
                 "browser_screenshot",
                 Category::Browser,
                 Tier::Read,
-                "Capture a PNG of the page, or of one element by ref. Returned inline as an image; save=true writes it to agentctl's media directory and returns {path, width, height, bytes} instead.",
+                "Capture a PNG of the page, or of one element by ref. Returned inline as an image; save=true writes it to agentctl's media directory and returns {path, width, height, bytes} instead. grid=true draws labelled lines in CSS pixels on the image, the x,y browser_act takes, for clicking where you see something.",
                 obj(
                     json!({
                         "target_id": { "type": "string", "description": "tab id (default: active tab)" },
                         "ref": { "type": "string", "description": "element ref (default: whole page)" },
-                        "save": { "type": "boolean" }
+                        "save": { "type": "boolean" },
+                        "grid": { "type": "boolean", "description": "draw a labelled coordinate grid on the image, in viewport CSS px (an element's labels are its viewport position, not 0-based); the result gives scale (image px per CSS px), grid_step and origin" },
+                        "grid_step": { "type": "integer", "description": "with grid: CSS px between lines (default 100, minimum 25)" }
                     }),
                     json!([]),
                 ),
             ).details(
-                "With save=true the PNG is written to agentctl's media directory (screenshots/, a generated file name) and \
+                "With grid=true the labels read as the x,y of browser_act with no ref or query (a viewport point): \
+                 lines are grid_step CSS px apart, so on a 2x display they are 2*grid_step image pixels apart and \
+                 the result's scale is 2. A ref screenshot is labelled with the element's viewport position, not \
+                 from 0, and says so in coordinate_space. The page itself is not touched: the grid is drawn on the \
+                 returned image only. Labels at line crossings read x,y.\n\n\
+                 With save=true the PNG is written to agentctl's media directory (screenshots/, a generated file name) and \
                  only {path, width, height, bytes} comes back, with no image payload (default false). The newest 200 saved \
                  screenshots are kept; older ones are deleted.",
             ),

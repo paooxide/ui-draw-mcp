@@ -13,7 +13,7 @@ enabled category, while a `dangerous` tool additionally has to be named in
 | Tool | Category | Tier | Summary |
 |---|---|---|---|
 | [`capture_screen`](#capture-screen) | vision | read | Capture a display (or a region) as a PNG image. |
-| [`capture_window`](#capture-window) | vision | read | Capture a single window as a PNG image: prefer this over capture_screen when you only care about one app; fewer pixels means proportionally… |
+| [`capture_window`](#capture-window) | vision | read | Capture a single window as a PNG image: prefer this over capture_screen when you only care about one app; fewer pixels means proportionally fewer tokens. |
 | [`find_elements`](#find-elements) | vision | read | Find elements without reading the whole UI. |
 | [`get_element`](#get-element) | vision | read | Read one property of an element by ref from the latest snapshot. |
 | [`get_ui_tree`](#get-ui-tree) | vision | read | Observe the UI. |
@@ -143,13 +143,15 @@ enabled category, while a `dangerous` tool additionally has to be named in
 
 `capture_screen` · read tier
 
-Capture a display (or a region) as a PNG image. Large captures are downscaled for token cost; the result carries a coordinate_mapping for converting a point on the image into a screen point for mouse_action/scroll.
+Capture a display (or a region) as a PNG image. Large captures are downscaled for token cost; the result carries a coordinate_mapping for converting a point on the image into a screen point for mouse_action/scroll. grid=true draws labelled lines in those screen points on the image, so a position is read off the picture rather than estimated.
 
 | Argument | Type | Required | Description |
 |---|---|---|---|
 | `detail` | one of: low, balanced, full |  | low ~768px (state checks, cheapest), balanced ~1024px, full ~1568px (default, small text legible). Cost scales with pixel area. |
 | `display` | integer |  | display index from list_displays |
 | `force` | boolean |  | re-send even if pixel-identical to the last capture of this source |
+| `grid` | boolean |  | draw a labelled coordinate grid on the image, labelled in screen points (what mouse_action takes); the result gives scale (image px per point), grid_step and origin |
+| `grid_step` | integer |  | with grid: points between lines (default 100, minimum 25) |
 | `max_edge` | integer |  | explicit longest-edge override in px |
 | `region` | object |  | capture just this screen rect: far cheaper than a full screen |
 | `region.h` | number |  |  |
@@ -161,12 +163,14 @@ Capture a display (or a region) as a PNG image. Large captures are downscaled fo
 
 `capture_window` · read tier
 
-Capture a single window as a PNG image: prefer this over capture_screen when you only care about one app; fewer pixels means proportionally fewer tokens.
+Capture a single window as a PNG image: prefer this over capture_screen when you only care about one app; fewer pixels means proportionally fewer tokens. grid=true labels the image in screen points (the window's own position included), what mouse_action takes.
 
 | Argument | Type | Required | Description |
 |---|---|---|---|
 | `detail` | one of: low, balanced, full |  |  |
 | `force` | boolean |  |  |
+| `grid` | boolean |  | draw a labelled coordinate grid on the image, labelled in screen points (what mouse_action takes, the window's position included); the result gives scale (image px per point), grid_step and origin |
+| `grid_step` | integer |  | with grid: points between lines (default 100, minimum 25) |
 | `max_edge` | integer |  |  |
 | `window_id` | integer | yes |  |
 
@@ -230,11 +234,13 @@ No arguments.
 
 `ocr_region` · read tier
 
-Read text off the screen, with a box for each line in screen coordinates. The fallback when get_ui_tree comes back sparse: a canvas, a game, a custom-drawn or Electron UI: where the text is visible but not in the accessibility tree. Cheaper than a screenshot for reading, and unlike a screenshot it hands back coordinates you can click.
+Read text off the screen, with a box for each line in screen coordinates. The fallback when get_ui_tree comes back sparse: a canvas, a game, a custom-drawn or Electron UI: where the text is visible but not in the accessibility tree. Cheaper than a screenshot for reading, and unlike a screenshot it hands back coordinates you can click. Pass find to get only the lines containing some text, ranked, each with the x,y to click: two small calls (ocr_region find, then mouse_action) instead of a screenshot.
 
 | Argument | Type | Required | Description |
 |---|---|---|---|
 | `display` | integer |  | which display, when no region or window is given |
+| `exact` | boolean |  | with find: only a line that is exactly the text, not one that contains it (default false) |
+| `find` | string |  | return only the lines containing this text (case-insensitive, whitespace-collapsed), best match first, each with x,y (the centre, in screen points, for mouse_action) and bounds, instead of all the text |
 | `lang` | array&lt;string&gt; |  | BCP-47 languages, e.g. ["en-US"]; default is the system's |
 | `level` | one of: accurate, fast |  | accuracy versus speed (default accurate) |
 | `min_confidence` | number |  | drop lines below this confidence, 0-1 (default 0.3) |
@@ -243,7 +249,7 @@ Read text off the screen, with a box for each line in screen coordinates. The fa
 | `region.w` | number |  |  |
 | `region.x` | number |  |  |
 | `region.y` | number |  |  |
-| `window_id` | integer |  | read one window (id from list_windows) |
+| `window_id` | integer |  | read one window (id from list_windows); results are still in screen coordinates |
 
 ### ui-extract
 
@@ -1116,12 +1122,16 @@ Record a tab to an mp4 video (browser_record is something else: it learns a repl
 
 `browser_screenshot` · read tier
 
-Capture a PNG of the page, or of one element by ref. Returned inline as an image; save=true writes it to agentctl's media directory and returns {path, width, height, bytes} instead.
+Capture a PNG of the page, or of one element by ref. Returned inline as an image; save=true writes it to agentctl's media directory and returns {path, width, height, bytes} instead. grid=true draws labelled lines in CSS pixels on the image, the x,y browser_act takes, for clicking where you see something.
+
+With grid=true the labels read as the x,y of browser_act with no ref or query (a viewport point): lines are grid_step CSS px apart, so on a 2x display they are 2*grid_step image pixels apart and the result's scale is 2. A ref screenshot is labelled with the element's viewport position, not from 0, and says so in coordinate_space. The page itself is not touched: the grid is drawn on the returned image only. Labels at line crossings read x,y.
 
 With save=true the PNG is written to agentctl's media directory (screenshots/, a generated file name) and only {path, width, height, bytes} comes back, with no image payload (default false). The newest 200 saved screenshots are kept; older ones are deleted.
 
 | Argument | Type | Required | Description |
 |---|---|---|---|
+| `grid` | boolean |  | draw a labelled coordinate grid on the image, in viewport CSS px (an element's labels are its viewport position, not 0-based); the result gives scale (image px per CSS px), grid_step and origin |
+| `grid_step` | integer |  | with grid: CSS px between lines (default 100, minimum 25) |
 | `ref` | string |  | element ref (default: whole page) |
 | `save` | boolean |  |  |
 | `target_id` | string |  | tab id (default: active tab) |

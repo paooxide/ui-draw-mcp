@@ -22,6 +22,23 @@ operated.
   steps, which covers sliders, sortable lists and selecting text, and plays native `draggable` elements back
   through Chrome's drag interception. In a MiniWoB++ run canvas, drag and slider tasks failed for want of
   these. Chrome only.
+- **A labelled coordinate grid on screenshots.** `browser_screenshot`, `capture_screen` and `capture_window`
+  take `grid` (and `grid_step`, default 100, minimum 25) and draw lines on the returned image labelled with
+  the numbers the click tools take: CSS px for `browser_act` x/y, screen points for `mouse_action` (the
+  window's own position included for `capture_window`). Models place clicks badly from a bare image,
+  worse when it is 2x or downscaled; the grid is in click space whatever the scale, and the result gives
+  `scale` (image px per unit), `grid_step` and `origin`. An element screenshot is labelled with the
+  element's viewport position, not from 0. Drawn on the decoded PNG, so the page is untouched. The drawer
+  is `mcp_vision::grid`, using the `png` and `base64` crates already in the tree through `mcp-linux`.
+- **`ocr_region` `find`.** `find: "Save"` (case-insensitive, whitespace-collapsed; `exact` for a line that is
+  exactly the text) returns only the matching lines, best first (a label before a sentence that mentions it),
+  each with `x`,`y` to pass to `mouse_action` and its box, instead of the whole page of text: "click the Save
+  label in a custom-drawn app" is two small calls. The recogniser reports lines, so a match inside a line
+  has an estimated box. `window_id` reads one window; boxes are screen points either way.
+- **Desktop name misses point at OCR.** When `ui_action` (and the other by-name tools) or `find_elements`
+  find no element and the app's tree has fewer than 12 elements, the hint says the app may draw its own UI
+  and to call `ocr_region` with `find` and a `window_id`, then `mouse_action`. Wording only: nothing is
+  captured or read on the model's behalf, so the vision tools' own policy still applies.
 - **Desktop: choose from a popup button or combo box by its text.** `ui_action select` and `ui_fill_form`
   take `option`; on macOS the popup is opened and the matching menu item pressed, on Linux the AT-SPI combo
   box's item is invoked. Before, both backends dropped `option`, so a popup button only opened and the call

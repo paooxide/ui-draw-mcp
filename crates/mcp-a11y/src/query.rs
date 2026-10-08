@@ -231,7 +231,40 @@ pub fn no_match_hint(snap: &Snapshot, q: &ElementQuery) -> String {
     if q.interactive_only {
         parts.push("pass interactive_only=false to include non-actionable elements".into());
     }
+    if let Some(name) = &q.name {
+        parts.extend(ocr_fallback_hint(snap, name));
+    }
     parts.join(". ")
+}
+
+/// A snapshot with fewer elements than this is treated as the tree of an app
+/// that draws its own UI. A window's chrome alone (close, minimise, zoom, a
+/// title) is about half a dozen; an app with real controls has dozens, so a
+/// dozen is a line between them that a canvas, a game or an Electron shell
+/// with accessibility off falls under. It is a heuristic and only ever changes
+/// the wording of an error.
+pub const SPARSE_MISS_ELEMENTS: usize = 12;
+
+/// What to add to a "no element named X" miss when the tree is too sparse to
+/// believe it: the text is probably on screen but not in the tree, so read it
+/// off the screen. This only words the advice. It does not call OCR or capture
+/// anything, because those tools sit in the vision category under their own
+/// policy; the model has to make that call for it to apply.
+pub fn ocr_fallback_hint(snap: &Snapshot, name: &str) -> Option<String> {
+    if snap.elements.len() >= SPARSE_MISS_ELEMENTS {
+        return None;
+    }
+    let app = snap
+        .app
+        .as_deref()
+        .map(|a| format!(", for app {a:?}"))
+        .unwrap_or_default();
+    Some(format!(
+        "this app exposes only {} accessibility elements, so it may draw its own UI and {name:?} \
+         may be on screen without being in the tree. Try ocr_region with find {name:?} and \
+         window_id (from list_windows{app}), then mouse_action at the x,y it returns",
+        snap.elements.len()
+    ))
 }
 
 /// How many candidates a described query hands to the judge. Above this the
@@ -616,6 +649,41 @@ mod tests {
 
         let hint = no_match_hint(&s, &q(json!({ "name": "zebra" })));
         assert!(hint.contains("shares a word"), "{hint}");
+    }
+
+    #[test]
+    fn a_miss_in_a_sparse_tree_points_at_ocr_without_running_it() {
+        let s = snapshot(&[
+            ("@e1", el("window", Some("Canvas"), None, None)),
+            ("@e2", el("button", Some("Close"), Some(2), None)),
+        ]);
+        let hint = no_match_hint(&s, &q(json!({ "name": "Save" })));
+        assert!(hint.contains("draw its own UI"), "{hint}");
+        // The query is folded to lower case; OCR matching is case-insensitive.
+        assert!(hint.contains("ocr_region with find \"save\""), "{hint}");
+        assert!(
+            hint.contains("window_id (from list_windows, for app \"Test\")"),
+            "{hint}"
+        );
+        assert!(hint.contains("mouse_action"), "{hint}");
+        assert!(hint.contains("only 2 accessibility elements"), "{hint}");
+    }
+
+    #[test]
+    fn a_miss_in_a_populated_tree_does_not_blame_the_app() {
+        let items: Vec<(String, ElementInfo)> = (1..=SPARSE_MISS_ELEMENTS)
+            .map(|i| {
+                (
+                    format!("@e{i}"),
+                    el("button", Some("Other"), Some(i as u64), None),
+                )
+            })
+            .collect();
+        let refs: Vec<(&str, ElementInfo)> =
+            items.iter().map(|(r, i)| (r.as_str(), i.clone())).collect();
+        let s = snapshot(&refs);
+        assert!(ocr_fallback_hint(&s, "Save").is_none());
+        assert!(!no_match_hint(&s, &q(json!({ "name": "Save" }))).contains("ocr_region"));
     }
 
     #[test]
