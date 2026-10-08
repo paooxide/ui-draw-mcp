@@ -6,7 +6,7 @@ use mcp_types::{
     CallCtx, Category, Envelope, ErrorCode, ImageContent, Tier, ToolDescriptor, ToolError,
     ToolModule,
 };
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 
 use crate::backend::{BrowserBackend, BrowserError};
 use crate::cdp::DialogPolicy;
@@ -24,6 +24,8 @@ pub struct BrowserModule {
     media_dir: Option<std::path::PathBuf>,
     /// Jails a path `browser_upload` was asked to attach; `None` refuses uploads.
     upload_resolver: Option<UploadResolver>,
+    /// The last snapshot returned per tab, for `browser_snapshot diff`.
+    snaps: std::sync::Mutex<crate::snapshot_diff::SnapMemory>,
 }
 
 /// Resolves a caller-supplied path to the real, contained one, or says why not.
@@ -40,6 +42,7 @@ impl BrowserModule {
             showcase: std::sync::Mutex::new(crate::showcase::ShowcaseConfig::default()),
             media_dir: None,
             upload_resolver: None,
+            snaps: std::sync::Mutex::new(crate::snapshot_diff::SnapMemory::default()),
         }
     }
 
@@ -183,6 +186,60 @@ fn browser_err(tool: &str, e: BrowserError) -> Envelope {
         BrowserError::Failed(m) => (ErrorCode::ActionFailed, m),
     };
     Envelope::fail(tool, code, msg)
+}
+
+/// Most steps one batched `browser_act` may carry.
+const MAX_ACT_STEPS: usize = 20;
+
+/// The steps of a batched `browser_act`, each completed with the batch's
+/// `target_id` (and its `wait_after` and `timeout_ms` where the step sets none).
+/// Nothing else is inherited: a step carries its own `secret` flag, so the
+/// audit log redacts exactly the values that are meant to be secret.
+fn batch_steps(args: &Value) -> Result<Vec<Value>, String> {
+    let Some(steps) = args.get("steps").and_then(Value::as_array) else {
+        return Err("'steps' must be an array of act steps".into());
+    };
+    if steps.is_empty() || steps.len() > MAX_ACT_STEPS {
+        return Err(format!(
+            "'steps' needs 1 to {MAX_ACT_STEPS} steps, got {}",
+            steps.len()
+        ));
+    }
+    for k in ["action", "ref", "query", "value"] {
+        if args.get(k).is_some() {
+            return Err(format!(
+                "with 'steps', put '{k}' inside each step, not beside them"
+            ));
+        }
+    }
+    let mut out = Vec::with_capacity(steps.len());
+    for (i, step) in steps.iter().enumerate() {
+        let Some(m) = step.as_object() else {
+            return Err(format!("step {i} must be an object"));
+        };
+        if m.contains_key("steps") {
+            return Err(format!("step {i}: steps cannot be nested"));
+        }
+        let mut m = m.clone();
+        match (m.get("target_id"), args.get("target_id")) {
+            (Some(own), Some(batch)) if own != batch => {
+                return Err(format!(
+                    "step {i}: a batch acts on one tab; drop the step's target_id"
+                ))
+            }
+            (_, Some(batch)) => {
+                m.insert("target_id".into(), batch.clone());
+            }
+            _ => {}
+        }
+        for k in ["wait_after", "timeout_ms"] {
+            if let (false, Some(v)) = (m.contains_key(k), args.get(k)) {
+                m.insert(k.into(), v.clone());
+            }
+        }
+        out.push(Value::Object(m));
+    }
+    Ok(out)
 }
 
 fn result(tool: &str, r: Result<Value, BrowserError>) -> Envelope {
@@ -901,10 +958,13 @@ impl BrowserModule {
             );
         };
         let kill = args.get("kill").and_then(Value::as_bool).unwrap_or(false);
-        result(
-            "browser_disconnect",
-            self.backend.disconnect(browser_id as u32, kill).await,
-        )
+        let r = self.backend.disconnect(browser_id as u32, kill).await;
+        if r.is_ok() {
+            if let Ok(mut m) = self.snaps.lock() {
+                m.clear();
+            }
+        }
+        result("browser_disconnect", r)
     }
 
     async fn tabs(&self, args: &Value) -> Envelope {
@@ -918,12 +978,16 @@ impl BrowserModule {
         let action = str_arg(args, "action").unwrap_or("list");
         let target = str_arg(args, "target_id");
         let url = str_arg(args, "url");
-        result(
-            "browser_tabs",
-            self.backend
-                .tabs(browser_id as u32, action, target, url)
-                .await,
-        )
+        let r = self
+            .backend
+            .tabs(browser_id as u32, action, target, url)
+            .await;
+        if let (Ok(_), "close", Some(t)) = (&r, action, target) {
+            if let Ok(mut m) = self.snaps.lock() {
+                m.forget(t);
+            }
+        }
+        result("browser_tabs", r)
     }
 
     async fn navigate(&self, args: &Value) -> Envelope {
@@ -946,12 +1010,40 @@ impl BrowserModule {
             Err(e) => return e,
         };
         let mode = str_arg(args, "mode").unwrap_or("dom");
+        let since = str_arg(args, "since");
+        if since.is_some_and(|s| s != "last") {
+            return Envelope::fail(
+                "browser_snapshot",
+                ErrorCode::InvalidArgs,
+                "'since' can only be \"last\" (the previous snapshot of this tab)",
+            );
+        }
+        let want_diff = args.get("diff").and_then(Value::as_bool) == Some(true) || since.is_some();
         result(
             "browser_snapshot",
-            self.backend
-                .snapshot(target, mode, str_arg(args, "root_selector"))
+            self.snapshot_reply(target, mode, str_arg(args, "root_selector"), want_diff)
                 .await,
         )
+    }
+
+    /// A snapshot, or with `want_diff` what changed since the last one this
+    /// module returned for the tab. Either way it becomes the new "last".
+    async fn snapshot_reply(
+        &self,
+        target: &str,
+        mode: &str,
+        root: Option<&str>,
+        want_diff: bool,
+    ) -> Result<Value, BrowserError> {
+        let snap = self.backend.snapshot(target, mode, root).await?;
+        let scope = format!("{mode}:{}", root.unwrap_or_default());
+        let mut mem = self
+            .snaps
+            .lock()
+            .map_err(|_| BrowserError::Failed("snapshot memory lock poisoned".into()))?;
+        Ok(crate::snapshot_diff::reply(
+            &mut mem, target, scope, snap, want_diff,
+        ))
     }
 
     async fn query(&self, args: &Value) -> Envelope {
@@ -975,7 +1067,15 @@ impl BrowserModule {
         )
     }
 
+    /// One `browser_act`; `steps` runs several through [`Self::act_one`].
     async fn act(&self, args: &Value) -> Envelope {
+        if args.get("steps").is_some() {
+            return self.act_batch(args).await;
+        }
+        self.act_one(args).await
+    }
+
+    async fn act_one(&self, args: &Value) -> Envelope {
         let target = match require(args, "target_id", "browser_act") {
             Ok(t) => t,
             Err(e) => return e,
@@ -1043,6 +1143,91 @@ impl BrowserModule {
                 .await,
             &css,
         )
+    }
+
+    /// `browser_act` with `steps`: each runs through [`Self::act_one`], the
+    /// path a single act takes, so a step is validated as one would be. The
+    /// dispatcher has already applied policy and audit to the batch as one
+    /// call (a step's own `secret` flag is honoured by the audit redactor at
+    /// any depth). The first failing step ends the batch.
+    async fn act_batch(&self, args: &Value) -> Envelope {
+        let tool = "browser_act";
+        let steps = match batch_steps(args) {
+            Ok(s) => s,
+            Err(m) => return Envelope::fail(tool, ErrorCode::InvalidArgs, m),
+        };
+        let snapshot = str_arg(args, "snapshot");
+        if snapshot.is_some_and(|m| !matches!(m, "diff" | "full" | "none")) {
+            return Envelope::fail(
+                tool,
+                ErrorCode::InvalidArgs,
+                "'snapshot' is \"diff\", \"full\" or \"none\"",
+            );
+        }
+        let mut results = Vec::with_capacity(steps.len());
+        let mut failed: Option<(usize, Envelope)> = None;
+        for (i, step) in steps.iter().enumerate() {
+            let env = self.act_one(step).await;
+            let mut row = Map::new();
+            row.insert("i".into(), json!(i));
+            if let Some(Value::Object(d)) = &env.data {
+                row.extend(d.clone());
+            }
+            row.insert("ok".into(), json!(env.ok));
+            if let Some(e) = &env.error {
+                row.insert(
+                    "error".into(),
+                    json!({ "code": e.code, "message": e.message }),
+                );
+            }
+            results.push(Value::Object(row));
+            if !env.ok {
+                failed = Some((i, env));
+                break;
+            }
+        }
+        let mut data = Map::new();
+        data.insert("ran".into(), json!(results.len()));
+        data.insert("total".into(), json!(steps.len()));
+        if let Some((i, _)) = &failed {
+            data.insert("failed_at".into(), json!(i));
+        }
+        data.insert("steps".into(), Value::Array(results));
+        if matches!(snapshot, Some("diff" | "full")) {
+            let target = str_arg(args, "target_id").unwrap_or_default();
+            match self
+                .snapshot_reply(target, "dom", None, snapshot == Some("diff"))
+                .await
+            {
+                Ok(s) => data.insert("snapshot".into(), s),
+                Err(e) => data.insert(
+                    "snapshot_error".into(),
+                    json!(browser_err(tool, e).error.map(|e| e.message)),
+                ),
+            };
+        }
+        match failed {
+            None => Envelope::ok(tool, Value::Object(data)),
+            Some((i, env)) => {
+                let (code, msg, hint) = env
+                    .error
+                    .map_or((ErrorCode::ActionFailed, String::new(), None), |e| {
+                        (e.code, e.message, e.suggestion)
+                    });
+                Envelope::fail_with_data(
+                    tool,
+                    code,
+                    format!(
+                        "step {i} ({}) failed: {msg}",
+                        str_arg(&steps[i], "action").unwrap_or("click")
+                    ),
+                    hint.unwrap_or_else(|| {
+                        format!("steps before {i} ran; fix step {i} and send it and the rest again")
+                    }),
+                    Value::Object(data),
+                )
+            }
+        }
     }
 
     async fn upload(&self, args: &Value) -> Envelope {
@@ -2774,7 +2959,9 @@ impl ToolModule for BrowserModule {
                     json!({
                         "target_id": { "type": "string", "description": "tab id (default: active tab)" },
                         "mode": { "type": "string", "enum": ["dom", "accessibility", "text"] },
-                        "root_selector": { "type": "string", "description": "limit the snapshot to this subtree" }
+                        "root_selector": { "type": "string", "description": "limit the snapshot to this subtree" },
+                        "diff": { "type": "boolean", "description": "return only what changed since the last snapshot of this tab (added, removed, changed nodes), not the whole page" },
+                        "since": { "type": "string", "enum": ["last"], "description": "same as diff: true" }
                     }),
                     json!([]),
                 ),
@@ -2784,7 +2971,17 @@ impl ToolModule for BrowserModule {
                  any other canvas is an opaque node. Besides controls and roles, an element a page makes clickable with \
                  a pointer cursor is listed (the outermost one, not each span inside it); one with no text is named by \
                  its aria-label, title or alt, the file name of the icon it draws, or its id or class words, and that name \
-                 works as a by=text query. 'root_selector' is a CSS selector or an XPath (a ref from an earlier snapshot).",
+                 works as a by=text query. 'root_selector' is a CSS selector or an XPath (a ref from an earlier snapshot).\n\n\
+                 A node carries only what is set: ref, tag, role, name, value (what a text field holds, never a password's), \
+                 checked, expanded, selected, options (a <select>), disabled, x, y, w, h. A field is named by its aria-label, \
+                 placeholder or <label>, not by its content.\n\n\
+                 `diff: true` (or since: \"last\") answers with what changed since the last snapshot this server returned for \
+                 the tab: {diff: \"delta\", unchanged: N, added: [nodes], removed: [{ref, tag, name}], changed: [{ref, name, \
+                 changes: {field: [was, now]}}]}, plus url and title when they changed. A node whose ref shifted shows as a \
+                 change of ref: use the new one. The position (x, y, w, h) of a node that stayed is not compared. The reply is \
+                 a full snapshot, with diff: \"full\" and a reason, when there is no earlier snapshot of the tab, the page is a \
+                 different document, mode or root_selector differ, or the diff would not be smaller. Every snapshot returned, \
+                 diff or not, becomes the one the next diff is measured against.",
             ).untrusted_output(),
             ToolDescriptor::new(
                 "browser_query",
@@ -2813,7 +3010,7 @@ impl ToolModule for BrowserModule {
                 "browser_act",
                 Category::Browser,
                 Tier::Standard,
-                "Act on a DOM node: click, double_click, triple_click, right_click, hover, drag, scroll, type, select, focus, scroll_into_view, submit or press. Target it with 'ref' (from browser_query/snapshot) or with 'query' plus optional by, within, text, index. x and y click or hover at a point (offsets inside the target, or viewport px without one). type replaces the field's content and reports value_after. press takes a key or combo such as ctrl+a. A click returns at once, before its request or navigation has begun: use wait_after='settle' or browser_wait.",
+                "Act on a DOM node: click, double_click, triple_click, right_click, hover, drag, scroll, type, select, focus, scroll_into_view, submit or press. Target it with 'ref' (from browser_query/snapshot) or with 'query' plus optional by, within, text, index. x and y click or hover at a point (offsets inside the target, or viewport px without one). type replaces the field's content and reports value_after. press takes a key or combo such as ctrl+a. A click returns at once, before its request or navigation has begun: use wait_after='settle' or browser_wait. Batch: steps=[{action, ref|query, value}, ...] runs up to 20 in one call and stops at the first failure; snapshot='diff' adds what the page changed.",
                 obj(
                     json!({
                         "target_id": { "type": "string", "description": "tab id (default: active tab)" },
@@ -2836,9 +3033,11 @@ impl ToolModule for BrowserModule {
                         "secret": { "type": "boolean", "description": "value is a secret: kept out of the audit log and the showcase HUD" },
                         "scroll": { "type": "string", "enum": ["none", "nearest", "center"], "description": "bring the element into view first (default nearest)" },
                         "wait_after": { "type": "string", "enum": ["none", "settle"], "description": "settle waits for a started navigation, htmx and quiet network, and adds navigated, requests_started and settled to the result (Chrome; about 2s when nothing starts). Default none" },
-                        "timeout_ms": { "type": "integer", "description": "settle bound (default 10000); on expiry the action still succeeded and the result has settled:false" }
+                        "timeout_ms": { "type": "integer", "description": "settle bound (default 10000); on expiry the action still succeeded and the result has settled:false" },
+                        "steps": { "type": "array", "description": "several actions in one call, run in order on target_id: each item takes the fields above (action, ref or query, value, ...) except target_id. Stops at the first failure. At most 20. Use instead of action/ref/query", "items": { "type": "object" } },
+                        "snapshot": { "type": "string", "enum": ["none", "diff", "full"], "description": "with steps: also return the page after the last step, as a snapshot diff against the last browser_snapshot or in full" }
                     }),
-                    json!(["action"]),
+                    json!([]),
                 ),
             ).details(
                 "`press` takes a key or a combo in `value`: a named key (Enter, Escape, Tab, Arrow keys, Home, End, PageUp, \
@@ -2856,6 +3055,16 @@ impl ToolModule for BrowserModule {
                  points, else dx and dy from the start; the destination must be on screen. Mouse-event drags (sliders, \
                  sortable lists, selecting text) and HTML5 draggable elements both work; the result says html5_drag. \
                  Spellings such as key, dblclick, triple-click, drag_and_drop are accepted.\n\n\
+                 Batches: `steps` is a list of acts (each with its own action, ref or query, value, and so on; target_id \
+                 comes from the call, and wait_after and timeout_ms are inherited when a step sets none; secret is not, so \
+                 flag each step that types one). They run in order through the same code as a single act, so each step is \
+                 checked the same way, and the first that fails ends the batch. At most 20 steps. The result is {ran, total, \
+                 failed_at (the 0-based step that failed, absent when all succeeded), steps: [{i, ok, ...that step's result}]}; \
+                 ok is true only when every step succeeded, and a failed batch is an error that still carries this data. \
+                 `snapshot: \"diff\"` adds `snapshot`, the page after the last step as a browser_snapshot diff (a full \
+                 snapshot when this tab has none yet to compare with; \"full\" always sends the whole page), also after a \
+                 failure. Take a full browser_snapshot first so the diff has something to compare with. A form is one call: \
+                 steps type into each field, then click submit.\n\n\
                  On Chrome a click is real pointer input (mousedown, mouseup, click, as a person's) and type is a real \
                  insertion that replaces the field's content, so React-style controlled fields and menus that open on \
                  mousedown work; the result reports input 'cdp', or 'synthetic' with input_reason when the element is \

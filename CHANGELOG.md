@@ -82,8 +82,29 @@ operated.
   below were shortened). `browser_upload` stays dangerous-tier; listing it only lets an operator enable it.
 - **`ToolDescriptor::details`**, docs-only text that `tools/list` does not send and
   `agentctl tools --markdown` prints after the description.
+- **`browser_snapshot` `diff: true`** (or `since: "last"`) returns what changed since the last snapshot the
+  server returned for the tab: `added` nodes, `removed` refs and `changed` nodes with `{field: [was, now]}`,
+  `unchanged: N`, and `url`/`title` when they moved. Nodes are matched by ref, then by tag, role and name when
+  refs shifted (the shift is reported as a change of `ref`). With no earlier snapshot, another document, another
+  mode or `root_selector`, or a diff no smaller than the page, the reply is the full snapshot marked
+  `diff: "full"` with a `reason`. Memory is the last snapshot of at most 16 tabs, dropped on tab close and
+  disconnect. The default stays the full snapshot. In MiniWoB++ Haiku runs the full page was re-sent after every
+  action; on a 21-node form a one-field diff is 132 bytes against 2120.
+- **`browser_act` `steps`**: up to 20 actions in one call, run in order through the same path as a single act,
+  stopping at the first failure. The result is `{ran, total, failed_at, steps: [...]}` and the call is ok only
+  if every step was; a failed batch is an error that still carries the per-step results. `snapshot: "diff"`
+  (or `"full"`) adds the page after the last step. `target_id` comes from the call; `wait_after` and
+  `timeout_ms` are inherited by steps that set none; `secret` is not, so each step that types one flags it
+  (the audit log redacts per step). Filling a form took one call per field.
 
 ### Changed
+
+- **Snapshot nodes carry control state.** A text field's `value` (never a password's), a checkbox or radio's
+  `checked`, `expanded` (`aria-expanded`, or a `<details>` summary) and `selected` for `aria-selected` are
+  listed when present; before, what a field held was visible only as its name when it had no placeholder, and a
+  ticked box not at all. A field is now named by its `aria-label`, placeholder, `<label>` or title rather than
+  by its content, so typing does not rename it (a diff and a name-based locator stay stable); a checkbox is
+  named by its label instead of `on`. A button made of an `<input>` is still named by its value.
 
 - **Shorter browser tool list.** The MiniWoB++ dry run (`eval/README.md`) found Claude Haiku 4.5 using about
   twice the input tokens with agentctl's browser tools than with Playwright MCP, and the tool list is part of
