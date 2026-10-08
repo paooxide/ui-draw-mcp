@@ -6,14 +6,18 @@
 //! module answers that one.
 //!
 //! The matching is deliberately forgiving in the directions a caller is likely
-//! to be imprecise — case, substring, role synonyms — and exact in the one that
-//! matters, which is that a returned ref must be usable by `ui_action`.
+//! to be imprecise — case, whitespace, substring, role synonyms — and exact in
+//! the one that matters, which is that a returned ref must be usable by
+//! `ui_action`. Names are ranked by [`crate::matcher`], the same matcher the
+//! input tools resolve `name` with.
 
 use serde::Serialize;
 use serde_json::{json, Value};
 
 use crate::arena::{ElementInfo, Snapshot};
+use crate::matcher::{fold, ref_order, role_matches, score, Candidate, Score};
 use crate::tree::{normalize_role, Bounds};
+use mcp_types::args::{as_f64, as_u64};
 
 /// Default and maximum number of matches returned.
 const DEFAULT_LIMIT: usize = 20;
@@ -24,7 +28,8 @@ const MAX_LIMIT: usize = 200;
 pub struct ElementQuery {
     /// Role to match, already normalised (`button`, `textfield`, …).
     pub role: Option<String>,
-    /// Case-insensitive substring of the element's name.
+    /// Case-insensitive, whitespace-collapsed text found in the element's
+    /// name or value, already folded.
     pub name: Option<String>,
     /// Rank by distance from this screen point rather than by tree order.
     pub near: Option<(f64, f64)>,
@@ -68,10 +73,7 @@ pub fn parse_query(args: &Value) -> Result<ElementQuery, String> {
     let near = match args.get("near") {
         None | Some(Value::Null) => None,
         Some(v) => {
-            let (x, y) = (
-                v.get("x").and_then(Value::as_f64),
-                v.get("y").and_then(Value::as_f64),
-            );
+            let (x, y) = (v.get("x").and_then(as_f64), v.get("y").and_then(as_f64));
             match (x, y) {
                 (Some(x), Some(y)) => Some((x, y)),
                 _ => return Err("'near' needs numeric 'x' and 'y'".into()),
@@ -80,7 +82,7 @@ pub fn parse_query(args: &Value) -> Result<ElementQuery, String> {
     };
     let limit = args
         .get("limit")
-        .and_then(Value::as_u64)
+        .and_then(as_u64)
         .map(|n| (n as usize).clamp(1, MAX_LIMIT))
         .unwrap_or(DEFAULT_LIMIT);
 
@@ -92,7 +94,7 @@ pub fn parse_query(args: &Value) -> Result<ElementQuery, String> {
         name: args
             .get("name")
             .and_then(Value::as_str)
-            .map(|n| n.trim().to_lowercase())
+            .map(fold)
             .filter(|n| !n.is_empty()),
         near,
         interactive_only: args
@@ -123,28 +125,20 @@ fn distance(b: &Bounds, x: f64, y: f64) -> f64 {
     ((cx - x).powi(2) + (cy - y).powi(2)).sqrt()
 }
 
-fn matches(info: &ElementInfo, q: &ElementQuery) -> bool {
+/// Whether an element satisfies the query, and how well its name did.
+fn matches(info: &ElementInfo, q: &ElementQuery) -> Option<Option<Score>> {
     if let Some(role) = &q.role {
-        if &info.role != role {
-            return false;
-        }
-    }
-    if let Some(name) = &q.name {
-        let hay = info.name.as_deref().unwrap_or_default().to_lowercase();
-        if !hay.contains(name) {
-            return false;
+        if !role_matches(&info.role, role) {
+            return None;
         }
     }
     if q.interactive_only && info.node_id.is_none() {
-        return false;
+        return None;
     }
-    true
-}
-
-/// Numeric part of a `@eN` ref, for stable tree-order sorting. Refs are
-/// allocated in document order, so this is the order the agent would have read.
-fn ref_order(reff: &str) -> u64 {
-    reff.trim_start_matches("@e").parse().unwrap_or(u64::MAX)
+    match &q.name {
+        Some(name) => score(info, name).map(Some),
+        None => Some(None),
+    }
 }
 
 /// Run a query against an installed snapshot.
@@ -152,26 +146,40 @@ fn ref_order(reff: &str) -> u64 {
 /// Returns the hits (already limited) and how many matched in total, so the
 /// caller can say "20 of 47" rather than implying it found everything.
 pub fn query_snapshot(snap: &Snapshot, q: &ElementQuery) -> (Vec<ElementHit>, usize) {
-    let mut hits: Vec<ElementHit> = snap
+    let mut scored: Vec<(Option<Score>, ElementHit)> = snap
         .elements
         .iter()
-        .filter(|(_, info)| matches(info, q))
-        .map(|(reff, info)| ElementHit {
-            reff: reff.clone(),
-            role: info.role.clone(),
-            name: info.name.clone(),
-            value: info.value_preview.clone(),
-            secure: info.secure,
-            bounds: info.bounds,
-            distance: q
-                .near
-                .and_then(|(x, y)| info.bounds.as_ref().map(|b| distance(b, x, y))),
-            actionable: info.node_id.is_some(),
-            probability: None,
+        .filter_map(|(reff, info)| {
+            let sc = matches(info, q)?;
+            Some((
+                sc,
+                ElementHit {
+                    reff: reff.clone(),
+                    role: info.role.clone(),
+                    name: info.name.clone(),
+                    value: info.value_preview.clone(),
+                    secure: info.secure,
+                    bounds: info.bounds,
+                    distance: q
+                        .near
+                        .and_then(|(x, y)| info.bounds.as_ref().map(|b| distance(b, x, y))),
+                    actionable: info.node_id.is_some(),
+                    probability: None,
+                },
+            ))
         })
         .collect();
 
-    let total = hits.len();
+    let total = scored.len();
+    if q.near.is_none() {
+        // Best name match first (`Save` before `Save As…`); with no name to
+        // rank by, every score is `None` and this is plain tree order.
+        scored.sort_by(|a, b| {
+            a.0.cmp(&b.0)
+                .then_with(|| ref_order(&a.1.reff).cmp(&ref_order(&b.1.reff)))
+        });
+    }
+    let mut hits: Vec<ElementHit> = scored.into_iter().map(|(_, h)| h).collect();
     if q.near.is_some() {
         // Nearest first; anything without bounds cannot be ranked, so it sorts
         // last rather than being dropped.
@@ -182,8 +190,6 @@ pub fn query_snapshot(snap: &Snapshot, q: &ElementQuery) -> (Vec<ElementHit>, us
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then_with(|| ref_order(&a.reff).cmp(&ref_order(&b.reff)))
         });
-    } else {
-        hits.sort_by_key(|h| ref_order(&h.reff));
     }
     // A described query keeps every candidate for the judge to rank; the
     // limit applies after ranking.
@@ -191,6 +197,41 @@ pub fn query_snapshot(snap: &Snapshot, q: &ElementQuery) -> (Vec<ElementHit>, us
         hits.truncate(q.limit);
     }
     (hits, total)
+}
+
+/// What to tell a caller whose query matched nothing: the nearest names, and
+/// which roles exist, so the next query is better aimed than the last.
+pub fn no_match_hint(snap: &Snapshot, q: &ElementQuery) -> String {
+    let usable = |i: &ElementInfo| !q.interactive_only || i.node_id.is_some();
+    let mut parts = Vec::new();
+    if let Some(name) = &q.name {
+        let close: Vec<Candidate> = crate::matcher::near_misses(snap, name, &usable, 5);
+        if close.is_empty() {
+            parts.push(format!("no element's name shares a word with {name:?}"));
+        } else {
+            let lines: Vec<String> = close.iter().map(Candidate::line).collect();
+            parts.push(format!("close matches: {}", lines.join("; ")));
+        }
+    }
+    if let Some(role) = &q.role {
+        parts.push(format!("no {role:?} element satisfied the query"));
+    }
+    let mut roles: Vec<&str> = snap
+        .elements
+        .values()
+        .filter(|i| usable(i))
+        .map(|i| i.role.as_str())
+        .collect();
+    roles.sort_unstable();
+    roles.dedup();
+    if !roles.is_empty() {
+        roles.truncate(12);
+        parts.push(format!("roles present: {}", roles.join(", ")));
+    }
+    if q.interactive_only {
+        parts.push("pass interactive_only=false to include non-actionable elements".into());
+    }
+    parts.join(". ")
 }
 
 /// How many candidates a described query hands to the judge. Above this the
@@ -258,8 +299,8 @@ pub fn query_schema() -> Value {
                 "enum": ["window", "focused", "menu", "menubar", "sheet", "popover", "alert"],
                 "description": "which UI surface to search"
             },
-            "role": { "type": "string", "description": "element role, e.g. button, textfield, checkbox" },
-            "name": { "type": "string", "description": "case-insensitive substring of the element name" },
+            "role": { "type": "string", "description": "element role, e.g. button, textfield, checkbox; common synonyms work (popup button = combobox, text field = textarea)" },
+            "name": { "type": "string", "description": "case-insensitive text of the element name or value; best match first (exact, prefix, substring)" },
             "near": {
                 "type": "object",
                 "description": "rank by distance from this screen point",
@@ -519,5 +560,68 @@ mod tests {
         let (hits, total) = query_snapshot(&s, &q(json!({"role":"button","limit": 5})));
         assert_eq!(hits.len(), 5);
         assert_eq!(total, 50, "the caller must be told what it did not see");
+    }
+
+    #[test]
+    fn role_synonyms_find_the_same_control() {
+        let s = snapshot(&[
+            ("@e1", el("popupbutton", Some("Format"), Some(1), None)),
+            ("@e2", el("textfield", Some("Title"), Some(2), None)),
+            ("@e3", el("checkbox", Some("Wrap"), Some(3), None)),
+        ]);
+        for (want, found) in [
+            ("combobox", "@e1"),
+            ("pop up button", "@e1"),
+            ("text field", "@e2"),
+            ("textarea", "@e2"),
+            ("check box", "@e3"),
+        ] {
+            let (hits, _) = query_snapshot(&s, &q(json!({ "role": want })));
+            assert_eq!(hits.len(), 1, "{want}");
+            assert_eq!(hits[0].reff, found, "{want}");
+        }
+    }
+
+    #[test]
+    fn a_name_finds_values_too_and_ranks_the_exact_one_first() {
+        let mut field = el("textfield", Some("Subject"), Some(1), None);
+        field.value_preview = Some("Quarterly   report".into());
+        let s = snapshot(&[
+            ("@e1", field),
+            (
+                "@e2",
+                el("button", Some("Quarterly report draft"), Some(2), None),
+            ),
+            ("@e3", el("button", Some("Quarterly Report"), Some(3), None)),
+        ]);
+        let (hits, total) = query_snapshot(&s, &q(json!({ "name": "quarterly report" })));
+        assert_eq!(total, 3);
+        // Exact names (with the value hit trailing its own tier) before the prefix.
+        assert_eq!(hits[0].reff, "@e3");
+        assert_eq!(hits.last().unwrap().reff, "@e2");
+    }
+
+    #[test]
+    fn a_miss_hint_names_close_candidates_and_the_roles_present() {
+        let s = snapshot(&[
+            ("@e1", el("button", Some("Save Draft"), Some(1), None)),
+            ("@e2", el("checkbox", Some("Wrap"), Some(2), None)),
+        ]);
+        let query = q(json!({ "name": "save document" }));
+        let (hits, _) = query_snapshot(&s, &query);
+        assert!(hits.is_empty());
+        let hint = no_match_hint(&s, &query);
+        assert!(hint.contains("@e1 button \"Save Draft\""), "{hint}");
+        assert!(hint.contains("roles present: button, checkbox"), "{hint}");
+
+        let hint = no_match_hint(&s, &q(json!({ "name": "zebra" })));
+        assert!(hint.contains("shares a word"), "{hint}");
+    }
+
+    #[test]
+    fn numeric_strings_work_in_limits_and_points() {
+        assert_eq!(q(json!({"role":"button","limit": "7"})).limit, 7);
+        let near = q(json!({"near": {"x": "1.5", "y": "2"}})).near;
+        assert_eq!(near, Some((1.5, 2.0)));
     }
 }

@@ -21,6 +21,8 @@ mod imp;
 #[cfg(target_os = "macos")]
 mod ocr;
 #[cfg(target_os = "macos")]
+mod popup;
+#[cfg(target_os = "macos")]
 mod vision;
 #[cfg(target_os = "macos")]
 pub use imp::{permissions, MacosBackend, Permissions};

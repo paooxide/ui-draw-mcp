@@ -86,7 +86,16 @@ pub fn keysym_for(name: &str) -> Option<Keysym> {
         "f10" => key::F10,
         "f11" => key::F11,
         "f12" => key::F12,
+        "f13" => key::F13,
+        "f14" => key::F14,
+        "f15" => key::F15,
+        "f16" => key::F16,
+        "f17" => key::F17,
+        "f18" => key::F18,
+        "f19" => key::F19,
+        "f20" => key::F20,
         "minus" => key::minus,
+        "plus" => key::plus,
         "equal" | "equals" => key::equal,
         "comma" => key::comma,
         "period" => key::period,
@@ -238,6 +247,51 @@ mod tests {
         assert_eq!(keysym_for("é"), Some(Keysym::from_char('é')));
         assert_eq!(keysym_for("ab"), None);
         assert_eq!(keysym_for(""), None);
+    }
+
+    /// Whatever the shared parser (`mcp_input::parse_combo`) emits for Linux,
+    /// this module must be able to press: the two are one pipeline.
+    #[test]
+    fn every_chord_the_shared_parser_emits_parses_here() {
+        use mcp_input::{parse_combo, Os};
+        for given in [
+            "Control+A",
+            "Cmd+Shift+Z",
+            "ctrl-a",
+            "Return",
+            "Esc",
+            "PageUp",
+            "pgdn",
+            "ArrowUp",
+            "Del",
+            "Insert",
+            "F1",
+            "F13",
+            "F20",
+            "cmd++",
+            "ctrl+plus",
+            "cmd+,",
+            "cmd+/",
+            "cmd+[",
+            "alt+`",
+            "mod+c",
+            "super+h",
+            "ctrl+?",
+        ] {
+            let canonical = parse_combo(given, Os::Linux)
+                .unwrap_or_else(|e| panic!("{given}: {e}"))
+                .canonical();
+            parse_combo_here(&canonical).unwrap_or_else(|e| panic!("{given} -> {canonical}: {e}"));
+        }
+        // And the chords come out as intended.
+        let c = parse_combo_here(&parse_combo("mod+c", Os::Linux).unwrap().canonical()).unwrap();
+        assert_eq!((c.modifiers, c.key), (vec![Modifier::Control], Keysym::c));
+        let c = parse_combo_here(&parse_combo("cmd++", Os::Linux).unwrap().canonical()).unwrap();
+        assert_eq!(c.key, Keysym::new(key::plus));
+    }
+
+    fn parse_combo_here(s: &str) -> Result<Combo, String> {
+        parse_combo(s)
     }
 
     #[test]

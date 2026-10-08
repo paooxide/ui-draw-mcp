@@ -64,7 +64,7 @@ impl A11yModule {
             root_ref: str_arg(args, "root"),
             max_depth: args
                 .get("max_depth")
-                .and_then(Value::as_u64)
+                .and_then(mcp_types::args::as_u64)
                 .map(|n| n as usize),
             surface: str_arg(args, "surface"),
         };
@@ -213,6 +213,10 @@ impl A11yModule {
         );
         let snapshot = f.snapshot;
         let (mut hits, total) = query_snapshot(&snapshot, &q);
+        // Computed while the snapshot is still in hand: an empty answer with
+        // no hint reads as "nothing like it is on screen".
+        let hint = (hits.is_empty() && q.describe.is_none())
+            .then(|| crate::query::no_match_hint(&snapshot, &q));
         {
             let mut arena = self.arena.lock().unwrap_or_else(|e| e.into_inner());
             arena.install(snapshot);
@@ -291,20 +295,23 @@ impl A11yModule {
         if !ranking.is_null() {
             data["ranking"] = ranking;
         }
+        if let Some(h) = hint {
+            data["hint"] = json!(h);
+        }
         Envelope::ok("find_elements", data)
     }
 
     fn get_element(&self, args: &Value) -> Envelope {
-        let Some(reff) = str_arg(args, "ref") else {
+        let Some(raw) = args.get("ref") else {
             return Envelope::fail("get_element", ErrorCode::InvalidArgs, "missing 'ref'");
         };
-        if !valid_ref(&reff) {
+        let Some(reff) = crate::matcher::parse_ref(raw) else {
             return Envelope::fail(
                 "get_element",
                 ErrorCode::InvalidArgs,
-                "ref must match @e<number>",
+                "ref must look like @e12 (e12 and 12 also work)",
             );
-        }
+        };
         let property = str_arg(args, "property").unwrap_or_else(|| "value".to_string());
 
         let arena = self.arena.lock().unwrap_or_else(|e| e.into_inner());
@@ -443,7 +450,7 @@ impl ToolModule for A11yModule {
                 Category::Vision,
                 Tier::Read,
                 "Find elements without reading the whole UI. Filter by role and/or a \
-                 case-insensitive substring of the name, or rank by distance from a \
+                 case-insensitive name, or rank by distance from a \
                  screen point. With 'describe', say what you want in plain language \
                  ('the button that saves the document') and the candidates come back \
                  ranked, each with a probability, plus 'ranking.any_fits' for whether \
@@ -451,6 +458,14 @@ impl ToolModule for A11yModule {
                  get_ui_tree on a busy app. Takes a fresh snapshot, so the refs it \
                  returns are usable by ui_action until the next observation.",
                 query_schema(),
+            ).details(
+                "`name` matches the element's name (its title, else its description) and its current value, \
+                 ignoring case and extra whitespace. Matches come back best first: exact, then prefix, then \
+                 substring, name before value, then document order; `ui_action` and the other input tools \
+                 resolve a `name` with the same ranking. `role` accepts common synonyms: button/push button, \
+                 popup button/combobox/menu button, text field/text area/entry/edit, check box, radio button/radio, \
+                 link/hyperlink, menu item, slider, tab/page tab. A query with no match is still `ok` with \
+                 `count: 0`, and carries a `hint` naming close candidates and the roles present."
             ).untrusted_output(),
             ToolDescriptor::new(
                 "get_element",
@@ -515,12 +530,6 @@ impl ToolModule for A11yModule {
 
 fn str_arg(args: &Value, key: &str) -> Option<String> {
     args.get(key).and_then(Value::as_str).map(str::to_string)
-}
-
-fn valid_ref(s: &str) -> bool {
-    s.strip_prefix("@e")
-        .map(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))
-        .unwrap_or(false)
 }
 
 fn backend_err(tool: &str, e: BackendError) -> Envelope {
