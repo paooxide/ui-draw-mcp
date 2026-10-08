@@ -82,8 +82,28 @@ operated.
   below were shortened). `browser_upload` stays dangerous-tier; listing it only lets an operator enable it.
 - **`ToolDescriptor::details`**, docs-only text that `tools/list` does not send and
   `agentctl tools --markdown` prints after the description.
+- **Role locators:** `by: "role"` takes the ARIA role as `query` and an optional accessible `name` (a
+  case-insensitive substring, exact matches first). Roles are explicit or implied (button, link with href,
+  textbox, checkbox, radio, combobox/listbox, heading with `[level=n]`, img, list, listitem, tab, menuitem,
+  option, dialog and the landmarks); the name comes from aria-labelledby, aria-label, an associated label,
+  alt, title, placeholder or the text. The spellings models copy from Playwright and Testing Library are read
+  as role queries without a `by`: `role=button[name="Submit"]` (name may be `/sub/i`),
+  `getByRole('button', { name: 'Submit' })` and the snapshot's `button "Submit"`. A miss lists the elements
+  that do have the role, nearest name first. Benchmarks written for Playwright send these spellings.
+- **Shadow DOM and same-origin iframes are searched** by CSS, text and role alike. Refs to elements in a
+  frame are `<frame ref>::frame/<path>` (chained for nested frames) and resolve again on later calls; refs
+  outside frames are unchanged. `browser_snapshot` lists interactive elements in open shadow roots and
+  same-origin frames, with boxes in page coordinates (the frame's offset, border and padding added), and
+  names the frames it could not read as `frames_skipped` (`ref` and `src`). A locator miss says when a
+  cross-origin frame was not searched. Before, text matching stopped at a shadow root and any frame was
+  invisible to a selector.
 
 ### Changed
+
+- **A click on an element in a same-origin frame is real input** at the element's page position, as the
+  top page's is, instead of a synthetic `click()`; `type` into a frame field is a real insertion too. A frame
+  covered by another element still falls back to the synthetic click and says why. Shadow-root CSS matches no
+  longer wait for the light DOM to have none: both are returned, light DOM first.
 
 - **Shorter browser tool list.** The MiniWoB++ dry run (`eval/README.md`) found Claude Haiku 4.5 using about
   twice the input tokens with agentctl's browser tools than with Playwright MCP, and the tool list is part of

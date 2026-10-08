@@ -1697,7 +1697,7 @@ impl CdpBackend {
       out.rect = {{left:cb.x, top:cb.y, width:cb.w, height:cb.h}};
       out.target = {{tag:'canvas-region', text:''}};
     }} else {{
-      var b = el.getBoundingClientRect();
+      var b = __rect(el);
       out.rect = {{left:b.left, top:b.top, width:b.width, height:b.height}};
       var isRoot = el === document.body || el === document.documentElement;
       out.target = isRoot ? {{tag:'body'}} : __target(el);
@@ -2363,7 +2363,50 @@ function __xp(el){
     segments.unshift(seg);
     curr = inShadow ? root.host : null;
   }
-  return segments.join('::shadow/');
+  var own = segments.join('::shadow/');
+  // An element in a same-origin frame is the frame element's ref, then
+  // `::frame`, then its path in the frame's own document (a nested frame
+  // chains: `a::frame/b::frame/c`).
+  var fd = el.ownerDocument, fe = fd && fd !== document && fd.defaultView && fd.defaultView.frameElement;
+  return fe ? __xp(fe) + '::frame' + own : own;
+}
+
+// The document of a same-origin <iframe>, or null for a cross-origin or
+// unloaded one (reading it throws or gives null).
+function __frame_doc(f){
+  try { return f.contentDocument || null; } catch(e) { return null; }
+}
+// Where the frames holding `el` put its document in the top page: the sum of
+// each frame element's offset, its border and its padding. null when `el`'s
+// frame has gone.
+function __frame_off(el){
+  var x = 0, y = 0, d = el.ownerDocument;
+  while(d && d !== document){
+    var f = d.defaultView && d.defaultView.frameElement;
+    if(!f) return null;
+    var fr = f.getBoundingClientRect(), cs = getComputedStyle(f);
+    x += fr.left + f.clientLeft + (parseFloat(cs.paddingLeft) || 0);
+    y += fr.top + f.clientTop + (parseFloat(cs.paddingTop) || 0);
+    d = f.ownerDocument;
+  }
+  return {x: x, y: y};
+}
+// The outermost frame element (in the top page) that holds `el`, or null.
+function __top_frame(el){
+  var d = el.ownerDocument, top = null;
+  while(d && d !== document){
+    top = d.defaultView && d.defaultView.frameElement;
+    if(!top) return null;
+    d = top.ownerDocument;
+  }
+  return top;
+}
+// getBoundingClientRect in the top page's viewport, which is where a pointer
+// lands; an element in a frame is otherwise measured from the frame's corner.
+function __rect(el){
+  var b = el.getBoundingClientRect(), o = __frame_off(el) || {x: 0, y: 0};
+  return {left: b.left + o.x, top: b.top + o.y, right: b.right + o.x, bottom: b.bottom + o.y,
+    x: b.left + o.x, y: b.top + o.y, width: b.width, height: b.height};
 }
 
 // Page-published canvas regions: a canvas only has child nodes when the page
@@ -2420,15 +2463,16 @@ function __walk_steps(root, seg){
   }
   return cur;
 }
-function __resolve(xp){
+function __resolve(xp, doc){
   if(!xp) return null;
+  doc = doc || document;
   if(xp.indexOf('::canvas[') >= 0){
     var cat = xp.lastIndexOf('::canvas[');
     if(xp.charAt(xp.length - 1) !== ']') return null;
     var canvasXp = xp.slice(0, cat);
     var btnKey;
     try { btnKey = decodeURIComponent(xp.slice(cat + 9, -1)); } catch(e){ return null; }
-    var canvas = __resolve(canvasXp);
+    var canvas = __resolve(canvasXp, doc);
     if(!canvas) return null;
     var regions = __canvas_regions(canvas);
     for(var k = 0; k < regions.length; k++){
@@ -2438,13 +2482,18 @@ function __resolve(xp){
     }
     return null;
   }
+  var fi = xp.indexOf('::frame/');
+  if(fi >= 0){
+    var fe = __resolve(xp.slice(0, fi), doc), fdoc = fe && __frame_doc(fe);
+    return fdoc ? __resolve(xp.slice(fi + 7), fdoc) : null;
+  }
   if(xp.indexOf('::shadow/') >= 0){
     var parts = xp.split('::shadow/');
-    var curr = document;
+    var curr = doc;
     for(var i = 0; i < parts.length; i++){
       var seg = parts[i];
       if(i === 0){
-        var r = document.evaluate(seg, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null);
+        var r = doc.evaluate(seg, doc, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null);
         var host = r.singleNodeValue;
         if(!host) return null;
         if(!host.shadowRoot) return null;
@@ -2459,7 +2508,7 @@ function __resolve(xp){
     }
     return null;
   }
-  var r = document.evaluate(xp, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null);
+  var r = doc.evaluate(xp, doc, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null);
   return r.singleNodeValue;
 }
 "#;
@@ -2509,11 +2558,12 @@ const JS_ICON_NAME: &str = js_icon_name!();
 
 /// Resolve an element by selector, matching `browser_query`'s `by` values, for
 /// act-by-selector. Supports scoped container root (`within`), substring text filter (`textFilter`),
-/// and ordinal selection (`index`). Searches across open shadow roots.
+/// and ordinal selection (`index`). Searches open shadow roots and same-origin
+/// frames (see `__deep`); a frame of another origin cannot be read and is skipped.
 ///
 /// `__find_all` returns the whole ranked list; `__find` picks one and leaves the
 /// size of the list in `__find.count`, which `browser_act` reports as `matches`,
-/// and how it was found in `__find.via` (`css`, `xpath` or `text`).
+/// and how it was found in `__find.via` (`css`, `xpath`, `text` or `role`).
 /// `by: text` is ranked (see `__text_matches`), so the first match is the one
 /// a person would mean, not the first element in the page that mentions it.
 /// `by: auto` (no `by` given) is CSS, else text.
@@ -2571,7 +2621,7 @@ var __ACTIONABLE = 'button, a[href], input:not([type=hidden]), select, textarea,
 function __text_matches(root, q){
   q = __norm(q);
   if(!q || !root.querySelectorAll) return [];
-  var all = root.querySelectorAll('*'), n = all.length, has = new Array(n), tx = new Array(n), skip = /^(SCRIPT|STYLE|NOSCRIPT|TEMPLATE|HEAD|TITLE|META|LINK)$/;
+  var all = __deep(root).els, n = all.length, has = new Array(n), tx = new Array(n), skip = /^(SCRIPT|STYLE|NOSCRIPT|TEMPLATE|HEAD|TITLE|META|LINK)$/;
   var pos = new Map();
   for(var i=0; i<n; i++){
     pos.set(all[i], i);
@@ -2585,7 +2635,7 @@ function __text_matches(root, q){
     for(var k=0; k<kids.length; k++){ if(has[pos.get(kids[k])]){ inner = false; break; } }
     if(!inner) continue;
     var el = all[j], lifted = el.closest ? el.closest(__ACTIONABLE) : null;
-    var act = !!(lifted && (lifted === root || root.contains(lifted)));
+    var act = !!(lifted && (lifted === root || pos.has(lifted)));
     if(!act) lifted = el;
     var exact = tx[j].indexOf(q) >= 0;
     if(!exact && act){
@@ -2631,7 +2681,12 @@ function __target(el){
 // when the page has no focus to speak of: `<body>` is what an unfocused page reports.
 function __focused(){
   var a = document.activeElement;
-  while(a && a.shadowRoot && a.shadowRoot.activeElement) a = a.shadowRoot.activeElement;
+  for(;;){
+    var fd = a && /^i?frame$/i.test(a.tagName) ? __frame_doc(a) : null;
+    if(a && a.shadowRoot && a.shadowRoot.activeElement) a = a.shadowRoot.activeElement;
+    else if(fd && fd.activeElement && fd.activeElement !== fd.body) a = fd.activeElement;
+    else break;
+  }
   if(!a || a === document.body || a === document.documentElement) throw new Error('nothing is focused; pass ref or query');
   return a;
 }
@@ -2691,6 +2746,8 @@ function __find_all(by, q, within, textFilter){
       var r = document.evaluate(xq, root, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
       for(var i=0; i<r.snapshotLength; i++) matches.push(r.snapshotItem(i));
     } catch(e){}
+  } else if(by==='role'){
+    matches = __role_matches(root, __role_parse(q));
   } else { // text
     matches = __text_matches(root, q);
   }
@@ -2705,29 +2762,220 @@ function __find_all(by, q, within, textFilter){
   __find_all.via = via;
   return matches;
 }
-// CSS matches under `root`, through open shadow roots when the light DOM has
-// none. Throws what `querySelectorAll` throws for a selector that does not parse.
+// CSS matches under `root`, then in each open shadow root and same-origin
+// frame inside it. Throws what `querySelectorAll` throws for a selector that
+// does not parse.
 function __css_all(root, q){
   var matches = [];
-  var els = root.querySelectorAll ? root.querySelectorAll(q) : [];
-  for(var i=0; i<els.length; i++) matches.push(els[i]);
-  if(matches.length === 0) {
-    (function walk(r){
-      if(!r) return;
-      var children = r.querySelectorAll ? r.querySelectorAll('*') : [];
-      for(var i=0; i<children.length; i++){
-        try {
-          if(children[i].matches && children[i].matches(q)) matches.push(children[i]);
-        } catch(e){}
-        if(children[i].shadowRoot) walk(children[i].shadowRoot);
-      }
-    })(root);
+  var scopes = root.querySelectorAll ? __deep(root).scopes : [];
+  for(var s = 0; s < scopes.length; s++){
+    var els = scopes[s].querySelectorAll(q);
+    for(var i=0; i<els.length; i++) matches.push(els[i]);
   }
   return matches;
+}
+// Every element under `root`, reaching into open shadow roots and same-origin
+// frames, with the roots it visited (so a CSS query can run in each) and the
+// frames it could not read (another origin) in `skipped`.
+function __deep(root, skipped, acc){
+  acc = acc || {els: [], scopes: []};
+  acc.scopes.push(root);
+  var nodes = root.querySelectorAll ? root.querySelectorAll('*') : [], hosts = [];
+  for(var i = 0; i < nodes.length; i++){
+    acc.els.push(nodes[i]);
+    if(nodes[i].shadowRoot || /^i?frame$/i.test(nodes[i].tagName)) hosts.push(nodes[i]);
+  }
+  for(var h = 0; h < hosts.length; h++){
+    var n = hosts[h];
+    if(n.shadowRoot) __deep(n.shadowRoot, skipped, acc);
+    if(/^i?frame$/i.test(n.tagName)){
+      var d = __frame_doc(n);
+      if(d && d.documentElement) __deep(d, skipped, acc);
+      else if(skipped) skipped.push(String(n.getAttribute('src') || ''));
+    }
+  }
+  return acc;
+}
+var __ROLE_ALIAS = {image: 'img', textfield: 'textbox', 'text-field': 'textbox'};
+var __ROLE_TAG = {button: 'button', option: 'option', optgroup: 'group', fieldset: 'group', details: 'group',
+  textarea: 'textbox', ul: 'list', ol: 'list', menu: 'list', li: 'listitem', dialog: 'dialog', nav: 'navigation',
+  main: 'main', aside: 'complementary', footer: 'contentinfo', header: 'banner', article: 'article', form: 'form',
+  section: 'region', table: 'table', tr: 'row', td: 'cell', th: 'columnheader', thead: 'rowgroup', tbody: 'rowgroup',
+  tfoot: 'rowgroup', progress: 'progressbar', meter: 'meter', hr: 'separator', output: 'status'};
+// The ARIA role an element has with no `role` attribute.
+function __implicit_role(el){
+  var t = String(el.tagName).toLowerCase();
+  if(el.namespaceURI !== 'http://www.w3.org/1999/xhtml') return null;
+  if(t === 'a' || t === 'area') return el.hasAttribute('href') ? 'link' : null;
+  if(t === 'img') return el.getAttribute('alt') === '' ? null : 'img';
+  if(t === 'select') return (el.multiple || el.size > 1) ? 'listbox' : 'combobox';
+  if(t === 'input'){
+    var ty = String(el.type || 'text').toLowerCase();
+    if(/^(button|submit|reset|image)$/.test(ty)) return 'button';
+    if(ty === 'checkbox' || ty === 'radio') return ty;
+    if(ty === 'range') return 'slider';
+    if(ty === 'number') return 'spinbutton';
+    if(!/^(text|email|tel|url|password|search)$/.test(ty)) return null;
+    if(el.hasAttribute('list')) return 'combobox';
+    return ty === 'search' ? 'searchbox' : 'textbox';
+  }
+  if(/^h[1-6]$/.test(t)) return 'heading';
+  return __ROLE_TAG[t] || null;
+}
+function __roles_of(el){
+  var r = el.getAttribute && el.getAttribute('role');
+  var toks = r ? r.trim().toLowerCase().split(/\s+/).filter(function(x){ return x && x !== 'none' && x !== 'presentation'; }) : [];
+  if(toks.length) return toks;
+  var i = __implicit_role(el);
+  return i ? [i] : [];
+}
+function __role_is(el, want){
+  var rs = __roles_of(el);
+  if(rs.indexOf(want) >= 0) return true;
+  // A plain <select> is both a combobox and, to a person, a list; a search box is a text box.
+  if(el.tagName === 'SELECT' && !el.getAttribute('role')) return want === 'listbox' || want === 'combobox';
+  return want === 'textbox' && rs[0] === 'searchbox';
+}
+function __heading_level(el){
+  var l = parseInt(el.getAttribute('aria-level'), 10);
+  if(l > 0) return l;
+  var m = /^h([1-6])$/i.exec(el.tagName);
+  return m ? +m[1] : null;
+}
+var __NAME_FROM_CONTENT = /^(button|link|heading|tab|menuitem|menuitemcheckbox|menuitemradio|option|listitem|cell|columnheader|rowheader|row|checkbox|radio|switch|treeitem|tooltip|gridcell|article)$/;
+// What a screen reader would call an element, most authoritative first:
+// aria-labelledby, aria-label, an associated <label>, a button's value, alt,
+// then (for roles that are named by their content) the text, title and
+// placeholder. Every one is returned, so a name is matched by any of them.
+function __names(el, role){
+  var out = [];
+  var add = function(v){ v = String(v == null ? '' : v).replace(/\s+/g, ' ').trim(); if(v && out.indexOf(v) < 0) out.push(v); };
+  var at = function(a){ return el.getAttribute(a); };
+  var ids = at('aria-labelledby');
+  if(ids){
+    var rn = el.getRootNode(), parts = [];
+    ids.split(/\s+/).forEach(function(id){
+      var t = id && rn.getElementById ? rn.getElementById(id) : null;
+      if(t) parts.push(t.getAttribute('aria-label') || t.textContent);
+    });
+    add(parts.join(' '));
+  }
+  add(at('aria-label'));
+  if(el.labels) for(var i = 0; i < el.labels.length; i++) add(__label_text(el.labels[i]));
+  var tag = String(el.tagName), ty = tag === 'INPUT' ? String(el.type).toLowerCase() : '';
+  if(/^(button|submit|reset)$/.test(ty)) add(el.value || {submit: 'Submit', reset: 'Reset'}[ty]);
+  add(at('alt'));
+  var content = function(){
+    if(tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+    var t = el.innerText;
+    add(t != null && t !== '' ? t : el.textContent);
+  };
+  if(__NAME_FROM_CONTENT.test(role)) content();
+  add(at('title')); add(at('placeholder'));
+  if(!__NAME_FROM_CONTENT.test(role)) content();
+  if(!out.length) add(__icon_name(el));
+  return out;
+}
+// A role query: `role=button[name="Save"][level=2]`, or just `button`. A name
+// is quoted text or a /regex/flags; `exact` makes the text match whole and
+// case-sensitive. The other spellings are rewritten to this one before they
+// get here.
+function __role_parse(q){
+  var s = String(q).trim().replace(/^role=/, '');
+  var m = /^([A-Za-z][\w-]*)/.exec(s);
+  if(!m) throw new Error('not a role query: ' + JSON.stringify(q) + ' (use e.g. role=button[name="Save"])');
+  var role = m[1].toLowerCase();
+  var spec = {role: __ROLE_ALIAS[role] || role, name: null, exact: false, level: null};
+  var re = /\s*\[\s*(\w+)\s*(?:=\s*("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|\/(?:[^\/\\]|\\.)+\/[a-z]*|[^\]\s]*))?\s*\]/y;
+  var pos = m[0].length;
+  for(;;){
+    re.lastIndex = pos;
+    var a = re.exec(s);
+    if(!a) break;
+    pos = re.lastIndex;
+    var v = a[2];
+    if(v !== undefined && /^["']/.test(v)) v = v.slice(1, -1).replace(/\\(.)/g, '$1');
+    else if(v !== undefined && /^\/.+\/[a-z]*$/.test(v)){
+      var cut = v.lastIndexOf('/');
+      try { v = new RegExp(v.slice(1, cut), v.slice(cut + 1).replace(/[^imsu]/g, '')); }
+      catch(e) { throw new Error('bad regular expression in role query: ' + q); }
+    }
+    if(a[1] === 'name' && v !== undefined) spec.name = v;
+    else if(a[1] === 'level') spec.level = parseInt(v, 10);
+    else if(a[1] === 'exact') spec.exact = v === undefined || v === 'true';
+  }
+  if(s.slice(pos).trim()) throw new Error('unreadable role query: ' + JSON.stringify(q));
+  return spec;
+}
+// 2 for the name, 1 for text in it, 0 for neither.
+function __name_rank(names, want, exact){
+  var best = 0;
+  for(var i = 0; i < names.length; i++){
+    var n = names[i], r = 0;
+    if(want instanceof RegExp) r = want.test(n) ? 1 : 0;
+    else if(exact) r = n === String(want).replace(/\s+/g, ' ').trim() ? 2 : 0;
+    else {
+      var ln = n.toLowerCase(), w = __norm(want);
+      r = ln === w ? 2 : (ln.indexOf(w) >= 0 ? 1 : 0);
+    }
+    if(r > best) best = r;
+  }
+  return best;
+}
+// Elements with a role (and name, level), best first: exact name before
+// substring (substring ones dropped when any is exact), visible before hidden,
+// then document order. Reaches into open shadow roots and same-origin frames.
+function __role_matches(root, spec){
+  var els = __deep(root).els, hits = [];
+  for(var i = 0; i < els.length; i++){
+    var el = els[i];
+    if(!__role_is(el, spec.role)) continue;
+    if(spec.level != null && __heading_level(el) !== spec.level) continue;
+    var rank = 2;
+    if(spec.name !== null){
+      rank = __name_rank(__names(el, spec.role), spec.name, spec.exact);
+      if(!rank) continue;
+    }
+    hits.push({el: el, rank: rank, vis: __visible(el), ord: i});
+  }
+  if(hits.some(function(h){ return h.rank === 2; })) hits = hits.filter(function(h){ return h.rank === 2; });
+  hits.sort(function(a, b){ return (b.vis - a.vis) || (a.ord - b.ord); });
+  return hits.map(function(h){ return h.el; });
+}
+// The miss message for a role query: the elements that do have the role, with
+// their names, those sharing a word with the wanted name first.
+function __miss_role(q, within){
+  var sp;
+  try { sp = __role_parse(q); } catch(e) { return String(e.message); }
+  var wanted = sp.name instanceof RegExp ? [] : String(sp.name || '').toLowerCase().split(/[^\p{L}\p{N}]+/u).filter(function(w){ return w.length >= 2; });
+  var skipped = [], els = __deep(document, skipped).els, same = [], tally = {};
+  for(var i = 0; i < els.length; i++){
+    var rs = __roles_of(els[i]);
+    if(rs.length) tally[rs[0]] = (tally[rs[0]] || 0) + 1;
+    if(!__role_is(els[i], sp.role)) continue;
+    var nm = __names(els[i], sp.role)[0] || '';
+    var near = wanted.some(function(w){ return nm.toLowerCase().indexOf(w) >= 0; });
+    same.push({el: els[i], nm: nm, near: near, vis: __visible(els[i])});
+  }
+  same.sort(function(a, b){ return (b.near - a.near) || (b.vis - a.vis); });
+  var desc = sp.role + (sp.name === null ? '' : ' named ' + (sp.name instanceof RegExp ? String(sp.name) : JSON.stringify(sp.name))) + (sp.level != null ? ' of level ' + sp.level : '');
+  var msg = 'no element has the role ' + desc;
+  if(within) msg += ' inside ' + JSON.stringify(within);
+  if(same.length){
+    msg += '; the ' + same.length + ' with role ' + sp.role + ': ' + same.slice(0, 8).map(function(m){
+      return sp.role + (m.nm ? ' ' + JSON.stringify(m.nm.slice(0, 40)) : '') + ' at ' + __xp(m.el);
+    }).join(', ') + (same.length > 8 ? ', ...' : '');
+  } else {
+    var seen = Object.keys(tally).sort(function(a, b){ return tally[b] - tally[a]; }).slice(0, 8);
+    msg += '; none with that role' + (seen.length ? ' (roles on the page: ' + seen.join(', ') + ')' : '');
+  }
+  if(skipped.length) msg += '; ' + skipped.length + ' cross-origin frame(s) not searched: ' + skipped.slice(0, 3).map(function(s){ return JSON.stringify(s); }).join(', ');
+  return msg;
 }
 // Why nothing was found, for the error: what was tried and, for a text-like
 // query, up to three elements whose text holds one of its words.
 function __miss(by, q, within){
+  if(by === 'role') return __miss_role(q, within);
   var what = by === 'css' ? 'matches the CSS selector' : by === 'xpath' ? 'matches the XPath' : by === 'text' ? 'has the visible text' : 'matches';
   var msg = 'no element ' + what + ' ' + JSON.stringify(q);
   if(by === 'auto') msg += ' (as a CSS selector or as visible text)';
@@ -2746,6 +2994,13 @@ function __miss(by, q, within){
       }).join(', ');
     } catch(e){}
   }
+  // A frame of another origin cannot be searched; say so rather than let the
+  // miss read as "not on the page".
+  try {
+    var skipped = [];
+    __deep(document, skipped);
+    if(skipped.length) msg += '; ' + skipped.length + ' cross-origin frame(s) not searched: ' + skipped.slice(0, 3).map(function(s){ return JSON.stringify(s); }).join(', ');
+  } catch(e){}
   return msg;
 }
 "#
@@ -3100,7 +3355,7 @@ const JS_TYPE_HELPERS: &str = r#"function __readback(el, secret){
     return hide ? {value_length: v.length} : {value_after: v};
   }
   function __canInsert(el){
-    if(el.ownerDocument !== document || el.disabled || el.readOnly) return false;
+    if(el.disabled || el.readOnly) return false;
     var tag = (el.tagName || '').toLowerCase();
     if(tag === 'textarea') return true;
     if(tag === 'input') return ['', 'text', 'search', 'url', 'tel', 'email', 'password', 'number'].indexOf(String(el.getAttribute('type') || '').toLowerCase()) >= 0;
@@ -3108,8 +3363,8 @@ const JS_TYPE_HELPERS: &str = r#"function __readback(el, secret){
   }
   function __selectContents(el){
     if('value' in el){ try { el.select(); return; } catch(e) {} }
-    var r = document.createRange(); r.selectNodeContents(el);
-    var sel = window.getSelection(); sel.removeAllRanges(); sel.addRange(r);
+    var d = el.ownerDocument, r = d.createRange(); r.selectNodeContents(el);
+    var sel = d.defaultView.getSelection(); sel.removeAllRanges(); sel.addRange(r);
   }"#;
 
 /// Lets the act scripts tell the recorder "the next `type` event on `el` is
@@ -4003,7 +4258,9 @@ impl BrowserBackend for CdpBackend {
     if(!cursors.has(e)) cursors.set(e, getComputedStyle(e).cursor);
     return cursors.get(e);
   }}
-  var all = [];
+  var all = [], skippedFrames = [];
+  // Open shadow roots and same-origin frames are walked in place; a frame
+  // whose document cannot be read (another origin) is reported, not listed.
   function collect(root){{
     if(!root) return;
     var nodes = root.querySelectorAll ? root.querySelectorAll('*') : [];
@@ -4011,6 +4268,11 @@ impl BrowserBackend for CdpBackend {
       all.push(nodes[k]);
       if(nodes[k].shadowRoot){{
         collect(nodes[k].shadowRoot);
+      }}
+      if(/^i?frame$/i.test(nodes[k].tagName)){{
+        var fdoc = __frame_doc(nodes[k]);
+        if(fdoc && fdoc.documentElement) collect(fdoc);
+        else if(skippedFrames.length < 20) skippedFrames.push({{ref: __xp(nodes[k]), src: String(nodes[k].getAttribute('src') || '').slice(0, 200)}});
       }}
     }}
   }}
@@ -4022,7 +4284,7 @@ impl BrowserBackend for CdpBackend {
     var isCanvas = (tag === 'CANVAS');
     var interactive = INTERACT[tag] || role || (el.getAttribute && el.getAttribute('tabindex') !== null) || el.isContentEditable || typeof el.onclick === 'function';
     if(!interactive && !isCanvas && NOT_CLICKABLE[tag]) continue;
-    var rect = el.getBoundingClientRect();
+    var rect = __rect(el);
     if(!interactive && !isCanvas){{
       // A pointer cursor is how a page says "click me" when it has handlers
       // but no role (jQuery, addEventListener). `cursor` is inherited, so only
@@ -4103,7 +4365,9 @@ impl BrowserBackend for CdpBackend {
       is_enabled: isEnabled
     }});
   }}
-  return {{url:location.href,title:document.title,mode:{mode:?},nodes:out}};
+  var snap = {{url:location.href,title:document.title,mode:{mode:?},nodes:out}};
+  if(skippedFrames.length) snap.frames_skipped = skippedFrames;
+  return snap;
 }})()"#
         );
         if is_safari {
@@ -4144,7 +4408,7 @@ impl BrowserBackend for CdpBackend {
   }}
   if(!all) els=els.slice(0,1);
   return {{via:via,list:els.slice(0,200).map(function(el){{
-    var rect=el.getBoundingClientRect();
+    var rect=__rect(el);
     return {{ref:__xp(el),tag:el.tagName.toLowerCase(),name:(el.innerText||el.value||'').trim().slice(0,120),
       x:Math.round(rect.x),y:Math.round(rect.y),w:Math.round(rect.width),h:Math.round(rect.height)}};
   }})}};
@@ -4424,7 +4688,7 @@ impl BrowserBackend for CdpBackend {
   try {{ el = {resolve}; }} catch(e) {{ return null; }}
   if(!el || el.__is_canvas_target) return null;
   {el_scroll}
-  var b = el.getBoundingClientRect();
+  var b = __rect(el);
   if(!(b.width > 0 || b.height > 0)) return null;
   return {{x: b.left + b.width / 2, y: b.top + b.height / 2}};
 }})()"#
@@ -4479,7 +4743,7 @@ impl BrowserBackend for CdpBackend {
                     r#"
   try {{
     if(typeof window !== 'undefined' && window.__agentctl_showcase && typeof window.__agentctl_showcase.act === 'function') {{
-      var b = el.getBoundingClientRect();
+      var b = __rect(el);
       var cx = Math.round(b.left + b.width / 2);
       var cy = Math.round(b.top + b.height / 2);
       await window.__agentctl_showcase.act(cx, cy, action, value, {glide_ms}, {ripple_ms}, {beat_ms}, {typing_hud}, el, {secret});
@@ -4571,17 +4835,21 @@ impl BrowserBackend for CdpBackend {
       }}
       if(!realInput) why = 'the Safari engine cannot send real pointer input';
       else if(ctag === 'input' && String(el.type).toLowerCase() === 'file') why = 'a real click on a file input opens the OS file chooser';
-      else if(el.ownerDocument !== document) why = 'the element is inside a child frame';
       else {{
-        var cb = el.getBoundingClientRect();
+        // In a frame the box is in the top page's viewport (a pointer lands
+        // there), while hit tests run in the frame's own coordinates.
+        var cfo = __frame_off(el) || {{x: 0, y: 0}};
+        var cb = __rect(el);
         var cx = cb.left + cb.width / 2, cy = cb.top + cb.height / 2;
         var cvw = document.documentElement.clientWidth, cvh = document.documentElement.clientHeight;
         if(!(cb.width > 0 && cb.height > 0)) why = 'the element has no size';
         else if(!(cx >= 0 && cy >= 0 && cx < cvw && cy < cvh)) why = 'the element centre is outside the viewport';
         else {{
           var croot = el.getRootNode ? el.getRootNode() : document;
-          var ctop = (croot.elementFromPoint ? croot : document).elementFromPoint(cx, cy);
-          if(!ctop) why = 'nothing is rendered at the element centre';
+          var ctop = (croot.elementFromPoint ? croot : document).elementFromPoint(cx - cfo.x, cy - cfo.y);
+          var cframe = el.ownerDocument !== document ? document.elementFromPoint(cx, cy) : null;
+          if(cframe && cframe !== __top_frame(el)) why = 'the frame is covered by <' + String(cframe.tagName || '?').toLowerCase() + '>';
+          else if(!ctop) why = 'nothing is rendered at the element centre';
           else if(ctop === el || el.contains(ctop)) cpt = {{x: cx, y: cy}};
           else {{
             why = 'covered by <' + String(ctop.tagName || '?').toLowerCase() + '>';
@@ -4590,7 +4858,7 @@ impl BrowserBackend for CdpBackend {
             if(el instanceof SVGElement){{
               for(var gy = 1; gy < 6 && !cpt; gy++) for(var gx = 1; gx < 6 && !cpt; gx++){{
                 var px = cb.left + cb.width * gx / 6, py = cb.top + cb.height * gy / 6;
-                var ph = (croot.elementFromPoint ? croot : document).elementFromPoint(px, py);
+                var ph = (croot.elementFromPoint ? croot : document).elementFromPoint(px - cfo.x, py - cfo.y);
                 if(ph && (ph === el || el.contains(ph))) cpt = {{x: px, y: py}};
               }}
             }}

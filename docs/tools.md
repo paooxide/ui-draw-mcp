@@ -765,9 +765,9 @@ Act on a DOM node: click, double_click, triple_click, right_click, hover, drag, 
 
 Pointer actions are real input (Chrome only): double_click, triple_click (selects a line), right_click (contextmenu) and hover, and click too, accept `x` and `y`: with a target they are offsets from its top-left corner (for a canvas, its pixel coordinates), without one viewport CSS px; the result's click_at is where it landed, and a point outside the viewport is an error. `scroll` turns the mouse wheel over the target (or the page) by dx and dy, by default one viewport down; `value` may be up, down, left, right, top or bottom. `drag` presses on the target (or at x and y), moves in steps and releases at the destination: the to_ref or to_query element (its centre, or to_x and to_y inside it), else to_x and to_y as viewport points, else dx and dy from the start; the destination must be on screen. Mouse-event drags (sliders, sortable lists, selecting text) and HTML5 draggable elements both work; the result says html5_drag. Spellings such as key, dblclick, triple-click, drag_and_drop are accepted.
 
-On Chrome a click is real pointer input (mousedown, mouseup, click, as a person's) and type is a real insertion that replaces the field's content, so React-style controlled fields and menus that open on mousedown work; the result reports input 'cdp', or 'synthetic' with input_reason when the element is covered, off screen, in a frame, a select/option or a file input. type reports value_after (value_length for a password or secret field). A native <select> is set with select (on the list or one of its options) or a click on an <option>; both report selected and changed, and an option that is missing, disabled or undone by the page is an error. A page-published canvas region (a canvas-child ref from browser_snapshot) supports only click and hover, sent as real mouse input at the region centre; other actions on it return Unsupported.
+On Chrome a click is real pointer input (mousedown, mouseup, click, as a person's) and type is a real insertion that replaces the field's content, so React-style controlled fields and menus that open on mousedown work; the result reports input 'cdp', or 'synthetic' with input_reason when the element is covered, off screen, a select/option or a file input. type reports value_after (value_length for a password or secret field). A native <select> is set with select (on the list or one of its options) or a click on an <option>; both report selected and changed, and an option that is missing, disabled or undone by the page is an error. A page-published canvas region (a canvas-child ref from browser_snapshot) supports only click and hover, sent as real mouse input at the region centre; other actions on it return Unsupported.
 
-Query targeting: 'by' is css, xpath or text (used when no 'ref'); with none, the query is tried as CSS and, if it does not parse or matches nothing, as visible text (the result says matched_by), so a plain word such as "Submit" works. The spellings browser_query lists (/ or ( for XPath, text=..., :has-text(..) and so on) are read as what they mean here too, and in 'within', browser_upload and browser_fill_form. Text is case-insensitive, exact matches first, clickable elements preferred. When nothing matches the error says what was tried and lists up to three elements whose text holds a word of the query. The check is made once: act does not wait for an element to appear (use browser_wait). 'within' is an optional CSS/XPath root selector scoping the search, 'text' an optional substring filter to narrow matches, 'index' an optional 0-based match index when the query matches several elements (default 0).
+Query targeting: 'by' is css, xpath, text or role (used when no 'ref'; role takes the role as the query and the accessible name as 'name', see browser_query); with none, the query is tried as CSS and, if it does not parse or matches nothing, as visible text (the result says matched_by), so a plain word such as "Submit" works. The spellings browser_query lists (/ or ( for XPath, text=..., :has-text(..) and so on) are read as what they mean here too, and in 'within', browser_upload and browser_fill_form. Text is case-insensitive, exact matches first, clickable elements preferred. When nothing matches the error says what was tried and lists up to three elements whose text holds a word of the query. The check is made once: act does not wait for an element to appear (use browser_wait). 'within' is an optional CSS/XPath root selector scoping the search, 'text' an optional substring filter to narrow matches, 'index' an optional 0-based match index when the query matches several elements (default 0).
 
 `secret`: the value is a secret, so it stays out of the audit log and is never shown in the showcase typing HUD (password and one-time-code fields are masked automatically).
 
@@ -778,11 +778,12 @@ Query targeting: 'by' is css, xpath or text (used when no 'ref'); with none, the
 | Argument | Type | Required | Description |
 |---|---|---|---|
 | `action` | one of: click, double_click, triple_click, right_click, hover, drag, scroll, type, select, focus, scroll_into_view, submit, press | yes |  |
-| `by` | one of: css, xpath, text |  | how to read 'query' (default: CSS, else visible text) |
+| `by` | one of: css, xpath, text, role |  | how to read 'query' (default: CSS, else visible text) |
 | `dx` | number |  | drag: x distance from the start; scroll: horizontal distance in CSS px |
 | `dy` | number |  | drag: y distance from the start; scroll: vertical distance in CSS px (default one viewport down) |
 | `index` | integer |  | 0-based match index (default 0) |
-| `query` | string |  | selector to resolve and act on in one call, instead of 'ref'; type and press with neither act on the focused element, scroll on the page |
+| `name` | string |  | with by: role, the accessible name (case-insensitive substring) |
+| `query` | string |  | selector to resolve and act on in one call, instead of 'ref'; type and press with neither act on the focused element, scroll on the page; with by: role, the ARIA role |
 | `ref` | string |  | a ref from browser_query/snapshot |
 | `scroll` | one of: none, nearest, center |  | bring the element into view first (default nearest) |
 | `secret` | boolean |  | value is a secret: kept out of the audit log and the showcase HUD |
@@ -1068,11 +1069,14 @@ Resolve node refs by css selector, xpath or text (case-insensitive; exact matche
 
 Resolve node refs. With no 'by' the query is tried as CSS and, if it does not parse or matches nothing, as visible text; the result then says matched_by (css or text). Common spellings are read as what they mean: a query starting with / or ( is an XPath; xpath=..., css=..., text=..., text:..., text("..") and text ".." name their kind; a trailing :has-text("X"), :contains("X"), :text("X") or :text-is("X") becomes a text filter on the CSS before it (or a text search when nothing precedes it); and a truncated snapshot ref such as div[1]/div[2] is the XPath /html/body/div[1]/div[2]. An explicit 'by' of text or xpath is taken as given.
 
+by: role finds elements by ARIA role, explicit or implied (button, link with href, textbox, checkbox, radio, combobox, heading, img, list, listitem, tab, menuitem, option, dialog and so on), with 'name' the accessible name (aria-labelledby, aria-label, <label>, alt, title, placeholder, then text; a case-insensitive substring, exact matches first). The spellings role=button[name="Save"] (name may be a /regex/i), getByRole('button', { name: 'Save' }) and the snapshot's button "Save" are read as role queries, and [level=2] picks a heading level. A miss lists the elements that do have the role. Queries of every kind look inside open shadow roots and same-origin iframes; refs to such elements resolve again on later calls. Cross-origin frames cannot be read and are skipped (browser_snapshot lists them as frames_skipped).
+
 | Argument | Type | Required | Description |
 |---|---|---|---|
 | `all` | boolean |  |  |
-| `by` | one of: css, xpath, text |  |  |
-| `query` | string | yes |  |
+| `by` | one of: css, xpath, text, role |  |  |
+| `name` | string |  | with by: role, the accessible name (case-insensitive substring) |
+| `query` | string | yes | with by: role, the ARIA role (button, link, textbox, heading, ...) |
 | `target_id` | string |  | tab id (default: active tab) |
 
 ### browser-record
@@ -1184,7 +1188,7 @@ Attach local files to a file input (type=file; a click would open the OS file ch
 
 | Argument | Type | Required | Description |
 |---|---|---|---|
-| `by` | one of: css, xpath, text |  |  |
+| `by` | one of: css, xpath, text, role |  |  |
 | `index` | integer |  |  |
 | `paths` | array&lt;string&gt; | yes | absolute paths of the files to attach (1 to 10) |
 | `query` | string |  | selector, instead of 'ref' |
