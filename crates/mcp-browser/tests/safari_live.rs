@@ -195,7 +195,7 @@ async fn safari_session_act_and_failure_reporting() {
     assert!(matches!(e, BrowserError::NotFound(_)), "{e:?}");
 
     // Element screenshot measures the element.
-    let q = b.query(&t, "css", "#btn", false).await.unwrap();
+    let q = b.query(&t, "css", "#btn", false, None).await.unwrap();
     let r = q["matches"][0]["ref"].as_str().unwrap().to_string();
     let shot = b.screenshot(&t, Some(&r)).await.unwrap();
     assert!(shot.width > 0 && shot.height > 0);

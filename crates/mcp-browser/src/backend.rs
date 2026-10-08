@@ -158,13 +158,15 @@ pub trait BrowserBackend: Send + Sync {
         mode: &str,
         root: Option<&str>,
     ) -> Result<Value, BrowserError>;
-    /// Resolve node ref(s): `css` / `xpath` / `text`.
+    /// Resolve node ref(s): `auto` (CSS, else text) / `css` / `xpath` / `text`,
+    /// optionally narrowed to those whose text holds `text`.
     async fn query(
         &self,
         target: &str,
         by: &str,
         query: &str,
         all: bool,
+        text: Option<&str>,
     ) -> Result<Value, BrowserError>;
     /// Act on a DOM node ref.
     async fn act(
@@ -1742,6 +1744,27 @@ fn locator_js(locator: Locator<'_>) -> String {
     }
 }
 
+/// JS expression for the message when [`locator_js`] finds nothing: what was
+/// tried (a ref names the page changing; a selector lists near misses, see
+/// `__miss`).
+fn not_found_js(locator: Locator<'_>) -> String {
+    let lit = |s: &str| serde_json::to_string(s).unwrap_or_else(|_| "\"\"".into());
+    match locator {
+        Locator::Focused => lit("element not found"),
+        Locator::Ref(r) => lit(&format!(
+            "no element at ref {r}; the page may have changed, so take a fresh browser_snapshot"
+        )),
+        Locator::Selector {
+            by, query, within, ..
+        } => format!(
+            "__miss({},{},{})",
+            lit(by),
+            lit(query),
+            serde_json::to_string(&within).unwrap_or_else(|_| "null".into())
+        ),
+    }
+}
+
 /// JS that resolves `__RESOLVE__` and settles on the `<input type=file>` it
 /// stands for, or throws a string saying what was found instead. A `<label>`
 /// goes to its `control`; anything else that is not a file input gets one try
@@ -1753,7 +1776,7 @@ const JS_UPLOAD_INPUT: &str = r#"(function(){
   var n = __COUNT__;
   var el;
   try { el = __RESOLVE__; } catch(e) { throw String(e && e.message ? e.message : e); }
-  if(!el) throw 'element not found';
+  if(!el) throw __MISS__;
   if(el.__is_canvas_target) throw 'a canvas region is not a file input';
   function isFile(x){ return !!x && x.tagName === 'INPUT' && String(x.type).toLowerCase() === 'file'; }
   var found = el;
@@ -2071,17 +2094,72 @@ function __resolve(xp){
 }
 "#;
 
+/// JS for the name of a control that has no text, shared by the snapshot (which
+/// shows it) and [`JS_FIND`] (which matches it), so a name the snapshot gives
+/// is one `by: text` finds. A macro, so `concat!` can splice it into both.
+macro_rules! js_icon_name {
+    () => {
+        r##"
+// The file stem of a `content: url(...)` or `background-image: url(...)`:
+// `/img/send-mail.png` is "send mail". A data: URL has no name in it.
+function __url_stem(el){
+  var cs;
+  try { cs = getComputedStyle(el); } catch(e) { return ''; }
+  var vals = [cs.content, cs.backgroundImage];
+  for(var i = 0; i < vals.length; i++){
+    var m = /url\(\s*(["']?)(.*?)\1\s*\)/.exec(vals[i] || '');
+    if(!m || /^data:/i.test(m[2])) continue;
+    var file = m[2].split(/[?#]/)[0].split('/').pop();
+    try { file = decodeURIComponent(file); } catch(e) {}
+    var stem = file.replace(/\.[A-Za-z0-9]+$/, '').replace(/[-_.\s]+/g, ' ').trim();
+    if(stem) return stem;
+  }
+  return '';
+}
+// What to call an element with no text of its own: its aria-label, title or
+// alt, an image child's alt, the stem of the icon it draws (on itself or on
+// its one child), then the words of its id or class.
+function __icon_name(el){
+  var at = function(a){ return (el.getAttribute && el.getAttribute(a)) || ''; };
+  var v = at('aria-label') || at('title') || at('alt');
+  if(!v && el.querySelector){
+    var im = null;
+    try { im = el.querySelector(':scope > img[alt]'); } catch(e) {}
+    v = im ? im.getAttribute('alt') : '';
+  }
+  if(!v) v = __url_stem(el);
+  if(!v && el.children && el.children.length === 1) v = __url_stem(el.children[0]);
+  if(!v) v = String(el.id || at('class')).replace(/[-_]+/g, ' ');
+  return String(v).replace(/\s+/g, ' ').trim().slice(0, 80);
+}
+"##
+    };
+}
+const JS_ICON_NAME: &str = js_icon_name!();
+
 /// Resolve an element by selector, matching `browser_query`'s `by` values, for
 /// act-by-selector. Supports scoped container root (`within`), substring text filter (`textFilter`),
 /// and ordinal selection (`index`). Searches across open shadow roots.
 ///
 /// `__find_all` returns the whole ranked list; `__find` picks one and leaves the
-/// size of the list in `__find.count`, which `browser_act` reports as `matches`.
+/// size of the list in `__find.count`, which `browser_act` reports as `matches`,
+/// and how it was found in `__find.via` (`css`, `xpath` or `text`).
 /// `by: text` is ranked (see `__text_matches`), so the first match is the one
 /// a person would mean, not the first element in the page that mentions it.
-const JS_FIND: &str = r#"
+/// `by: auto` (no `by` given) is CSS, else text.
+const JS_FIND: &str = concat!(
+    js_icon_name!(),
+    r#"
 function __norm(s){ return String(s == null ? '' : s).replace(/\s+/g, ' ').trim().toLowerCase(); }
-// The strings an element answers to: its text, a button input's value, its aria-label.
+// Whether a person would click it, for naming it by its icon: a control, or
+// anything that shows a pointer.
+function __clickable(el){
+  if(!el.matches) return false;
+  try { if(el.matches(__ACTIONABLE + ', [tabindex]')) return true; } catch(e) {}
+  return getComputedStyle(el).cursor === 'pointer';
+}
+// The strings an element answers to: its text, a button input's value, its
+// aria-label, title and alt, and (for a clickable with no text) its icon's name.
 function __texts(el, q){
   // textContent is cheap and holds everything innerText shows, so only an
   // element whose textContent could match pays for innerText (which lays out).
@@ -2096,8 +2174,14 @@ function __texts(el, q){
     var ty = String(el.type).toLowerCase();
     if(ty === 'button' || ty === 'submit' || ty === 'reset') out.push(__norm(el.value));
   }
-  var al = el.getAttribute && el.getAttribute('aria-label');
-  if(al) out.push(__norm(al));
+  if(el.getAttribute){
+    var extra = [el.getAttribute('aria-label'), el.getAttribute('title'), el.getAttribute('alt')];
+    for(var x = 0; x < extra.length; x++) if(extra[x]) out.push(__norm(extra[x]));
+  }
+  if(tc === '' && __clickable(el)){
+    var ic = __icon_name(el);
+    if(ic) out.push(__norm(ic));
+  }
   return out;
 }
 // Rendered with a box: a hidden copy of a control (a closed menu, a template)
@@ -2184,6 +2268,7 @@ function __focused(){
 function __find(by, q, within, textFilter, index){
   var matches = __find_all(by, q, within, textFilter);
   __find.count = matches.length;
+  __find.via = __find_all.via;
   var idx = (typeof index === 'number' && index >= 0) ? index : 0;
   return matches[idx] || null;
 }
@@ -2208,22 +2293,18 @@ function __find_all(by, q, within, textFilter){
     if(!w.querySelectorAll) throw new Error("'within' root is not an element: " + within);
     root = w;
   }
-  var matches = [];
+  var matches = [], via = by;
   if(by==='css') {
-    var els = root.querySelectorAll ? root.querySelectorAll(q) : [];
-    for(var i=0; i<els.length; i++) matches.push(els[i]);
-    if(matches.length === 0) {
-      (function walk(r){
-        if(!r) return;
-        var children = r.querySelectorAll ? r.querySelectorAll('*') : [];
-        for(var i=0; i<children.length; i++){
-          try {
-            if(children[i].matches && children[i].matches(q)) matches.push(children[i]);
-          } catch(e){}
-          if(children[i].shadowRoot) walk(children[i].shadowRoot);
-        }
-      })(root);
-    }
+    matches = __css_all(root, q);
+  } else if(by==='auto') {
+    // No `by` was given. A query is CSS when it parses and matches; one that
+    // does not parse ("Section #1") or matches nothing ("Gilli" is the tag
+    // <gilli>) is the text it reads as. This is one look at the page, as a
+    // CSS-only find is: act does not poll for an element to appear, so a valid
+    // selector for something still to come is a miss now, as before, and `wait`
+    // is what waits for it.
+    try { matches = __css_all(root, q); via = 'css'; } catch(e){}
+    if(matches.length === 0) { matches = __text_matches(root, q); via = 'text'; }
   } else if(by==='xpath'){
     var xq = q;
     if(root !== document) {
@@ -2251,9 +2332,54 @@ function __find_all(by, q, within, textFilter){
       return t.indexOf(tf) >= 0;
     });
   }
+  __find_all.via = via;
   return matches;
 }
-"#;
+// CSS matches under `root`, through open shadow roots when the light DOM has
+// none. Throws what `querySelectorAll` throws for a selector that does not parse.
+function __css_all(root, q){
+  var matches = [];
+  var els = root.querySelectorAll ? root.querySelectorAll(q) : [];
+  for(var i=0; i<els.length; i++) matches.push(els[i]);
+  if(matches.length === 0) {
+    (function walk(r){
+      if(!r) return;
+      var children = r.querySelectorAll ? r.querySelectorAll('*') : [];
+      for(var i=0; i<children.length; i++){
+        try {
+          if(children[i].matches && children[i].matches(q)) matches.push(children[i]);
+        } catch(e){}
+        if(children[i].shadowRoot) walk(children[i].shadowRoot);
+      }
+    })(root);
+  }
+  return matches;
+}
+// Why nothing was found, for the error: what was tried and, for a text-like
+// query, up to three elements whose text holds one of its words.
+function __miss(by, q, within){
+  var what = by === 'css' ? 'matches the CSS selector' : by === 'xpath' ? 'matches the XPath' : by === 'text' ? 'has the visible text' : 'matches';
+  var msg = 'no element ' + what + ' ' + JSON.stringify(q);
+  if(by === 'auto') msg += ' (as a CSS selector or as visible text)';
+  if(within) msg += ' inside ' + JSON.stringify(within);
+  if(by === 'auto' || by === 'text'){
+    try {
+      var words = String(q).split(/[^\p{L}\p{N}]+/u).filter(function(w){ return w.length >= 3; }).slice(0, 3);
+      var seen = [];
+      for(var i = 0; i < words.length && seen.length < 3; i++){
+        var ms = __text_matches(document, words[i]);
+        for(var j = 0; j < ms.length && seen.length < 3; j++) if(seen.indexOf(ms[j]) < 0) seen.push(ms[j]);
+      }
+      if(seen.length) msg += '; similar: ' + seen.map(function(el){
+        var t = __target(el);
+        return t.tag + (t.text ? ' ' + JSON.stringify(t.text.slice(0, 40)) : '') + ' at ' + __xp(el);
+      }).join(', ');
+    } catch(e){}
+  }
+  return msg;
+}
+"#
+);
 
 /// Idempotent htmx listeners, as a JS function `__hx_hook()` returning the
 /// shared state (or `null` while `window.htmx` is absent).
@@ -2645,21 +2771,28 @@ const JS_FILL_FORM: &str = r##"(async function(){
   var fields = __FIELDS__;
   var submit = __SUBMIT__;
   var filled = 0, errors = [];
-  // `by` is css (the default), xpath or text, found as browser_act finds them;
-  // with no `by`, a selector that starts like an XPath is one. A label found by
-  // its text stands for the control it labels.
+  // `by` is auto (the default: CSS, else text), css, xpath or text, found as
+  // browser_act finds them; with no `by`, a selector that starts like an XPath
+  // is one. A label found by its text stands for the control it labels.
+  function byOf(f){
+    var c = String(f.selector).charAt(0);
+    return f.by || ((c === '/' || c === '(') ? 'xpath' : 'auto');
+  }
   function resolve(f){
     if(!f) return null;
     if(f.ref) return __resolve(f.ref);
     if(f.selector){
-      var s = String(f.selector), c = s.charAt(0);
-      var by = f.by || ((c === '/' || c === '(') ? 'xpath' : 'css');
-      if(by === 'css') return document.querySelector(s);
-      var found = __find_all(by, s, null, null)[0] || null;
-      if(found && by === 'text' && found.tagName === 'LABEL' && found.control) found = found.control;
+      var s = String(f.selector), by = byOf(f);
+      if(by === 'css' && !f.text) return document.querySelector(s);
+      var found = __find_all(by, s, null, f.text || null)[0] || null;
+      if(found && __find_all.via === 'text' && found.tagName === 'LABEL' && found.control) found = found.control;
       return found;
     }
     return null;
+  }
+  function missing(f){
+    if(f.selector) return __miss(byOf(f), String(f.selector), null);
+    return 'no element at ref ' + f.ref + '; the page may have changed, so take a fresh browser_snapshot';
   }
   try {
   for(var i=0; i<fields.length; i++){
@@ -2670,7 +2803,7 @@ const JS_FILL_FORM: &str = r##"(async function(){
       continue;
     }
     if(!el){
-      errors.push({field: f.selector || f.ref || ('index_' + i), error: 'element not found'});
+      errors.push({field: f.selector || f.ref || ('index_' + i), error: missing(f)});
       continue;
     }
     try {
@@ -2732,7 +2865,7 @@ const JS_FILL_FORM: &str = r##"(async function(){
       else if(subEl.form && subEl.form.submit) subEl.form.submit();
       submitted = true;
     } else if(submit.selector || submit.ref){
-      errors.push({field: 'submit', error: 'submit element not found'});
+      errors.push({field: 'submit', error: 'submit: ' + missing(submit)});
     }
   }
   } finally { __disarm(); }
@@ -3368,8 +3501,11 @@ impl BrowserBackend for CdpBackend {
         let expr = format!(
             r#"(function(){{
   {JS_XPATH}
+  {JS_ICON_NAME}
   var rootSel={root_arg};
-  var base=(rootSel && document.querySelector(rootSel)) || document.body;
+  // A ref (XPath, as a snapshot lists them) or a CSS selector.
+  var rootXp = rootSel && (rootSel.charAt(0) === '/' || rootSel.charAt(0) === '(');
+  var base=(rootSel && (rootXp ? __resolve(rootSel) : document.querySelector(rootSel))) || document.body;
   if(!base) return {{url:location.href,title:document.title,nodes:[]}};
 
   // Page-controlled values (`data-intent`, `data-state`, React props, canvas
@@ -3491,6 +3627,12 @@ impl BrowserBackend for CdpBackend {
   }}
 
   var INTERACT={{A:1,BUTTON:1,INPUT:1,SELECT:1,TEXTAREA:1,SUMMARY:1,LABEL:1,OPTION:1,CANVAS:1}};
+  var NOT_CLICKABLE={{HTML:1,BODY:1,HEAD:1,SCRIPT:1,STYLE:1,NOSCRIPT:1,TEMPLATE:1,META:1,LINK:1,TITLE:1}};
+  var cursors = new Map();
+  function cursorOf(e){{
+    if(!cursors.has(e)) cursors.set(e, getComputedStyle(e).cursor);
+    return cursors.get(e);
+  }}
   var all = [];
   function collect(root){{
     if(!root) return;
@@ -3509,8 +3651,18 @@ impl BrowserBackend for CdpBackend {
     var el = all[i], tag = el.tagName, role = el.getAttribute ? el.getAttribute('role') : null;
     var isCanvas = (tag === 'CANVAS');
     var interactive = INTERACT[tag] || role || (el.getAttribute && el.getAttribute('tabindex') !== null) || el.isContentEditable || typeof el.onclick === 'function';
-    if(!interactive && !isCanvas) continue;
+    if(!interactive && !isCanvas && NOT_CLICKABLE[tag]) continue;
     var rect = el.getBoundingClientRect();
+    if(!interactive && !isCanvas){{
+      // A pointer cursor is how a page says "click me" when it has handlers
+      // but no role (jQuery, addEventListener). `cursor` is inherited, so only
+      // the outermost such element is listed, not each span inside it. Styles
+      // are read only for elements that did not qualify already, and only once
+      // they are known to have a size.
+      if(rect.width === 0 && rect.height === 0) continue;
+      var parent = el.parentElement;
+      if(cursorOf(el) !== 'pointer' || (parent && cursorOf(parent) === 'pointer')) continue;
+    }}
     if(rect.width === 0 && rect.height === 0) continue;
 
     // Canvases that publish their interactive regions get child nodes; any
@@ -3545,6 +3697,8 @@ impl BrowserBackend for CdpBackend {
     }}
 
     var name = (el.getAttribute ? (el.getAttribute('aria-label') || el.getAttribute('placeholder') || el.value || el.innerText || el.getAttribute('title') || '') : '').trim().slice(0, 120);
+    // No text of its own: the icon it draws, else its id or class (see `__icon_name`).
+    if(!name) name = __icon_name(el);
     var isEnabled = el.disabled !== true && (!el.getAttribute || el.getAttribute('aria-disabled') !== 'true');
     // A native <select> is named by its label, not by the value it holds, and
     // carries its option texts (the first 25) and the selected one, so the
@@ -3600,27 +3754,30 @@ impl BrowserBackend for CdpBackend {
         by: &str,
         query: &str,
         all: bool,
+        text: Option<&str>,
     ) -> Result<Value, BrowserError> {
         let q = serde_json::to_string(query).unwrap_or_else(|_| "\"\"".into());
         let by_lit = serde_json::to_string(by).unwrap_or_else(|_| "\"css\"".into());
+        let text_lit = serde_json::to_string(&text).unwrap_or_else(|_| "null".into());
         let expr = format!(
             r#"(function(){{
   {JS_XPATH}
   {JS_FIND}
-  var by={by_lit}, q={q}, all={all}, els=[];
-  if(by==='css'){{ els=Array.from(document.querySelectorAll(q)); }}
-  else if(by==='xpath'){{
+  var by={by_lit}, q={q}, all={all}, tf={text_lit}, els=[], via=by;
+  if(by==='xpath'){{
     var r=document.evaluate(q,document,null,XPathResult.ORDERED_NODE_SNAPSHOT_TYPE,null);
     for(var i=0;i<r.snapshotLength;i++) els.push(r.snapshotItem(i));
-  }} else {{ // text, ranked as browser_act's is
-    els=__text_matches(document,q);
+    if(tf) els=els.filter(function(el){{ return (el.innerText||el.textContent||el.value||'').toLowerCase().indexOf(tf.toLowerCase())>=0; }});
+  }} else {{ // css, text (ranked as browser_act's is) or auto
+    els=__find_all(by,q,null,tf);
+    via=__find_all.via;
   }}
   if(!all) els=els.slice(0,1);
-  return els.slice(0,200).map(function(el){{
+  return {{via:via,list:els.slice(0,200).map(function(el){{
     var rect=el.getBoundingClientRect();
     return {{ref:__xp(el),tag:el.tagName.toLowerCase(),name:(el.innerText||el.value||'').trim().slice(0,120),
       x:Math.round(rect.x),y:Math.round(rect.y),w:Math.round(rect.width),h:Math.round(rect.height)}};
-  }});
+  }})}};
 }})()"#
         );
         let v = if target.starts_with("safari-") {
@@ -3633,8 +3790,14 @@ impl BrowserBackend for CdpBackend {
             let mut c = self.conn(target).await?;
             Self::eval_value(&mut c, &expr).await?
         };
-        let count = v.as_array().map(|a| a.len()).unwrap_or(0);
-        Ok(json!({ "matches": v, "count": count }))
+        let list = v.get("list").cloned().unwrap_or_else(|| json!([]));
+        let count = list.as_array().map(|a| a.len()).unwrap_or(0);
+        let mut out = json!({ "matches": list, "count": count });
+        // Said only when the caller left `by` to be worked out.
+        if let (true, Some(via)) = (by == "auto", v.get("via")) {
+            out["matched_by"] = via.clone();
+        }
+        Ok(out)
     }
 
     async fn upload(
@@ -3654,6 +3817,7 @@ impl BrowserBackend for CdpBackend {
             .replace("{JS_XPATH}", JS_XPATH)
             .replace("{JS_FIND}", JS_FIND)
             .replace("__COUNT__", &files.len().to_string())
+            .replace("__MISS__", &not_found_js(locator))
             .replace("__RESOLVE__", &locator_js(locator));
         // The element is kept as a remote object, not copied by value: that
         // handle is what `DOM.setFileInputFiles` takes. The page's own world
@@ -3787,6 +3951,8 @@ impl BrowserBackend for CdpBackend {
         // Resolve to an element in the same eval: a `ref` via XPath, or a
         // selector via `__find`, so a scripted action is one round trip.
         let resolve = locator_js(locator);
+        let not_found = not_found_js(locator);
+        let auto = matches!(locator, Locator::Selector { by: "auto", .. });
         let is_selector = matches!(locator, Locator::Selector { .. });
         let act = serde_json::to_string(action).unwrap_or_else(|_| "\"click\"".into());
         let val = serde_json::to_string(&value).unwrap_or_else(|_| "null".into());
@@ -3966,7 +4132,7 @@ impl BrowserBackend for CdpBackend {
   var el, action={act}, value={val}, realMove={real_move}, realInput={real_input};
   var inputKind = null, inputReason = null, clickAt = null, insertText = false, readback = null, selected, changed, options;
   try {{ el = {resolve}; }} catch(e) {{ return {{ok:false,error:String(e && e.message ? e.message : e)}}; }}
-  if(!el) return {{ok:false,error:'element not found'}};
+  if(!el) return {{ok:false,error:{not_found}}};
   if(el.__is_canvas_target){{
     var c = el.canvas;
     if(action !== 'click' && action !== 'hover' && action !== 'scroll_into_view'){{
@@ -4104,10 +4270,11 @@ impl BrowserBackend for CdpBackend {
     default: return {{ok:false,error:'unknown action '+action}};
   }}
   }} finally {{ __disarm(); }}
-  return {{ok:true,action:action,showcase:{}{showcase_rendered},input:inputKind,input_reason:inputReason,click_at:clickAt,type_insert:insertText,readback:readback,selected:selected,changed:changed,options:options,target:tgt,matches:found}};
+  return {{ok:true,action:action,showcase:{}{showcase_rendered},input:inputKind,input_reason:inputReason,click_at:clickAt,type_insert:insertText,readback:readback,selected:selected,changed:changed,options:options,target:tgt,matches:found,matched_by:{via}}};
 }})()"#,
             showcase_cfg.enabled,
             found = if is_selector { "__find.count" } else { "null" },
+            via = if auto { "__find.via" } else { "null" },
             showcase_rendered = if showcase_cfg.enabled {
                 format!(
                     ",showcase_rendered:{}",
@@ -4217,7 +4384,7 @@ impl BrowserBackend for CdpBackend {
             if map.get("input").is_some_and(Value::is_null) {
                 map.remove("input");
             }
-            for key in ["matches", "selected", "changed", "options"] {
+            for key in ["matches", "matched_by", "selected", "changed", "options"] {
                 if map.get(key).is_some_and(Value::is_null) {
                     map.remove(key);
                 }

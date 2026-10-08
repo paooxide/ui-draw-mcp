@@ -347,6 +347,7 @@ mod tests {
             _b: &str,
             _q: &str,
             _a: bool,
+            _text: Option<&str>,
         ) -> Result<Value, BrowserError> {
             Ok(json!({ "found": true }))
         }
