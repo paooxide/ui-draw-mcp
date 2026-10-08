@@ -21,7 +21,8 @@ pub use diff::{diff_snapshots, DeltaEntry, SnapshotDelta};
 pub use extract::extract_data;
 pub use flatten::{flatten, FlattenConfig, Flattened};
 pub use query::{
-    no_match_hint, parse_query, query_schema, query_snapshot, ElementHit, ElementQuery,
+    no_match_hint, ocr_fallback_hint, parse_query, query_schema, query_snapshot, ElementHit,
+    ElementQuery,
 };
 pub use tools::A11yModule;
 pub use tree::{is_interactive_role, normalize_role, Bounds, UiNode};

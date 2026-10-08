@@ -12,6 +12,8 @@ use crate::backend::{
     CaptureOpts, CaptureResult, Detail, OcrLine, OcrOpts, OcrTarget, VisionBackend, VisionError,
 };
 use crate::config::VisionConfig;
+use crate::find::{find_matches, Found};
+use crate::grid::{draw_grid_b64, step_from_args, GridSpec};
 
 /// The `vision` capture engine: `list_displays`, `capture_screen`,
 /// `capture_window`. Images are returned as MCP image content blocks.
@@ -181,18 +183,20 @@ impl VisionModule {
             Err(e) => return e,
         };
         let force = args.get("force").and_then(Value::as_bool).unwrap_or(false);
-        let source = match region {
+        let grid = step_from_args(args);
+        let mut source = match region {
             Some((x, y, w, h)) => format!("region:{x},{y},{w},{h}"),
             None => format!("screen:{}", display.map(|d| d as i64).unwrap_or(-1)),
         };
+        source.push_str(&grid_suffix(grid));
         match self.backend.capture_screen(display, region, opts).await {
-            Ok(cap) => self.image_envelope(
-                "capture_screen",
-                cap,
-                json!({ "display": display }),
-                &source,
-                force,
-            ),
+            Ok(mut cap) => {
+                let mut data = json!({ "display": display });
+                if let Err(e) = apply_grid("capture_screen", grid, &mut cap, &mut data) {
+                    return e;
+                }
+                self.image_envelope("capture_screen", cap, data, &source, force)
+            }
             Err(e) => vision_err("capture_screen", e),
         }
     }
@@ -210,17 +214,68 @@ impl VisionModule {
             Err(e) => return e,
         };
         let force = args.get("force").and_then(Value::as_bool).unwrap_or(false);
+        let grid = step_from_args(args);
+        let source = format!("window:{window_id}{}", grid_suffix(grid));
         match self.backend.capture_window(window_id as u32, opts).await {
-            Ok(cap) => self.image_envelope(
-                "capture_window",
-                cap,
-                json!({ "window_id": window_id }),
-                &format!("window:{window_id}"),
-                force,
-            ),
+            Ok(mut cap) => {
+                let mut data = json!({ "window_id": window_id });
+                if let Err(e) = apply_grid("capture_window", grid, &mut cap, &mut data) {
+                    return e;
+                }
+                self.image_envelope("capture_window", cap, data, &source, force)
+            }
             Err(e) => vision_err("capture_window", e),
         }
     }
+}
+
+/// Part of the dedup key: a frame with a grid is not the frame without one, so
+/// asking for the grid after a plain capture must not answer "unchanged".
+fn grid_suffix(grid: Option<u32>) -> String {
+    grid.map(|s| format!(":grid{s}")).unwrap_or_default()
+}
+
+/// Draw the coordinate grid on a capture when one was asked for, labelled in
+/// the screen points `mouse_action` takes, and say how it was laid out.
+// Envelope is intentionally large (it can carry an image); it is the Err type
+// here only as a control-flow shortcut.
+#[allow(clippy::result_large_err)]
+fn apply_grid(
+    tool: &str,
+    step: Option<u32>,
+    cap: &mut CaptureResult,
+    data: &mut Value,
+) -> Result<(), Envelope> {
+    let Some(step) = step else { return Ok(()) };
+    let (sw, sh) = cap.screen_size;
+    if cap.width == 0 || cap.height == 0 || sw <= 0.0 || sh <= 0.0 {
+        return Err(Envelope::fail(
+            tool,
+            ErrorCode::ActionFailed,
+            "cannot draw a grid: the capture has no size",
+        ));
+    }
+    // Image pixels per screen point: a Retina capture is 2 before any
+    // downscale, 1 or less after it. Labels stay in points either way.
+    let ppu = (cap.width as f64 / sw, cap.height as f64 / sh);
+    let spec = GridSpec {
+        step,
+        px_per_unit: ppu,
+        origin: cap.origin,
+    };
+    cap.base64 = draw_grid_b64(&cap.base64, &spec)
+        .map_err(|e| Envelope::fail(tool, ErrorCode::ActionFailed, format!("grid: {e}")))?;
+    data["grid"] = json!(true);
+    data["grid_step"] = json!(step);
+    data["scale"] = json!(ppu.0);
+    data["origin"] = json!({ "x": cap.origin.0, "y": cap.origin.1 });
+    data["coordinate_space"] = json!("screen");
+    data["grid_note"] = json!(
+        "grid labels are screen points, the space mouse_action takes (origin is the screen point of \
+         the image's top-left corner; scale is image pixels per point): click at a label's x,y or \
+         interpolate between lines"
+    );
+    Ok(())
 }
 
 impl VisionModule {
@@ -301,6 +356,14 @@ impl VisionModule {
         };
         order_lines(&mut res.lines);
         let (sx, sy) = (res.scale_x(), res.scale_y());
+        if let Some(q) = args.get("find").and_then(Value::as_str) {
+            if q.trim().is_empty() {
+                return Envelope::fail(tool, ErrorCode::InvalidArgs, "'find' is empty");
+            }
+            let exact = args.get("exact").and_then(Value::as_bool).unwrap_or(false);
+            let found = find_matches(&res.lines, q, exact);
+            return Envelope::ok(tool, find_result(q, exact, &found, &res, (sx, sy)));
+        }
         let lines: Vec<Value> = res
             .lines
             .iter()
@@ -338,6 +401,62 @@ impl VisionModule {
             }),
         )
     }
+}
+
+/// How many hits a `find` returns; the rest are counted, not listed.
+const MAX_FIND_MATCHES: usize = 10;
+
+/// The answer to an `ocr_region` call with `find`: the hits, best first, each
+/// with the screen point to click, instead of the page of text around them.
+fn find_result(
+    query: &str,
+    exact: bool,
+    found: &[Found],
+    res: &crate::backend::OcrResult,
+    (sx, sy): (f64, f64),
+) -> Value {
+    let matches: Vec<Value> = found
+        .iter()
+        .take(MAX_FIND_MATCHES)
+        .enumerate()
+        .map(|(rank, f)| {
+            let line = &res.lines[f.line];
+            let (x, y, w, h) = px_to_screen(f.px, res.origin, sx, sy);
+            json!({
+                "rank": rank + 1,
+                "text": line.text,
+                "matched": f.kind.as_str(),
+                "confidence": (line.confidence * 1000.0).round() / 1000.0,
+                // Pre-computed for mouse_action, as `center` is on a full read.
+                "x": x + w / 2.0,
+                "y": y + h / 2.0,
+                "bounds": { "x": x, "y": y, "w": w, "h": h },
+            })
+        })
+        .collect();
+    let mut data = json!({
+        "find": query,
+        "exact": exact,
+        "matches": matches,
+        "match_count": found.len(),
+        "line_count": res.lines.len(),
+        "coordinate_space": "screen",
+        "note": "x,y is the centre of the match in screen points: pass it to mouse_action. \
+                 When only part of a line matched, the box is estimated from the character \
+                 positions (the recogniser reports lines, not words).",
+        "region": { "x": res.origin.0, "y": res.origin.1,
+                    "w": res.screen_size.0, "h": res.screen_size.1 },
+        "engine": "apple-vision",
+    });
+    if found.is_empty() {
+        data["hint"] = json!(format!(
+            "no recognised line contains {query:?} among {} lines read. Try a shorter or \
+             differently spelled query, drop 'exact', narrow with 'region' or 'window_id' for a \
+             sharper read, or capture_screen with grid=true and read the position off the picture.",
+            res.lines.len()
+        ));
+    }
+    data
 }
 
 /// Group recognised lines into reading order: rows by vertical overlap, then
@@ -399,7 +518,9 @@ impl ToolModule for VisionModule {
                 Tier::Read,
                 "Capture a display (or a region) as a PNG image. Large captures are downscaled \
                  for token cost; the result carries a coordinate_mapping for converting a \
-                 point on the image into a screen point for mouse_action/scroll.",
+                 point on the image into a screen point for mouse_action/scroll. grid=true \
+                 draws labelled lines in those screen points on the image, so a position is \
+                 read off the picture rather than estimated.",
                 json!({
                     "type": "object",
                     "properties": {
@@ -418,7 +539,9 @@ impl ToolModule for VisionModule {
                             "description": "low ~768px (state checks, cheapest), balanced ~1024px, full ~1568px (default, small text legible). Cost scales with pixel area."
                         },
                         "max_edge": { "type": "integer", "description": "explicit longest-edge override in px" },
-                        "force": { "type": "boolean", "description": "re-send even if pixel-identical to the last capture of this source" }
+                        "force": { "type": "boolean", "description": "re-send even if pixel-identical to the last capture of this source" },
+                        "grid": { "type": "boolean", "description": "draw a labelled coordinate grid on the image, labelled in screen points (what mouse_action takes); the result gives scale (image px per point), grid_step and origin" },
+                        "grid_step": { "type": "integer", "description": "with grid: points between lines (default 100, minimum 25)" }
                     },
                     "required": []
                 }),
@@ -431,7 +554,9 @@ impl ToolModule for VisionModule {
                  The fallback when get_ui_tree comes back sparse: a canvas, a game, a \
                  custom-drawn or Electron UI: where the text is visible but not in the \
                  accessibility tree. Cheaper than a screenshot for reading, and unlike a \
-                 screenshot it hands back coordinates you can click.",
+                 screenshot it hands back coordinates you can click. Pass find to get only \
+                 the lines containing some text, ranked, each with the x,y to click: \
+                 two small calls (ocr_region find, then mouse_action) instead of a screenshot.",
                 json!({
                     "type": "object",
                     "properties": {
@@ -443,8 +568,10 @@ impl ToolModule for VisionModule {
                                 "w": { "type": "number" }, "h": { "type": "number" }
                             }
                         },
-                        "window_id": { "type": "integer", "description": "read one window (id from list_windows)" },
+                        "window_id": { "type": "integer", "description": "read one window (id from list_windows); results are still in screen coordinates" },
                         "display": { "type": "integer", "description": "which display, when no region or window is given" },
+                        "find": { "type": "string", "description": "return only the lines containing this text (case-insensitive, whitespace-collapsed), best match first, each with x,y (the centre, in screen points, for mouse_action) and bounds, instead of all the text" },
+                        "exact": { "type": "boolean", "description": "with find: only a line that is exactly the text, not one that contains it (default false)" },
                         "lang": {
                             "type": "array",
                             "items": { "type": "string" },
@@ -468,14 +595,18 @@ impl ToolModule for VisionModule {
                 Category::Vision,
                 Tier::Read,
                 "Capture a single window as a PNG image: prefer this over capture_screen when \
-                 you only care about one app; fewer pixels means proportionally fewer tokens.",
+                 you only care about one app; fewer pixels means proportionally fewer tokens. \
+                 grid=true labels the image in screen points (the window's own position \
+                 included), what mouse_action takes.",
                 json!({
                     "type": "object",
                     "properties": {
                         "window_id": { "type": "integer" },
                         "detail": { "type": "string", "enum": ["low", "balanced", "full"] },
                         "max_edge": { "type": "integer" },
-                        "force": { "type": "boolean" }
+                        "force": { "type": "boolean" },
+                        "grid": { "type": "boolean", "description": "draw a labelled coordinate grid on the image, labelled in screen points (what mouse_action takes, the window's position included); the result gives scale (image px per point), grid_step and origin" },
+                        "grid_step": { "type": "integer", "description": "with grid: points between lines (default 100, minimum 25)" }
                     },
                     "required": ["window_id"]
                 }),
@@ -769,5 +900,138 @@ mod tests {
             )
             .await;
         assert!(region.data.unwrap().get("unchanged").is_none());
+    }
+}
+
+#[cfg(test)]
+mod grid_find_tests {
+    use super::*;
+    use base64::Engine;
+
+    fn white_png(w: u32, h: u32) -> String {
+        let mut out = Vec::new();
+        let mut enc = png::Encoder::new(&mut out, w, h);
+        enc.set_color(png::ColorType::Rgb);
+        enc.set_depth(png::BitDepth::Eight);
+        let mut wr = enc.write_header().unwrap();
+        wr.write_image_data(&vec![255u8; (w * h * 3) as usize])
+            .unwrap();
+        drop(wr);
+        base64::engine::general_purpose::STANDARD.encode(out)
+    }
+
+    fn cap(w: u32, h: u32, origin: (f64, f64), screen: (f64, f64)) -> CaptureResult {
+        CaptureResult {
+            mime_type: "image/png".into(),
+            base64: white_png(w, h),
+            width: w,
+            height: h,
+            origin,
+            screen_size: screen,
+            original: (w, h),
+            signature: Vec::new(),
+        }
+    }
+
+    fn pixel(b64: &str, x: u32, y: u32) -> [u8; 3] {
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .unwrap();
+        let mut r = png::Decoder::new(std::io::Cursor::new(bytes))
+            .read_info()
+            .unwrap();
+        let mut buf = vec![0; r.output_buffer_size().unwrap()];
+        let info = r.next_frame(&mut buf).unwrap();
+        let n = info.color_type.samples();
+        let i = ((y * info.width + x) as usize) * n;
+        [buf[i], buf[i + 1], buf[i + 2]]
+    }
+
+    /// A Retina window capture: 800 px wide for 400 points, the window at
+    /// screen x=50. The line for screen x=100 is 50 points in, which is pixel
+    /// 100, and the result says how to convert.
+    #[test]
+    fn a_window_grid_is_labelled_in_screen_points_from_the_window_origin() {
+        let mut c = cap(800, 600, (50.0, 0.0), (400.0, 300.0));
+        let mut data = json!({});
+        apply_grid("capture_window", Some(100), &mut c, &mut data).unwrap();
+        assert_eq!(data["scale"], json!(2.0));
+        assert_eq!(data["grid_step"], json!(100));
+        assert_eq!(data["origin"], json!({ "x": 50.0, "y": 0.0 }));
+        assert_eq!(data["coordinate_space"], json!("screen"));
+        // Row 350 is clear of the crossing labels.
+        assert_ne!(pixel(&c.base64, 100, 350), [255, 255, 255], "x=100");
+        assert_eq!(pixel(&c.base64, 200, 350), [255, 255, 255], "x=150");
+        assert_ne!(pixel(&c.base64, 300, 350), [255, 255, 255], "x=200");
+    }
+
+    #[test]
+    fn no_grid_leaves_the_capture_and_the_result_alone() {
+        let mut c = cap(100, 100, (0.0, 0.0), (100.0, 100.0));
+        let before = c.base64.clone();
+        let mut data = json!({});
+        apply_grid("capture_screen", None, &mut c, &mut data).unwrap();
+        assert_eq!(c.base64, before);
+        assert_eq!(data, json!({}));
+    }
+
+    #[test]
+    fn a_grid_frame_is_not_the_same_source_as_the_plain_one() {
+        assert_eq!(grid_suffix(None), "");
+        assert_ne!(grid_suffix(Some(100)), grid_suffix(Some(50)));
+    }
+
+    fn ocr_result() -> crate::backend::OcrResult {
+        // 400x300 points captured at 800x600, the area starting at (250, 100).
+        crate::backend::OcrResult {
+            lines: vec![
+                OcrLine {
+                    text: "Cancel".into(),
+                    confidence: 0.9,
+                    px: (400.0, 500.0, 100.0, 20.0),
+                },
+                OcrLine {
+                    text: "Save".into(),
+                    confidence: 0.95,
+                    px: (100.0, 40.0, 80.0, 20.0),
+                },
+            ],
+            width: 800,
+            height: 600,
+            origin: (250.0, 100.0),
+            screen_size: (400.0, 300.0),
+        }
+    }
+
+    /// The click point must be in screen points: the box centre scaled by the
+    /// Retina factor and offset by the area's origin.
+    #[test]
+    fn find_returns_the_screen_point_to_click() {
+        let res = ocr_result();
+        let found = find_matches(&res.lines, "  SAVE ", false);
+        let v = find_result("  SAVE ", false, &found, &res, (0.5, 0.5));
+        assert_eq!(v["match_count"], json!(1));
+        assert_eq!(v["line_count"], json!(2));
+        let m = &v["matches"][0];
+        assert_eq!(m["text"], json!("Save"));
+        assert_eq!(m["matched"], json!("line"));
+        // Box (100,40,80,20) px is (300,120) size (40,10) in points.
+        assert_eq!(m["x"], json!(320.0));
+        assert_eq!(m["y"], json!(125.0));
+        assert_eq!(
+            m["bounds"],
+            json!({ "x": 300.0, "y": 120.0, "w": 40.0, "h": 10.0 })
+        );
+        assert_eq!(v["coordinate_space"], json!("screen"));
+        assert!(v.get("hint").is_none());
+    }
+
+    #[test]
+    fn a_miss_says_what_to_try_instead() {
+        let res = ocr_result();
+        let found = find_matches(&res.lines, "Delete", false);
+        let v = find_result("Delete", false, &found, &res, (0.5, 0.5));
+        assert_eq!(v["matches"], json!([]));
+        assert!(v["hint"].as_str().unwrap().contains("grid=true"));
     }
 }

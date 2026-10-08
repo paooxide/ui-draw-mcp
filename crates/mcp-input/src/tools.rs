@@ -310,12 +310,17 @@ impl InputModule {
                 Some(r) => format!("no {r} matching name '{name}' in the current snapshot"),
                 None => format!("no element matching name '{name}' in the current snapshot"),
             };
+            // A sparse tree may just not hold the text, so say where to look
+            // instead. Words the advice only: the model makes the OCR call.
+            let ocr = mcp_a11y::ocr_fallback_hint(snap, name)
+                .map(|h| format!(". {h}"))
+                .unwrap_or_default();
             return Err(if close.is_empty() {
                 Envelope::fail_with(
                     tool,
                     ErrorCode::NotFound,
                     what,
-                    "call find_elements or get_ui_tree to see what is on screen",
+                    format!("call find_elements or get_ui_tree to see what is on screen{ocr}"),
                 )
             } else {
                 let lines: Vec<String> = close.iter().map(Candidate::line).collect();
@@ -323,7 +328,7 @@ impl InputModule {
                     tool,
                     ErrorCode::NotFound,
                     what,
-                    format!("closest: {}", lines.join("; ")),
+                    format!("closest: {}{ocr}", lines.join("; ")),
                     json!({ "candidates": close }),
                 )
             });
@@ -2838,6 +2843,44 @@ mod tests {
         assert!(cands.len() <= 5 && cands.len() == 2);
         assert_eq!(cands[0]["ref"], "@e1");
         assert!(backend.actions.lock().unwrap().is_empty());
+    }
+
+    /// A miss in a nearly empty tree is where a custom-drawn app lands: the
+    /// label is on screen, just not in the tree. The error says to read it off
+    /// the screen, and nothing is clicked or captured on the model's behalf.
+    #[tokio::test]
+    async fn a_name_miss_in_a_sparse_tree_points_at_ocr() {
+        let (module, backend, arena) = test_module();
+        install(&arena, vec![("@e1", el("window", "Canvas", 1, None))]);
+        let env = call(
+            &module,
+            "ui_action",
+            json!({ "name": "Save", "action": "click" }),
+        )
+        .await;
+        let err = env.error.as_ref().unwrap();
+        assert_eq!(err.code, ErrorCode::NotFound);
+        let hint = err.suggestion.as_deref().unwrap();
+        assert!(hint.contains("ocr_region with find \"Save\""), "{hint}");
+        assert!(hint.contains("mouse_action"), "{hint}");
+        assert!(backend.actions.lock().unwrap().is_empty());
+
+        // A populated tree is not blamed on the app.
+        let items: Vec<(String, mcp_a11y::ElementInfo)> = (1..=12)
+            .map(|i| (format!("@e{i}"), el("button", "Other", i, None)))
+            .collect();
+        install(
+            &arena,
+            items.iter().map(|(r, i)| (r.as_str(), i.clone())).collect(),
+        );
+        let env = call(
+            &module,
+            "ui_action",
+            json!({ "name": "Save", "action": "click" }),
+        )
+        .await;
+        let hint = env.error.as_ref().unwrap().suggestion.clone().unwrap();
+        assert!(!hint.contains("ocr_region"), "{hint}");
     }
 
     /// An unobserved UI is observed on demand rather than refused, when the

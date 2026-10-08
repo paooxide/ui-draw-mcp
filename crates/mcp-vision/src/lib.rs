@@ -4,6 +4,8 @@
 
 mod backend;
 mod config;
+mod find;
+pub mod grid;
 mod tools;
 
 pub use backend::{
