@@ -110,6 +110,10 @@ pub struct ActOpts {
 /// The `timeout_ms` default of a settle wait.
 pub const ACT_SETTLE_TIMEOUT_MS: u64 = 10_000;
 
+/// A drag moves in this many steps, this many ms apart.
+const DRAG_STEPS: usize = 12;
+const DRAG_STEP_MS: u64 = 15;
+
 impl Default for ActOpts {
     fn default() -> Self {
         ActOpts {
@@ -118,6 +122,25 @@ impl Default for ActOpts {
             timeout_ms: ACT_SETTLE_TIMEOUT_MS,
         }
     }
+}
+
+/// What a pointer action (`double_click`, `triple_click`, `right_click`,
+/// `scroll`, `drag`, or a click/hover at coordinates) needs beyond what it
+/// acts on. Coordinates are CSS px: offsets from the target's top-left corner
+/// when the action has a target, else viewport points.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PointerArgs<'a> {
+    pub x: Option<f64>,
+    pub y: Option<f64>,
+    /// Where a `drag` ends: an element (its centre, or `to_x`/`to_y` inside it).
+    pub to: Option<Locator<'a>>,
+    pub to_x: Option<f64>,
+    pub to_y: Option<f64>,
+    /// A `drag` offset from where it starts, or how far a `scroll` goes.
+    pub dx: Option<f64>,
+    pub dy: Option<f64>,
+    /// A `scroll` direction.
+    pub value: Option<&'a str>,
 }
 
 #[async_trait]
@@ -205,6 +228,23 @@ pub trait BrowserBackend: Send + Sync {
         let _ = opts;
         self.act_masked(target, locator, action, value, secret)
             .await
+    }
+    /// A pointer action as real, trusted input at a point: a click at
+    /// coordinates, `double_click`, `triple_click`, `right_click`, `scroll`
+    /// (mouse wheel) or `drag`. `locator` is `None` when the action is given
+    /// viewport coordinates, or scrolls the page. Chrome only.
+    async fn act_pointer(
+        &self,
+        target: &str,
+        locator: Option<Locator<'_>>,
+        action: &str,
+        pointer: PointerArgs<'_>,
+        opts: ActOpts,
+    ) -> Result<Value, BrowserError> {
+        let _ = (target, locator, pointer, opts);
+        Err(BrowserError::Unsupported(format!(
+            "act '{action}' needs the CDP (Chrome) engine; it sends real pointer input, which the WebKit engine cannot"
+        )))
     }
     /// Set files on an `<input type=file>` located like `act` does. `files`
     /// are already-resolved absolute paths (the module layer jails and checks
@@ -1580,6 +1620,330 @@ impl CdpBackend {
         Ok(())
     }
 
+    /// One `Input.dispatchMouseEvent`. `buttons` is the mask of buttons held
+    /// after the event (left 1, right 2); `button` names the one it is about.
+    async fn mouse_event(
+        c: &mut CdpConn,
+        kind: &str,
+        (x, y): (f64, f64),
+        button: &str,
+        buttons: u32,
+        click_count: u32,
+    ) -> Result<(), BrowserError> {
+        c.call(
+            "Input.dispatchMouseEvent",
+            json!({
+                "type": kind, "x": x, "y": y, "button": button,
+                "buttons": buttons, "clickCount": click_count,
+            }),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// `count` real clicks in a row at a point with one button. Each is a
+    /// press and a release with its own `clickCount`, so `dblclick` fires on
+    /// the second and a third selects the line or paragraph.
+    async fn cdp_clicks(
+        c: &mut CdpConn,
+        at: (f64, f64),
+        right: bool,
+        count: u32,
+    ) -> Result<(), BrowserError> {
+        let (button, held) = if right { ("right", 2) } else { ("left", 1) };
+        Self::mouse_event(c, "mouseMoved", at, "none", 0, 0).await?;
+        for n in 1..=count {
+            Self::mouse_event(c, "mousePressed", at, button, held, n).await?;
+            Self::mouse_event(c, "mouseReleased", at, button, 0, n).await?;
+        }
+        Ok(())
+    }
+
+    /// Where an element is, for a pointer action: resolves `locator`
+    /// (nothing, for a page-level action), scrolls it into view per `scroll`,
+    /// and reads its box and the viewport. `stash` keeps the scroller for
+    /// [`Self::scroll_positions`].
+    async fn pointer_geometry(
+        c: &mut CdpConn,
+        locator: Option<Locator<'_>>,
+        scroll: ScrollMode,
+        stash: bool,
+    ) -> Result<Value, BrowserError> {
+        let resolve = locator.map(locator_js).unwrap_or_else(|| "null".into());
+        let not_found = locator
+            .map(not_found_js)
+            .unwrap_or_else(|| "'element not found'".into());
+        let scroll_js = scroll
+            .js_options()
+            .map(|o| {
+                format!(
+                    "try{{ (el.__is_canvas_target ? el.canvas : el).scrollIntoView({o}); }}catch(e){{}}"
+                )
+            })
+            .unwrap_or_default();
+        let expr = format!(
+            r#"(function(){{
+  {JS_XPATH}
+  {JS_FIND}
+  var el;
+  try {{ el = {resolve}; }} catch(e) {{ return {{ok:false,error:String(e && e.message ? e.message : e)}}; }}
+  var out = {{ok:true, vw:document.documentElement.clientWidth, vh:document.documentElement.clientHeight}};
+  var se = document.scrollingElement || document.documentElement;
+  if({has_target}){{
+    if(!el) return {{ok:false,error:{not_found}}};
+    {scroll_js}
+    if(el.__is_canvas_target){{
+      var cb = __canvas_box(el.canvas, el.reg);
+      out.rect = {{left:cb.x, top:cb.y, width:cb.w, height:cb.h}};
+      out.target = {{tag:'canvas-region', text:''}};
+    }} else {{
+      var b = el.getBoundingClientRect();
+      out.rect = {{left:b.left, top:b.top, width:b.width, height:b.height}};
+      var isRoot = el === document.body || el === document.documentElement;
+      out.target = isRoot ? {{tag:'body'}} : __target(el);
+      if(!isRoot && (el.scrollHeight > el.clientHeight || el.scrollWidth > el.clientWidth)) se = el;
+    }}
+  }}
+  if({stash}) Object.defineProperty(window, '__agentctl_scroller', {{value: se, configurable: true, writable: true}});
+  out.scroll = [window.scrollX, window.scrollY, se.scrollLeft, se.scrollTop];
+  return out;
+}})()"#,
+            has_target = locator.is_some(),
+        );
+        let v = Self::eval_value(c, &expr).await?;
+        if v.get("ok").and_then(Value::as_bool) != Some(true) {
+            return Err(BrowserError::NotFound(
+                v.get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("element not found")
+                    .to_string(),
+            ));
+        }
+        Ok(v)
+    }
+
+    /// The positions `pointer_geometry` read, again: `[window x, y,
+    /// scroller x, y]`, for the scroller it stashed.
+    async fn scroll_positions(c: &mut CdpConn) -> Option<Vec<f64>> {
+        let v = Self::eval_value(
+            c,
+            "(function(){ var s = window.__agentctl_scroller; if(!s) return null; return [window.scrollX, window.scrollY, s.scrollLeft, s.scrollTop]; })()",
+        )
+        .await
+        .ok()?;
+        v.as_array()?.iter().map(Value::as_f64).collect()
+    }
+
+    /// Move the real pointer to `to`. With the showcase on, its drawn cursor
+    /// glides along; the click ripple belongs to the element script of
+    /// `act_opts`, which these actions do not run, so they show the cursor
+    /// only.
+    async fn pointer_glide(
+        &self,
+        c: &mut CdpConn,
+        target: &str,
+        to: (f64, f64),
+        cfg: &crate::showcase::ShowcaseConfig,
+    ) {
+        let last = self
+            .cursor_pos
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(target)
+            .copied();
+        let glide_ms = if cfg.enabled { cfg.glide_ms() } else { 0 };
+        let from = last.unwrap_or(if cfg.enabled { (0.0, 0.0) } else { to });
+        if cfg.enabled {
+            let engine = showcase_guarded(&cfg.engine_js());
+            let place = match last {
+                Some((x, y)) => format!("window.__agentctl_showcase.place({x},{y});"),
+                None => format!("window.__agentctl_showcase.place({},{});", from.0, from.1),
+            };
+            let kick = format!(
+                "{engine} try{{ if(window.__agentctl_showcase){{ {place} window.__agentctl_showcase.move({},{},{glide_ms}); }} }}catch(e){{}} true",
+                to.0, to.1
+            );
+            let _ = Self::eval_value(c, &kick).await;
+        }
+        if Self::glide_mouse(c, from, to, glide_ms).await {
+            self.cursor_pos
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(target.to_string(), to);
+        }
+    }
+
+    /// Press at `from`, move to `to` in small steps with the button held,
+    /// release. Plain mouse listeners (sliders, jQuery UI, text selection)
+    /// hear a person's drag. A native `draggable` element gets no `dragstart`
+    /// or `drop` from mouse events alone: Chrome starts the drag and hands it
+    /// to the embedder, so drags are intercepted (`Input.setInterceptDrags`)
+    /// and played back as drag events. Says whether that happened.
+    async fn drag_pointer(
+        c: &mut CdpConn,
+        from: (f64, f64),
+        to: (f64, f64),
+    ) -> Result<bool, BrowserError> {
+        let intercept = c
+            .call("Input.setInterceptDrags", json!({ "enabled": true }))
+            .await
+            .is_ok();
+        c.keep_events(true);
+        let run = Self::drag_steps(c, from, to, intercept).await;
+        c.keep_events(false);
+        c.take_events();
+        if intercept {
+            c.call("Input.setInterceptDrags", json!({ "enabled": false }))
+                .await
+                .ok();
+        }
+        run
+    }
+
+    async fn drag_steps(
+        c: &mut CdpConn,
+        from: (f64, f64),
+        to: (f64, f64),
+        intercept: bool,
+    ) -> Result<bool, BrowserError> {
+        let step = std::time::Duration::from_millis(DRAG_STEP_MS);
+        Self::mouse_event(c, "mouseMoved", from, "none", 0, 0).await?;
+        Self::mouse_event(c, "mousePressed", from, "left", 1, 1).await?;
+        let mut data: Option<Value> = None;
+        let mut pos = from;
+        for at in crate::input::drag_path(from, to, DRAG_STEPS) {
+            pos = at;
+            if data.is_some() {
+                Self::drag_event(c, "dragOver", at, data.as_ref()).await?;
+                tokio::time::sleep(step).await;
+                continue;
+            }
+            Self::mouse_event(c, "mouseMoved", at, "left", 1, 0).await?;
+            if !intercept {
+                tokio::time::sleep(step).await;
+                continue;
+            }
+            // The drag starts once the pointer has moved a few pixels, and
+            // the event may arrive after the reply to the move.
+            let mut seen = c.take_events();
+            if seen.is_empty() {
+                seen = c
+                    .collect_events(&["Input.dragIntercepted"], DRAG_STEP_MS, 1)
+                    .await?;
+            }
+            data = seen.iter().find_map(|e| {
+                (e.get("method").and_then(Value::as_str) == Some("Input.dragIntercepted"))
+                    .then(|| e.pointer("/params/data").cloned())
+                    .flatten()
+            });
+            if data.is_some() {
+                // The page's `dragstart` has run and the pointer is over
+                // the element: the first thing the drag enters.
+                Self::drag_event(c, "dragEnter", at, data.as_ref()).await?;
+                Self::drag_event(c, "dragOver", at, data.as_ref()).await?;
+            }
+        }
+        if data.is_some() {
+            Self::drag_event(c, "dragOver", pos, data.as_ref()).await?;
+            Self::drag_event(c, "drop", pos, data.as_ref()).await?;
+            Self::mouse_event(c, "mouseReleased", pos, "left", 0, 1).await?;
+            return Ok(true);
+        }
+        Self::mouse_event(c, "mouseReleased", to, "left", 0, 1).await?;
+        Ok(false)
+    }
+
+    async fn drag_event(
+        c: &mut CdpConn,
+        kind: &str,
+        (x, y): (f64, f64),
+        data: Option<&Value>,
+    ) -> Result<(), BrowserError> {
+        c.call(
+            "Input.dispatchDragEvent",
+            json!({ "type": kind, "x": x, "y": y, "data": data }),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// A real key press: the modifiers go down, the key goes down and up with
+    /// their bitmask, the modifiers come up. A browser that ignores the key
+    /// event's own editing action (headless Chrome on macOS: select all,
+    /// copy, cut, paste, undo) is also given the editing command; one that
+    /// runs it itself must not get it twice, a paste would insert twice.
+    async fn press_combo(
+        c: &mut CdpConn,
+        combo: &crate::input::KeyCombo,
+    ) -> Result<(), BrowserError> {
+        let bits = combo.bits();
+        let command = match combo.edit_command() {
+            Some(cmd) if Self::is_mac(c).await => Some(cmd),
+            _ => None,
+        };
+        let mut held = 0;
+        for m in &combo.mods {
+            held |= m.bit;
+            c.call(
+                "Input.dispatchKeyEvent",
+                json!({
+                    "type": "rawKeyDown", "key": m.key, "code": m.code,
+                    "windowsVirtualKeyCode": m.vk,
+                    "modifiers": held,
+                }),
+            )
+            .await?;
+        }
+        let k = &combo.key;
+        let mut down = json!({
+            "type": if k.text.is_some() { "keyDown" } else { "rawKeyDown" },
+            "key": k.key, "code": k.code,
+            "windowsVirtualKeyCode": k.vk,
+            "modifiers": bits,
+        });
+        if let Some(m) = down.as_object_mut() {
+            if let Some(t) = &k.text {
+                m.insert("text".into(), json!(t));
+            }
+            if let Some(cmd) = command {
+                m.insert("commands".into(), json!([cmd]));
+            }
+        }
+        c.call("Input.dispatchKeyEvent", down).await?;
+        c.call(
+            "Input.dispatchKeyEvent",
+            json!({
+                "type": "keyUp", "key": k.key, "code": k.code,
+                "windowsVirtualKeyCode": k.vk,
+                "modifiers": bits,
+            }),
+        )
+        .await?;
+        for m in combo.mods.iter().rev() {
+            held &= !m.bit;
+            c.call(
+                "Input.dispatchKeyEvent",
+                json!({
+                    "type": "keyUp", "key": m.key, "code": m.code,
+                    "windowsVirtualKeyCode": m.vk,
+                    "modifiers": held,
+                }),
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// Whether the browser runs on macOS, where headless Chrome does not act
+    /// on editing shortcuts by itself.
+    async fn is_mac(c: &mut CdpConn) -> bool {
+        Self::eval_value(c, "/Mac/.test(navigator.platform)")
+            .await
+            .ok()
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+    }
+
     /// Put the page tabs on a connect result, active first, with the active
     /// one as `target_id`, so the first call after connecting needs no
     /// `browser_tabs`. Best effort: a browser that cannot list leaves the
@@ -1883,6 +2247,12 @@ pub(crate) fn key_event_spec(name: &str) -> Option<KeySpec> {
             key: "Delete",
             code: "Delete",
             vk: 46,
+            text: None,
+        }),
+        "Insert" => Some(KeySpec {
+            key: "Insert",
+            code: "Insert",
+            vk: 45,
             text: None,
         }),
         // The space bar types a character, so unlike the others it carries text.
@@ -3916,12 +4286,7 @@ impl BrowserBackend for CdpBackend {
                     "act 'press' is not supported on the Safari engine".into(),
                 ));
             }
-            Some(key_event_spec(value.unwrap_or("")).ok_or_else(|| {
-                BrowserError::Failed(format!(
-                    "act 'press' needs a supported key in 'value' (Enter, Escape, Tab, ArrowDown, ArrowUp, ArrowLeft, ArrowRight, Home, End, PageUp, PageDown, Backspace, Delete, Space), got '{}'",
-                    value.unwrap_or("")
-                ))
-            })?)
+            Some(crate::input::parse_key_combo(value.unwrap_or("")).map_err(BrowserError::Failed)?)
         } else {
             None
         };
@@ -3950,7 +4315,14 @@ impl BrowserBackend for CdpBackend {
         let js_arm = JS_ARM.replace("__ISO__", if iso.is_some() { "true" } else { "false" });
         // Resolve to an element in the same eval: a `ref` via XPath, or a
         // selector via `__find`, so a scripted action is one round trip.
-        let resolve = locator_js(locator);
+        // A key press with nothing focused goes to the page: the key events
+        // reach the focused element or the body, as a person's would.
+        let resolve = if action == "press" && matches!(locator, Locator::Focused) {
+            "(function(){ try { return __focused(); } catch(e) { return document.body; } })()"
+                .to_string()
+        } else {
+            locator_js(locator)
+        };
         let not_found = not_found_js(locator);
         let auto = matches!(locator, Locator::Selector { by: "auto", .. });
         let is_selector = matches!(locator, Locator::Selector { .. });
@@ -4156,7 +4528,17 @@ impl BrowserBackend for CdpBackend {
   {el_scroll}
   {showcase_call}
   {nav_mark_in_script}
-  var tgt = __target(el), found = {found};
+  // An SVG element has no click(): send the sequence a pointer would.
+  function __clickEl(n){{
+    if(typeof n.click === 'function'){{ n.click(); return; }}
+    var r = n.getBoundingClientRect(), o = {{bubbles:true,cancelable:true,composed:true,view:window,clientX:r.left+r.width/2,clientY:r.top+r.height/2,button:0}};
+    n.dispatchEvent(new PointerEvent('pointerdown', Object.assign({{buttons:1,pointerId:1,isPrimary:true}}, o)));
+    n.dispatchEvent(new MouseEvent('mousedown', Object.assign({{buttons:1}}, o)));
+    n.dispatchEvent(new PointerEvent('pointerup', Object.assign({{pointerId:1,isPrimary:true}}, o)));
+    n.dispatchEvent(new MouseEvent('mouseup', o));
+    n.dispatchEvent(new MouseEvent('click', o));
+  }}
+  var tgt = el === document.body ? {{tag:'body'}} : __target(el), found = {found};
   try {{
   switch(action){{
     case 'click': {{
@@ -4201,11 +4583,22 @@ impl BrowserBackend for CdpBackend {
           var ctop = (croot.elementFromPoint ? croot : document).elementFromPoint(cx, cy);
           if(!ctop) why = 'nothing is rendered at the element centre';
           else if(ctop === el || el.contains(ctop)) cpt = {{x: cx, y: cy}};
-          else why = 'covered by <' + String(ctop.tagName || '?').toLowerCase() + '>';
+          else {{
+            why = 'covered by <' + String(ctop.tagName || '?').toLowerCase() + '>';
+            // The box centre of a bent SVG shape can be empty space: look for
+            // a point on the shape itself.
+            if(el instanceof SVGElement){{
+              for(var gy = 1; gy < 6 && !cpt; gy++) for(var gx = 1; gx < 6 && !cpt; gx++){{
+                var px = cb.left + cb.width * gx / 6, py = cb.top + cb.height * gy / 6;
+                var ph = (croot.elementFromPoint ? croot : document).elementFromPoint(px, py);
+                if(ph && (ph === el || el.contains(ph))) cpt = {{x: px, y: py}};
+              }}
+            }}
+          }}
         }}
       }}
       if(cpt){{ clickAt = cpt; inputKind = 'cdp'; }}
-      else {{ inputKind = 'synthetic'; inputReason = why; __arm(el, 'click'); el.click(); }}
+      else {{ inputKind = 'synthetic'; inputReason = why; __arm(el, 'click'); __clickEl(el); }}
       break;
     }}
     case 'focus': el.focus({{preventScroll:true}}); break;
@@ -4390,33 +4783,16 @@ impl BrowserBackend for CdpBackend {
                 }
             }
         }
-        if let (Some(spec), Some(c)) = (press_key, c_opt.as_mut()) {
+        if let (Some(combo), Some(c)) = (press_key, c_opt.as_mut()) {
             // The element is focused by the eval above; send a real key
             // press so default actions (implicit form submit, focus move) run.
-            let mut down = json!({
-                "type": if spec.text.is_some() { "keyDown" } else { "rawKeyDown" },
-                "key": spec.key,
-                "code": spec.code,
-                "windowsVirtualKeyCode": spec.vk,
-                "nativeVirtualKeyCode": spec.vk,
-            });
-            if let (Some(t), Some(m)) = (spec.text, down.as_object_mut()) {
-                m.insert("text".into(), json!(t));
-            }
-            c.call("Input.dispatchKeyEvent", down).await?;
-            c.call(
-                "Input.dispatchKeyEvent",
-                json!({
-                    "type": "keyUp",
-                    "key": spec.key,
-                    "code": spec.code,
-                    "windowsVirtualKeyCode": spec.vk,
-                    "nativeVirtualKeyCode": spec.vk,
-                }),
-            )
-            .await?;
+            Self::press_combo(c, &combo).await?;
             if let Some(m) = v.as_object_mut() {
-                m.insert("key".into(), json!(spec.key));
+                m.insert("key".into(), json!(combo.key.key));
+                if !combo.mods.is_empty() {
+                    let mods: Vec<&str> = combo.mods.iter().map(|m| m.key).collect();
+                    m.insert("modifiers".into(), json!(mods));
+                }
             }
         }
         if let Some(ref mut c) = c_opt {
@@ -4432,6 +4808,211 @@ impl BrowserBackend for CdpBackend {
             }
         }
         Ok(v)
+    }
+
+    async fn act_pointer(
+        &self,
+        target: &str,
+        locator: Option<Locator<'_>>,
+        action: &str,
+        p: PointerArgs<'_>,
+        opts: ActOpts,
+    ) -> Result<Value, BrowserError> {
+        use crate::input::{check_in_viewport, point_in, scroll_delta, visible_center, Rect};
+        if target.starts_with("safari-") {
+            return Err(BrowserError::Unsupported(format!(
+                "act '{action}' needs the CDP (Chrome) engine; it sends real pointer input, which the WebKit engine cannot"
+            )));
+        }
+        let failed = BrowserError::Failed;
+        let mut c = self.conn(target).await?;
+        Self::emulate_focus(&mut c).await;
+        let showcase_cfg = self
+            .showcase
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        // A click may start a navigation: mark the document it happens on, as
+        // `act_opts` does, so a following `wait navigation` can tell.
+        let clicks = matches!(
+            action,
+            "click" | "double_click" | "triple_click" | "right_click"
+        );
+        let nav_token = clicks.then(new_nav_token);
+        if let Some(t) = &nav_token {
+            Self::eval_value(
+                &mut c,
+                &format!("window.__agentctl_nav_token = {t:?}; true"),
+            )
+            .await?;
+        }
+        let _ = Self::eval_value(&mut c, &act_arm_js()).await;
+
+        // A scroll goes where the wheel is; every other action brings its
+        // target into view first.
+        let scrolling = action == "scroll";
+        let geom = Self::pointer_geometry(
+            &mut c,
+            locator,
+            if scrolling {
+                ScrollMode::None
+            } else {
+                opts.scroll
+            },
+            scrolling,
+        )
+        .await?;
+        let num = |v: &Value, k: &str| v.get(k).and_then(Value::as_f64).unwrap_or(0.0);
+        let (vw, vh) = (num(&geom, "vw"), num(&geom, "vh"));
+        let rect = geom.get("rect").map(|r| Rect {
+            left: num(r, "left"),
+            top: num(r, "top"),
+            width: num(r, "width"),
+            height: num(r, "height"),
+        });
+        let mut out = json!({ "ok": true, "action": action, "input": "cdp" });
+        if let (Some(t), Some(m)) = (geom.get("target"), out.as_object_mut()) {
+            m.insert("target".into(), t.clone());
+        }
+        let at_json = |(x, y): (f64, f64)| json!({ "x": x, "y": y });
+
+        match action {
+            "scroll" => {
+                let at = match (rect, p.x, p.y) {
+                    (Some(r), None, None) => visible_center(r, vw, vh).ok_or_else(|| {
+                        failed(
+                            "the element is outside the viewport; scroll it into view first".into(),
+                        )
+                    })?,
+                    (None, None, None) => (vw / 2.0, vh / 2.0),
+                    _ => point_in(rect, p.x, p.y).map_err(failed)?,
+                };
+                check_in_viewport(at, vw, vh).map_err(failed)?;
+                let (dx, dy) = scroll_delta(p.value, p.dx, p.dy, (vw, vh)).map_err(failed)?;
+                Self::mouse_event(&mut c, "mouseMoved", at, "none", 0, 0).await?;
+                c.call(
+                    "Input.dispatchMouseEvent",
+                    json!({ "type": "mouseWheel", "x": at.0, "y": at.1, "deltaX": dx, "deltaY": dy }),
+                )
+                .await?;
+                // The wheel scrolls over a few frames: wait for it to stop.
+                let mut now = Self::scroll_positions(&mut c).await;
+                for _ in 0..15 {
+                    tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+                    let next = Self::scroll_positions(&mut c).await;
+                    let still = next == now;
+                    now = next;
+                    if still {
+                        break;
+                    }
+                }
+                let before: Option<Vec<f64>> = geom
+                    .get("scroll")
+                    .and_then(Value::as_array)
+                    .and_then(|a| a.iter().map(Value::as_f64).collect());
+                if let (Some(m), Some(n)) = (out.as_object_mut(), &now) {
+                    m.insert("scroll_at".into(), at_json(at));
+                    m.insert("scroll_x".into(), json!(n[0]));
+                    m.insert("scroll_y".into(), json!(n[1]));
+                    m.insert("scroller_top".into(), json!(n[3]));
+                    m.insert("moved".into(), json!(before.as_ref() != Some(n)));
+                }
+                self.cursor_pos
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(target.to_string(), at);
+            }
+            "hover" | "click" | "double_click" | "triple_click" | "right_click" => {
+                let at = point_in(rect, p.x, p.y).map_err(failed)?;
+                check_in_viewport(at, vw, vh).map_err(failed)?;
+                if action == "hover" || showcase_cfg.enabled {
+                    self.pointer_glide(&mut c, target, at, &showcase_cfg).await;
+                }
+                if action != "hover" {
+                    let count = match action {
+                        "double_click" => 2,
+                        "triple_click" => 3,
+                        _ => 1,
+                    };
+                    Self::cdp_clicks(&mut c, at, action == "right_click", count).await?;
+                    self.cursor_pos
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .insert(target.to_string(), at);
+                }
+                if let Some(m) = out.as_object_mut() {
+                    m.insert("click_at".into(), at_json(at));
+                }
+            }
+            "drag" => {
+                let from = point_in(rect, p.x, p.y).map_err(|_| {
+                    failed("drag needs a source: ref or query, or x and y (viewport CSS px)".into())
+                })?;
+                check_in_viewport(from, vw, vh).map_err(failed)?;
+                let to = if let Some(dest) = p.to {
+                    // The destination must already be on screen: scrolling to
+                    // it would move the source.
+                    let g = Self::pointer_geometry(&mut c, Some(dest), ScrollMode::None, false)
+                        .await
+                        .map_err(|e| match e {
+                            BrowserError::NotFound(m) => {
+                                BrowserError::NotFound(format!("drag destination: {m}"))
+                            }
+                            other => other,
+                        })?;
+                    let r = g.get("rect").map(|r| Rect {
+                        left: num(r, "left"),
+                        top: num(r, "top"),
+                        width: num(r, "width"),
+                        height: num(r, "height"),
+                    });
+                    point_in(r, p.to_x, p.to_y).map_err(failed)?
+                } else if p.to_x.is_some() || p.to_y.is_some() {
+                    (p.to_x.unwrap_or(from.0), p.to_y.unwrap_or(from.1))
+                } else if p.dx.is_some() || p.dy.is_some() {
+                    (from.0 + p.dx.unwrap_or(0.0), from.1 + p.dy.unwrap_or(0.0))
+                } else {
+                    return Err(failed(
+                        "drag needs a destination: to_ref or to_query, to_x and to_y (viewport CSS px), or dx and dy".into(),
+                    ));
+                };
+                check_in_viewport(to, vw, vh)
+                    .map_err(|m| failed(format!("drag destination: {m}")))?;
+                if showcase_cfg.enabled {
+                    self.pointer_glide(&mut c, target, from, &showcase_cfg)
+                        .await;
+                }
+                let html5 = Self::drag_pointer(&mut c, from, to).await?;
+                self.cursor_pos
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(target.to_string(), to);
+                if let Some(m) = out.as_object_mut() {
+                    m.insert("from".into(), at_json(from));
+                    m.insert("to".into(), at_json(to));
+                    m.insert("html5_drag".into(), json!(html5));
+                }
+            }
+            other => {
+                return Err(BrowserError::Unsupported(format!(
+                    "'{other}' is not a pointer action"
+                )))
+            }
+        }
+        if let Some(token) = &nav_token {
+            self.set_nav_pending(target, token.clone(), false);
+        }
+        self.note_dialogs(target, &mut c, &mut out);
+        if opts.settle {
+            drop(c);
+            let report = self
+                .settle_after_act(target, nav_token, opts.timeout_ms)
+                .await;
+            if let (Some(m), Some(r)) = (out.as_object_mut(), report.as_object()) {
+                m.extend(r.iter().map(|(k, x)| (k.clone(), x.clone())));
+            }
+        }
+        Ok(out)
     }
 
     async fn wait(

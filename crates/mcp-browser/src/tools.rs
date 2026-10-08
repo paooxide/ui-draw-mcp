@@ -982,11 +982,28 @@ impl BrowserModule {
         };
         // Either a ref from a prior snapshot/query, or a selector resolved in
         // the same call (one round trip instead of query-then-act).
-        let action = str_arg(args, "action").unwrap_or("click");
+        let action =
+            match crate::input::canonical_action(str_arg(args, "action").unwrap_or("click")) {
+                Ok(a) => a,
+                Err(m) => return Envelope::fail("browser_act", ErrorCode::InvalidArgs, m),
+            };
+        let pointer = match pointer_args(args) {
+            Ok(p) => p,
+            Err(m) => return Envelope::fail("browser_act", ErrorCode::InvalidArgs, m),
+        };
+        // Real pointer input: the multi-click, scroll and drag actions, and a
+        // click or hover given coordinates.
+        let is_pointer = matches!(
+            action,
+            "double_click" | "triple_click" | "right_click" | "scroll" | "drag"
+        ) || (matches!(action, "click" | "hover")
+            && (pointer.x.is_some() || pointer.y.is_some()));
         // Typing and key presses may go to whatever has focus.
-        let locator = match parse_locator(args) {
+        let found = parse_locator(args);
+        let locator = match found {
             Some(l) => l,
             None if matches!(action, "type" | "press") => crate::backend::Locator::Focused,
+            None if is_pointer => crate::backend::Locator::Focused,
             None => {
                 return Envelope::fail_with(
                     "browser_act",
@@ -1003,6 +1020,15 @@ impl BrowserModule {
         };
         let mut css: Vec<&str> = css_candidate(args, "query").into_iter().collect();
         css.extend(str_arg(args, "within").filter(|w| !looks_like_xpath(w)));
+        if is_pointer {
+            return result_with_selector_hint(
+                "browser_act",
+                self.backend
+                    .act_pointer(target, found, action, pointer, opts)
+                    .await,
+                &css,
+            );
+        }
         result_with_selector_hint(
             "browser_act",
             self.backend
@@ -1389,6 +1415,11 @@ impl BrowserModule {
             .get("timeout_ms")
             .and_then(Value::as_u64)
             .unwrap_or(10_000);
+        // A duration and no condition is a plain sleep.
+        if let Some(ms) = sleep_only_ms(args) {
+            tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+            return Envelope::ok("browser_wait", json!({ "waited_ms": ms }));
+        }
         let (cond, arg) = match parse_wait_condition(args) {
             Ok(c) => c,
             Err(m) => return Envelope::fail("browser_wait", ErrorCode::InvalidArgs, m),
@@ -2431,6 +2462,59 @@ fn parse_wait_condition(args: &Value) -> Result<(&'static str, Option<&str>), St
     }
 }
 
+/// The longest plain `browser_wait` sleep.
+const WAIT_SLEEP_MAX_MS: u64 = 30_000;
+
+/// The sleep a `browser_wait` with a duration (`timeout_ms`, `ms` or
+/// `duration_ms`) and no condition asks for, in ms, capped. `None` when any
+/// condition is given: the duration is then that condition's timeout.
+fn sleep_only_ms(args: &Value) -> Option<u64> {
+    let flagged = WAIT_CONDITIONS[1..]
+        .iter()
+        .any(|f| args.get(*f).and_then(Value::as_bool) == Some(true));
+    if flagged || str_arg(args, "selector").is_some() || str_arg(args, "condition").is_some() {
+        return None;
+    }
+    ["timeout_ms", "ms", "duration_ms"]
+        .iter()
+        .find_map(|k| args.get(*k).and_then(crate::input::coord))
+        .map(|ms| (ms.max(0.0) as u64).min(WAIT_SLEEP_MAX_MS))
+}
+
+/// The pointer arguments of `browser_act`: coordinates may be numbers or
+/// numeric strings, and the drag destination is an element or a point.
+fn pointer_args(args: &Value) -> Result<crate::backend::PointerArgs<'_>, String> {
+    let num = |k: &str| -> Result<Option<f64>, String> {
+        match args.get(k) {
+            None | Some(Value::Null) => Ok(None),
+            Some(v) => crate::input::coord(v)
+                .map(Some)
+                .ok_or_else(|| format!("'{k}' must be a number of CSS px, got {v}")),
+        }
+    };
+    let to = if let Some(r) = str_arg(args, "to_ref") {
+        Some(crate::backend::Locator::Ref(r))
+    } else {
+        str_arg(args, "to_query").map(|q| crate::backend::Locator::Selector {
+            by: if looks_like_xpath(q) { "xpath" } else { "auto" },
+            query: q,
+            within: None,
+            text: None,
+            index: None,
+        })
+    };
+    Ok(crate::backend::PointerArgs {
+        x: num("x")?,
+        y: num("y")?,
+        to,
+        to_x: num("to_x")?,
+        to_y: num("to_y")?,
+        dx: num("dx")?,
+        dy: num("dy")?,
+        value: str_arg(args, "value"),
+    })
+}
+
 /// How the element is located: a `ref`, else a `query` (the `browser_act`
 /// arguments); `None` when neither is given.
 fn parse_locator(args: &Value) -> Option<crate::backend::Locator<'_>> {
@@ -2729,18 +2813,26 @@ impl ToolModule for BrowserModule {
                 "browser_act",
                 Category::Browser,
                 Tier::Standard,
-                "Act on a DOM node: click, type, select, hover, focus, scroll_into_view, submit or press. Target it with 'ref' (from browser_query/snapshot) or with 'query' plus optional by, within, text, index. type replaces the field's content and reports value_after. A click returns at once, before its request or navigation has begun: use wait_after='settle' or browser_wait.",
+                "Act on a DOM node: click, double_click, triple_click, right_click, hover, drag, scroll, type, select, focus, scroll_into_view, submit or press. Target it with 'ref' (from browser_query/snapshot) or with 'query' plus optional by, within, text, index. x and y click or hover at a point (offsets inside the target, or viewport px without one). type replaces the field's content and reports value_after. press takes a key or combo such as ctrl+a. A click returns at once, before its request or navigation has begun: use wait_after='settle' or browser_wait.",
                 obj(
                     json!({
                         "target_id": { "type": "string", "description": "tab id (default: active tab)" },
                         "ref": { "type": "string", "description": "a ref from browser_query/snapshot" },
                         "by": { "type": "string", "enum": ["css", "xpath", "text"], "description": "how to read 'query' (default: CSS, else visible text)" },
-                        "query": { "type": "string", "description": "selector to resolve and act on in one call, instead of 'ref'; type and press with neither act on the focused element" },
+                        "query": { "type": "string", "description": "selector to resolve and act on in one call, instead of 'ref'; type and press with neither act on the focused element, scroll on the page" },
                         "within": { "type": "string", "description": "root selector scoping the query" },
                         "text": { "type": "string", "description": "substring filter on the matches" },
                         "index": { "type": "integer", "description": "0-based match index (default 0)" },
-                        "action": { "type": "string", "enum": ["click", "type", "select", "hover", "focus", "scroll_into_view", "submit", "press"] },
-                        "value": { "type": "string", "description": "text for type, option text or value for select (on the <select> or an option), key for press: Enter, Escape, Tab, ArrowDown/Up/Left/Right, Home, End, PageUp, PageDown, Backspace, Delete, Space" },
+                        "action": { "type": "string", "enum": ["click", "double_click", "triple_click", "right_click", "hover", "drag", "scroll", "type", "select", "focus", "scroll_into_view", "submit", "press"] },
+                        "value": { "type": "string", "description": "text for type, option text or value for select (on the <select> or an option), key or combo for press (Enter, Escape, ArrowDown, a, ctrl+a, Shift+Tab), direction for scroll (up, down, left, right, top, bottom)" },
+                        "x": { "type": "number", "description": "pointer x in CSS px: an offset from the target's top-left corner, or a viewport point without a target" },
+                        "y": { "type": "number", "description": "pointer y, as x" },
+                        "to_ref": { "type": "string", "description": "drag destination element (a ref)" },
+                        "to_query": { "type": "string", "description": "drag destination element (a selector)" },
+                        "to_x": { "type": "number", "description": "drag destination x: an offset inside to_ref/to_query, else a viewport point" },
+                        "to_y": { "type": "number", "description": "drag destination y, as to_x" },
+                        "dx": { "type": "number", "description": "drag: x distance from the start; scroll: horizontal distance in CSS px" },
+                        "dy": { "type": "number", "description": "drag: y distance from the start; scroll: vertical distance in CSS px (default one viewport down)" },
                         "secret": { "type": "boolean", "description": "value is a secret: kept out of the audit log and the showcase HUD" },
                         "scroll": { "type": "string", "enum": ["none", "nearest", "center"], "description": "bring the element into view first (default nearest)" },
                         "wait_after": { "type": "string", "enum": ["none", "settle"], "description": "settle waits for a started navigation, htmx and quiet network, and adds navigated, requests_started and settled to the result (Chrome; about 2s when nothing starts). Default none" },
@@ -2749,9 +2841,22 @@ impl ToolModule for BrowserModule {
                     json!(["action"]),
                 ),
             ).details(
-                "`press` takes a key name in `value` (Enter, Escape, Tab, ArrowDown, ArrowUp, ArrowLeft, ArrowRight, Home, \
-                 End, PageUp, PageDown, Backspace, Delete or Space), sent as a real key event to the focused node; Chrome \
-                 only. On Chrome a click is real pointer input (mousedown, mouseup, click, as a person's) and type is a real \
+                "`press` takes a key or a combo in `value`: a named key (Enter, Escape, Tab, Arrow keys, Home, End, PageUp, \
+                 PageDown, Backspace, Delete, Insert, Space, F1-F12), a character, or modifiers (ctrl, alt, shift, meta/cmd) \
+                 joined by +, as in ctrl+a or Shift+ArrowDown. It is a real key event to the target, or to the focused node \
+                 or page with no target; Chrome only. ctrl or cmd with a, c, x, v, z or y edits as a person's shortcut \
+                 does, also on macOS.\n\n\
+                 Pointer actions are real input (Chrome only): double_click, triple_click (selects a line), right_click \
+                 (contextmenu) and hover, and click too, accept `x` and `y`: with a target they are offsets from its top-left \
+                 corner (for a canvas, its pixel coordinates), without one viewport CSS px; the result's click_at is where \
+                 it landed, and a point outside the viewport is an error. `scroll` turns the mouse wheel over the target (or \
+                 the page) by dx and dy, by default one viewport down; `value` may be up, down, left, right, top or bottom. \
+                 `drag` presses on the target (or at x and y), moves in steps and releases at the destination: the \
+                 to_ref or to_query element (its centre, or to_x and to_y inside it), else to_x and to_y as viewport \
+                 points, else dx and dy from the start; the destination must be on screen. Mouse-event drags (sliders, \
+                 sortable lists, selecting text) and HTML5 draggable elements both work; the result says html5_drag. \
+                 Spellings such as key, dblclick, triple-click, drag_and_drop are accepted.\n\n\
+                 On Chrome a click is real pointer input (mousedown, mouseup, click, as a person's) and type is a real \
                  insertion that replaces the field's content, so React-style controlled fields and menus that open on \
                  mousedown work; the result reports input 'cdp', or 'synthetic' with input_reason when the element is \
                  covered, off screen, in a frame, a select/option or a file input. type reports value_after (value_length \
@@ -2931,7 +3036,7 @@ impl ToolModule for BrowserModule {
                 "browser_wait",
                 Category::Browser,
                 Tier::Read,
-                "Wait for one condition: selector, dom_settled, htmx_settled, navigation, network_idle or challenge_cleared. Use 'condition' ('selector' also needs the selector argument); the boolean arguments of the same names are aliases, and exactly one may be given. After a click or key press, navigation waits for the new document (navigated:false if none starts within navigation_timeout_ms).",
+                "Wait for one condition: selector, dom_settled, htmx_settled, navigation, network_idle or challenge_cleared. Use 'condition' ('selector' also needs the selector argument); the boolean arguments of the same names are aliases, and exactly one may be given. After a click or key press, navigation waits for the new document (navigated:false if none starts within navigation_timeout_ms). With only timeout_ms and no condition it sleeps that long (max 30000).",
                 obj(
                     json!({
                         "target_id": { "type": "string", "description": "tab id (default: active tab)" },
@@ -4741,6 +4846,60 @@ mod arg_tests {
 #[cfg(test)]
 mod forgiving_args_tests {
     use super::*;
+
+    #[test]
+    fn a_wait_with_only_a_duration_is_a_sleep() {
+        assert_eq!(sleep_only_ms(&json!({"timeout_ms": 500})), Some(500));
+        assert_eq!(sleep_only_ms(&json!({"ms": "250"})), Some(250));
+        assert_eq!(sleep_only_ms(&json!({"duration_ms": 90_000})), Some(30_000));
+        // A condition makes the duration its timeout.
+        assert_eq!(
+            sleep_only_ms(&json!({"timeout_ms": 500, "condition": "navigation"})),
+            None
+        );
+        assert_eq!(
+            sleep_only_ms(&json!({"timeout_ms": 500, "selector": "#a"})),
+            None
+        );
+        assert_eq!(
+            sleep_only_ms(&json!({"timeout_ms": 500, "dom_settled": true})),
+            None
+        );
+        // A false flag is no condition, and nothing at all is still an error.
+        assert_eq!(
+            sleep_only_ms(&json!({"timeout_ms": 5, "dom_settled": false})),
+            Some(5)
+        );
+        assert_eq!(sleep_only_ms(&json!({})), None);
+    }
+
+    #[test]
+    fn pointer_args_take_quoted_numbers_and_name_a_destination() {
+        let a = json!({"x": "60", "y": 115, "to_query": "#zone", "to_x": "3", "dy": -4.5});
+        let p = pointer_args(&a).unwrap();
+        assert_eq!(
+            (p.x, p.y, p.to_x, p.to_y, p.dx),
+            (Some(60.0), Some(115.0), Some(3.0), None, None)
+        );
+        assert_eq!(p.dy, Some(-4.5));
+        assert!(matches!(
+            p.to,
+            Some(crate::backend::Locator::Selector {
+                by: "auto",
+                query: "#zone",
+                ..
+            })
+        ));
+        let both = json!({"to_query": "//div[1]", "to_ref": "//*[@id=\"a\"]"});
+        let p = pointer_args(&both).unwrap();
+        assert!(
+            matches!(p.to, Some(crate::backend::Locator::Ref(_))),
+            "a ref wins"
+        );
+        let e = pointer_args(&json!({"x": "left"})).unwrap_err();
+        assert!(e.contains("'x'") && e.contains("number"), "{e}");
+        assert!(pointer_args(&json!({"x": null})).unwrap().x.is_none());
+    }
 
     fn b(id: u32, tabs: &[&str]) -> BrowserTabs {
         BrowserTabs {
