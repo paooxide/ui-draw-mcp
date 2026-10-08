@@ -16,6 +16,7 @@ pub mod record;
 pub mod safari;
 mod screencast;
 pub mod showcase;
+mod snapshot_diff;
 mod tools;
 mod visual;
 

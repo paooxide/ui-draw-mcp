@@ -4066,7 +4066,18 @@ impl BrowserBackend for CdpBackend {
       }}
     }}
 
-    var name = (el.getAttribute ? (el.getAttribute('aria-label') || el.getAttribute('placeholder') || el.value || el.innerText || el.getAttribute('title') || '') : '').trim().slice(0, 120);
+    // A field is named by what labels it, never by what it holds: the content
+    // is its own `value`, so typing changes one key and not the name that a
+    // later snapshot is matched on. Buttons made of an <input> are their value.
+    var itype = tag === 'INPUT' ? String(el.type || 'text').toLowerCase() : '';
+    var isField = (tag === 'INPUT' && !/^(button|submit|reset|image)$/.test(itype)) || tag === 'TEXTAREA';
+    var name;
+    if(isField){{
+      var flab = el.labels && el.labels.length ? (el.labels[0].innerText || '').replace(/\s+/g, ' ') : '';
+      name = (el.getAttribute('aria-label') || el.getAttribute('placeholder') || flab || el.getAttribute('title') || '').trim().slice(0, 120);
+    }} else {{
+      name = (el.getAttribute ? (el.getAttribute('aria-label') || el.getAttribute('placeholder') || el.value || el.innerText || el.getAttribute('title') || '') : '').trim().slice(0, 120);
+    }}
     // No text of its own: the icon it draws, else its id or class (see `__icon_name`).
     if(!name) name = __icon_name(el);
     var isEnabled = el.disabled !== true && (!el.getAttribute || el.getAttribute('aria-disabled') !== 'true');
@@ -4087,11 +4098,26 @@ impl BrowserBackend for CdpBackend {
       if(el.options.length > 25) options.push('... ' + (el.options.length - 25) + ' more');
       selected = el.multiple ? picked : (picked[0] == null ? null : picked[0]);
     }}
+    // State a person sees on the control: what a field holds (never a
+    // password's), whether a box is ticked, whether a disclosure is open.
+    var value = null, checked = null, expanded = null;
+    if(isField && !/^(checkbox|radio|password|file|hidden)$/.test(itype) && el.value) value = String(el.value).slice(0, 120);
+    if(tag === 'INPUT' && (itype === 'checkbox' || itype === 'radio')) checked = el.checked === true;
+    var ac = el.getAttribute ? el.getAttribute('aria-checked') : null;
+    if(ac !== null && checked === null) checked = ac === 'mixed' ? 'mixed' : ac === 'true';
+    var ae = el.getAttribute ? el.getAttribute('aria-expanded') : null;
+    if(ae !== null) expanded = ae === 'true';
+    else if(tag === 'SUMMARY' && el.parentElement && el.parentElement.tagName === 'DETAILS') expanded = el.parentElement.open === true;
+    var asel = el.getAttribute ? el.getAttribute('aria-selected') : null;
+    if(asel !== null && selected === null) selected = asel === 'true';
     out.push({{
       ref: __xp(el),
       tag: tag.toLowerCase(),
       role: role || null,
       name: name,
+      value: value,
+      checked: checked,
+      expanded: expanded,
       selected: selected,
       options: options,
       x: Math.round(rect.x),

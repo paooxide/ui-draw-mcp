@@ -759,11 +759,13 @@ Read or change a desktop setting. Settings the platform does not expose return U
 
 `browser_act` · standard tier
 
-Act on a DOM node: click, double_click, triple_click, right_click, hover, drag, scroll, type, select, focus, scroll_into_view, submit or press. Target it with 'ref' (from browser_query/snapshot) or with 'query' plus optional by, within, text, index. x and y click or hover at a point (offsets inside the target, or viewport px without one). type replaces the field's content and reports value_after. press takes a key or combo such as ctrl+a. A click returns at once, before its request or navigation has begun: use wait_after='settle' or browser_wait.
+Act on a DOM node: click, double_click, triple_click, right_click, hover, drag, scroll, type, select, focus, scroll_into_view, submit or press. Target it with 'ref' (from browser_query/snapshot) or with 'query' plus optional by, within, text, index. x and y click or hover at a point (offsets inside the target, or viewport px without one). type replaces the field's content and reports value_after. press takes a key or combo such as ctrl+a. A click returns at once, before its request or navigation has begun: use wait_after='settle' or browser_wait. Batch: steps=[{action, ref|query, value}, ...] runs up to 20 in one call and stops at the first failure; snapshot='diff' adds what the page changed.
 
 `press` takes a key or a combo in `value`: a named key (Enter, Escape, Tab, Arrow keys, Home, End, PageUp, PageDown, Backspace, Delete, Insert, Space, F1-F12), a character, or modifiers (ctrl, alt, shift, meta/cmd) joined by +, as in ctrl+a or Shift+ArrowDown. It is a real key event to the target, or to the focused node or page with no target; Chrome only. ctrl or cmd with a, c, x, v, z or y edits as a person's shortcut does, also on macOS.
 
 Pointer actions are real input (Chrome only): double_click, triple_click (selects a line), right_click (contextmenu) and hover, and click too, accept `x` and `y`: with a target they are offsets from its top-left corner (for a canvas, its pixel coordinates), without one viewport CSS px; the result's click_at is where it landed, and a point outside the viewport is an error. `scroll` turns the mouse wheel over the target (or the page) by dx and dy, by default one viewport down; `value` may be up, down, left, right, top or bottom. `drag` presses on the target (or at x and y), moves in steps and releases at the destination: the to_ref or to_query element (its centre, or to_x and to_y inside it), else to_x and to_y as viewport points, else dx and dy from the start; the destination must be on screen. Mouse-event drags (sliders, sortable lists, selecting text) and HTML5 draggable elements both work; the result says html5_drag. Spellings such as key, dblclick, triple-click, drag_and_drop are accepted.
+
+Batches: `steps` is a list of acts (each with its own action, ref or query, value, and so on; target_id comes from the call, and wait_after and timeout_ms are inherited when a step sets none; secret is not, so flag each step that types one). They run in order through the same code as a single act, so each step is checked the same way, and the first that fails ends the batch. At most 20 steps. The result is {ran, total, failed_at (the 0-based step that failed, absent when all succeeded), steps: [{i, ok, ...that step's result}]}; ok is true only when every step succeeded, and a failed batch is an error that still carries this data. `snapshot: "diff"` adds `snapshot`, the page after the last step as a browser_snapshot diff (a full snapshot when this tab has none yet to compare with; "full" always sends the whole page), also after a failure. Take a full browser_snapshot first so the diff has something to compare with. A form is one call: steps type into each field, then click submit.
 
 On Chrome a click is real pointer input (mousedown, mouseup, click, as a person's) and type is a real insertion that replaces the field's content, so React-style controlled fields and menus that open on mousedown work; the result reports input 'cdp', or 'synthetic' with input_reason when the element is covered, off screen, in a frame, a select/option or a file input. type reports value_after (value_length for a password or secret field). A native <select> is set with select (on the list or one of its options) or a click on an <option>; both report selected and changed, and an option that is missing, disabled or undone by the page is an error. A page-published canvas region (a canvas-child ref from browser_snapshot) supports only click and hover, sent as real mouse input at the region centre; other actions on it return Unsupported.
 
@@ -777,7 +779,7 @@ Query targeting: 'by' is css, xpath or text (used when no 'ref'); with none, the
 
 | Argument | Type | Required | Description |
 |---|---|---|---|
-| `action` | one of: click, double_click, triple_click, right_click, hover, drag, scroll, type, select, focus, scroll_into_view, submit, press | yes |  |
+| `action` | one of: click, double_click, triple_click, right_click, hover, drag, scroll, type, select, focus, scroll_into_view, submit, press |  |  |
 | `by` | one of: css, xpath, text |  | how to read 'query' (default: CSS, else visible text) |
 | `dx` | number |  | drag: x distance from the start; scroll: horizontal distance in CSS px |
 | `dy` | number |  | drag: y distance from the start; scroll: vertical distance in CSS px (default one viewport down) |
@@ -786,6 +788,8 @@ Query targeting: 'by' is css, xpath or text (used when no 'ref'); with none, the
 | `ref` | string |  | a ref from browser_query/snapshot |
 | `scroll` | one of: none, nearest, center |  | bring the element into view first (default nearest) |
 | `secret` | boolean |  | value is a secret: kept out of the audit log and the showcase HUD |
+| `snapshot` | one of: none, diff, full |  | with steps: also return the page after the last step, as a snapshot diff against the last browser_snapshot or in full |
+| `steps` | array&lt;object&gt; |  | several actions in one call, run in order on target_id: each item takes the fields above (action, ref or query, value, ...) except target_id. Stops at the first failure. At most 20. Use instead of action/ref/query |
 | `target_id` | string |  | tab id (default: active tab) |
 | `text` | string |  | substring filter on the matches |
 | `timeout_ms` | integer |  | settle bound (default 10000); on expiry the action still succeeded and the result has settled:false |
@@ -1155,10 +1159,16 @@ Flatten a page into interactable node refs (dom or accessibility mode) or raw te
 
 The web equivalent of get_ui_tree. A <canvas> gets child nodes (tag canvas-child) only if the page itself publishes its interactive regions via canvas.__agentctl_regions or a data-canvas-regions JSON attribute; any other canvas is an opaque node. Besides controls and roles, an element a page makes clickable with a pointer cursor is listed (the outermost one, not each span inside it); one with no text is named by its aria-label, title or alt, the file name of the icon it draws, or its id or class words, and that name works as a by=text query. 'root_selector' is a CSS selector or an XPath (a ref from an earlier snapshot).
 
+A node carries only what is set: ref, tag, role, name, value (what a text field holds, never a password's), checked, expanded, selected, options (a <select>), disabled, x, y, w, h. A field is named by its aria-label, placeholder or <label>, not by its content.
+
+`diff: true` (or since: "last") answers with what changed since the last snapshot this server returned for the tab: {diff: "delta", unchanged: N, added: [nodes], removed: [{ref, tag, name}], changed: [{ref, name, changes: {field: [was, now]}}]}, plus url and title when they changed. A node whose ref shifted shows as a change of ref: use the new one. The position (x, y, w, h) of a node that stayed is not compared. The reply is a full snapshot, with diff: "full" and a reason, when there is no earlier snapshot of the tab, the page is a different document, mode or root_selector differ, or the diff would not be smaller. Every snapshot returned, diff or not, becomes the one the next diff is measured against.
+
 | Argument | Type | Required | Description |
 |---|---|---|---|
+| `diff` | boolean |  | return only what changed since the last snapshot of this tab (added, removed, changed nodes), not the whole page |
 | `mode` | one of: dom, accessibility, text |  |  |
 | `root_selector` | string |  | limit the snapshot to this subtree |
+| `since` | one of: last |  | same as diff: true |
 | `target_id` | string |  | tab id (default: active tab) |
 
 ### browser-tabs
