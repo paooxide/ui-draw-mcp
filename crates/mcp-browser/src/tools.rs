@@ -26,6 +26,11 @@ pub struct BrowserModule {
     upload_resolver: Option<UploadResolver>,
     /// The last snapshot returned per tab, for `browser_snapshot diff`.
     snaps: std::sync::Mutex<crate::snapshot_diff::SnapMemory>,
+    /// Where the OCR models live (`browser_screenshot ocr/find`); `None`
+    /// refuses OCR rather than fetching models into a guessed directory.
+    ocr_models: Option<std::path::PathBuf>,
+    /// The recogniser, loaded on the first OCR call and kept.
+    ocr: tokio::sync::OnceCell<Arc<mcp_vision::ocr::Ocr>>,
 }
 
 /// Resolves a caller-supplied path to the real, contained one, or says why not.
@@ -43,7 +48,17 @@ impl BrowserModule {
             media_dir: None,
             upload_resolver: None,
             snaps: std::sync::Mutex::new(crate::snapshot_diff::SnapMemory::default()),
+            ocr_models: None,
+            ocr: tokio::sync::OnceCell::new(),
         }
+    }
+
+    /// Enable `browser_screenshot ocr` and `find`: the recogniser's models are
+    /// read from (and on first use downloaded into) this directory. Pass the
+    /// same directory the desktop `ocr_region` uses so they are fetched once.
+    pub fn with_ocr_models(mut self, dir: std::path::PathBuf) -> Self {
+        self.ocr_models = Some(dir);
+        self
     }
 
     /// Enable `browser_upload`. Every path goes through `resolve` (the
@@ -2203,38 +2218,68 @@ impl BrowserModule {
     }
 
     async fn screenshot(&self, args: &Value) -> Envelope {
-        let target = match require(args, "target_id", "browser_screenshot") {
+        let tool = "browser_screenshot";
+        let target = match require(args, "target_id", tool) {
             Ok(t) => t,
             Err(e) => return e,
         };
         let save = args.get("save").and_then(Value::as_bool).unwrap_or(false);
         let media = if save {
-            match self.media_dir_for("browser_screenshot") {
+            match self.media_dir_for(tool) {
                 Ok(d) => Some(d),
                 Err(e) => return e,
             }
         } else {
             None
         };
+        let find = str_arg(args, "find");
+        if let Some(q) = find {
+            if q.trim().is_empty() {
+                return Envelope::fail(tool, ErrorCode::InvalidArgs, "'find' is empty");
+            }
+        }
+        let ocr = find.is_some() || args.get("ocr").and_then(Value::as_bool).unwrap_or(false);
+        // OCR exists to save the image's tokens, so the picture is left out
+        // unless asked for; without OCR the picture is the whole point.
+        let with_image = !ocr || args.get("image").and_then(Value::as_bool).unwrap_or(false);
         let node_ref = str_arg(args, "ref");
         let mut shot = match self.backend.screenshot(target, node_ref).await {
             Ok(s) => s,
-            Err(e) => return browser_err("browser_screenshot", e),
+            Err(e) => return browser_err(tool, e),
         };
+        // The grid and OCR both need to know how the picture maps to CSS px.
+        let step = mcp_vision::grid::step_from_args(args);
+        let geometry = if step.is_some() || ocr {
+            match self.capture_geometry(target, node_ref, &shot).await {
+                Ok(g) => Some(g),
+                Err(e) => return browser_err(tool, e),
+            }
+        } else {
+            None
+        };
+        let mut ocr_info = json!({});
+        if let (true, Some(g)) = (ocr, geometry) {
+            // Read the text before the grid is drawn on the pixels it reads.
+            match self.ocr_shot(&shot, &g, find, args).await {
+                Ok(info) => ocr_info = info,
+                Err(e) => return browser_err(tool, e),
+            }
+        }
         // What the grid adds to the result; empty without one.
         let mut grid_info = json!({});
-        if let Some(step) = mcp_vision::grid::step_from_args(args) {
-            match self.draw_grid(target, node_ref, step, &mut shot).await {
+        if let (Some(step), Some(g)) = (step, geometry) {
+            match Self::draw_grid(step, &g, &mut shot) {
                 Ok(info) => grid_info = info,
-                Err(e) => return browser_err("browser_screenshot", e),
+                Err(e) => return browser_err(tool, e),
             }
         }
         if let Some(dir) = media {
             return result(
-                "browser_screenshot",
+                tool,
                 crate::screencast::save_screenshot(&dir, &shot.base64, shot.width, shot.height)
                     .map(|mut saved| {
                         merge_into(&mut saved, grid_info);
+                        merge_into(&mut saved, ocr_info);
                         saved
                     }),
             );
@@ -2247,8 +2292,12 @@ impl BrowserModule {
         };
         let mut data = json!({ "width": width, "height": height });
         merge_into(&mut data, grid_info);
+        merge_into(&mut data, ocr_info);
+        if !with_image {
+            return Envelope::ok(tool, data);
+        }
         Envelope::ok_image(
-            "browser_screenshot",
+            tool,
             data,
             ImageContent {
                 mime_type: "image/png".into(),
@@ -2257,25 +2306,22 @@ impl BrowserModule {
         )
     }
 
-    /// Draw the coordinate grid on `shot`, labelled in the CSS pixels
-    /// `browser_act` takes as `x`/`y` with no target (viewport points).
+    /// How the picture maps to the CSS pixels `browser_act` takes as `x`/`y`
+    /// with no target (viewport points): the shared ground for the grid and
+    /// for OCR, measured once so the two cannot disagree.
     ///
-    /// Done on the decoded PNG, not by injecting an overlay: the page is left
-    /// exactly as it was, and the grid is on the picture only. The image is
-    /// `scale` device pixels per CSS pixel, so the lines are `step * scale`
-    /// apart and still labelled in CSS pixels. An element's shot starts at the
-    /// element, so its labels are offset by where the element sits in the
-    /// viewport rather than restarting at 0.
-    async fn draw_grid(
+    /// A viewport shot is the viewport at the device pixel ratio, so the image
+    /// width over the viewport width is the scale. An element shot is clipped
+    /// in CSS px at the same ratio and starts at the element, so its boxes are
+    /// offset by where the element sits in the viewport rather than from 0.
+    async fn capture_geometry(
         &self,
         target: &str,
         node_ref: Option<&str>,
-        step: u32,
-        shot: &mut crate::backend::Shot,
-    ) -> Result<Value, BrowserError> {
-        let (img_w, img_h) = crate::screencast::png_b64_size(&shot.base64).ok_or_else(|| {
-            BrowserError::Failed("screenshot is not a PNG; cannot draw a grid".into())
-        })?;
+        shot: &crate::backend::Shot,
+    ) -> Result<crate::ocr::Geometry, BrowserError> {
+        let (img_w, _) = crate::screencast::png_b64_size(&shot.base64)
+            .ok_or_else(|| BrowserError::Failed("screenshot is not a PNG".into()))?;
         let xp = serde_json::to_string(&node_ref.unwrap_or("")).unwrap_or_else(|_| "\"\"".into());
         let probe = format!(
             r#"(function(){{
@@ -2294,34 +2340,45 @@ impl BrowserModule {
         let num = |v: &Value, k: &str| v.get(k).and_then(Value::as_f64).unwrap_or(0.0);
         let (vw, vh, dpr) = (num(&facts, "vw"), num(&facts, "vh"), num(&facts, "dpr"));
         let rect = facts.get("rect").filter(|r| r.is_object());
-
-        // A viewport shot is the viewport at the device pixel ratio, so the
-        // image width over the viewport width is the scale. An element shot is
-        // clipped in CSS px at the same ratio.
+        let dpr = if dpr > 0.0 { dpr } else { 1.0 };
         let (scale, origin, space) = match (node_ref, rect) {
-            (Some(_), Some(r)) => (
-                if dpr > 0.0 { dpr } else { 1.0 },
-                (num(r, "x"), num(r, "y")),
-                "viewport",
-            ),
-            // The ref did not resolve to a rect: still draw, but say the
+            (Some(_), Some(r)) => (dpr, (num(r, "x"), num(r, "y")), "viewport"),
+            // The ref did not resolve to a rect: still answer, but say the
             // numbers are offsets inside the element, which is what browser_act
             // takes as x,y together with that ref.
-            (Some(_), None) => (if dpr > 0.0 { dpr } else { 1.0 }, (0.0, 0.0), "element"),
+            (Some(_), None) => (dpr, (0.0, 0.0), "element"),
             (None, _) => (
-                if vw > 0.0 {
-                    img_w as f64 / vw
-                } else {
-                    dpr.max(1.0)
-                },
+                if vw > 0.0 { img_w as f64 / vw } else { dpr },
                 (0.0, 0.0),
                 "viewport",
             ),
         };
+        Ok(crate::ocr::Geometry {
+            scale,
+            origin,
+            space,
+            viewport: (vw, vh),
+        })
+    }
+
+    /// Draw the coordinate grid on `shot`, labelled in CSS px.
+    ///
+    /// Done on the decoded PNG, not by injecting an overlay: the page is left
+    /// exactly as it was, and the grid is on the picture only. The image is
+    /// `scale` device pixels per CSS pixel, so the lines are `step * scale`
+    /// apart and still labelled in CSS pixels.
+    fn draw_grid(
+        step: u32,
+        g: &crate::ocr::Geometry,
+        shot: &mut crate::backend::Shot,
+    ) -> Result<Value, BrowserError> {
+        let (img_w, img_h) = crate::screencast::png_b64_size(&shot.base64).ok_or_else(|| {
+            BrowserError::Failed("screenshot is not a PNG; cannot draw a grid".into())
+        })?;
         let spec = mcp_vision::grid::GridSpec {
             step,
-            px_per_unit: (scale, scale),
-            origin,
+            px_per_unit: (g.scale, g.scale),
+            origin: g.origin,
         };
         shot.base64 = mcp_vision::grid::draw_grid_b64(&shot.base64, &spec)
             .map_err(|e| BrowserError::Failed(format!("grid: {e}")))?;
@@ -2330,7 +2387,7 @@ impl BrowserModule {
         shot.width = img_w;
         shot.height = img_h;
 
-        let note = if space == "viewport" {
+        let note = if g.space == "viewport" {
             "grid labels are CSS pixels from the viewport's top-left, the x,y browser_act takes \
              with no ref or query (scale is image pixels per CSS pixel; the image is width x \
              height pixels)"
@@ -2343,12 +2400,59 @@ impl BrowserModule {
             "height": img_h,
             "grid": true,
             "grid_step": step,
-            "scale": scale,
-            "coordinate_space": space,
-            "origin": { "x": origin.0, "y": origin.1 },
-            "viewport": { "w": vw, "h": vh },
+            "scale": g.scale,
+            "coordinate_space": g.space,
+            "origin": { "x": g.origin.0, "y": g.origin.1 },
+            "viewport": { "w": g.viewport.0, "h": g.viewport.1 },
             "grid_note": note,
         }))
+    }
+
+    /// Read the text in `shot` and shape it as `ocr` or `find` asks.
+    ///
+    /// Recognition is CPU work of a second or more on a large capture, so it
+    /// runs off the async threads; the engine loads once per module and is
+    /// kept, the first call paying for the model load (and, the first time on
+    /// a machine, the download).
+    async fn ocr_shot(
+        &self,
+        shot: &crate::backend::Shot,
+        g: &crate::ocr::Geometry,
+        find: Option<&str>,
+        args: &Value,
+    ) -> Result<Value, BrowserError> {
+        let Some(dir) = self.ocr_models.clone() else {
+            return Err(BrowserError::Unsupported(
+                "OCR is not configured for the browser engine (no model directory); take the \
+                 screenshot without ocr/find, or use grid=true and read the picture"
+                    .into(),
+            ));
+        };
+        let engine = self
+            .ocr
+            .get_or_try_init(|| async {
+                tokio::task::spawn_blocking(move || mcp_vision::ocr::Ocr::load(&dir).map(Arc::new))
+                    .await
+                    .map_err(|e| format!("ocr load task: {e}"))?
+            })
+            .await
+            .map_err(|e| BrowserError::Failed(format!("ocr: {e}")))?
+            .clone();
+        let (w, h, rgba) = mcp_vision::grid::decode_rgba_b64(&shot.base64)
+            .map_err(|e| BrowserError::Failed(format!("ocr: {e}")))?;
+        let mut lines = tokio::task::spawn_blocking(move || engine.recognise(&rgba, w, h))
+            .await
+            .map_err(|e| BrowserError::Failed(format!("ocr task: {e}")))?
+            .map_err(BrowserError::Failed)?;
+        mcp_vision::find::order_lines(&mut lines);
+        Ok(match find {
+            Some(q) => {
+                let exact = args.get("exact").and_then(Value::as_bool).unwrap_or(false);
+                let found = mcp_vision::find::find_matches(&lines, q, exact);
+                crate::ocr::find_result(q, exact, &found, &lines, g, (w, h))
+            }
+            None => crate::ocr::lines_result(&lines, g, (w, h)),
+        })
     }
 
     #[allow(clippy::result_large_err)]
@@ -3841,23 +3945,41 @@ impl ToolModule for BrowserModule {
                 "browser_screenshot",
                 Category::Browser,
                 Tier::Read,
-                "Capture a PNG of the page, or of one element by ref. Returned inline as an image; save=true writes it to agentctl's media directory and returns {path, width, height, bytes} instead. grid=true draws labelled lines in CSS pixels on the image, the x,y browser_act takes, for clicking where you see something.",
+                "Capture a PNG of the page or of one element (ref), inline; save=true writes it and returns the path. grid=true labels the image in CSS px, the x,y browser_act takes. ocr=true or find=\"text\" read the text instead (no image): each line, or each match, with x,y in CSS px to click, for a canvas or image UI the snapshot cannot see.",
                 obj(
                     json!({
                         "target_id": { "type": "string", "description": "tab id (default: active tab)" },
                         "ref": { "type": "string", "description": "element ref (default: whole page)" },
                         "save": { "type": "boolean" },
-                        "grid": { "type": "boolean", "description": "draw a labelled coordinate grid on the image, in viewport CSS px (an element's labels are its viewport position, not 0-based); the result gives scale (image px per CSS px), grid_step and origin" },
-                        "grid_step": { "type": "integer", "description": "with grid: CSS px between lines (default 100, minimum 25)" }
+                        "grid": { "type": "boolean", "description": "labelled grid in viewport CSS px on the image; the result gives scale, grid_step, origin" },
+                        "grid_step": { "type": "integer", "description": "with grid: CSS px between lines (default 100, min 25)" },
+                        "ocr": { "type": "boolean", "description": "read the text instead of the image: lines with bounds and center in CSS px" },
+                        "find": { "type": "string", "description": "OCR only the lines containing this text, best first, each with x,y to click; count 0 and a hint when none" },
+                        "exact": { "type": "boolean", "description": "with find: whole-line match only" },
+                        "image": { "type": "boolean", "description": "with ocr/find: also return the image" }
                     }),
                     json!([]),
                 ),
             ).details(
-                "With grid=true the labels read as the x,y of browser_act with no ref or query (a viewport point): \
-                 lines are grid_step CSS px apart, so on a 2x display they are 2*grid_step image pixels apart and \
-                 the result's scale is 2. A ref screenshot is labelled with the element's viewport position, not \
-                 from 0, and says so in coordinate_space. The page itself is not touched: the grid is drawn on the \
-                 returned image only. Labels at line crossings read x,y.\n\n\
+                "The image comes back inline as an MCP image block; with save=true only {path, width, height, bytes} \
+                 does.\n\n\
+                 With grid=true the labels read as the x,y of browser_act with no ref or query (a viewport point): \
+                 lines are grid_step CSS px apart (default 100, minimum 25), so on a 2x display they are 2*grid_step \
+                 image pixels apart and the result's scale is 2. A ref screenshot is labelled with the element's \
+                 viewport position, not from 0, and says so in coordinate_space. The page itself is not touched: the \
+                 grid is drawn on the returned image only. Labels at line crossings read x,y.\n\n\
+                 With ocr=true or find the capture is run through a text recogniser (ocrs, in-process, no network \
+                 after its two models are fetched on first use) and the image is left out unless image=true. It is \
+                 the fallback for a page whose text is pixels: a canvas app, an image-based UI, an annotation tool, \
+                 where browser_snapshot sees one element and browser_query finds nothing. Boxes come back in \
+                 viewport CSS px whatever the device scale factor (the result's scale is image px per CSS px), so \
+                 center x,y (ocr) or x,y (find) go straight to browser_act with no ref or query, or with the same \
+                 ref when coordinate_space is element. find is case-insensitive and whitespace-collapsed; exact=true \
+                 keeps only a line that is the text. It ranks a whole-line match first, then a whole word, then a \
+                 fragment of a word; a partial match's box is estimated from the character positions. No match is \
+                 ok with count 0 and a hint naming the nearest lines read. image=true returns the picture too. The capture is the viewport (or the \
+                 element with ref), never the whole scrollable page, so every box is clickable as returned. The \
+                 engine reports no per-line confidence; confidence is always 1.\n\n\
                  With save=true the PNG is written to agentctl's media directory (screenshots/, a generated file name) and \
                  only {path, width, height, bytes} comes back, with no image payload (default false). The newest 200 saved \
                  screenshots are kept; older ones are deleted.",

@@ -54,9 +54,11 @@ fn browser_core_stays_small() {
         .filter(|d| role.allows_tool(d))
         .map(wire_chars)
         .sum();
-    // About 2.2k tokens when written, at 4 chars to a token. A descriptor that
-    // grows past this should move its prose into `details`.
-    assert!(total < 11_000, "browser-core wire text is {total} chars");
+    // About 2.3k tokens, at 4 chars to a token. A descriptor that grows past
+    // this should move its prose into `details`. The ceiling was 11_000 before
+    // `browser_screenshot` gained OCR (`ocr`, `find`, `exact`, `image`): the
+    // parameters are the growth, their prose is in `details`.
+    assert!(total < 11_300, "browser-core wire text is {total} chars");
 }
 
 #[test]
