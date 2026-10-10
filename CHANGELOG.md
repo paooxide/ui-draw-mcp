@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-10
+
 ### Added
 
 - **`scroll` takes `modifiers`.** `["cmd"]`, `["ctrl"]`, `["shift"]` or `["opt"]`, the names `mouse_action` and
@@ -74,6 +76,11 @@ All notable changes to this project are documented here. The format follows
   the pixel under any point that lands on one.
 ### Security
 
+- **macOS release binaries are signed and notarized.** Each macOS archive's `agentctl` is signed with a
+  Developer ID certificate (Techbeaver IT Systems LTD), hardened runtime and timestamp, and submitted to
+  Apple's notary service by the release workflow; Gatekeeper runs a browser download without the
+  `xattr -d com.apple.quarantine` step that 0.2.1 needed. The Sigstore build attestation remains the proof of
+  which workflow and tag produced an archive.
 - **OCR model files are pinned by SHA-256.** The two `ocrs` models are downloaded once and parsed
   in-process; before, a modified or substituted file, on disk or from the download, would have been
   loaded. Every file is now verified against a pinned digest before anything parses it, whether it was
