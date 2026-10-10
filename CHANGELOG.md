@@ -6,6 +6,14 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- **Audit key generation uses `rand_core::OsRng` directly.** The audit log signing key was the only thing in
+  the workspace that used `rand`, and only to reach the operating system's randomness. `rand_core` 0.6 is what
+  `ed25519-dalek` is built on and already in the tree, so `rand`, `rand_chacha` and `ppv-lite86` leave it:
+  fewer crates, and one version of `rand_core` whatever `rand` does next. Keys come from the same source as
+  before.
+
 ## [0.2.1] - 2026-10-10
 
 Most of this release comes from two field sessions: a QA run and a demo recording against a server-rendered
