@@ -86,6 +86,17 @@ pub fn draw_grid_b64(png_b64: &str, spec: &GridSpec) -> Result<String, String> {
     Ok(base64::engine::general_purpose::STANDARD.encode(out))
 }
 
+/// Decode a base64 PNG to 8-bit RGBA pixels: `(width, height, pixels)`.
+///
+/// Public because `browser_screenshot` feeds the capture it already has to
+/// the recogniser, and should not need a second PNG decoder to do it.
+pub fn decode_rgba_b64(png_b64: &str) -> Result<(u32, u32, Vec<u8>), String> {
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(png_b64.trim())
+        .map_err(|e| format!("image is not valid base64: {e}"))?;
+    decode_rgba(&bytes)
+}
+
 /// Draw the grid on PNG bytes and return the new PNG bytes (RGBA).
 pub fn draw_grid(png_bytes: &[u8], spec: &GridSpec) -> Result<Vec<u8>, String> {
     let (w, h, mut px) = decode_rgba(png_bytes)?;

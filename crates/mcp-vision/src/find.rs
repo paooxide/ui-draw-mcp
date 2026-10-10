@@ -2,9 +2,33 @@
 //!
 //! "Click the Save label in a custom-drawn app" should cost two small calls,
 //! not a page of recognised text the model then has to search. This is the
-//! search, kept pure so it is tested on synthetic OCR output.
+//! search, kept pure so it is tested on synthetic OCR output. It is shared by
+//! `ocr_region` (screen points) and `browser_screenshot` (CSS pixels): both
+//! search image-pixel boxes and map the hits to their own space afterwards.
 
 use crate::backend::OcrLine;
+
+/// Group recognised lines into reading order: rows by vertical overlap, then
+/// left to right within a row.
+///
+/// A recogniser returns observations in its own order, which is not the order
+/// a person reads them in. An agent handed a jumbled transcript has to reason
+/// about geometry it cannot see.
+pub fn order_lines(lines: &mut [OcrLine]) {
+    lines.sort_by(|a, b| {
+        let row_height = a.px.3.max(b.px.3).max(1.0);
+        let dy = (a.px.1 - b.px.1).abs();
+        if dy < row_height * 0.5 {
+            a.px.0
+                .partial_cmp(&b.px.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        } else {
+            a.px.1
+                .partial_cmp(&b.px.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        }
+    });
+}
 
 /// How a line matched, best first. The order is the ranking.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
