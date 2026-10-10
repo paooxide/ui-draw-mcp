@@ -30,5 +30,4 @@ the button it named (now ranked: exact, visible, clickable first), `browser_act`
 hit (now `target` and `matches`), and a whole-page screenshot reported `0x0`. The other failures were the
 model passing `browser_id` for `target_id` and copying XPath refs with escaped quotes.
 
-`results/dry-run/` holds the 48 run records; `results/pilot-v0-no-transcripts/` is an earlier first pass.
-Transcripts and audit logs go to `results/traces/`, which is not committed.
+Run records, transcripts and audit logs go to `results/`, which is not committed.

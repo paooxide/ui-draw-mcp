@@ -13,7 +13,7 @@ OS permissions, and running the server from the terminal it is driving.
 2. **Run `agentctl doctor`.** It prints the OS, the protocol version, the kill-switch path, the audit
    directory, which config file was loaded, the enabled categories, the consent channel, and the
    platform's permission state (macOS grants, or the Linux bus and portals). Everything below assumes it looks right.
-3. **Decide what to enable.** The defaults are `vision`, `input` and `window`, with no dangerous tools, no
+3. **Decide what to enable.** With no config file the defaults are `vision`, `input`, `window`, `system` and `browser`, with no dangerous tools, no
    filesystem roots, no runnable commands and no reachable hosts. Copy `config.example.toml` to
    `~/.agentctl/config.toml` and open only what the task needs.
 4. **Do not run the server from the terminal it will drive.** Keystrokes go to whatever is frontmost, so a

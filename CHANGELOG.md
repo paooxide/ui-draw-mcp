@@ -15,6 +15,10 @@ operated.
 
 ### Added
 
+- **A Claude Code plugin and a usage skill.** `/plugin install agentctl --marketplace paooxide/ui-draw-mcp`
+  registers the server and adds `skills/agentctl/SKILL.md`: observe cheaply, act on refs, verify with
+  `expect`, and stop at a policy refusal, consent denial or kill switch instead of routing around it. The
+  skill never tells an agent to change agentctl's own policy.
 - **`browser_act` pointer actions:** `double_click`, `triple_click`, `right_click`, `scroll` and `drag`, all
   real CDP input. `x` and `y` place a click or hover at a point (offsets inside the target, so a canvas is
   clicked at its own pixel coordinates; viewport px without one), and the result's `click_at` says where it
@@ -317,6 +321,30 @@ operated.
   `:has-text(`, `:text(`, `:visible`, `:eq(`, `:first` and `:last` are not CSS. `browser_act`,
   `browser_query` and `browser_fill_form` now answer `INVALID_ARGS` with the browser's message and a
   suggestion to use `by: "text"` (or act's `text` filter).
+
+### Security
+
+- **`fs_archive` extract could write credential stores and the server's own config.** Extraction went
+  straight into the destination and was checked only for escapes from the roots, afterwards; an archive
+  carrying `.ssh/authorized_keys` or `.agentctl/config.toml` landed inside a root of `~` with nothing
+  refused. Archives now extract into a staging directory, every entry is checked against the jail (deny
+  list included) before anything moves into place, and an archive holding a symlink or special file is
+  refused. A refused archive leaves the destination unchanged.
+- **`fs_archive` compress could bundle a denied path into a readable archive.** Compressing a directory
+  that held `.ssh/` (or any other denied path) is now refused, and `zip` stores symlinks as links instead
+  of following them.
+- **`fs_search` read files the jail denies.** The walk started inside the jail but never re-checked what
+  it found, so a search under `~` returned matching lines from `~/.ssh/` and `~/.agentctl/`. Denied files
+  are now skipped.
+- **The server's own files were only protected at their default location.** `/.agentctl/` is on the deny
+  list, but `$AGENTCTL_CONFIG`, `policy.kill_switch_file`, `policy.audit_dir` and
+  `policy.audit_signing_key` can each point elsewhere, and inside a root an agent could then rewrite its
+  own policy, pre-empt the STOP file or trash the audit log. Those paths are now refused wherever they
+  live, and `fs_delete` and `fs_move` refuse a directory that holds one.
+- **Release archives carry signed build provenance.** Each archive is attested through Sigstore with the
+  release workflow's GitHub identity; `gh attestation verify <archive> -R paooxide/ui-draw-mcp` proves it
+  was built by this repository's workflow from the tag. macOS Developer ID signing and notarization are
+  wired into the workflow and run once the signing secrets are configured.
 
 ## [0.2.0] - 2026-10-04
 

@@ -23,7 +23,9 @@ potentially prompt-injected or adversarial: the safety of the system does not re
 The policy layer is the security boundary. Read this before running it.
 
 - **Everything is closed by default.** No filesystem roots, no runnable commands, no reachable hosts, no
-  keychain services, until an operator opts in. Only `vision`, `input` and `window` are enabled at all.
+  keychain services, until an operator opts in. With no config file, `vision`, `input`, `window`,
+  `system` (diagnostics) and `browser` are enabled; with one, its `policy.categories` decides (`vision`,
+  `input` and `window` if it does not say).
 - **Tiered tools.** Every tool is `read`, `standard` or `dangerous`. Enabling a category never enables its
   dangerous tools; each of those must additionally be named in `policy.enable`.
 - **Per-call consent.** High-impact actions raise a native dialog whose default button is Deny, out of band
@@ -73,7 +75,9 @@ heuristic.
 | credentials | 2 | `secure_vault`, `ssh_gpg_identities` | 1 |
 | memory | 3 | `memory_find`, `memory_forget`, `memory_save` | 0 |
 
-Only `vision`, `input` and `window` are enabled out of the box, and only their non-dangerous tools.
+With no config file, `vision`, `input`, `window`, `system` and `browser` are enabled, and only their
+non-dangerous tools. With a config file, its `policy.categories` decides, and leaving it out means `vision`,
+`input` and `window`.
 
 **The cheapest way to observe is `get_ui_tree`**: plain text, no image, no vision tokens. Ask it for a
 delta with `since` and a follow-up observation costs only what changed. `find_elements` is cheaper still
@@ -101,8 +105,16 @@ shasum -a 256 -c SHA256SUMS --ignore-missing
 tar xzf agentctl-v0.2.1-aarch64-apple-darwin.tar.gz
 ```
 
-Release binaries are **not signed or notarized**. macOS quarantines anything a browser downloaded, so clear
-the flag before first run (a `curl` download is not quarantined and needs no such step):
+The checksum proves the download is intact; the attestation proves who built it. Every archive carries
+signed build provenance, so with the [GitHub CLI](https://cli.github.com) you can confirm it came from this
+repository's release workflow and not from a mirror or a re-upload:
+
+```sh
+gh attestation verify agentctl-v0.2.1-aarch64-apple-darwin.tar.gz -R paooxide/ui-draw-mcp
+```
+
+The macOS binaries are **not yet notarized** by Apple. macOS quarantines anything a browser downloaded, so
+clear the flag before first run (a `curl` download is not quarantined and needs no such step):
 
 ```sh
 xattr -d com.apple.quarantine ./agentctl 2>/dev/null || true
@@ -140,6 +152,17 @@ Register it with a client. For Claude Code:
 ```sh
 claude mcp add agentctl -- /usr/local/bin/agentctl serve
 ```
+
+Or install the Claude Code plugin, which registers the same server and adds a skill that teaches the agent
+to use it well: observe cheaply, act on element refs, verify each step, and stop at a policy refusal rather
+than look for a way around it. The plugin runs `agentctl` from your `PATH`, so install the binary first.
+
+```sh
+/plugin install agentctl --marketplace paooxide/ui-draw-mcp
+```
+
+The skill itself is plain [`SKILL.md`](plugins/agentctl/skills/agentctl/SKILL.md), so other agents that read
+skills can use it from that folder directly.
 
 Then ask the agent to do something a shell cannot: *"Open TextEdit, type today's date, and save it to my
 Desktop."* Per-client setup for Claude Desktop, Cursor and Gemini is in
