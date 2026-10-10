@@ -31,6 +31,20 @@ All notable changes to this project are documented here. The format follows
 - **`docs/fixtures/whiteboard.html`:** a dependency-free drawing page (a 2x CSS-scaled bordered canvas that
   records pointer events, strokes and polygons, an SVG rect with a draggable vertex, wheel and modifier-key
   recording) with live tests in `crates/mcp-browser/tests/whiteboard_live.rs`.
+- **`browser_screenshot` reads text: `ocr` and `find`.** A canvas app, an image-based UI or an annotation
+  tool shows its text as pixels: `browser_snapshot` sees one element and `browser_query` finds nothing, so
+  the only way to click "Save" was a screenshot the model read with its own eyes, every turn, guessing a
+  coordinate off the picture. `ocr=true` returns every visible line with `bounds` and `center` in viewport
+  CSS px, and `find="Save"` returns only the lines containing it, best first (whole line, then whole word,
+  then a fragment), each with the `x`,`y` to pass to `browser_act`; no match is `ok` with `count 0` and a
+  hint naming the nearest lines read. Boxes are mapped from image pixels through the capture's scale, so
+  they are right on a 2x display and for a `ref` capture, and the image stays out of the result unless
+  `image=true`. The browser-side twin of the desktop `ocr_region`: same argument names, same result shape.
+  The recogniser is the pure-Rust `ocrs` engine, now in `mcp-vision` behind its `ocr` feature and shared
+  with the Linux desktop backend, so one model download (about 20 MB, on first use into the state
+  directory or `$AGENTCTL_OCR_MODELS`) serves both. Labels side by side on one row, which the recogniser
+  reads as one line, are split where the words are a row height or more apart, so each gets its own
+  centre; this applies to `ocr_region` on Linux too. Fixture: `docs/fixtures/ocr_canvas.html`.
 
 ### Changed
 
@@ -58,21 +72,6 @@ All notable changes to this project are documented here. The format follows
   as published canvas regions already were, and a region's offsets count from its own corner in bitmap pixels.
   `click_at`, `at`, `from`, `to` and `scroll_at` add `pixel` (the bitmap pixel) on a canvas, and `hit` names
   the pixel under any point that lands on one.
-- **`browser_screenshot` reads text: `ocr` and `find`.** A canvas app, an image-based UI or an annotation
-  tool shows its text as pixels: `browser_snapshot` sees one element and `browser_query` finds nothing, so
-  the only way to click "Save" was a screenshot the model read with its own eyes, every turn, guessing a
-  coordinate off the picture. `ocr=true` returns every visible line with `bounds` and `center` in viewport
-  CSS px, and `find="Save"` returns only the lines containing it, best first (whole line, then whole word,
-  then a fragment), each with the `x`,`y` to pass to `browser_act`; no match is `ok` with `count 0` and a
-  hint naming the nearest lines read. Boxes are mapped from image pixels through the capture's scale, so
-  they are right on a 2x display and for a `ref` capture, and the image stays out of the result unless
-  `image=true`. The browser-side twin of the desktop `ocr_region`: same argument names, same result shape.
-  The recogniser is the pure-Rust `ocrs` engine, now in `mcp-vision` behind its `ocr` feature and shared
-  with the Linux desktop backend, so one model download (about 20 MB, on first use into the state
-  directory or `$AGENTCTL_OCR_MODELS`) serves both. Labels side by side on one row, which the recogniser
-  reads as one line, are split where the words are a row height or more apart, so each gets its own
-  centre; this applies to `ocr_region` on Linux too. Fixture: `docs/fixtures/ocr_canvas.html`.
-
 ### Security
 
 - **OCR model files are pinned by SHA-256.** The two `ocrs` models are downloaded once and parsed
