@@ -198,20 +198,146 @@ pub fn modifier_flags(modifiers: &[String]) -> CGEventFlags {
     flags
 }
 
-/// Post one mouse event.
+/// A mouse button, as the backend tracks it. Its own type because
+/// `CGMouseButton` derives neither `PartialEq` nor `Eq`, and the held-button
+/// record needs to compare.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Button {
+    Left,
+    Right,
+    Center,
+}
+
+impl Button {
+    /// Resolve a button name; anything unrecognised is the left button.
+    pub fn parse(name: &str) -> Button {
+        match name {
+            "right" => Button::Right,
+            "middle" | "center" => Button::Center,
+            _ => Button::Left,
+        }
+    }
+
+    fn cg(self) -> CGMouseButton {
+        match self {
+            Button::Left => CGMouseButton::Left,
+            Button::Right => CGMouseButton::Right,
+            Button::Center => CGMouseButton::Center,
+        }
+    }
+
+    fn down(self) -> CGEventType {
+        match self {
+            Button::Left => CGEventType::LeftMouseDown,
+            Button::Right => CGEventType::RightMouseDown,
+            Button::Center => CGEventType::OtherMouseDown,
+        }
+    }
+
+    fn up(self) -> CGEventType {
+        match self {
+            Button::Left => CGEventType::LeftMouseUp,
+            Button::Right => CGEventType::RightMouseUp,
+            Button::Center => CGEventType::OtherMouseUp,
+        }
+    }
+
+    fn dragged(self) -> CGEventType {
+        match self {
+            Button::Left => CGEventType::LeftMouseDragged,
+            Button::Right => CGEventType::RightMouseDragged,
+            Button::Center => CGEventType::OtherMouseDragged,
+        }
+    }
+}
+
+/// The buttons this backend currently holds down.
+///
+/// macOS has two kinds of pointer motion: `MouseMoved` with nothing pressed
+/// and `*MouseDragged` while a button is down, and targets that track a drag
+/// (Finder, sliders, canvases, text selection) listen only for the second.
+/// A `mouse_action down` followed by `move` is how an agent composes its own
+/// drag, so the backend has to remember the press to send the right motion.
+/// Owned by the backend rather than a static so a test can have its own.
+#[derive(Debug, Default)]
+pub struct Held {
+    buttons: Mutex<Vec<Button>>,
+}
+
+impl Held {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<Button>> {
+        self.buttons.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub fn press(&self, b: Button) {
+        let mut g = self.lock();
+        if !g.contains(&b) {
+            g.push(b);
+        }
+    }
+
+    pub fn release(&self, b: Button) {
+        self.lock().retain(|h| *h != b);
+    }
+
+    /// Forget everything: the human-override brake fired, so whatever was
+    /// held is no longer this backend's gesture.
+    pub fn clear(&self) {
+        self.lock().clear();
+    }
+
+    pub fn buttons(&self) -> Vec<Button> {
+        self.lock().clone()
+    }
+}
+
+/// The event a pointer motion must carry given what is held: a plain
+/// `MouseMoved` with nothing down, otherwise the `*MouseDragged` of the held
+/// button. With several held, the precedence is the one IOHIDSystem uses for
+/// a real mouse: left, then right, then any other button.
+pub fn motion_event(held: &[Button]) -> (CGEventType, Button) {
+    let btn = if held.contains(&Button::Left) {
+        Button::Left
+    } else if held.contains(&Button::Right) {
+        Button::Right
+    } else if let Some(b) = held.first() {
+        *b
+    } else {
+        return (CGEventType::MouseMoved, Button::Left);
+    };
+    (btn.dragged(), btn)
+}
+
+/// The pressure a real mouse reports: 1 while a button is down (a press or a
+/// drag), 0 otherwise. `CGEventCreateMouseEvent` leaves it at 0 for every
+/// type, which makes a drag look like a move to anything that reads it.
+fn pressure_for(ty: CGEventType) -> f64 {
+    match ty {
+        CGEventType::LeftMouseDown
+        | CGEventType::RightMouseDown
+        | CGEventType::OtherMouseDown
+        | CGEventType::LeftMouseDragged
+        | CGEventType::RightMouseDragged
+        | CGEventType::OtherMouseDragged => 1.0,
+        _ => 0.0,
+    }
+}
+
+/// Build one mouse event without posting it, so a test can inspect what would
+/// go out. The returned point is where the pointer will actually land.
 ///
 /// `click_state` is the part that is easy to leave out and impossible to notice
 /// afterwards: macOS decides "double click" from this field, not from how fast
 /// two clicks arrive. Sending down/up twice with the default state of 1 gives
 /// the target two ordinary single clicks, so double-click-to-open and
 /// triple-click-to-select-line quietly do nothing.
-fn post_mouse_ex(
+fn build_mouse_event(
     ty: CGEventType,
     pt: CGPoint,
-    btn: CGMouseButton,
+    btn: Button,
     flags: CGEventFlags,
     click_state: i64,
-) -> Result<(), InputError> {
+) -> Result<(CGEvent, CGPoint), InputError> {
     // The OS clamps a point past the screen edge; recording the unclamped
     // request would have the watcher compare against a position the pointer
     // never occupied, and read the server's own click as a human takeover.
@@ -219,13 +345,15 @@ fn post_mouse_ex(
         let (x, y) = clamp_point((pt.x, pt.y), &display_rects());
         CGPoint::new(x, y)
     };
-    let ev = CGEvent::new_mouse_event(source()?, ty, pt, btn).map_err(|_| fail("mouse event"))?;
+    let ev =
+        CGEvent::new_mouse_event(source()?, ty, pt, btn.cg()).map_err(|_| fail("mouse event"))?;
     // Always set it, including for a single click. `CGEventCreateMouseEvent`
     // leaves the field at 0, which reaches AppKit as `clickCount == 0` — not
     // "one click". Measured against a live NSTextView, a second such click
     // extends the selection from the previous caret instead of moving it, so
     // plain clicks silently behaved like shift-clicks.
     ev.set_integer_value_field(EventField::MOUSE_EVENT_CLICK_STATE, click_state.max(1));
+    ev.set_double_value_field(EventField::MOUSE_EVENT_PRESSURE, pressure_for(ty));
     // Always set flags, including the empty set. A mouse event created from an
     // HID-state source *inherits* whatever modifiers the system currently
     // believes are held, so skipping this when no modifier was asked for lets a
@@ -233,6 +361,18 @@ fn post_mouse_ex(
     // then behaves as shift-click and extends a selection instead of moving the
     // caret. Setting it explicitly clears the inherited state.
     ev.set_flags(flags);
+    Ok((ev, pt))
+}
+
+/// Post one mouse event.
+fn post_mouse_ex(
+    ty: CGEventType,
+    pt: CGPoint,
+    btn: Button,
+    flags: CGEventFlags,
+    click_state: i64,
+) -> Result<(), InputError> {
+    let (ev, pt) = build_mouse_event(ty, pt, btn, flags, click_state)?;
     // Record before posting: this is the only place the pointer is written, so
     // it is the only place the override watcher can learn what was ours.
     record_set(pt);
@@ -240,32 +380,14 @@ fn post_mouse_ex(
     Ok(())
 }
 
-fn post_mouse(ty: CGEventType, pt: CGPoint, btn: CGMouseButton) -> Result<(), InputError> {
-    post_mouse_ex(ty, pt, btn, CGEventFlags::empty(), 1)
-}
-
-/// Resolve a button name to its `(button, down, up)` event triple.
-fn button_events(name: &str) -> (CGMouseButton, CGEventType, CGEventType) {
-    match name {
-        "right" => (
-            CGMouseButton::Right,
-            CGEventType::RightMouseDown,
-            CGEventType::RightMouseUp,
-        ),
-        "middle" | "center" => (
-            CGMouseButton::Center,
-            CGEventType::OtherMouseDown,
-            CGEventType::OtherMouseUp,
-        ),
-        _ => (
-            CGMouseButton::Left,
-            CGEventType::LeftMouseDown,
-            CGEventType::LeftMouseUp,
-        ),
-    }
+/// Move the pointer to `pt`, as a drag when a button is held.
+fn post_motion(held: &Held, pt: CGPoint, flags: CGEventFlags) -> Result<(), InputError> {
+    let (ty, btn) = motion_event(&held.buttons());
+    post_mouse_ex(ty, pt, btn, flags, 1)
 }
 
 pub fn mouse(
+    held: &Held,
     kind: MouseKind,
     x: f64,
     y: f64,
@@ -273,17 +395,17 @@ pub fn mouse(
     modifiers: &[String],
 ) -> Result<(), InputError> {
     let pt = CGPoint::new(x, y);
-    let name = if matches!(kind, MouseKind::RightClick) {
-        "right"
+    let btn = if matches!(kind, MouseKind::RightClick) {
+        Button::Right
     } else {
-        button.unwrap_or("left")
+        Button::parse(button.unwrap_or("left"))
     };
-    let (btn, down, up) = button_events(name);
     let flags = modifier_flags(modifiers);
     // A click at a position the pointer is not at can miss hover-activated
-    // targets, so move there first.
+    // targets, so move there first — as a drag if a button is already down,
+    // since the release point of a composed drag is reached by dragging.
     if !matches!(kind, MouseKind::Move) {
-        post_mouse_ex(CGEventType::MouseMoved, pt, btn, flags, 1)?;
+        post_motion(held, pt, flags)?;
     }
     // Multi-clicks are a *sequence* of clicks with a rising click-state, not N
     // independent clicks: the target reads state 2 as "this is the double".
@@ -293,13 +415,22 @@ pub fn mouse(
         _ => 1,
     };
     match kind {
-        MouseKind::Move => post_mouse_ex(CGEventType::MouseMoved, pt, btn, flags, 1)?,
-        MouseKind::Down => post_mouse_ex(down, pt, btn, flags, 1)?,
-        MouseKind::Up => post_mouse_ex(up, pt, btn, flags, 1)?,
+        MouseKind::Move => post_motion(held, pt, flags)?,
+        MouseKind::Down => {
+            post_mouse_ex(btn.down(), pt, btn, flags, 1)?;
+            held.press(btn);
+        }
+        MouseKind::Up => {
+            // Forget the press even if the release could not be posted: the
+            // next motion must not claim a drag the agent has given up on.
+            let r = post_mouse_ex(btn.up(), pt, btn, flags, 1);
+            held.release(btn);
+            r?;
+        }
         _ => {
             for state in 1..=clicks {
-                post_mouse_ex(down, pt, btn, flags, state)?;
-                post_mouse_ex(up, pt, btn, flags, state)?;
+                post_mouse_ex(btn.down(), pt, btn, flags, state)?;
+                post_mouse_ex(btn.up(), pt, btn, flags, state)?;
             }
         }
     }
@@ -310,31 +441,35 @@ pub fn mouse(
 ///
 /// Split into three calls so the caller can space the intermediate moves out in
 /// time without blocking an async runtime with `thread::sleep`.
-pub fn drag_begin(pt: (f64, f64), modifiers: &[String]) -> Result<(), InputError> {
+pub fn drag_begin(held: &Held, pt: (f64, f64), modifiers: &[String]) -> Result<(), InputError> {
     let p = CGPoint::new(pt.0, pt.1);
     let flags = modifier_flags(modifiers);
-    post_mouse_ex(CGEventType::MouseMoved, p, CGMouseButton::Left, flags, 1)?;
-    post_mouse_ex(CGEventType::LeftMouseDown, p, CGMouseButton::Left, flags, 1)
+    post_motion(held, p, flags)?;
+    post_mouse_ex(CGEventType::LeftMouseDown, p, Button::Left, flags, 1)?;
+    held.press(Button::Left);
+    Ok(())
 }
 
 pub fn drag_to(pt: (f64, f64), modifiers: &[String]) -> Result<(), InputError> {
     post_mouse_ex(
         CGEventType::LeftMouseDragged,
         CGPoint::new(pt.0, pt.1),
-        CGMouseButton::Left,
+        Button::Left,
         modifier_flags(modifiers),
         1,
     )
 }
 
-pub fn drag_end(pt: (f64, f64), modifiers: &[String]) -> Result<(), InputError> {
-    post_mouse_ex(
+pub fn drag_end(held: &Held, pt: (f64, f64), modifiers: &[String]) -> Result<(), InputError> {
+    let r = post_mouse_ex(
         CGEventType::LeftMouseUp,
         CGPoint::new(pt.0, pt.1),
-        CGMouseButton::Left,
+        Button::Left,
         modifier_flags(modifiers),
         1,
-    )
+    );
+    held.release(Button::Left);
+    r
 }
 
 /// Interpolate `steps` points from `from` to `to`, exclusive of the start.
@@ -348,13 +483,9 @@ pub fn drag_path(from: (f64, f64), to: (f64, f64), steps: u32) -> Vec<(f64, f64)
         .collect()
 }
 
-pub fn scroll(x: f64, y: f64, dir: ScrollDir, amount: i32) -> Result<(), InputError> {
+pub fn scroll(held: &Held, x: f64, y: f64, dir: ScrollDir, amount: i32) -> Result<(), InputError> {
     // Position the cursor so the scroll targets that location.
-    post_mouse(
-        CGEventType::MouseMoved,
-        CGPoint::new(x, y),
-        CGMouseButton::Left,
-    )?;
+    post_motion(held, CGPoint::new(x, y), CGEventFlags::empty())?;
     let a = amount.max(1);
     let (vertical, horizontal) = match dir {
         ScrollDir::Up => (a, 0),
@@ -371,12 +502,8 @@ pub fn scroll(x: f64, y: f64, dir: ScrollDir, amount: i32) -> Result<(), InputEr
     Ok(())
 }
 
-pub fn hover(x: f64, y: f64) -> Result<(), InputError> {
-    post_mouse(
-        CGEventType::MouseMoved,
-        CGPoint::new(x, y),
-        CGMouseButton::Left,
-    )
+pub fn hover(held: &Held, x: f64, y: f64) -> Result<(), InputError> {
+    post_motion(held, CGPoint::new(x, y), CGEventFlags::empty())
 }
 
 pub fn clipboard_read_text() -> Result<Option<String>, InputError> {
@@ -753,12 +880,157 @@ mod tests {
 
     #[test]
     fn button_names_map_to_matching_down_up_pairs() {
-        let (_, d, u) = button_events("right");
-        assert!(matches!(d, CGEventType::RightMouseDown));
-        assert!(matches!(u, CGEventType::RightMouseUp));
-        let (_, d, u) = button_events("anything-else");
-        assert!(matches!(d, CGEventType::LeftMouseDown));
-        assert!(matches!(u, CGEventType::LeftMouseUp));
+        let b = Button::parse("right");
+        assert!(matches!(b.down(), CGEventType::RightMouseDown));
+        assert!(matches!(b.up(), CGEventType::RightMouseUp));
+        assert!(matches!(b.dragged(), CGEventType::RightMouseDragged));
+        let b = Button::parse("middle");
+        assert_eq!(b, Button::Center);
+        assert!(matches!(b.down(), CGEventType::OtherMouseDown));
+        assert!(matches!(b.dragged(), CGEventType::OtherMouseDragged));
+        let b = Button::parse("anything-else");
+        assert!(matches!(b.down(), CGEventType::LeftMouseDown));
+        assert!(matches!(b.up(), CGEventType::LeftMouseUp));
+        assert!(matches!(b.dragged(), CGEventType::LeftMouseDragged));
+    }
+}
+
+/// The held-button record and the motion events it selects. None of these
+/// post anything: they build events, or run pure logic, and the owner's
+/// pointer never moves.
+#[cfg(test)]
+mod drag_tests {
+    use super::*;
+
+    /// This was a live bug: `mouse_action down` then `move` posted
+    /// `MouseMoved`, which anything that tracks `LeftMouseDragged` ignores,
+    /// so a composed drag was a click followed by an idle pointer. Only
+    /// `drag_drop` sent drag events.
+    #[test]
+    fn a_move_with_a_button_held_is_a_drag_of_that_button() {
+        let (ty, b) = motion_event(&[]);
+        assert!(matches!(ty, CGEventType::MouseMoved), "{ty:?}");
+        assert_eq!(b, Button::Left);
+        let (ty, b) = motion_event(&[Button::Left]);
+        assert!(matches!(ty, CGEventType::LeftMouseDragged), "{ty:?}");
+        assert_eq!(b, Button::Left);
+        let (ty, b) = motion_event(&[Button::Right]);
+        assert!(matches!(ty, CGEventType::RightMouseDragged), "{ty:?}");
+        assert_eq!(b, Button::Right);
+        let (ty, b) = motion_event(&[Button::Center]);
+        assert!(matches!(ty, CGEventType::OtherMouseDragged), "{ty:?}");
+        assert_eq!(b, Button::Center);
+    }
+
+    /// With several buttons down, left wins, then right, as a real mouse
+    /// reports it; the order they were pressed in does not matter.
+    #[test]
+    fn with_several_buttons_held_left_wins_then_right() {
+        let (ty, _) = motion_event(&[Button::Right, Button::Left]);
+        assert!(matches!(ty, CGEventType::LeftMouseDragged), "{ty:?}");
+        let (ty, _) = motion_event(&[Button::Center, Button::Right]);
+        assert!(matches!(ty, CGEventType::RightMouseDragged), "{ty:?}");
+    }
+
+    /// The record follows down and up exactly, does not double-count a
+    /// repeated press, and forgets everything when the brake fires.
+    #[test]
+    fn the_held_record_follows_presses_and_releases() {
+        let held = Held::default();
+        assert!(held.buttons().is_empty());
+        held.press(Button::Left);
+        held.press(Button::Left);
+        assert_eq!(held.buttons(), vec![Button::Left]);
+        held.press(Button::Right);
+        held.release(Button::Left);
+        assert_eq!(held.buttons(), vec![Button::Right]);
+        let (ty, _) = motion_event(&held.buttons());
+        assert!(matches!(ty, CGEventType::RightMouseDragged), "{ty:?}");
+        held.release(Button::Right);
+        assert!(held.buttons().is_empty());
+        // Releasing a button that is not held is not an error.
+        held.release(Button::Center);
+        held.press(Button::Left);
+        held.press(Button::Center);
+        held.clear();
+        assert!(held.buttons().is_empty(), "the brake forgets every press");
+        let (ty, _) = motion_event(&held.buttons());
+        assert!(matches!(ty, CGEventType::MouseMoved), "{ty:?}");
+    }
+
+    /// A press and a drag carry pressure; a move and a release do not. The
+    /// constructor leaves every type at 0, which reads as "no button".
+    #[test]
+    fn pressure_is_one_while_a_button_is_down() {
+        assert_eq!(pressure_for(CGEventType::LeftMouseDragged), 1.0);
+        assert_eq!(pressure_for(CGEventType::OtherMouseDown), 1.0);
+        assert_eq!(pressure_for(CGEventType::MouseMoved), 0.0);
+        assert_eq!(pressure_for(CGEventType::RightMouseUp), 0.0);
+    }
+
+    /// The event that would go out for a motion while the left button is
+    /// held: a `LeftMouseDragged` naming button 0, with the asked-for
+    /// modifiers and pressure 1. Built, inspected and dropped, never posted.
+    #[test]
+    fn a_built_drag_event_names_its_type_button_flags_and_pressure() {
+        if source().is_err() {
+            return; // No window server (headless CI): nothing to build.
+        }
+        let held = Held::default();
+        held.press(Button::Right);
+        let (ty, btn) = motion_event(&held.buttons());
+        let flags = modifier_flags(&["cmd".into()]);
+        let (ev, _) = build_mouse_event(ty, CGPoint::new(10.0, 10.0), btn, flags, 1).unwrap();
+        assert!(matches!(ev.get_type(), CGEventType::RightMouseDragged));
+        assert_eq!(
+            ev.get_integer_value_field(EventField::MOUSE_EVENT_BUTTON_NUMBER),
+            1,
+            "right is button 1"
+        );
+        assert_eq!(
+            ev.get_double_value_field(EventField::MOUSE_EVENT_PRESSURE),
+            1.0
+        );
+        assert!(ev.get_flags().contains(CGEventFlags::CGEventFlagCommand));
+        assert_eq!(
+            ev.get_integer_value_field(EventField::MOUSE_EVENT_CLICK_STATE),
+            1
+        );
+
+        held.release(Button::Right);
+        held.press(Button::Left);
+        let (ty, btn) = motion_event(&held.buttons());
+        let (ev, _) =
+            build_mouse_event(ty, CGPoint::new(10.0, 10.0), btn, CGEventFlags::empty(), 1).unwrap();
+        assert!(matches!(ev.get_type(), CGEventType::LeftMouseDragged));
+        assert_eq!(
+            ev.get_integer_value_field(EventField::MOUSE_EVENT_BUTTON_NUMBER),
+            0
+        );
+        assert_eq!(
+            ev.get_double_value_field(EventField::MOUSE_EVENT_PRESSURE),
+            1.0
+        );
+        assert!(ev.get_flags().is_empty());
+    }
+
+    /// With nothing held the same motion is a plain `MouseMoved` with no
+    /// pressure and, when nothing was asked for, no inherited modifiers.
+    #[test]
+    fn a_built_move_event_with_nothing_held_is_a_plain_move() {
+        if source().is_err() {
+            return;
+        }
+        let held = Held::default();
+        let (ty, btn) = motion_event(&held.buttons());
+        let (ev, _) =
+            build_mouse_event(ty, CGPoint::new(10.0, 10.0), btn, CGEventFlags::empty(), 1).unwrap();
+        assert!(matches!(ev.get_type(), CGEventType::MouseMoved));
+        assert_eq!(
+            ev.get_double_value_field(EventField::MOUSE_EVENT_PRESSURE),
+            0.0
+        );
+        assert!(ev.get_flags().is_empty());
     }
 }
 

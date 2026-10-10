@@ -14,6 +14,18 @@ All notable changes to this project are documented here. The format follows
   fewer crates, and one version of `rand_core` whatever `rand` does next. Keys come from the same source as
   before.
 
+### Fixed
+
+- **macOS: `mouse_action move` with a button held posted a plain `MouseMoved`.** `down`, `move`, `up` is how
+  an agent composes a drag `drag_drop` cannot express (a pause mid-path, a hover over the target before the
+  drop, a second button), but the moves went out as `MouseMoved`, so anything that tracks `LeftMouseDragged`,
+  `RightMouseDragged` or `OtherMouseDragged` (Finder, sliders, canvases, text selection) saw a click and an
+  idle pointer; only `drag_drop` sent real drag events. The backend now remembers which buttons it holds and,
+  while one is down, posts the matching `*MouseDragged` event with the button number and pressure set, for
+  `move`, `hover` and the positioning move before `scroll`. The record is released on `up`, when `drag_drop`
+  ends, and when the human-override brake fires, so a takeover never leaves a later move claiming a drag.
+  Linux already carried the held button through the portal and is unchanged.
+
 ## [0.2.1] - 2026-10-10
 
 Most of this release comes from two field sessions: a QA run and a demo recording against a server-rendered
