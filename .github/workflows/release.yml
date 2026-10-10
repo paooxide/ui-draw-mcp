@@ -32,8 +32,9 @@ jobs:
           - os: macos-latest
             target: x86_64-apple-darwin
           # Linux links against an old glibc through cargo-zigbuild. A plain
-          # build links against the runner's (2.39 on ubuntu-24.04), and the
-          # binary then refuses to start on Ubuntu 22.04, Debian 12 or RHEL 9.
+          # build links against the runner's glibc (2.39 on Ubuntu 24.04, newer
+          # once ubuntu-latest is 26.04), and the binary then refuses to start
+          # on Ubuntu 22.04, Debian 12 or RHEL 9.
           # 2.28 is RHEL 8 and Debian 10; the smoke test runs it on AlmaLinux 8.
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
@@ -66,6 +67,9 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
+      # Still a Node 20 action (v2.2.1 and main both declare node20), so the
+      # runner forces it onto Node 24 and prints a deprecation warning. It works;
+      # drop this note when a node24 release of setup-zig exists.
       - uses: mlugg/setup-zig@v2
         if: matrix.glibc
         with:
@@ -194,7 +198,9 @@ jobs:
       # Signed provenance for every archive: proves it was built by this
       # workflow, from this tag, in this repository. Verify with
       #   gh attestation verify <archive> -R ${{ github.repository }}
-      - uses: actions/attest-build-provenance@v2
+      # v4 is a thin wrapper over actions/attest (Node 24); v2 pulled in Node 20
+      # builds of actions/attest and the predicate action.
+      - uses: actions/attest-build-provenance@v4
         with:
           subject-path: dist/*.tar.gz
 
