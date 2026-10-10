@@ -6,6 +6,23 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **`browser_screenshot` reads text: `ocr` and `find`.** A canvas app, an image-based UI or an annotation
+  tool shows its text as pixels: `browser_snapshot` sees one element and `browser_query` finds nothing, so
+  the only way to click "Save" was a screenshot the model read with its own eyes, every turn, guessing a
+  coordinate off the picture. `ocr=true` returns every visible line with `bounds` and `center` in viewport
+  CSS px, and `find="Save"` returns only the lines containing it, best first (whole line, then whole word,
+  then a fragment), each with the `x`,`y` to pass to `browser_act`; no match is `ok` with `count 0` and a
+  hint naming the nearest lines read. Boxes are mapped from image pixels through the capture's scale, so
+  they are right on a 2x display and for a `ref` capture, and the image stays out of the result unless
+  `image=true`. The browser-side twin of the desktop `ocr_region`: same argument names, same result shape.
+  The recogniser is the pure-Rust `ocrs` engine, now in `mcp-vision` behind its `ocr` feature and shared
+  with the Linux desktop backend, so one model download (about 20 MB, on first use into the state
+  directory or `$AGENTCTL_OCR_MODELS`) serves both. Labels side by side on one row, which the recogniser
+  reads as one line, are split where the words are a row height or more apart, so each gets its own
+  centre; this applies to `ocr_region` on Linux too. Fixture: `docs/fixtures/ocr_canvas.html`.
+
 ## [0.2.1] - 2026-10-10
 
 Most of this release comes from two field sessions: a QA run and a demo recording against a server-rendered
