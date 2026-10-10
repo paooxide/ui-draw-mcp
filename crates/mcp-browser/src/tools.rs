@@ -3666,7 +3666,7 @@ impl ToolModule for BrowserModule {
                         "to_y": { "type": "number", "description": "drag end y, as to_x" },
                         "dx": { "type": "number", "description": "drag or scroll: x distance in CSS px" },
                         "dy": { "type": "number", "description": "as dx (scroll default: one viewport down)" },
-                        "path": { "type": "array", "description": "drag: waypoints [{x,y},...] in to_x/to_y's frame; releases at the last (max 200)" },
+                        "path": { "type": "array", "description": "drag: waypoints [{x,y},...] in to_ref's frame, else the source's (canvas: bitmap px); releases at the last (max 200)" },
                         "moves": { "type": "integer", "description": "drag: how many moves (2-200, default 12)" },
                         "duration_ms": { "type": "number", "description": "drag: total time of its moves (max 10000)" },
                         "hold_ms": { "type": "number", "description": "hold a click or press this many ms (max 10000)" },
@@ -3704,10 +3704,10 @@ impl ToolModule for BrowserModule {
                  12) is how many moves it makes, `duration_ms` (at most 10000) how long they take in all (15 ms a step \
                  by default) and `button` which button is held (default left). `path` is a list of waypoints ({x, y}, \
                  up to 200) the drag passes through in order before releasing at the last, each in the frame of \
-                 to_x/to_y: offsets inside the to_ref/to_query element when one is given (bitmap pixels on a canvas), \
-                 else viewport px; the moves are spread over the segments by length with at least one landing on every \
-                 waypoint. That is a brush stroke, lasso or freehand shape: to draw on a canvas, name it as the target \
-                 and as to_query so the path is in its pixels. A polygon tool is a batch: click each vertex, then \
+                 the to_ref/to_query element when one is given, else of the source ref/query (bitmap pixels on a \
+                 canvas), else viewport px; the moves are spread over the segments by length with at least one landing \
+                 on every waypoint. That is a brush stroke, lasso or freehand shape: drawn on a canvas ref, the whole \
+                 stroke is in its pixels. A polygon tool is a batch: click each vertex, then \
                  double_click the last. Mouse-event drags (sliders, sortable lists, selecting text, drawing tools) \
                  and HTML5 draggable elements both work; the result says html5_drag, moves and duration_ms. \
                  `mouse_move` (also `hover` with x and y) moves the real pointer to the target or point without clicking, \

@@ -23,10 +23,10 @@ All notable changes to this project are documented here. The format follows
   the result reports `modifiers`. Each entry of a `steps` batch may carry its own. Chrome only.
 - **Drag control for brush strokes and freehand shapes.** `drag` takes `moves` (2 to 200, default 12),
   `duration_ms` (how long they take in all, at most 10000; 15 ms a step by default), `button` (left, middle or
-  right) and `path`, up to 200 waypoints `{x, y}` in the frame of `to_x`/`to_y` (offsets inside the
-  `to_ref`/`to_query` element when one is given, else viewport px) that the drag passes through in order before
-  releasing at the last, with the moves spread over the segments by length and at least one landing on every
-  waypoint. `dx`/`dy`, `to_x`/`to_y` and `to_ref`/`to_query` work as before. The result says `moves`,
+  right) and `path`, up to 200 waypoints `{x, y}` that the drag passes through in order before releasing at
+  the last, with the moves spread over the segments by length and at least one landing on every waypoint. The
+  waypoints are in the frame of the `to_ref`/`to_query` element when one is given, else of the source element
+  (a canvas's bitmap pixels, so a stroke on a canvas ref is in its pixels end to end), else viewport px. `dx`/`dy`, `to_x`/`to_y` and `to_ref`/`to_query` work as before. The result says `moves`,
   `duration_ms` and, with a path, `waypoints`. A CVAT-style lasso or brush stroke was a straight line before.
 - **`docs/fixtures/whiteboard.html`:** a dependency-free drawing page (a 2x CSS-scaled bordered canvas that
   records pointer events, strokes and polygons, an SVG rect with a draggable vertex, wheel and modifier-key

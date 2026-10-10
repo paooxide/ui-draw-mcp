@@ -2218,9 +2218,9 @@ impl CdpBackend {
                 {
                     m.insert("hit".into(), h);
                 }
-                // The frame of the destination (and of each `path` point): an
-                // element named by to_ref/to_query, else the viewport. It must
-                // already be on screen: scrolling to it would move the source.
+                // The frame of the destination: an element named by
+                // to_ref/to_query, else the viewport. It must already be on
+                // screen: scrolling to it would move the source.
                 let to_rect = match p.to {
                     Some(dest) => {
                         let g = Self::pointer_geometry(c, Some(dest), ScrollMode::None, false)
@@ -2235,10 +2235,15 @@ impl CdpBackend {
                     }
                     None => None,
                 };
+                // A path is read in the destination's frame when one is named,
+                // else in the source's: a stroke drawn on a canvas ref is given
+                // in that canvas's pixels end to end, not pressed in bitmap
+                // pixels and continued in viewport ones.
+                let path_rect = if p.to.is_some() { to_rect } else { rect };
                 let waypoints: Vec<(f64, f64)> = if !p.path.is_empty() {
                     p.path
                         .iter()
-                        .map(|&(x, y)| point_in(to_rect, Some(x), Some(y)).map_err(failed))
+                        .map(|&(x, y)| point_in(path_rect, Some(x), Some(y)).map_err(failed))
                         .collect::<Result<_, _>>()?
                 } else if to_rect.is_some() {
                     vec![point_in(to_rect, p.to_x, p.to_y).map_err(failed)?]
