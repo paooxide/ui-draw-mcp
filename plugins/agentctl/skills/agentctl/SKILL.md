@@ -45,7 +45,8 @@ Cheapest first:
 | The shape of a busy app | `get_ui_tree` with `skeleton: true` | then `root: "@eN"` to drill into one container |
 | What changed since last time | `get_ui_tree` with `since: <snapshot_id>` | costs only the delta |
 | A page in the browser | `browser_snapshot` | then `diff: true` on later calls |
-| A canvas, game or app with no tree | `ocr_region` | returns a clickable box per line of text |
+| A desktop canvas, game or app with no tree | `ocr_region` | returns a clickable box per line of text |
+| Text drawn in a web page (canvas, image UI) | `browser_screenshot` with `find: "text"` | ranked matches with viewport x,y for `browser_act`; `ocr: true` lists every line; no image unless `image: true` |
 | Pixels, as a last resort | `capture_screen` / `browser_screenshot` | image tokens are expensive |
 
 Refs are valid only for the latest snapshot. After any observation, use the refs it returned, not older
@@ -63,7 +64,9 @@ ones.
    observation. Without `expect`, call `wait_for` before observing: input is asynchronous, and observing
    straight after acting reads the previous state.
 5. Use `keyboard_type`, `keyboard_shortcut` and coordinate `mouse_action` only when there is no
-   semantic route. They go to the frontmost window, so confirm focus first.
+   semantic route. They go to the frontmost window, so confirm focus first. For a drag, `drag_drop` is one
+   call; `mouse_action` `down`, `move`, `up` composes one with pauses or a second button. `scroll` with
+   `modifiers: ["cmd"]` (macOS) or `["ctrl"]` (Linux) zooms where the app binds it.
 6. `handle_dialogs` lists open sheets, alerts and popovers with their buttons and which one Return or
    Escape triggers. Read it before pressing keys at a dialog.
 
@@ -83,6 +86,22 @@ in its own console.
 5. `browser_assert` checks text, URL, counts and (with capture enabled) console errors and failed
    requests, returning `{passed, checks}`. `browser_flow` saves a passing sequence for replay with
    `agentctl test`.
+
+### Drawing and annotation tools (canvas, SVG, image labelling)
+
+- Find where to draw: `browser_snapshot` for SVG shapes and handles (they are real elements), and
+  `browser_screenshot` with `grid: true` or `find: "label"` for a canvas. Every x,y action returns `hit`
+  (and `pixel` on a canvas), so check it after the first click rather than assuming.
+- Canvas coordinates: with a `<canvas>` target, `x` and `y` are the canvas's **bitmap pixels**, mapped
+  through its on-screen size. Without a target they are viewport CSS px.
+- Box: `drag` from `x,y` to `to_x,to_y` on the canvas ref (or `dx,dy`). Polygon: `steps` of clicks ending
+  in `double_click` or `press` of the tool's finish key, in one call. Vertex: `drag` on the handle element.
+  Brush or freehand: `drag` with `path: [{x,y}, ...]`, `moves` and `duration_ms`.
+- Hold a key: `modifiers: ["shift"]` (or ctrl, alt, meta) on any pointer action, including `scroll` for
+  Ctrl+wheel zoom. The keys are pressed before and released after, even if the action fails.
+- Verify: re-snapshot the SVG, or `browser_screenshot` with `find` for text the tool shows, before moving
+  on. Drawing tools often need the right mode first (`press` its hotkey), and a miss usually means the
+  wrong mode, not the wrong point.
 
 `browser_eval`, `browser_cookies`, `browser_capture` and similar tools are dangerous-tier. If they are not
 offered, use the ordinary tools; do not ask for them to be enabled unless the task cannot be done
