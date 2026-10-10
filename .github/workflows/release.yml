@@ -17,6 +17,9 @@ jobs:
   build:
     name: ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
+    # Secrets cannot appear in a step's `if`, so their presence is read here.
+    env:
+      HAS_APPLE_SIGNING: ${{ secrets.APPLE_DEVELOPER_ID_P12 != '' }}
     strategy:
       # One platform failing should not hide the others; the release job checks
       # what actually arrived.
@@ -103,6 +106,47 @@ jobs:
         if: ${{ !matrix.glibc && matrix.target == 'aarch64-apple-darwin' }}
         run: target/${{ matrix.target }}/release/agentctl --version
 
+      # Developer ID signing and notarization. Off until the secrets exist: it
+      # needs a "Developer ID Application" certificate (paid Apple Developer
+      # Program), which an "Apple Development" certificate cannot stand in for.
+      # Secrets: APPLE_DEVELOPER_ID_P12 (base64 .p12), APPLE_DEVELOPER_ID_P12_PASSWORD,
+      # APPLE_SIGNING_IDENTITY ("Developer ID Application: Name (TEAMID)"),
+      # APPLE_NOTARY_KEY (base64 App Store Connect .p8), APPLE_NOTARY_KEY_ID,
+      # APPLE_NOTARY_ISSUER.
+      - name: Sign and notarize (macOS)
+        if: ${{ runner.os == 'macOS' && env.HAS_APPLE_SIGNING == 'true' }}
+        shell: bash
+        env:
+          APPLE_DEVELOPER_ID_P12: ${{ secrets.APPLE_DEVELOPER_ID_P12 }}
+          APPLE_DEVELOPER_ID_P12_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_P12_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_NOTARY_KEY: ${{ secrets.APPLE_NOTARY_KEY }}
+          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER: ${{ secrets.APPLE_NOTARY_ISSUER }}
+        run: |
+          set -euo pipefail
+          bin="target/${{ matrix.target }}/release/agentctl"
+          kc="$RUNNER_TEMP/signing.keychain-db"
+          kcpass=$(openssl rand -hex 16)
+          echo "$APPLE_DEVELOPER_ID_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$kcpass" "$kc"
+          security set-keychain-settings -lut 900 "$kc"
+          security unlock-keychain -p "$kcpass" "$kc"
+          security import "$RUNNER_TEMP/cert.p12" -k "$kc" -P "$APPLE_DEVELOPER_ID_P12_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$kcpass" "$kc" >/dev/null
+          security list-keychains -d user -s "$kc" login.keychain-db
+          # Hardened runtime and a secure timestamp are what notarization requires.
+          codesign --force --options runtime --timestamp --keychain "$kc" \
+            --sign "$APPLE_SIGNING_IDENTITY" "$bin"
+          codesign --verify --strict --verbose=2 "$bin"
+          # A bare Mach-O cannot be stapled; Gatekeeper looks the ticket up online.
+          echo "$APPLE_NOTARY_KEY" | base64 --decode > "$RUNNER_TEMP/notary.p8"
+          ditto -c -k --keepParent "$bin" "$RUNNER_TEMP/agentctl.zip"
+          xcrun notarytool submit "$RUNNER_TEMP/agentctl.zip" --wait \
+            --key "$RUNNER_TEMP/notary.p8" --key-id "$APPLE_NOTARY_KEY_ID" --issuer "$APPLE_NOTARY_ISSUER"
+          rm -f "$RUNNER_TEMP/cert.p12" "$RUNNER_TEMP/notary.p8"
+          security delete-keychain "$kc"
+
       - name: Package
         shell: bash
         run: |
@@ -127,6 +171,12 @@ jobs:
     needs: build
     if: startsWith(github.ref, 'refs/tags/v') && !cancelled()
     runs-on: ubuntu-latest
+    # Build provenance is signed keylessly through Sigstore with this job's
+    # GitHub OIDC identity; no key to hold or leak.
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@v7
 
@@ -140,6 +190,13 @@ jobs:
         run: |
           sha256sum ./*.tar.gz > SHA256SUMS
           cat SHA256SUMS
+
+      # Signed provenance for every archive: proves it was built by this
+      # workflow, from this tag, in this repository. Verify with
+      #   gh attestation verify <archive> -R ${{ github.repository }}
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/*.tar.gz
 
       # The changelog section for this tag becomes the release body, so the
       # notes cannot drift from the file.
@@ -155,8 +212,9 @@ jobs:
             echo "No changelog entry for $version." > notes.md
           fi
 
-      # Draft, not published: the binaries are unsigned, and a matrix leg may
-      # have failed without failing this job. A human checks the asset list.
+      # Draft, not published: a matrix leg may have failed without failing this
+      # job, and without Developer ID secrets the macOS binaries are not
+      # notarized. A human checks the asset list before publishing.
       - uses: softprops/action-gh-release@v3
         with:
           draft: true
