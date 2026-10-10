@@ -1,6 +1,6 @@
 {
   "name": "agentctl",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "Grounded control of a real computer: native apps through the accessibility tree, a browser over DevTools, behind a closed-by-default policy with consent and a signed audit log. Bundles the agentctl MCP server registration and a skill for using it well.",
   "author": {
     "name": "paooxide",

@@ -10,7 +10,7 @@
       "name": "agentctl",
       "source": "./plugins/agentctl",
       "description": "Grounded control of a real computer through the accessibility tree and the browser, behind a closed-by-default policy.",
-      "version": "0.2.1"
+      "version": "0.3.0"
     }
   ]
 }
