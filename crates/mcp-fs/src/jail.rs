@@ -68,6 +68,9 @@ pub fn default_denied() -> Vec<String> {
 pub struct Jail {
     roots: Vec<PathBuf>,
     denied: Vec<String>,
+    /// The server's own files wherever the operator put them (config, kill
+    /// switch, audit log), as lowercased resolved paths with a trailing slash.
+    protected: Vec<String>,
 }
 
 impl Jail {
@@ -87,7 +90,33 @@ impl Jail {
             .map(|r| std::fs::canonicalize(&r).unwrap_or(r))
             .collect();
         let denied = denied.iter().map(|d| d.to_lowercase()).collect();
-        Jail { roots, denied }
+        Jail {
+            roots,
+            denied,
+            protected: Vec::new(),
+        }
+    }
+
+    /// Refuse these paths, everything under them, and (through [`Jail::shields`])
+    /// moving or deleting any directory that holds them.
+    ///
+    /// `/.agentctl/` in [`default_denied`] only covers the default location.
+    /// `$AGENTCTL_CONFIG`, `policy.kill_switch_file` and `policy.audit_dir` can
+    /// each point anywhere, and inside a root the agent could then rewrite its
+    /// own policy, delete the STOP file or trash the audit log.
+    pub fn with_protected(mut self, paths: impl IntoIterator<Item = PathBuf>) -> Self {
+        for p in paths {
+            let resolved = resolve_existing_prefix(&p).unwrap_or(p);
+            self.protected.push(slashed(&resolved));
+        }
+        self
+    }
+
+    /// Does `path` contain a protected path? Moving or deleting it would carry
+    /// the protected path along without ever naming it.
+    pub fn shields(&self, path: &Path) -> bool {
+        let dir = slashed(path);
+        self.protected.iter().any(|p| p.starts_with(&dir))
     }
 
     pub fn roots(&self) -> &[PathBuf] {
@@ -140,10 +169,25 @@ impl Jail {
                 return Err(PathError::Denied(input.into()));
             }
         }
+        if self.protected.iter().any(|p| hay.starts_with(p.as_str())) {
+            return Err(PathError::Denied(input.into()));
+        }
         if !self.roots.iter().any(|r| resolved.starts_with(r)) {
             return Err(PathError::Escapes(input.into()));
         }
         Ok(resolved)
+    }
+}
+
+/// Lowercased with a trailing slash, so a prefix test respects component
+/// boundaries (`/a/b/` is not a prefix of `/a/bc/`) and case-insensitive
+/// filesystems cannot alias past it.
+fn slashed(p: &Path) -> String {
+    let s = p.to_string_lossy().to_lowercase();
+    if s.ends_with('/') {
+        s
+    } else {
+        format!("{s}/")
     }
 }
 

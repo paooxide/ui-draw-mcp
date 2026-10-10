@@ -163,6 +163,19 @@ fn state_dir(cfg: &PolicyConfig) -> std::path::PathBuf {
         .unwrap_or_else(std::env::temp_dir)
 }
 
+/// Files an agent must never reach through a file tool, wherever they live:
+/// the config that sets its policy, the kill switch that stops it, and the
+/// audit log and key that record what it did.
+fn own_state_paths(cfg: &PolicyConfig) -> Vec<std::path::PathBuf> {
+    let mut paths = vec![
+        mcp_policy::config_path(),
+        cfg.kill_switch_file.clone(),
+        cfg.audit_dir.clone(),
+    ];
+    paths.extend(cfg.audit_signing_key.clone());
+    paths
+}
+
 /// Wire every engine, and hand back the extra handles.
 #[cfg_attr(
     not(any(target_os = "macos", target_os = "linux")),
@@ -204,8 +217,10 @@ pub fn build_stack(cfg: &PolicyConfig) -> (Vec<Arc<dyn ToolModule>>, Wiring) {
 
         let showcase = demo_showcase(engines.demo, &engines.demo_speed);
 
-        // The same jail the fs engine uses (roots + credential deny-list).
-        let jail = Jail::new(engines.fs_roots.clone(), default_denied());
+        // The same jail the fs engine uses (roots + credential deny-list), plus
+        // the server's own files wherever the operator relocated them.
+        let jail = Jail::new(engines.fs_roots.clone(), default_denied())
+            .with_protected(own_state_paths(cfg));
         let browser_backend = Arc::new(
             CdpBackend::new(NavPolicy::new(
                 &engines.allowed_origins,

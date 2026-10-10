@@ -227,6 +227,14 @@ impl FsModule {
             Ok(x) => x,
             Err(e) => return Self::path_err(tool, e),
         };
+        // Renaming a directory moves everything in it, protected files included.
+        if is_move && self.jail.shields(&src) {
+            return Envelope::fail(
+                tool,
+                ErrorCode::PolicyDenied,
+                "refusing to move a directory that holds agentctl's own config, kill switch or audit log",
+            );
+        }
         let res = if is_move {
             std::fs::rename(&src, &dst)
         } else {
@@ -260,6 +268,13 @@ impl FsModule {
                 tool,
                 ErrorCode::PolicyDenied,
                 "refusing to delete a configured root",
+            );
+        }
+        if self.jail.shields(&path) {
+            return Envelope::fail(
+                tool,
+                ErrorCode::PolicyDenied,
+                "refusing to delete a directory that holds agentctl's own config, kill switch or audit log",
             );
         }
         let meta = match std::fs::symlink_metadata(&path) {
@@ -435,6 +450,18 @@ impl FsModule {
             .and_then(Value::as_str)
             .map(str::to_string)
             .unwrap_or_else(|| guess_format(&dst));
+        if action == "compress" {
+            if let Some(bad) = first_refused(&self.jail, &src) {
+                return Envelope::fail(
+                    tool,
+                    ErrorCode::PolicyDenied,
+                    format!("refusing to archive a tree that holds a denied path: {bad}"),
+                );
+            }
+        }
+        if action == "extract" {
+            return self.extract_staged(tool, &src, &dst, &format).await;
+        }
         let (s, d) = (src.display().to_string(), dst.display().to_string());
 
         let result = match (action, format.as_str()) {
@@ -444,7 +471,9 @@ impl FsModule {
                     .file_name()
                     .map(|n| n.to_string_lossy().to_string())
                     .unwrap_or_else(|| ".".into());
-                run_fs_tool("/usr/bin/zip", &["-qr", &d, &name], parent.as_deref()).await
+                // -y stores a symlink as a link: following it would pack whatever it
+                // points at, jail or no jail.
+                run_fs_tool("/usr/bin/zip", &["-qry", &d, &name], parent.as_deref()).await
             }
             ("compress", "tar.gz") => {
                 run_fs_tool(
@@ -462,31 +491,126 @@ impl FsModule {
                 )
                 .await
             }
-            ("extract", "zip") => {
-                // -o overwrite, and unzip refuses absolute paths itself; the
-                // containment check below covers the `../` case.
-                run_fs_tool("/usr/bin/unzip", &["-qo", &s, "-d", &d], None).await
-            }
-            ("extract", _) => run_fs_tool("/usr/bin/tar", &["-xf", &s, "-C", &d], None).await,
             (a, f) => Err(format!("cannot {a} format '{f}'")),
         };
         if let Err(e) = result {
             return Envelope::fail(tool, ErrorCode::ActionFailed, e);
         }
-        if action == "extract" {
-            if let Some(escaped) = first_escape(&dst, self.jail.roots()) {
-                return Envelope::fail_with(
-                    tool,
-                    ErrorCode::PolicyDenied,
-                    format!("archive wrote outside the allowed roots: {escaped}"),
-                    "the extraction is incomplete; inspect the destination before using it",
-                );
-            }
-        }
         Envelope::ok(
             tool,
             json!({ "action": action, "format": format, "src": s, "dst": d }),
         )
+    }
+
+    /// Extract into a staging directory inside `dst`, check every entry the
+    /// archive produced against the jail, and only then move them into place.
+    ///
+    /// Extracting straight into `dst` and checking afterwards leaves the damage
+    /// done: an archive carrying `.ssh/authorized_keys` or `.agentctl/config.toml`
+    /// would land before any check ran. A refused archive changes nothing.
+    async fn extract_staged(
+        &self,
+        tool: &str,
+        src: &std::path::Path,
+        dst: &std::path::Path,
+        format: &str,
+    ) -> Envelope {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let staging = dst.join(format!(
+            ".fs-archive-staging-{}-{nanos}",
+            std::process::id()
+        ));
+        if let Err(e) = std::fs::create_dir_all(&staging) {
+            return Self::io_err(tool, e);
+        }
+        let (s, st) = (src.display().to_string(), staging.display().to_string());
+        let result = if format == "zip" {
+            // -o overwrite, and unzip refuses absolute paths itself.
+            run_fs_tool("/usr/bin/unzip", &["-qo", &s, "-d", &st], None).await
+        } else {
+            run_fs_tool("/usr/bin/tar", &["-xf", &s, "-C", &st], None).await
+        };
+        let outcome = result
+            .map_err(|e| (ErrorCode::ActionFailed, e))
+            .and_then(|_| match first_escape(&staging, self.jail.roots()) {
+                Some(escaped) => Err((
+                    ErrorCode::PolicyDenied,
+                    format!("archive wrote outside the allowed roots: {escaped}"),
+                )),
+                None => Ok(()),
+            })
+            .and_then(|_| self.place_staged(&staging, dst));
+        let _ = std::fs::remove_dir_all(&staging);
+        match outcome {
+            Ok(n) => Envelope::ok(
+                tool,
+                json!({ "action": "extract", "format": format, "src": s,
+                        "dst": dst.display().to_string(), "entries": n }),
+            ),
+            Err((code, e)) => {
+                let hint = if code == ErrorCode::PolicyDenied {
+                    "nothing was extracted; the destination is unchanged"
+                } else {
+                    "inspect the destination; some entries may already be in place"
+                };
+                Envelope::fail_with(tool, code, e, hint)
+            }
+        }
+    }
+
+    /// Check every staged entry, then move them all into `dst`. Returns the
+    /// number of entries placed.
+    fn place_staged(
+        &self,
+        staging: &std::path::Path,
+        dst: &std::path::Path,
+    ) -> Result<usize, (ErrorCode, String)> {
+        let denied = |m: String| (ErrorCode::PolicyDenied, m);
+        let mut entries: Vec<(PathBuf, bool)> = Vec::new();
+        let mut stack = vec![staging.to_path_buf()];
+        while let Some(d) = stack.pop() {
+            let rd = std::fs::read_dir(&d).map_err(|e| (ErrorCode::ActionFailed, e.to_string()))?;
+            for entry in rd.flatten() {
+                let p = entry.path();
+                let ft = entry
+                    .file_type()
+                    .map_err(|e| (ErrorCode::ActionFailed, e.to_string()))?;
+                let rel = p.strip_prefix(staging).unwrap_or(&p).to_path_buf();
+                // A link would let a later write land wherever it points.
+                if !ft.is_dir() && !ft.is_file() {
+                    return Err(denied(format!(
+                        "archive holds a link or special file: {}",
+                        rel.display()
+                    )));
+                }
+                let target = dst.join(&rel);
+                self.jail
+                    .resolve(&target.to_string_lossy())
+                    .map_err(|e| denied(e.message()))?;
+                if ft.is_dir() {
+                    stack.push(p);
+                }
+                entries.push((rel, ft.is_dir()));
+                if entries.len() > 20_000 {
+                    return Err(denied("archive holds more than 20000 entries".into()));
+                }
+            }
+        }
+        // Parents sort before their children.
+        entries.sort();
+        for (rel, is_dir) in &entries {
+            let (from, to) = (staging.join(rel), dst.join(rel));
+            let res = if *is_dir {
+                std::fs::create_dir_all(&to)
+            } else {
+                std::fs::rename(&from, &to)
+            };
+            res.map_err(|e| (ErrorCode::ActionFailed, format!("{}: {e}", rel.display())))?;
+        }
+        Ok(entries.len())
     }
 
     /// Watch a tree for changes and report the delta.
@@ -676,6 +800,12 @@ impl FsModule {
         walk(&root, 0, 12, &mut |file: &std::path::Path| {
             if hits.len() >= self.max_entries {
                 return false;
+            }
+            // The walk starts inside the jail but does not stay checked: a root
+            // of `~` holds `.ssh/` and `.agentctl/`, whose lines must not come
+            // back as search hits.
+            if self.jail.resolve(&file.to_string_lossy()).is_err() {
+                return true;
             }
             scanned += 1;
             let name = file
@@ -1028,6 +1158,35 @@ fn diff_trees(before: &Tree, after: &Tree) -> (Vec<String>, Vec<String>, Vec<Str
 
 /// First path under `dir` that resolves outside every root. An archive can
 /// carry `../` entries; this catches what the extractor let through.
+/// The first path at or under `dir` the jail refuses, without following links.
+/// Fails closed past 20000 entries.
+fn first_refused(jail: &Jail, dir: &std::path::Path) -> Option<String> {
+    if jail.shields(dir) {
+        return Some(dir.display().to_string());
+    }
+    let mut stack = vec![dir.to_path_buf()];
+    let mut seen = 0usize;
+    while let Some(d) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for entry in rd.flatten() {
+            seen += 1;
+            if seen > 20_000 {
+                return Some(format!("more than 20000 entries under {}", dir.display()));
+            }
+            let p = entry.path();
+            if jail.resolve(&p.to_string_lossy()).is_err() {
+                return Some(p.display().to_string());
+            }
+            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                stack.push(p);
+            }
+        }
+    }
+    None
+}
+
 fn first_escape(dir: &std::path::Path, roots: &[PathBuf]) -> Option<String> {
     let mut stack = vec![dir.to_path_buf()];
     let mut seen = 0usize;
@@ -1405,6 +1564,95 @@ mod tests {
         assert!(root.exists(), "root must survive");
     }
 
+    /// The server's own files, relocated inside a root (as `$AGENTCTL_CONFIG`,
+    /// `kill_switch_file` and `audit_dir` allow), stay out of the agent's
+    /// reach: by name, by case alias, and by moving or trashing their folder.
+    #[tokio::test]
+    async fn the_servers_own_files_are_protected_wherever_they_live() {
+        let (_, root) = setup("ownstate");
+        let ops = root.join("ops");
+        std::fs::create_dir_all(ops.join("audit")).unwrap();
+        std::fs::write(ops.join("agentctl.toml"), "[policy]\n").unwrap();
+        std::fs::write(ops.join("notes.txt"), "free").unwrap();
+        let jail = Jail::new(vec![root.clone()], default_denied()).with_protected([
+            ops.join("agentctl.toml"),
+            ops.join("STOP"), // not created yet, as usual
+            ops.join("audit"),
+        ]);
+        let m = FsModule::new(jail, 1_000_000, 100);
+        let s = |p: PathBuf| p.to_str().unwrap().to_string();
+        let refused: Vec<(&str, Value)> = vec![
+            (
+                "fs_write",
+                json!({ "path": s(ops.join("agentctl.toml")), "content": "[policy]\nmode = \"bypass\"\n" }),
+            ),
+            (
+                "fs_write",
+                json!({ "path": s(ops.join("AGENTCTL.TOML")), "content": "x" }),
+            ),
+            ("fs_read", json!({ "path": s(ops.join("agentctl.toml")) })),
+            (
+                "fs_write",
+                json!({ "path": s(ops.join("STOP")), "content": "" }),
+            ),
+            (
+                "fs_write",
+                json!({ "path": s(ops.join("audit/log.jsonl")), "content": "{}" }),
+            ),
+            (
+                "fs_delete",
+                json!({ "path": s(ops.join("audit")), "recursive": true, "trash": false }),
+            ),
+            (
+                "fs_delete",
+                json!({ "path": s(ops.clone()), "recursive": true }),
+            ),
+            (
+                "fs_delete",
+                json!({ "path": s(ops.clone()), "recursive": true, "trash": false }),
+            ),
+            (
+                "fs_move",
+                json!({ "from": s(ops.clone()), "to": s(root.join("elsewhere")) }),
+            ),
+            (
+                "fs_copy",
+                json!({ "from": s(root.join("a.txt")), "to": s(ops.join("agentctl.toml")) }),
+            ),
+        ];
+        for (tool, args) in refused {
+            let env = m.call(tool, args.clone(), &ctx()).await;
+            assert!(!env.ok, "{tool} {args} reached a protected path");
+        }
+        assert_eq!(
+            std::fs::read_to_string(ops.join("agentctl.toml")).unwrap(),
+            "[policy]\n"
+        );
+        assert!(ops.join("audit").is_dir());
+        assert!(!ops.join("STOP").exists());
+
+        // Neighbours stay usable: protection is by path component, not prefix.
+        let allowed: Vec<(&str, Value)> = vec![
+            (
+                "fs_write",
+                json!({ "path": s(ops.join("notes.txt")), "content": "still free" }),
+            ),
+            (
+                "fs_write",
+                json!({ "path": s(ops.join("agentctl.toml.bak")), "content": "x" }),
+            ),
+            ("fs_list", json!({ "path": s(ops.clone()) })),
+            (
+                "fs_delete",
+                json!({ "path": s(ops.join("notes.txt")), "trash": false }),
+            ),
+        ];
+        for (tool, args) in allowed {
+            let env = m.call(tool, args.clone(), &ctx()).await;
+            assert!(env.ok, "{tool} {args} was refused: {env:?}");
+        }
+    }
+
     /// Deletes must ask a human, name the target, and distinguish recoverable
     /// from permanent: calling a trash move "cannot be undone" trains people to
     /// click through the prompt that actually matters.
@@ -1772,6 +2020,140 @@ mod extended_tests {
                 "{fmt}: round trip lost the file"
             );
         }
+    }
+
+    /// Build a tar outside any jail, the way an attacker would hand one over.
+    fn tar_of(tag: &str, build: impl FnOnce(&std::path::Path), member: &str) -> PathBuf {
+        let dir = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("mcp-fs-evil-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("tree")).unwrap();
+        build(&dir.join("tree"));
+        let out = dir.join("evil.tar");
+        let st = std::process::Command::new("tar")
+            .arg("-cf")
+            .arg(&out)
+            .arg("-C")
+            .arg(dir.join("tree"))
+            .arg(member)
+            .status()
+            .unwrap();
+        assert!(st.success());
+        out
+    }
+
+    fn leftovers(dir: &std::path::Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.starts_with(".fs-archive-staging"))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn search_does_not_read_denied_files_under_the_root() {
+        let (m, root) = setup("searchdeny");
+        std::fs::create_dir_all(root.join(".ssh")).unwrap();
+        std::fs::write(root.join(".ssh/id_ed25519"), "BEGIN OPENSSH PRIVATE KEY").unwrap();
+        std::fs::write(root.join("notes.txt"), "BEGIN OPENSSH notes").unwrap();
+        let env = m
+            .call(
+                "fs_search",
+                json!({ "query": "BEGIN OPENSSH", "path": root.display().to_string() }),
+                &ctx(),
+            )
+            .await;
+        assert!(env.ok, "{env:?}");
+        let text = serde_json::to_string(&env.data).unwrap();
+        assert!(text.contains("notes.txt"), "{text}");
+        assert!(!text.contains(".ssh"), "search read a denied file: {text}");
+    }
+
+    #[tokio::test]
+    async fn compress_refuses_a_tree_holding_a_denied_path() {
+        let (m, root) = setup("compressdeny");
+        std::fs::create_dir_all(root.join("home/.ssh")).unwrap();
+        std::fs::write(root.join("home/.ssh/id_ed25519"), "key").unwrap();
+        std::fs::write(root.join("home/ok.txt"), "ok").unwrap();
+        for fmt in ["zip", "tar.gz"] {
+            let out = root.join(format!("bundle.{fmt}"));
+            let env = m
+                .call(
+                    "fs_archive",
+                    json!({ "action": "compress", "src": root.join("home").display().to_string(),
+                            "dst": out.display().to_string(), "format": fmt }),
+                    &ctx(),
+                )
+                .await;
+            assert!(!env.ok, "{fmt} packed a credential store");
+            assert!(!out.exists(), "{fmt}: archive written anyway");
+        }
+    }
+
+    /// An archive is checked before anything lands, so a refused one leaves
+    /// the destination exactly as it was.
+    #[tokio::test]
+    async fn extract_refuses_an_archive_that_writes_a_denied_path() {
+        let (m, root) = setup("extractdeny");
+        let evil = tar_of(
+            "creds",
+            |t| {
+                std::fs::create_dir_all(t.join(".ssh")).unwrap();
+                std::fs::write(t.join(".ssh/authorized_keys"), "ssh-ed25519 AAAA attacker")
+                    .unwrap();
+            },
+            ".ssh",
+        );
+        let env = m
+            .call(
+                "fs_archive",
+                json!({ "action": "extract", "src": evil.display().to_string(),
+                        "dst": root.display().to_string(), "format": "tar" }),
+                &ctx(),
+            )
+            .await;
+        assert!(!env.ok, "extracted into .ssh: {env:?}");
+        let _ = std::fs::copy(&evil, root.join("evil.tar"));
+        let env = m
+            .call(
+                "fs_archive",
+                json!({ "action": "extract", "src": root.join("evil.tar").display().to_string(),
+                        "dst": root.display().to_string(), "format": "tar" }),
+                &ctx(),
+            )
+            .await;
+        assert!(!env.ok, "extracted into .ssh: {env:?}");
+        assert!(!root.join(".ssh").exists(), "a refused archive still wrote");
+        assert!(leftovers(&root).is_empty(), "staging left behind");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn extract_refuses_an_archive_holding_a_link() {
+        let (m, root) = setup("extractlink");
+        let evil = tar_of(
+            "link",
+            |t| {
+                std::fs::create_dir_all(t.join("pkg")).unwrap();
+                std::os::unix::fs::symlink("/etc", t.join("pkg/etc")).unwrap();
+            },
+            "pkg",
+        );
+        std::fs::copy(&evil, root.join("pkg.tar")).unwrap();
+        let env = m
+            .call(
+                "fs_archive",
+                json!({ "action": "extract", "src": root.join("pkg.tar").display().to_string(),
+                        "dst": root.display().to_string(), "format": "tar" }),
+                &ctx(),
+            )
+            .await;
+        assert!(!env.ok, "extracted a symlink: {env:?}");
+        assert!(!root.join("pkg").exists());
+        assert!(leftovers(&root).is_empty(), "staging left behind");
     }
 
     #[tokio::test]
