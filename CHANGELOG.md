@@ -6,7 +6,7 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
-## [0.2.1] - 2026-10-07
+## [0.2.1] - 2026-10-10
 
 Most of this release comes from two field sessions: a QA run and a demo recording against a server-rendered
 HTMX app, where several browser tools answered before the page had done what the agent asked, and a job
