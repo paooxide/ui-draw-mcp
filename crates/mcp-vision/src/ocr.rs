@@ -10,28 +10,63 @@
 //! The two models (about 20 MB) are downloaded on first use into the model
 //! directory, the way the macOS backend compiles its helper on first use, and
 //! can be placed there ahead of time on a machine that must not fetch
-//! anything. Loading and recognition block the thread: callers on an async
-//! runtime wrap them in `spawn_blocking`.
+//! anything. A model file is parsed in-process by rten, so every file is
+//! checked against a pinned SHA-256 before it is loaded, whether it was just
+//! downloaded or was already there: a substituted or modified file is refused
+//! and named, never parsed. Loading and recognition block the thread: callers
+//! on an async runtime wrap them in `spawn_blocking`.
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+
+use sha2::{Digest, Sha256};
 
 use crate::backend::OcrLine;
 
 /// What the result reports as `engine`.
 pub const ENGINE: &str = "ocrs";
 
-/// Where the models come from, and what they are called on disk.
-pub const MODEL_URLS: [(&str, &str); 2] = [
-    (
-        "text-detection.onnx",
-        "https://ocrs-models.s3-accelerate.amazonaws.com/text-detection.onnx",
-    ),
-    (
-        "text-recognition.onnx",
-        "https://ocrs-models.s3-accelerate.amazonaws.com/text-recognition.onnx",
-    ),
+/// A model file: what it is called on disk, where it comes from, and the
+/// SHA-256 it must have.
+#[derive(Debug, Clone, Copy)]
+pub struct ModelFile {
+    pub name: &'static str,
+    pub url: &'static str,
+    pub sha256: &'static str,
+}
+
+/// The models, pinned by digest.
+///
+/// The files are the unversioned ones that `ocrs` 0.13.1's own
+/// `examples/download-models.sh` fetches from these URLs (the crate names
+/// no model version). Digests taken from fresh downloads on 2026-10-10,
+/// matching the copies already in use here. Should the upstream files
+/// change, the download fails verification and these need updating on
+/// purpose, after checking the new files, rather than the server silently
+/// parsing whatever the bucket serves.
+pub const MODELS: [ModelFile; 2] = [
+    ModelFile {
+        name: "text-detection.onnx",
+        url: "https://ocrs-models.s3-accelerate.amazonaws.com/text-detection.onnx",
+        sha256: "a917b23dbd9524b465df7e922641b3ff2981623df4ded5a0234004ef2fee7cfe",
+    },
+    ModelFile {
+        name: "text-recognition.onnx",
+        url: "https://ocrs-models.s3-accelerate.amazonaws.com/text-recognition.onnx",
+        sha256: "86c145c2edb96c8caed5b1ebb8f44d706408922211451c309c625157dd6061c5",
+    },
 ];
+
+/// Points at a directory of operator-supplied models instead of the state
+/// directory. They are still verified against [`MODELS`]'s digests unless
+/// [`UNVERIFIED_ENV`] is set.
+pub const MODELS_ENV: &str = "AGENTCTL_OCR_MODELS";
+
+/// `=1` lets models in [`MODELS_ENV`]'s directory load without a digest
+/// check: for an operator who trained or converted their own. It does
+/// nothing for the default directory, whose files the server downloaded.
+pub const UNVERIFIED_ENV: &str = "AGENTCTL_OCR_MODELS_UNVERIFIED";
 
 /// Words on one row further apart than this many row heights are separate
 /// lines. The recogniser groups by row, so two buttons side by side come back
@@ -111,74 +146,107 @@ impl Ocr {
     /// Where the models live: `$AGENTCTL_OCR_MODELS` when set (a shared or
     /// pre-populated directory), else `<state>/ocr`.
     pub fn model_dir(state_dir: &Path) -> PathBuf {
-        std::env::var_os("AGENTCTL_OCR_MODELS")
+        Self::operator_dir().unwrap_or_else(|| state_dir.join("ocr"))
+    }
+
+    /// The operator's own model directory, when `$AGENTCTL_OCR_MODELS` names one.
+    fn operator_dir() -> Option<PathBuf> {
+        std::env::var_os(MODELS_ENV)
             .map(PathBuf::from)
             .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or_else(|| state_dir.join("ocr"))
     }
 
     /// Both model files, present or fetched.
     pub fn model_paths(dir: &Path) -> [PathBuf; 2] {
-        [dir.join(MODEL_URLS[0].0), dir.join(MODEL_URLS[1].0)]
+        [dir.join(MODELS[0].name), dir.join(MODELS[1].name)]
     }
 
     pub fn models_present(dir: &Path) -> bool {
         Self::model_paths(dir).iter().all(|p| p.is_file())
     }
 
-    /// Download whichever model is missing. Blocking: it runs `curl`.
+    /// Download whichever model is missing, and verify every model, present
+    /// or fetched, before anything parses it. Blocking: it runs `curl`.
     ///
     /// Safe to race: a process downloads one model at a time, each download
-    /// goes to a file named for its process and is renamed into place, and a
-    /// model that appeared meanwhile (another process got there first) is
-    /// kept rather than fetched again.
-    fn fetch(dir: &Path) -> Result<(), String> {
+    /// goes to a file named for its process, is verified there, and is only
+    /// then renamed into place; a model that appeared meanwhile (another
+    /// process got there first) is verified and kept rather than fetched
+    /// again.
+    fn fetch_and_verify(dir: &Path) -> Result<(), String> {
         let _one_at_a_time = FETCH_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let operator = Self::operator_dir().is_some_and(|d| d == dir);
+        let unverified = operator && std::env::var_os(UNVERIFIED_ENV).is_some_and(|v| v == "1");
         std::fs::create_dir_all(dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
-        for (name, url) in MODEL_URLS {
-            let dest = dir.join(name);
+        for m in MODELS {
+            let dest = dir.join(m.name);
             if dest.is_file() {
+                if unverified {
+                    tracing::warn!(file = %dest.display(), "loading OCR model without verification ({UNVERIFIED_ENV}=1)");
+                    continue;
+                }
+                // A file the operator put here is theirs to replace; one the
+                // server downloaded is deleted so the next call fetches afresh.
+                verify_file(&dest, m.sha256, !operator).map_err(|e| {
+                    if operator {
+                        format!(
+                            "{e}; replace it with the published model, or set {UNVERIFIED_ENV}=1                              to load models of your own from {MODELS_ENV}"
+                        )
+                    } else {
+                        format!("{e}; it was deleted, and the next call downloads it again")
+                    }
+                })?;
                 continue;
             }
-            tracing::info!(url, dest = %dest.display(), "downloading OCR model (first use)");
-            let tmp = dir.join(format!("{name}.{}.part", std::process::id()));
+            tracing::info!(url = m.url, dest = %dest.display(), "downloading OCR model (first use)");
+            let tmp = dir.join(format!("{}.{}.part", m.name, std::process::id()));
             let out = std::process::Command::new("/usr/bin/curl")
                 .args(["-fsSL", "--max-time", "300", "-o"])
                 .arg(&tmp)
-                .arg(url)
+                .arg(m.url)
                 .output()
                 .map_err(|e| {
                     format!(
-                        "curl: {e} (place {name} in {} by hand to skip the download)",
+                        "curl: {e} (place {} in {} by hand to skip the download)",
+                        m.name,
                         dir.display()
                     )
                 })?;
             if !out.status.success() {
                 let _ = std::fs::remove_file(&tmp);
                 return Err(format!(
-                    "downloading {url} failed: {} (place {name} in {} by hand to skip the download)",
+                    "downloading {} failed: {} (place {} in {} by hand to skip the download)",
+                    m.url,
                     String::from_utf8_lossy(&out.stderr).trim(),
+                    m.name,
                     dir.display()
                 ));
             }
+            // Verified before it gets its real name: a bad download never
+            // sits where the next call would trust it.
+            verify_file(&tmp, m.sha256, true)
+                .map_err(|e| format!("{e}; the download was discarded"))?;
             if let Err(e) = std::fs::rename(&tmp, &dest) {
                 let _ = std::fs::remove_file(&tmp);
                 if !dest.is_file() {
                     return Err(format!("moving {}: {e}", tmp.display()));
+                }
+                // Another process won the race: its file is checked too.
+                if !unverified {
+                    verify_file(&dest, m.sha256, !operator)?;
                 }
             }
         }
         Ok(())
     }
 
-    /// Load the models from `dir`, fetching them first if they are missing.
-    /// Blocking: a few hundred milliseconds when present, longer to download.
+    /// Load the models from `dir`, fetching them first if they are missing
+    /// and verifying each against its pinned digest. Blocking: a few hundred
+    /// milliseconds when present, longer to download.
     pub fn load(dir: &Path) -> Result<Ocr, String> {
-        if !Self::models_present(dir) {
-            Self::fetch(dir)?;
-        }
+        Self::fetch_and_verify(dir)?;
         let [det, rec] = Self::model_paths(dir);
         let detection_model = rten::Model::load_file(&det)
             .map_err(|e| format!("loading {}: {e} (delete it to re-download)", det.display()))?;
@@ -252,6 +320,45 @@ impl Ocr {
     }
 }
 
+/// The hex SHA-256 of a file, streamed.
+fn sha256_file(path: &Path) -> Result<String, String> {
+    let mut f =
+        std::fs::File::open(path).map_err(|e| format!("opening {}: {e}", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = f
+            .read(&mut buf)
+            .map_err(|e| format!("reading {}: {e}", path.display()))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hex(&hasher.finalize()))
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Check `path` against `expected` (hex SHA-256). On a mismatch the file is
+/// removed when `delete` is set, and the error names the file and both
+/// digests, so the operator sees what was refused and why.
+fn verify_file(path: &Path, expected: &str, delete: bool) -> Result<(), String> {
+    let got = sha256_file(path)?;
+    if got.eq_ignore_ascii_case(expected) {
+        return Ok(());
+    }
+    if delete {
+        let _ = std::fs::remove_file(path);
+    }
+    Err(format!(
+        "{} failed verification: sha256 {got}, expected {expected}",
+        path.display()
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -303,11 +410,94 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("agentctl-ocr-{}", std::process::id()));
         assert!(!Ocr::models_present(&dir));
         // Without the override the models sit under the state directory.
-        if std::env::var_os("AGENTCTL_OCR_MODELS").is_none() {
+        if std::env::var_os(MODELS_ENV).is_none() {
             assert_eq!(Ocr::model_dir(&dir), dir.join("ocr"));
         }
         let [a, b] = Ocr::model_paths(&dir);
         assert!(a.ends_with("text-detection.onnx"));
         assert!(b.ends_with("text-recognition.onnx"));
+    }
+
+    const HELLO_SHA256: &str = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("agentctl-ocr-verify-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join(name)
+    }
+
+    /// The pinned digests are well-formed, so a typo cannot make every
+    /// download fail verification.
+    #[test]
+    fn pinned_digests_are_hex_sha256() {
+        for m in MODELS {
+            assert_eq!(m.sha256.len(), 64, "{}", m.name);
+            assert!(
+                m.sha256.chars().all(|c| c.is_ascii_hexdigit()),
+                "{}",
+                m.name
+            );
+            assert!(m.url.starts_with("https://"), "{}", m.name);
+        }
+        assert_ne!(MODELS[0].sha256, MODELS[1].sha256);
+    }
+
+    /// A file with the expected content passes and stays; the digest is
+    /// computed by streaming, so it is the same as `sha256sum`'s.
+    #[test]
+    fn a_file_with_the_pinned_content_passes_and_is_kept() {
+        let p = scratch("good.onnx");
+        std::fs::write(&p, b"hello").unwrap();
+        assert_eq!(sha256_file(&p).unwrap(), HELLO_SHA256);
+        verify_file(&p, HELLO_SHA256, true).unwrap();
+        verify_file(&p, &HELLO_SHA256.to_uppercase(), true).unwrap();
+        assert!(p.is_file(), "a verified file must not be touched");
+    }
+
+    /// Wrong content is refused, named, and removed when asked, so a bad
+    /// download never sits where the next call would trust it; an
+    /// operator's file is refused but left for them to replace.
+    #[test]
+    fn a_file_with_other_content_is_refused_and_removed() {
+        let p = scratch("bad.onnx");
+        std::fs::write(&p, b"hello, tampered").unwrap();
+        let err = verify_file(&p, HELLO_SHA256, true).unwrap_err();
+        assert!(err.contains("bad.onnx"), "{err}");
+        assert!(err.contains("failed verification"), "{err}");
+        assert!(err.contains(HELLO_SHA256), "{err}");
+        assert!(!p.exists(), "a refused download must be deleted");
+
+        let p = scratch("operator.onnx");
+        std::fs::write(&p, b"hello, tampered").unwrap();
+        assert!(verify_file(&p, HELLO_SHA256, false).is_err());
+        assert!(
+            p.is_file(),
+            "an operator-supplied file is theirs to replace"
+        );
+    }
+
+    /// A present-but-wrong model in the default directory is refused before
+    /// anything parses it, with the way out in the message, and no network
+    /// is touched: the file is gone afterwards, which is the "clear it" step
+    /// done for the operator.
+    #[test]
+    fn a_tampered_model_in_the_state_directory_is_refused_before_load() {
+        if std::env::var_os(MODELS_ENV).is_some() {
+            return; // the override makes every dir the operator's
+        }
+        let dir = scratch("state").join("ocr");
+        std::fs::create_dir_all(&dir).unwrap();
+        // Both present so no download is attempted; the first is wrong.
+        for m in MODELS {
+            std::fs::write(dir.join(m.name), b"not a model").unwrap();
+        }
+        let err = match Ocr::load(&dir) {
+            Ok(_) => panic!("a tampered model must not load"),
+            Err(e) => e,
+        };
+        assert!(err.contains(MODELS[0].name), "{err}");
+        assert!(err.contains("failed verification"), "{err}");
+        assert!(err.contains("deleted"), "{err}");
+        assert!(!dir.join(MODELS[0].name).exists());
     }
 }

@@ -23,6 +23,16 @@ All notable changes to this project are documented here. The format follows
   reads as one line, are split where the words are a row height or more apart, so each gets its own
   centre; this applies to `ocr_region` on Linux too. Fixture: `docs/fixtures/ocr_canvas.html`.
 
+### Security
+
+- **OCR model files are pinned by SHA-256.** The two `ocrs` models are downloaded once and parsed
+  in-process; before, a modified or substituted file, on disk or from the download, would have been
+  loaded. Every file is now verified against a pinned digest before anything parses it, whether it was
+  just fetched or was already there: a mismatch is refused and named, a bad download or a bad file in the
+  state directory is deleted so the next call fetches afresh, and a file under `AGENTCTL_OCR_MODELS` is
+  left for the operator to replace. `AGENTCTL_OCR_MODELS_UNVERIFIED=1` loads operator-supplied models
+  without the check, for models of their own; it does nothing for the default directory.
+
 ## [0.2.1] - 2026-10-10
 
 Most of this release comes from two field sessions: a QA run and a demo recording against a server-rendered
