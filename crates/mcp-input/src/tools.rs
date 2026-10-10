@@ -1174,6 +1174,10 @@ impl InputModule {
             );
         };
         let amount = i64_arg(args, "amount").unwrap_or(3).clamp(-10_000, 10_000) as i32;
+        let modifiers = match parse_modifiers(tool, args) {
+            Ok(m) => m,
+            Err(e) => return e,
+        };
         let ((x, y), target) = match self.parse_point(tool, args).await {
             Ok(p) => p,
             Err(e) => return e,
@@ -1181,9 +1185,9 @@ impl InputModule {
         if let Some(deny) = self.clamp_check(tool, x, y) {
             return deny;
         }
-        match self.backend.scroll_at(x, y, dir, amount).await {
+        match self.backend.scroll_at(x, y, dir, amount, &modifiers).await {
             Ok(()) => {
-                let data = json!({ "ok": true, "at": { "x": x, "y": y } });
+                let data = json!({ "ok": true, "at": { "x": x, "y": y }, "modifiers": modifiers });
                 Envelope::ok(
                     tool,
                     match target {
@@ -1769,15 +1773,19 @@ impl ToolModule for InputModule {
                 "scroll",
                 Category::Input,
                 Tier::Standard,
-                "Scroll at an element (ref or name) or a point.",
+                "Scroll at an element (ref or name) or a point. 'modifiers' holds keys down for the wheel, e.g. [\"cmd\"] or [\"ctrl\"] to zoom.",
                 target_schema(json!({
                     "x":{"type":"number","description":"screen x, or offset from the element's left"},
                     "y":{"type":"number","description":"screen y, or offset from the element's top"},
                     "direction":{"type":"string","enum":["up","down","left","right","page_up","page_down"]},
-                    "amount":{"type":"integer"}}), &["direction"]),
+                    "amount":{"type":"integer","description":"wheel lines (default 3); a page is ten lines"},
+                    "modifiers":{"type":"array","items":{"type":"string","enum":["cmd","shift","opt","alt","ctrl","fn"]}}}), &["direction"]),
             ).details(TARGET_DETAILS.to_string() + "\n\n\
                 With a target, `x` and `y` are offsets from the element's top-left (default its centre); without \
-                one they are absolute screen coordinates."),
+                one they are absolute screen coordinates. `modifiers` takes the same names as `mouse_action` and \
+                `drag_drop` and is held for the whole gesture: `[\"cmd\"]` (macOS) or `[\"ctrl\"]` zooms in most \
+                documents, maps and canvases, `[\"shift\"]` scrolls sideways where an app binds it. The result's \
+                `modifiers` is what was held."),
             ToolDescriptor::new(
                 "hover",
                 Category::Input,
@@ -2012,6 +2020,8 @@ mod tests {
         pointer: std::sync::Mutex<Vec<(MouseKind, f64, f64)>>,
         drags: std::sync::Mutex<Vec<Drag>>,
         scrolls: std::sync::Mutex<Vec<(f64, f64, i32)>>,
+        /// The modifiers handed to each scroll, in the same order as `scrolls`.
+        scroll_modifiers: std::sync::Mutex<Vec<Vec<String>>>,
         typed: std::sync::Mutex<Vec<String>>,
         /// What `read_element` returns per node, one entry per read; the last
         /// one repeats. Scripts the *tool layer's* judging of a read-back, not
@@ -2117,8 +2127,13 @@ mod tests {
             y: f64,
             _dir: ScrollDir,
             amount: i32,
+            modifiers: &[String],
         ) -> Result<(), InputError> {
             self.scrolls.lock().unwrap().push((x, y, amount));
+            self.scroll_modifiers
+                .lock()
+                .unwrap()
+                .push(modifiers.to_vec());
             Ok(())
         }
         async fn hover(&self, _x: f64, _y: f64) -> Result<(), InputError> {
@@ -3092,6 +3107,48 @@ mod tests {
         assert!(env.ok, "{env:?}");
         assert_eq!(backend.scrolls.lock().unwrap()[0], (130.0, 210.0, 4));
         assert_eq!(env.data.unwrap()["ref"], "@e1");
+    }
+
+    /// Cmd+wheel is zoom in most apps, and `scroll` had no way to ask for it.
+    /// The names are the ones `mouse_action` and `drag_drop` take, reach the
+    /// backend as given, and come back in the result.
+    #[tokio::test]
+    async fn scroll_passes_modifiers_to_the_backend_and_reports_them() {
+        let (module, backend, _arena) = test_module();
+        let env = call(
+            &module,
+            "scroll",
+            json!({ "x": 10, "y": 20, "direction": "down", "modifiers": ["cmd"] }),
+        )
+        .await;
+        assert!(env.ok, "{env:?}");
+        assert_eq!(
+            backend.scroll_modifiers.lock().unwrap()[0],
+            vec!["cmd".to_string()]
+        );
+        assert_eq!(env.data.unwrap()["modifiers"], json!(["cmd"]));
+
+        // Without the field nothing is held, and the result says so.
+        let env = call(
+            &module,
+            "scroll",
+            json!({ "x": 10, "y": 20, "direction": "down" }),
+        )
+        .await;
+        assert!(env.ok, "{env:?}");
+        assert!(backend.scroll_modifiers.lock().unwrap()[1].is_empty());
+        assert_eq!(env.data.unwrap()["modifiers"], json!([]));
+
+        // An unknown name is refused before the wheel turns.
+        let env = call(
+            &module,
+            "scroll",
+            json!({ "x": 10, "y": 20, "direction": "down", "modifiers": ["hyper"] }),
+        )
+        .await;
+        assert!(!env.ok);
+        assert_eq!(env.error.as_ref().unwrap().code, ErrorCode::InvalidArgs);
+        assert_eq!(backend.scrolls.lock().unwrap().len(), 2);
     }
 
     #[tokio::test]

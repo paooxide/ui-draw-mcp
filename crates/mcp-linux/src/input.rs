@@ -516,7 +516,9 @@ impl InputBackend for LinuxBackend {
         y: f64,
         dir: ScrollDir,
         amount: i32,
+        modifiers: &[String],
     ) -> Result<(), InputError> {
+        let mods = keys::pointer_modifiers(modifiers).map_err(InputError::Failed)?;
         self.portal.pointer_abs(x, y).await?;
         self.note_pointer(x, y);
         sleep(Duration::from_millis(10)).await;
@@ -531,11 +533,22 @@ impl InputBackend for LinuxBackend {
             ScrollDir::PageUp => (true, -1, amount * 10),
             ScrollDir::PageDown => (true, 1, amount * 10),
         };
+        // The portal has no modifier state on a wheel event; the keys are
+        // pressed for real, as for a click, and stay down across the whole
+        // burst so every step arrives as Ctrl+wheel (zoom) or Shift+wheel.
+        self.press_modifiers(&mods, true).await?;
+        let mut turned = Ok(());
         for _ in 0..steps {
-            self.portal.axis_discrete(vertical, sign).await?;
+            if let Err(e) = self.portal.axis_discrete(vertical, sign).await {
+                turned = Err(e);
+                break;
+            }
             sleep(Duration::from_millis(4)).await;
         }
-        Ok(())
+        // Always release what was pressed, even if the wheel failed: a Ctrl
+        // left down turns the human's next keystrokes into shortcuts.
+        let released = self.press_modifiers(&mods, false).await;
+        turned.and(released)
     }
 
     async fn hover(&self, x: f64, y: f64) -> Result<(), InputError> {

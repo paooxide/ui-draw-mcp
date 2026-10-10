@@ -753,8 +753,15 @@ impl InputBackend for MacosBackend {
     ) -> Result<(), InputError> {
         crate::event::mouse(&self.held, k, x, y, b, modifiers)
     }
-    async fn scroll_at(&self, x: f64, y: f64, d: ScrollDir, a: i32) -> Result<(), InputError> {
-        crate::event::scroll(&self.held, x, y, d, a)
+    async fn scroll_at(
+        &self,
+        x: f64,
+        y: f64,
+        d: ScrollDir,
+        a: i32,
+        modifiers: &[String],
+    ) -> Result<(), InputError> {
+        crate::event::scroll(&self.held, x, y, d, a, modifiers)
     }
     async fn pointer_position(&self) -> Result<Option<(f64, f64)>, InputError> {
         crate::event::pointer_position()

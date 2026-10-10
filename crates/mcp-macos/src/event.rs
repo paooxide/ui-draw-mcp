@@ -483,22 +483,50 @@ pub fn drag_path(from: (f64, f64), to: (f64, f64), steps: u32) -> Vec<(f64, f64)
         .collect()
 }
 
-pub fn scroll(held: &Held, x: f64, y: f64, dir: ScrollDir, amount: i32) -> Result<(), InputError> {
-    // Position the cursor so the scroll targets that location.
-    post_motion(held, CGPoint::new(x, y), CGEventFlags::empty())?;
+/// Wheel deltas in lines for a direction: `(vertical, horizontal)`, positive
+/// meaning up and left as CoreGraphics counts them. A page is ten lines.
+pub fn scroll_deltas(dir: ScrollDir, amount: i32) -> (i32, i32) {
     let a = amount.max(1);
-    let (vertical, horizontal) = match dir {
+    match dir {
         ScrollDir::Up => (a, 0),
         ScrollDir::Down => (-a, 0),
         ScrollDir::Left => (0, a),
         ScrollDir::Right => (0, -a),
         ScrollDir::PageUp => (a * 10, 0),
         ScrollDir::PageDown => (-a * 10, 0),
-    };
+    }
+}
+
+/// Build one wheel event without posting it.
+fn build_scroll_event(
+    dir: ScrollDir,
+    amount: i32,
+    flags: CGEventFlags,
+) -> Result<CGEvent, InputError> {
+    let (vertical, horizontal) = scroll_deltas(dir, amount);
     let ev =
         CGEvent::new_scroll_event(source()?, ScrollEventUnit::LINE, 2, vertical, horizontal, 0)
             .map_err(|_| fail("scroll event"))?;
-    ev.post(CGEventTapLocation::HID);
+    // Cmd+wheel and Ctrl+wheel are zoom in most apps, Shift+wheel is sideways
+    // in some; the modifier rides on the event's flags, which is where AppKit
+    // reads it from. Set even when empty, for the same reason as a click: an
+    // event from the HID source inherits whatever the system thinks is held.
+    ev.set_flags(flags);
+    Ok(ev)
+}
+
+pub fn scroll(
+    held: &Held,
+    x: f64,
+    y: f64,
+    dir: ScrollDir,
+    amount: i32,
+    modifiers: &[String],
+) -> Result<(), InputError> {
+    let flags = modifier_flags(modifiers);
+    // Position the cursor so the scroll targets that location.
+    post_motion(held, CGPoint::new(x, y), flags)?;
+    build_scroll_event(dir, amount, flags)?.post(CGEventTapLocation::HID);
     Ok(())
 }
 
@@ -1030,6 +1058,53 @@ mod drag_tests {
             ev.get_double_value_field(EventField::MOUSE_EVENT_PRESSURE),
             0.0
         );
+        assert!(ev.get_flags().is_empty());
+    }
+}
+
+/// Wheel events: deltas and the modifiers that ride on them. Built, never
+/// posted.
+#[cfg(test)]
+mod scroll_tests {
+    use super::*;
+
+    #[test]
+    fn scroll_deltas_follow_direction_and_a_page_is_ten_lines() {
+        assert_eq!(scroll_deltas(ScrollDir::Up, 3), (3, 0));
+        assert_eq!(scroll_deltas(ScrollDir::Down, 3), (-3, 0));
+        assert_eq!(scroll_deltas(ScrollDir::Left, 2), (0, 2));
+        assert_eq!(scroll_deltas(ScrollDir::Right, 2), (0, -2));
+        assert_eq!(scroll_deltas(ScrollDir::PageUp, 1), (10, 0));
+        assert_eq!(scroll_deltas(ScrollDir::PageDown, 2), (-20, 0));
+        // Zero and negative amounts still scroll one line rather than nothing.
+        assert_eq!(scroll_deltas(ScrollDir::Down, 0), (-1, 0));
+        assert_eq!(scroll_deltas(ScrollDir::Down, -5), (-1, 0));
+    }
+
+    /// Cmd+wheel zooms in most apps; the modifier has to be on the wheel
+    /// event's flags, which `scroll` had no way to set before.
+    #[test]
+    fn a_built_wheel_event_carries_the_asked_for_modifiers() {
+        if source().is_err() {
+            return; // No window server (headless CI): nothing to build.
+        }
+        let ev = build_scroll_event(
+            ScrollDir::Down,
+            3,
+            modifier_flags(&["cmd".into(), "shift".into()]),
+        )
+        .unwrap();
+        assert!(matches!(ev.get_type(), CGEventType::ScrollWheel));
+        let f = ev.get_flags();
+        assert!(f.contains(CGEventFlags::CGEventFlagCommand));
+        assert!(f.contains(CGEventFlags::CGEventFlagShift));
+        assert!(!f.contains(CGEventFlags::CGEventFlagControl));
+        assert_eq!(
+            ev.get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_DELTA_AXIS_1),
+            -3
+        );
+        // Asking for none clears whatever the system believes is held.
+        let ev = build_scroll_event(ScrollDir::Up, 1, CGEventFlags::empty()).unwrap();
         assert!(ev.get_flags().is_empty());
     }
 }

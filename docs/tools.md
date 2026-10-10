@@ -441,16 +441,17 @@ Target an element by `ref` (`@e12`; `e12` and `12` also work) or by `name`, with
 
 `scroll` · standard tier
 
-Scroll at an element (ref or name) or a point.
+Scroll at an element (ref or name) or a point. 'modifiers' holds keys down for the wheel, e.g. ["cmd"] or ["ctrl"] to zoom.
 
 Target an element by `ref` (`@e12`; `e12` and `12` also work) or by `name`, with an optional `role` to narrow it. A name is matched against the latest snapshot (a fresh one is taken if there is none), ignoring case and extra whitespace: exact name first, then prefix, then substring; the name and the current value both count; controls come before other elements; ties go to document order. The result reports the `ref` it resolved to and, for a name, `matches`: how many elements matched as well as the one used. A name that matches nothing is NOT_FOUND, with up to five elements that share a word with it.
 
-With a target, `x` and `y` are offsets from the element's top-left (default its centre); without one they are absolute screen coordinates.
+With a target, `x` and `y` are offsets from the element's top-left (default its centre); without one they are absolute screen coordinates. `modifiers` takes the same names as `mouse_action` and `drag_drop` and is held for the whole gesture: `["cmd"]` (macOS) or `["ctrl"]` zooms in most documents, maps and canvases, `["shift"]` scrolls sideways where an app binds it. The result's `modifiers` is what was held.
 
 | Argument | Type | Required | Description |
 |---|---|---|---|
-| `amount` | integer |  |  |
+| `amount` | integer |  | wheel lines (default 3); a page is ten lines |
 | `direction` | one of: up, down, left, right, page_up, page_down | yes |  |
+| `modifiers` | array&lt;one of: cmd, shift, opt, alt, ctrl, fn&gt; |  |  |
 | `name` | string |  | element name or label, instead of ref; best match wins |
 | `ref` | string |  | element ref @eN |
 | `role` | string |  | narrow a name by role, e.g. button, popup button, text field |

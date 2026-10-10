@@ -6,6 +6,16 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **`scroll` takes `modifiers`.** `["cmd"]`, `["ctrl"]`, `["shift"]` or `["opt"]`, the names `mouse_action` and
+  `drag_drop` already accept, are held for the whole wheel gesture, so Cmd+wheel (macOS) or Ctrl+wheel zooms a
+  document, map or canvas and Shift+wheel scrolls sideways where an app binds it. Before, the wheel always
+  arrived bare and an agent had no way to zoom with the pointer. On macOS the modifiers ride on the wheel
+  event's flags, as they do on a modified click; on Linux the keys are pressed through the portal before the
+  wheel steps and released after them, even when a step fails. An unknown name is `INVALID_ARGS` before
+  anything moves, and the result reports `modifiers`.
+
 ### Changed
 
 - **Audit key generation uses `rand_core::OsRng` directly.** The audit log signing key was the only thing in
