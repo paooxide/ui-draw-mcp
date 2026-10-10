@@ -71,7 +71,7 @@ enabled category, while a `dangerous` tool additionally has to be named in
 | [`browser_query`](#browser-query) | browser | read | Resolve node refs by css selector, xpath or text (case-insensitive; exact matches first, clickable elements preferred). |
 | [`browser_record`](#browser-record) | browser | standard | Observe a tab's interactions (a person's and the agent's) and turn them into browser_flow steps. |
 | [`browser_screencast`](#browser-screencast) | browser | standard | Record a tab to an mp4 video (browser_record is different: it learns replayable flows). |
-| [`browser_screenshot`](#browser-screenshot) | browser | read | Capture a PNG of the page, or of one element by ref. |
+| [`browser_screenshot`](#browser-screenshot) | browser | read | Capture a PNG of the page or of one element (ref), inline; save=true writes it and returns the path. |
 | [`browser_showcase`](#browser-showcase) | browser | standard | Demo visuals drawn in the tab: animated cursor, click ripples, typing HUD. |
 | [`browser_snapshot`](#browser-snapshot) | browser | read | Flatten a page into interactable node refs (dom or accessibility mode) or raw text. |
 | [`browser_tabs`](#browser-tabs) | browser | standard | List, open (url), activate or close (target_id) tabs of a connected browser. |
@@ -1143,16 +1143,24 @@ Record a tab to an mp4 video (browser_record is something else: it learns a repl
 
 `browser_screenshot` · read tier
 
-Capture a PNG of the page, or of one element by ref. Returned inline as an image; save=true writes it to agentctl's media directory and returns {path, width, height, bytes} instead. grid=true draws labelled lines in CSS pixels on the image, the x,y browser_act takes, for clicking where you see something.
+Capture a PNG of the page or of one element (ref), inline; save=true writes it and returns the path. grid=true labels the image in CSS px, the x,y browser_act takes. ocr=true or find="text" read the text instead (no image): each line, or each match, with x,y in CSS px to click, for a canvas or image UI the snapshot cannot see.
 
-With grid=true the labels read as the x,y of browser_act with no ref or query (a viewport point): lines are grid_step CSS px apart, so on a 2x display they are 2*grid_step image pixels apart and the result's scale is 2. A ref screenshot is labelled with the element's viewport position, not from 0, and says so in coordinate_space. The page itself is not touched: the grid is drawn on the returned image only. Labels at line crossings read x,y.
+The image comes back inline as an MCP image block; with save=true only {path, width, height, bytes} does.
+
+With grid=true the labels read as the x,y of browser_act with no ref or query (a viewport point): lines are grid_step CSS px apart (default 100, minimum 25), so on a 2x display they are 2*grid_step image pixels apart and the result's scale is 2. A ref screenshot is labelled with the element's viewport position, not from 0, and says so in coordinate_space. The page itself is not touched: the grid is drawn on the returned image only. Labels at line crossings read x,y.
+
+With ocr=true or find the capture is run through a text recogniser (ocrs, in-process, no network after its two models are fetched on first use) and the image is left out unless image=true. It is the fallback for a page whose text is pixels: a canvas app, an image-based UI, an annotation tool, where browser_snapshot sees one element and browser_query finds nothing. Boxes come back in viewport CSS px whatever the device scale factor (the result's scale is image px per CSS px), so center x,y (ocr) or x,y (find) go straight to browser_act with no ref or query, or with the same ref when coordinate_space is element. find is case-insensitive and whitespace-collapsed; exact=true keeps only a line that is the text. It ranks a whole-line match first, then a whole word, then a fragment of a word; a partial match's box is estimated from the character positions. No match is ok with count 0 and a hint naming the nearest lines read. image=true returns the picture too. The capture is the viewport (or the element with ref), never the whole scrollable page, so every box is clickable as returned. The engine reports no per-line confidence; confidence is always 1.
 
 With save=true the PNG is written to agentctl's media directory (screenshots/, a generated file name) and only {path, width, height, bytes} comes back, with no image payload (default false). The newest 200 saved screenshots are kept; older ones are deleted.
 
 | Argument | Type | Required | Description |
 |---|---|---|---|
-| `grid` | boolean |  | draw a labelled coordinate grid on the image, in viewport CSS px (an element's labels are its viewport position, not 0-based); the result gives scale (image px per CSS px), grid_step and origin |
-| `grid_step` | integer |  | with grid: CSS px between lines (default 100, minimum 25) |
+| `exact` | boolean |  | with find: whole-line match only |
+| `find` | string |  | OCR only the lines containing this text, best first, each with x,y to click; count 0 and a hint when none |
+| `grid` | boolean |  | labelled grid in viewport CSS px on the image; the result gives scale, grid_step, origin |
+| `grid_step` | integer |  | with grid: CSS px between lines (default 100, min 25) |
+| `image` | boolean |  | with ocr/find: also return the image |
+| `ocr` | boolean |  | read the text instead of the image: lines with bounds and center in CSS px |
 | `ref` | string |  | element ref (default: whole page) |
 | `save` | boolean |  |  |
 | `target_id` | string |  | tab id (default: active tab) |

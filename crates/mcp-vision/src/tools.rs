@@ -9,10 +9,10 @@ use serde_json::{json, Value};
 use std::sync::Mutex;
 
 use crate::backend::{
-    CaptureOpts, CaptureResult, Detail, OcrLine, OcrOpts, OcrTarget, VisionBackend, VisionError,
+    CaptureOpts, CaptureResult, Detail, OcrOpts, OcrTarget, VisionBackend, VisionError,
 };
 use crate::config::VisionConfig;
-use crate::find::{find_matches, Found};
+use crate::find::{find_matches, order_lines, Found};
 use crate::grid::{draw_grid_b64, step_from_args, GridSpec};
 
 /// The `vision` capture engine: `list_displays`, `capture_screen`,
@@ -459,28 +459,6 @@ fn find_result(
     data
 }
 
-/// Group recognised lines into reading order: rows by vertical overlap, then
-/// left to right within a row.
-///
-/// Vision returns observations in its own order, which is not the order a
-/// person reads them in. An agent handed a jumbled transcript has to reason
-/// about geometry it cannot see.
-fn order_lines(lines: &mut [OcrLine]) {
-    lines.sort_by(|a, b| {
-        let row_height = a.px.3.max(b.px.3).max(1.0);
-        let dy = (a.px.1 - b.px.1).abs();
-        if dy < row_height * 0.5 {
-            a.px.0
-                .partial_cmp(&b.px.0)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        } else {
-            a.px.1
-                .partial_cmp(&b.px.1)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        }
-    });
-}
-
 /// Map an image-pixel box to screen points.
 ///
 /// Image pixels are not screen points: a Retina capture is already twice the
@@ -650,6 +628,7 @@ fn vision_err(tool: &str, e: VisionError) -> Envelope {
 #[cfg(test)]
 mod ocr_tests {
     use super::*;
+    use crate::backend::OcrLine;
 
     fn line(text: &str, px: (f64, f64, f64, f64)) -> OcrLine {
         OcrLine {
@@ -906,6 +885,7 @@ mod tests {
 #[cfg(test)]
 mod grid_find_tests {
     use super::*;
+    use crate::backend::OcrLine;
     use base64::Engine;
 
     fn white_png(w: u32, h: u32) -> String {

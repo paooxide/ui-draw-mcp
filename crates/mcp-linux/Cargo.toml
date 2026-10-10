@@ -33,8 +33,8 @@ notify-rust = { version = "4.17.0", default-features = false, features = ["z"] }
 xkeysym = "0.2.1"
 png = "0.18.1"
 base64 = "0.23.1"
-ocrs = "0.13.1"
-rten = "0.26"
+# The OCR engine itself lives in mcp-vision (shared with the browser engine).
+mcp-vision = { path = "../mcp-vision", features = ["ocr"] }
 url = "2"
 
 [dev-dependencies]

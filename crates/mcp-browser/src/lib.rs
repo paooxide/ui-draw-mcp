@@ -11,6 +11,7 @@ mod checkpoint;
 pub mod flow;
 mod input;
 mod nav;
+mod ocr;
 mod profile;
 pub mod record;
 pub mod safari;
@@ -29,6 +30,10 @@ pub use cdp::{DialogPolicy, RecordDialogs};
 pub use challenge::{ChallengeKind, ChallengeManager, ChallengeStatus};
 pub use checkpoint::{Checkpoint, CheckpointStore, FormInputState};
 pub use flow::{Flow, FlowError, FlowStore};
+/// The recogniser behind `browser_screenshot ocr/find`, re-exported so the
+/// server can point the module at the same model directory the desktop OCR
+/// uses without depending on `mcp-vision` itself.
+pub use mcp_vision::ocr::Ocr as OcrEngine;
 pub use nav::{NavDenied, NavPolicy};
 pub use profile::{Profile, ProfileError, ProfileStore};
 pub use record::{MacroSynthesizer, RawInteractionEvent, RecordManager};

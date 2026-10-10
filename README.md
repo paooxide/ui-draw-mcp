@@ -84,8 +84,10 @@ delta with `since` and a follow-up observation costs only what changed. `find_el
 when the question is narrow, and `expect` on an input tool folds act-wait-verify into one call.
 
 For surfaces with no accessibility tree (canvases, games, some Electron apps), `ocr_region` reads the text
-and returns a clickable box for each line. Screen capture remains the last resort; captures deduplicate
-against the previous frame, so polling an unchanged screen costs nothing.
+and returns a clickable box for each line. In the browser, `browser_screenshot` with `ocr` or `find` does
+the same for a page whose text is pixels (a canvas app, an image-based UI), returning each line's centre
+in the CSS px `browser_act` clicks. Screen capture remains the last resort; captures deduplicate against
+the previous frame, so polling an unchanged screen costs nothing.
 
 ---
 

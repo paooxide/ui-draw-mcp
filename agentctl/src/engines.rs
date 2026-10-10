@@ -244,6 +244,12 @@ pub fn build_stack(cfg: &PolicyConfig) -> (Vec<Arc<dyn ToolModule>>, Wiring) {
                 500,
             ))
             .with_media_dir(state_dir(cfg).join("media"))
+            // The same directory the Linux desktop OCR reads its models from
+            // (`<state>/bin/ocr`, or `$AGENTCTL_OCR_MODELS`), so one download
+            // serves `ocr_region` and `browser_screenshot ocr/find` alike.
+            .with_ocr_models(mcp_browser::OcrEngine::model_dir(
+                &state_dir(cfg).join("bin"),
+            ))
             .with_judge(judge.clone());
         // With no roots `browser_upload` stays unwired and refuses, naming
         // `fs.roots`, rather than the jail turning every path into an escape.
