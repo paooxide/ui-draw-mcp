@@ -79,3 +79,25 @@ debug = 0
 [profile.dev.package."*"]
 opt-level = 0
 debug = 0
+
+# The OCR engine is numeric code: unoptimised, one recognition of a viewport
+# takes ten seconds and more, which makes `cargo test` on the browser OCR
+# unusable and dev builds misleading about its cost. Optimise just it.
+[profile.dev.package.ocrs]
+opt-level = 3
+[profile.dev.package.rten]
+opt-level = 3
+[profile.dev.package.rten-base]
+opt-level = 3
+[profile.dev.package.rten-gemm]
+opt-level = 3
+[profile.dev.package.rten-imageproc]
+opt-level = 3
+[profile.dev.package.rten-parallel]
+opt-level = 3
+[profile.dev.package.rten-simd]
+opt-level = 3
+[profile.dev.package.rten-tensor]
+opt-level = 3
+[profile.dev.package.rten-vecmath]
+opt-level = 3

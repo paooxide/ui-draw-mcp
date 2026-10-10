@@ -17,6 +17,16 @@ tracing.workspace = true
 # through mcp-linux.
 png = "0.18.1"
 base64 = "0.23.1"
+# The pure-Rust OCR engine (CPU, no system framework), behind `ocr`. Its two
+# models are fetched on first use; see `ocr::Ocr`.
+ocrs = { version = "0.13.1", optional = true }
+rten = { version = "0.26", optional = true }
+# The model files are verified against pinned SHA-256 digests before rten
+# parses them.
+sha2 = { workspace = true, optional = true }
+
+[features]
+ocr = ["dep:ocrs", "dep:rten", "dep:sha2"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros"] }

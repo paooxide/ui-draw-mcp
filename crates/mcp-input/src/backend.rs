@@ -203,12 +203,17 @@ pub trait InputBackend: Send + Sync {
         button: Option<&str>,
         modifiers: &[String],
     ) -> Result<(), InputError>;
+    /// Turn the wheel at `(x, y)`: `amount` lines (ten per page) in `dir`,
+    /// with `modifiers` held for the whole gesture, so Cmd+wheel or Ctrl+wheel
+    /// zooms and Shift+wheel scrolls sideways where the app binds them. Same
+    /// vocabulary as [`InputBackend::mouse`].
     async fn scroll_at(
         &self,
         x: f64,
         y: f64,
         dir: ScrollDir,
         amount: i32,
+        modifiers: &[String],
     ) -> Result<(), InputError>;
     async fn hover(&self, x: f64, y: f64) -> Result<(), InputError>;
     /// Press at `from`, travel to `to` in `steps` intermediate moves, release.

@@ -26,6 +26,11 @@ pub struct BrowserModule {
     upload_resolver: Option<UploadResolver>,
     /// The last snapshot returned per tab, for `browser_snapshot diff`.
     snaps: std::sync::Mutex<crate::snapshot_diff::SnapMemory>,
+    /// Where the OCR models live (`browser_screenshot ocr/find`); `None`
+    /// refuses OCR rather than fetching models into a guessed directory.
+    ocr_models: Option<std::path::PathBuf>,
+    /// The recogniser, loaded on the first OCR call and kept.
+    ocr: tokio::sync::OnceCell<Arc<mcp_vision::ocr::Ocr>>,
 }
 
 /// Resolves a caller-supplied path to the real, contained one, or says why not.
@@ -43,7 +48,17 @@ impl BrowserModule {
             media_dir: None,
             upload_resolver: None,
             snaps: std::sync::Mutex::new(crate::snapshot_diff::SnapMemory::default()),
+            ocr_models: None,
+            ocr: tokio::sync::OnceCell::new(),
         }
+    }
+
+    /// Enable `browser_screenshot ocr` and `find`: the recogniser's models are
+    /// read from (and on first use downloaded into) this directory. Pass the
+    /// same directory the desktop `ocr_region` uses so they are fetched once.
+    pub fn with_ocr_models(mut self, dir: std::path::PathBuf) -> Self {
+        self.ocr_models = Some(dir);
+        self
     }
 
     /// Enable `browser_upload`. Every path goes through `resolve` (the
@@ -1458,7 +1473,8 @@ impl BrowserModule {
             );
         }
         // Real pointer input: the multi-click, scroll, drag and bare mouse
-        // actions, a held click, and a click or hover given coordinates.
+        // actions, a held click, and a click or hover given coordinates or
+        // modifier keys.
         let is_pointer = matches!(
             action,
             "double_click"
@@ -1470,8 +1486,33 @@ impl BrowserModule {
                 | "mouse_down"
                 | "mouse_up"
         ) || (matches!(action, "click" | "hover")
-            && (pointer.x.is_some() || pointer.y.is_some()))
+            && (pointer.x.is_some() || pointer.y.is_some() || pointer.modifiers != 0))
             || (action == "click" && opts.hold_ms > 0);
+        if pointer.modifiers != 0 && !is_pointer {
+            return Envelope::fail(
+                "browser_act",
+                ErrorCode::InvalidArgs,
+                format!(
+                    "modifiers apply to pointer actions (click, drag, scroll, hover and the mouse actions), not '{action}'; for a key combo put them in press's value (ctrl+a)"
+                ),
+            );
+        }
+        if (pointer.moves.is_some() || pointer.duration_ms.is_some())
+            && !matches!(action, "drag" | "mouse_move" | "hover")
+        {
+            return Envelope::fail(
+                "browser_act",
+                ErrorCode::InvalidArgs,
+                format!("moves and duration_ms pace a drag (or a mouse_move with a button held), not '{action}'"),
+            );
+        }
+        if !pointer.path.is_empty() && action != "drag" {
+            return Envelope::fail(
+                "browser_act",
+                ErrorCode::InvalidArgs,
+                format!("path is a drag's waypoints, not '{action}'s"),
+            );
+        }
         // Typing and key presses may go to whatever has focus.
         let found = parse_locator(args);
         let locator = match found {
@@ -2203,38 +2244,68 @@ impl BrowserModule {
     }
 
     async fn screenshot(&self, args: &Value) -> Envelope {
-        let target = match require(args, "target_id", "browser_screenshot") {
+        let tool = "browser_screenshot";
+        let target = match require(args, "target_id", tool) {
             Ok(t) => t,
             Err(e) => return e,
         };
         let save = args.get("save").and_then(Value::as_bool).unwrap_or(false);
         let media = if save {
-            match self.media_dir_for("browser_screenshot") {
+            match self.media_dir_for(tool) {
                 Ok(d) => Some(d),
                 Err(e) => return e,
             }
         } else {
             None
         };
+        let find = str_arg(args, "find");
+        if let Some(q) = find {
+            if q.trim().is_empty() {
+                return Envelope::fail(tool, ErrorCode::InvalidArgs, "'find' is empty");
+            }
+        }
+        let ocr = find.is_some() || args.get("ocr").and_then(Value::as_bool).unwrap_or(false);
+        // OCR exists to save the image's tokens, so the picture is left out
+        // unless asked for; without OCR the picture is the whole point.
+        let with_image = !ocr || args.get("image").and_then(Value::as_bool).unwrap_or(false);
         let node_ref = str_arg(args, "ref");
         let mut shot = match self.backend.screenshot(target, node_ref).await {
             Ok(s) => s,
-            Err(e) => return browser_err("browser_screenshot", e),
+            Err(e) => return browser_err(tool, e),
         };
+        // The grid and OCR both need to know how the picture maps to CSS px.
+        let step = mcp_vision::grid::step_from_args(args);
+        let geometry = if step.is_some() || ocr {
+            match self.capture_geometry(target, node_ref, &shot).await {
+                Ok(g) => Some(g),
+                Err(e) => return browser_err(tool, e),
+            }
+        } else {
+            None
+        };
+        let mut ocr_info = json!({});
+        if let (true, Some(g)) = (ocr, geometry) {
+            // Read the text before the grid is drawn on the pixels it reads.
+            match self.ocr_shot(&shot, &g, find, args).await {
+                Ok(info) => ocr_info = info,
+                Err(e) => return browser_err(tool, e),
+            }
+        }
         // What the grid adds to the result; empty without one.
         let mut grid_info = json!({});
-        if let Some(step) = mcp_vision::grid::step_from_args(args) {
-            match self.draw_grid(target, node_ref, step, &mut shot).await {
+        if let (Some(step), Some(g)) = (step, geometry) {
+            match Self::draw_grid(step, &g, &mut shot) {
                 Ok(info) => grid_info = info,
-                Err(e) => return browser_err("browser_screenshot", e),
+                Err(e) => return browser_err(tool, e),
             }
         }
         if let Some(dir) = media {
             return result(
-                "browser_screenshot",
+                tool,
                 crate::screencast::save_screenshot(&dir, &shot.base64, shot.width, shot.height)
                     .map(|mut saved| {
                         merge_into(&mut saved, grid_info);
+                        merge_into(&mut saved, ocr_info);
                         saved
                     }),
             );
@@ -2247,8 +2318,12 @@ impl BrowserModule {
         };
         let mut data = json!({ "width": width, "height": height });
         merge_into(&mut data, grid_info);
+        merge_into(&mut data, ocr_info);
+        if !with_image {
+            return Envelope::ok(tool, data);
+        }
         Envelope::ok_image(
-            "browser_screenshot",
+            tool,
             data,
             ImageContent {
                 mime_type: "image/png".into(),
@@ -2257,25 +2332,22 @@ impl BrowserModule {
         )
     }
 
-    /// Draw the coordinate grid on `shot`, labelled in the CSS pixels
-    /// `browser_act` takes as `x`/`y` with no target (viewport points).
+    /// How the picture maps to the CSS pixels `browser_act` takes as `x`/`y`
+    /// with no target (viewport points): the shared ground for the grid and
+    /// for OCR, measured once so the two cannot disagree.
     ///
-    /// Done on the decoded PNG, not by injecting an overlay: the page is left
-    /// exactly as it was, and the grid is on the picture only. The image is
-    /// `scale` device pixels per CSS pixel, so the lines are `step * scale`
-    /// apart and still labelled in CSS pixels. An element's shot starts at the
-    /// element, so its labels are offset by where the element sits in the
-    /// viewport rather than restarting at 0.
-    async fn draw_grid(
+    /// A viewport shot is the viewport at the device pixel ratio, so the image
+    /// width over the viewport width is the scale. An element shot is clipped
+    /// in CSS px at the same ratio and starts at the element, so its boxes are
+    /// offset by where the element sits in the viewport rather than from 0.
+    async fn capture_geometry(
         &self,
         target: &str,
         node_ref: Option<&str>,
-        step: u32,
-        shot: &mut crate::backend::Shot,
-    ) -> Result<Value, BrowserError> {
-        let (img_w, img_h) = crate::screencast::png_b64_size(&shot.base64).ok_or_else(|| {
-            BrowserError::Failed("screenshot is not a PNG; cannot draw a grid".into())
-        })?;
+        shot: &crate::backend::Shot,
+    ) -> Result<crate::ocr::Geometry, BrowserError> {
+        let (img_w, _) = crate::screencast::png_b64_size(&shot.base64)
+            .ok_or_else(|| BrowserError::Failed("screenshot is not a PNG".into()))?;
         let xp = serde_json::to_string(&node_ref.unwrap_or("")).unwrap_or_else(|_| "\"\"".into());
         let probe = format!(
             r#"(function(){{
@@ -2294,34 +2366,45 @@ impl BrowserModule {
         let num = |v: &Value, k: &str| v.get(k).and_then(Value::as_f64).unwrap_or(0.0);
         let (vw, vh, dpr) = (num(&facts, "vw"), num(&facts, "vh"), num(&facts, "dpr"));
         let rect = facts.get("rect").filter(|r| r.is_object());
-
-        // A viewport shot is the viewport at the device pixel ratio, so the
-        // image width over the viewport width is the scale. An element shot is
-        // clipped in CSS px at the same ratio.
+        let dpr = if dpr > 0.0 { dpr } else { 1.0 };
         let (scale, origin, space) = match (node_ref, rect) {
-            (Some(_), Some(r)) => (
-                if dpr > 0.0 { dpr } else { 1.0 },
-                (num(r, "x"), num(r, "y")),
-                "viewport",
-            ),
-            // The ref did not resolve to a rect: still draw, but say the
+            (Some(_), Some(r)) => (dpr, (num(r, "x"), num(r, "y")), "viewport"),
+            // The ref did not resolve to a rect: still answer, but say the
             // numbers are offsets inside the element, which is what browser_act
             // takes as x,y together with that ref.
-            (Some(_), None) => (if dpr > 0.0 { dpr } else { 1.0 }, (0.0, 0.0), "element"),
+            (Some(_), None) => (dpr, (0.0, 0.0), "element"),
             (None, _) => (
-                if vw > 0.0 {
-                    img_w as f64 / vw
-                } else {
-                    dpr.max(1.0)
-                },
+                if vw > 0.0 { img_w as f64 / vw } else { dpr },
                 (0.0, 0.0),
                 "viewport",
             ),
         };
+        Ok(crate::ocr::Geometry {
+            scale,
+            origin,
+            space,
+            viewport: (vw, vh),
+        })
+    }
+
+    /// Draw the coordinate grid on `shot`, labelled in CSS px.
+    ///
+    /// Done on the decoded PNG, not by injecting an overlay: the page is left
+    /// exactly as it was, and the grid is on the picture only. The image is
+    /// `scale` device pixels per CSS pixel, so the lines are `step * scale`
+    /// apart and still labelled in CSS pixels.
+    fn draw_grid(
+        step: u32,
+        g: &crate::ocr::Geometry,
+        shot: &mut crate::backend::Shot,
+    ) -> Result<Value, BrowserError> {
+        let (img_w, img_h) = crate::screencast::png_b64_size(&shot.base64).ok_or_else(|| {
+            BrowserError::Failed("screenshot is not a PNG; cannot draw a grid".into())
+        })?;
         let spec = mcp_vision::grid::GridSpec {
             step,
-            px_per_unit: (scale, scale),
-            origin,
+            px_per_unit: (g.scale, g.scale),
+            origin: g.origin,
         };
         shot.base64 = mcp_vision::grid::draw_grid_b64(&shot.base64, &spec)
             .map_err(|e| BrowserError::Failed(format!("grid: {e}")))?;
@@ -2330,7 +2413,7 @@ impl BrowserModule {
         shot.width = img_w;
         shot.height = img_h;
 
-        let note = if space == "viewport" {
+        let note = if g.space == "viewport" {
             "grid labels are CSS pixels from the viewport's top-left, the x,y browser_act takes \
              with no ref or query (scale is image pixels per CSS pixel; the image is width x \
              height pixels)"
@@ -2343,12 +2426,59 @@ impl BrowserModule {
             "height": img_h,
             "grid": true,
             "grid_step": step,
-            "scale": scale,
-            "coordinate_space": space,
-            "origin": { "x": origin.0, "y": origin.1 },
-            "viewport": { "w": vw, "h": vh },
+            "scale": g.scale,
+            "coordinate_space": g.space,
+            "origin": { "x": g.origin.0, "y": g.origin.1 },
+            "viewport": { "w": g.viewport.0, "h": g.viewport.1 },
             "grid_note": note,
         }))
+    }
+
+    /// Read the text in `shot` and shape it as `ocr` or `find` asks.
+    ///
+    /// Recognition is CPU work of a second or more on a large capture, so it
+    /// runs off the async threads; the engine loads once per module and is
+    /// kept, the first call paying for the model load (and, the first time on
+    /// a machine, the download).
+    async fn ocr_shot(
+        &self,
+        shot: &crate::backend::Shot,
+        g: &crate::ocr::Geometry,
+        find: Option<&str>,
+        args: &Value,
+    ) -> Result<Value, BrowserError> {
+        let Some(dir) = self.ocr_models.clone() else {
+            return Err(BrowserError::Unsupported(
+                "OCR is not configured for the browser engine (no model directory); take the \
+                 screenshot without ocr/find, or use grid=true and read the picture"
+                    .into(),
+            ));
+        };
+        let engine = self
+            .ocr
+            .get_or_try_init(|| async {
+                tokio::task::spawn_blocking(move || mcp_vision::ocr::Ocr::load(&dir).map(Arc::new))
+                    .await
+                    .map_err(|e| format!("ocr load task: {e}"))?
+            })
+            .await
+            .map_err(|e| BrowserError::Failed(format!("ocr: {e}")))?
+            .clone();
+        let (w, h, rgba) = mcp_vision::grid::decode_rgba_b64(&shot.base64)
+            .map_err(|e| BrowserError::Failed(format!("ocr: {e}")))?;
+        let mut lines = tokio::task::spawn_blocking(move || engine.recognise(&rgba, w, h))
+            .await
+            .map_err(|e| BrowserError::Failed(format!("ocr task: {e}")))?
+            .map_err(BrowserError::Failed)?;
+        mcp_vision::find::order_lines(&mut lines);
+        Ok(match find {
+            Some(q) => {
+                let exact = args.get("exact").and_then(Value::as_bool).unwrap_or(false);
+                let found = mcp_vision::find::find_matches(&lines, q, exact);
+                crate::ocr::find_result(q, exact, &found, &lines, g, (w, h))
+            }
+            None => crate::ocr::lines_result(&lines, g, (w, h)),
+        })
     }
 
     #[allow(clippy::result_large_err)]
@@ -3163,6 +3293,16 @@ fn pointer_args(args: &Value) -> Result<crate::backend::PointerArgs<'_>, String>
             index: None,
         })
     };
+    let path = crate::input::parse_drag_path(args.get("path"))?;
+    if !path.is_empty() {
+        for k in ["to_x", "to_y", "dx", "dy"] {
+            if args.get(k).is_some_and(|v| !v.is_null()) {
+                return Err(format!(
+                    "with 'path', drop '{k}': the drag ends at the last path point"
+                ));
+            }
+        }
+    }
     Ok(crate::backend::PointerArgs {
         x: num("x")?,
         y: num("y")?,
@@ -3173,6 +3313,10 @@ fn pointer_args(args: &Value) -> Result<crate::backend::PointerArgs<'_>, String>
         dy: num("dy")?,
         value: str_arg(args, "value"),
         button: crate::input::parse_button(str_arg(args, "button"))?,
+        modifiers: crate::input::parse_modifiers(args.get("modifiers"))?,
+        moves: crate::input::drag_moves(num("moves")?)?,
+        duration_ms: crate::input::drag_duration(num("duration_ms")?)?,
+        path,
     })
 }
 
@@ -3500,35 +3644,39 @@ impl ToolModule for BrowserModule {
                 "browser_act",
                 Category::Browser,
                 Tier::Standard,
-                "Act on a DOM node. Target it with 'ref' (from browser_snapshot/query) or 'query' (CSS, visible text, XPath or role=...) plus optional by, within, text, index. x and y act at a point (offsets in the target, else viewport px); the result's hit names what is there. type replaces the field's content. press takes a key or combo (ctrl+a). The result's effects says what changed (url, new_tab, dialog, appeared, disappeared, focus), so no snapshot is needed to see it. A click returns before any navigation it starts: use wait_after='settle'. steps=[{action, ref|query, value}, ...] runs up to 20 in one call.",
+                "Act on a DOM node. Target 'ref' (from browser_snapshot/query) or 'query' (CSS, visible text, XPath or role=...; optional by, within, text, index). x, y act at a point (offsets in the target, canvas bitmap px, or viewport px): hit says what is there. type replaces the field's content; press takes a key or combo (ctrl+a). effects says what changed (url, new_tab, dialog, appeared, disappeared, focus). A click returns before navigation: use wait_after='settle'. steps=[{action, ...}] runs up to 20 acts in one call.",
                 obj(
                     json!({
                         "target_id": { "type": "string", "description": "tab id (default: active tab)" },
                         "ref": { "type": "string", "description": "a ref from browser_query/snapshot" },
-                        "by": { "type": "string", "enum": ["css", "xpath", "text", "role"], "description": "how to read 'query' (default: CSS, else visible text)" },
-                        "query": { "type": "string", "description": "selector or text to act on, instead of 'ref'; type and press with neither act on the focused element; with by: role, the ARIA role" },
-                        "name": { "type": "string", "description": "with by: role, the accessible name (case-insensitive substring)" },
-                        "within": { "type": "string", "description": "root selector scoping the query" },
-                        "text": { "type": "string", "description": "substring filter on the matches" },
-                        "index": { "type": "integer", "description": "0-based match index (default 0)" },
+                        "by": { "type": "string", "enum": ["css", "xpath", "text", "role"], "description": "how to read 'query' (default CSS, else text)" },
+                        "query": { "type": "string", "description": "selector or text, instead of 'ref' (by: role: the role); type/press with neither act on the focused element" },
+                        "name": { "type": "string", "description": "by: role: the accessible name (substring)" },
+                        "within": { "type": "string", "description": "root selector for the query" },
+                        "text": { "type": "string", "description": "substring filter on matches" },
+                        "index": { "type": "integer", "description": "0-based match index" },
                         "action": { "type": "string", "enum": ["click", "double_click", "triple_click", "right_click", "hover", "mouse_move", "mouse_down", "mouse_up", "drag", "scroll", "type", "select", "focus", "scroll_into_view", "submit", "press"] },
-                        "value": { "type": "string", "description": "type: the text; select: option text or value; press: key or combo (Enter, ctrl+a, Shift+Tab); scroll: up, down, left, right, top or bottom" },
-                        "x": { "type": "number", "description": "CSS px: offset from the target's top-left, or a viewport point without one" },
+                        "value": { "type": "string", "description": "type: the text; select: option text or value; press: key or combo (ctrl+a); scroll: up, down, left, right, top, bottom" },
+                        "x": { "type": "number", "description": "offset from the target's top-left (canvas: bitmap px), else viewport" },
                         "y": { "type": "number", "description": "pointer y, as x" },
-                        "to_ref": { "type": "string", "description": "drag destination element (a ref)" },
-                        "to_query": { "type": "string", "description": "drag destination element (a selector)" },
-                        "to_x": { "type": "number", "description": "drag end x: offset in to_ref/to_query, else a viewport point" },
-                        "to_y": { "type": "number", "description": "drag destination y, as to_x" },
+                        "modifiers": { "type": "array", "items": { "type": "string", "enum": ["shift", "ctrl", "alt", "meta"] }, "description": "keys held through a pointer action" },
+                        "to_ref": { "type": "string", "description": "drag destination (a ref)" },
+                        "to_query": { "type": "string", "description": "drag destination (a selector)" },
+                        "to_x": { "type": "number", "description": "drag end x: offset in to_ref/to_query, else viewport" },
+                        "to_y": { "type": "number", "description": "drag end y, as to_x" },
                         "dx": { "type": "number", "description": "drag or scroll: x distance in CSS px" },
-                        "dy": { "type": "number", "description": "drag or scroll: y distance (scroll default: one viewport down)" },
-                        "hold_ms": { "type": "number", "description": "hold a click's button or a press's key this long (max 10000)" },
-                        "button": { "type": "string", "enum": ["left", "right", "middle"], "description": "mouse_down/mouse_up button (default left)" },
-                        "secret": { "type": "boolean", "description": "value is a secret: kept out of the audit log and the showcase HUD" },
+                        "dy": { "type": "number", "description": "as dx (scroll default: one viewport down)" },
+                        "path": { "type": "array", "description": "drag: waypoints [{x,y},...] in to_ref's frame, else the source's (canvas: bitmap px); releases at the last (max 200)" },
+                        "moves": { "type": "integer", "description": "drag: how many moves (2-200, default 12)" },
+                        "duration_ms": { "type": "number", "description": "drag: total time of its moves (max 10000)" },
+                        "hold_ms": { "type": "number", "description": "hold a click or press this many ms (max 10000)" },
+                        "button": { "type": "string", "enum": ["left", "right", "middle"], "description": "mouse_down/up/drag button (default left)" },
+                        "secret": { "type": "boolean", "description": "value is a secret (not logged)" },
                         "scroll": { "type": "string", "enum": ["none", "nearest", "center"], "description": "bring the element into view first (default nearest)" },
-                        "wait_after": { "type": "string", "enum": ["none", "settle"], "description": "settle: wait for a started navigation and quiet network (Chrome). Default none" },
+                        "wait_after": { "type": "string", "enum": ["none", "settle"], "description": "settle: wait for navigation and quiet network" },
                         "timeout_ms": { "type": "integer", "description": "settle bound in ms (default 10000)" },
-                        "steps": { "type": "array", "description": "batch: acts with the fields above, run in order, stopping at the first failure (max 20)", "items": { "type": "object" } },
-                        "snapshot": { "type": "string", "enum": ["none", "diff", "full"], "description": "with steps: the page after the last step, as a snapshot diff or in full" }
+                        "steps": { "type": "array", "description": "batch: acts with these fields, in order until one fails (max 20)", "items": { "type": "object" } },
+                        "snapshot": { "type": "string", "enum": ["none", "diff", "full"], "description": "with steps: the page after, as a diff or in full" }
                     }),
                     json!([]),
                 ),
@@ -3540,13 +3688,28 @@ impl ToolModule for BrowserModule {
                  does, also on macOS.\n\n\
                  Pointer actions are real input (Chrome only): double_click, triple_click (selects a line), right_click \
                  (contextmenu) and hover, and click too, accept `x` and `y`: with a target they are offsets from its top-left \
-                 corner (for a canvas, its pixel coordinates), without one viewport CSS px; the result's click_at is where \
-                 it landed, and a point outside the viewport is an error. `scroll` turns the mouse wheel over the target (or \
-                 the page) by dx and dy, by default one viewport down; `value` may be up, down, left, right, top or bottom. \
+                 corner, without one viewport CSS px. A <canvas> target is addressed in its bitmap pixels, mapped through \
+                 its content box: a 400-wide canvas styled 800px wide with a border is clicked at bitmap (100, 50) with \
+                 x 100 and y 50, whatever its CSS size, and a page-published canvas region counts from its own corner. \
+                 The result's click_at is where it landed in viewport px (with `pixel`, the bitmap pixel, on a canvas), \
+                 and a point outside the viewport is an error. `modifiers` (an array of shift, ctrl, alt, meta/cmd) are \
+                 held through any pointer action: every mouse event carries them (shiftKey, ctrlKey...) and the keys \
+                 themselves go down before and up after, so a tool that listens for the Shift key sees it held; use it \
+                 for shift-click to extend a selection, ctrl+wheel to zoom a canvas, shift-drag to constrain a shape. \
+                 `scroll` turns the mouse wheel over the target (or the page) by dx and dy, by default one viewport \
+                 down; `value` may be up, down, left, right, top or bottom. \
                  `drag` presses on the target (or at x and y), moves in steps and releases at the destination: the \
                  to_ref or to_query element (its centre, or to_x and to_y inside it), else to_x and to_y as viewport \
-                 points, else dx and dy from the start; the destination must be on screen. Mouse-event drags (sliders, \
-                 sortable lists, selecting text) and HTML5 draggable elements both work; the result says html5_drag. \
+                 points, else dx and dy from the start; the destination must be on screen. `moves` (2 to 200, default \
+                 12) is how many moves it makes, `duration_ms` (at most 10000) how long they take in all (15 ms a step \
+                 by default) and `button` which button is held (default left). `path` is a list of waypoints ({x, y}, \
+                 up to 200) the drag passes through in order before releasing at the last, each in the frame of \
+                 the to_ref/to_query element when one is given, else of the source ref/query (bitmap pixels on a \
+                 canvas), else viewport px; the moves are spread over the segments by length with at least one landing \
+                 on every waypoint. That is a brush stroke, lasso or freehand shape: drawn on a canvas ref, the whole \
+                 stroke is in its pixels. A polygon tool is a batch: click each vertex, then \
+                 double_click the last. Mouse-event drags (sliders, sortable lists, selecting text, drawing tools) \
+                 and HTML5 draggable elements both work; the result says html5_drag, moves and duration_ms. \
                  `mouse_move` (also `hover` with x and y) moves the real pointer to the target or point without clicking, \
                  so mouseover, mousemove and CSS :hover fire; `mouse_down` and `mouse_up` press and release a `button` \
                  (left, right or middle) at the target or point, so a drag or hold the page implements itself can be \
@@ -3582,8 +3745,8 @@ impl ToolModule for BrowserModule {
                  for a password or secret field). A native <select> is set with select (on the list or one of its \
                  options) or a click on an <option>; both report selected and changed, and an option that is missing, \
                  disabled or undone by the page is an error. A page-published canvas region (a canvas-child ref from browser_snapshot) \
-                 supports only click and hover, sent as real mouse input at the region centre; other actions on it return \
-                 Unsupported.\n\n\
+                 supports click and hover, sent as real mouse input at the region centre (or at x and y, bitmap pixels \
+                 from its corner), and the pointer actions; the other actions on it return Unsupported.\n\n\
                  Query targeting: 'by' is css, xpath, text or role (used when no 'ref'; role takes the role as the query and the accessible name as 'name', see browser_query); with none, the query is tried as CSS and, \
                  if it does not parse or matches nothing, as visible text (the result says matched_by), so a plain word \
                  such as \"Submit\" works. The spellings browser_query lists (/ or ( for XPath, text=..., :has-text(..) \
@@ -3841,23 +4004,41 @@ impl ToolModule for BrowserModule {
                 "browser_screenshot",
                 Category::Browser,
                 Tier::Read,
-                "Capture a PNG of the page, or of one element by ref. Returned inline as an image; save=true writes it to agentctl's media directory and returns {path, width, height, bytes} instead. grid=true draws labelled lines in CSS pixels on the image, the x,y browser_act takes, for clicking where you see something.",
+                "Capture a PNG of the page or of one element (ref), inline; save=true writes it and returns the path. grid=true labels the image in CSS px, the x,y browser_act takes. ocr=true or find=\"text\" read the text instead (no image): each line, or each match, with x,y in CSS px to click, for a canvas or image UI the snapshot cannot see.",
                 obj(
                     json!({
                         "target_id": { "type": "string", "description": "tab id (default: active tab)" },
                         "ref": { "type": "string", "description": "element ref (default: whole page)" },
                         "save": { "type": "boolean" },
-                        "grid": { "type": "boolean", "description": "draw a labelled coordinate grid on the image, in viewport CSS px (an element's labels are its viewport position, not 0-based); the result gives scale (image px per CSS px), grid_step and origin" },
-                        "grid_step": { "type": "integer", "description": "with grid: CSS px between lines (default 100, minimum 25)" }
+                        "grid": { "type": "boolean", "description": "labelled grid in viewport CSS px on the image; the result gives scale, grid_step, origin" },
+                        "grid_step": { "type": "integer", "description": "with grid: CSS px between lines (default 100, min 25)" },
+                        "ocr": { "type": "boolean", "description": "read the text instead of the image: lines with bounds and center in CSS px" },
+                        "find": { "type": "string", "description": "OCR only the lines containing this text, best first, each with x,y to click; count 0 and a hint when none" },
+                        "exact": { "type": "boolean", "description": "with find: whole-line match only" },
+                        "image": { "type": "boolean", "description": "with ocr/find: also return the image" }
                     }),
                     json!([]),
                 ),
             ).details(
-                "With grid=true the labels read as the x,y of browser_act with no ref or query (a viewport point): \
-                 lines are grid_step CSS px apart, so on a 2x display they are 2*grid_step image pixels apart and \
-                 the result's scale is 2. A ref screenshot is labelled with the element's viewport position, not \
-                 from 0, and says so in coordinate_space. The page itself is not touched: the grid is drawn on the \
-                 returned image only. Labels at line crossings read x,y.\n\n\
+                "The image comes back inline as an MCP image block; with save=true only {path, width, height, bytes} \
+                 does.\n\n\
+                 With grid=true the labels read as the x,y of browser_act with no ref or query (a viewport point): \
+                 lines are grid_step CSS px apart (default 100, minimum 25), so on a 2x display they are 2*grid_step \
+                 image pixels apart and the result's scale is 2. A ref screenshot is labelled with the element's \
+                 viewport position, not from 0, and says so in coordinate_space. The page itself is not touched: the \
+                 grid is drawn on the returned image only. Labels at line crossings read x,y.\n\n\
+                 With ocr=true or find the capture is run through a text recogniser (ocrs, in-process, no network \
+                 after its two models are fetched on first use) and the image is left out unless image=true. It is \
+                 the fallback for a page whose text is pixels: a canvas app, an image-based UI, an annotation tool, \
+                 where browser_snapshot sees one element and browser_query finds nothing. Boxes come back in \
+                 viewport CSS px whatever the device scale factor (the result's scale is image px per CSS px), so \
+                 center x,y (ocr) or x,y (find) go straight to browser_act with no ref or query, or with the same \
+                 ref when coordinate_space is element. find is case-insensitive and whitespace-collapsed; exact=true \
+                 keeps only a line that is the text. It ranks a whole-line match first, then a whole word, then a \
+                 fragment of a word; a partial match's box is estimated from the character positions. No match is \
+                 ok with count 0 and a hint naming the nearest lines read. image=true returns the picture too. The capture is the viewport (or the \
+                 element with ref), never the whole scrollable page, so every box is clickable as returned. The \
+                 engine reports no per-line confidence; confidence is always 1.\n\n\
                  With save=true the PNG is written to agentctl's media directory (screenshots/, a generated file name) and \
                  only {path, width, height, bytes} comes back, with no image payload (default false). The newest 200 saved \
                  screenshots are kept; older ones are deleted.",
@@ -5625,6 +5806,44 @@ mod forgiving_args_tests {
         let e = pointer_args(&json!({"x": "left"})).unwrap_err();
         assert!(e.contains("'x'") && e.contains("number"), "{e}");
         assert!(pointer_args(&json!({"x": null})).unwrap().x.is_none());
+    }
+
+    /// The drawing-tool arguments: modifier keys, a drag's pacing and button,
+    /// and a path of waypoints.
+    #[test]
+    fn pointer_args_take_modifiers_and_drag_control() {
+        let a = json!({
+            "modifiers": ["shift", "Ctrl"], "moves": "30", "duration_ms": 900, "button": "right",
+            "path": [{"x": 1, "y": 2}, [3, 4]]
+        });
+        let p = pointer_args(&a).unwrap();
+        assert_eq!(p.modifiers, 2 | 8);
+        assert_eq!(p.moves, Some(30));
+        assert_eq!(p.duration_ms, Some(900));
+        assert_eq!(p.button, Some(crate::input::Button::Right));
+        assert_eq!(p.path, vec![(1.0, 2.0), (3.0, 4.0)]);
+        let batch = json!({"steps": [{"action": "click"}]});
+        let none = pointer_args(&batch).unwrap();
+        assert_eq!((none.moves, none.modifiers), (None, 0));
+        assert!(none.path.is_empty());
+        let e = pointer_args(&json!({"moves": 1})).unwrap_err();
+        assert!(e.contains("2 to 200"), "{e}");
+        let e = pointer_args(&json!({"moves": "many"})).unwrap_err();
+        assert!(e.contains("'moves'"), "{e}");
+        let e = pointer_args(&json!({"duration_ms": 10_001})).unwrap_err();
+        assert!(e.contains("duration_ms"), "{e}");
+        let e = pointer_args(&json!({"modifiers": ["hyper"]})).unwrap_err();
+        assert!(e.contains("hyper"), "{e}");
+        let e = pointer_args(&json!({"path": [{"x": 1, "y": 2}], "dx": 5})).unwrap_err();
+        assert!(e.contains("'dx'") && e.contains("path"), "{e}");
+    }
+
+    #[test]
+    fn a_drag_move_count_inside_a_batch_step_is_not_a_nested_batch() {
+        let nested = json!({"target_id": "t", "steps": [{"action": "click", "steps": [{}]}]});
+        assert!(batch_steps(&nested).unwrap_err().contains("nested"));
+        let paced = json!({"target_id": "t", "steps": [{"action": "drag", "query": "#a", "dx": 5, "moves": 30}]});
+        assert!(batch_steps(&paced).is_ok());
     }
 
     fn b(id: u32, tabs: &[&str]) -> BrowserTabs {

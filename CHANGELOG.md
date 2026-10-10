@@ -6,6 +6,46 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **`scroll` takes `modifiers`.** `["cmd"]`, `["ctrl"]`, `["shift"]` or `["opt"]`, the names `mouse_action` and
+  `drag_drop` already accept, are held for the whole wheel gesture, so Cmd+wheel (macOS) or Ctrl+wheel zooms a
+  document, map or canvas and Shift+wheel scrolls sideways where an app binds it. Before, the wheel always
+  arrived bare and an agent had no way to zoom with the pointer. On macOS the modifiers ride on the wheel
+  event's flags, as they do on a modified click; on Linux the keys are pressed through the portal before the
+  wheel steps and released after them, even when a step fails. An unknown name is `INVALID_ARGS` before
+  anything moves, and the result reports `modifiers`.
+- **Modifier keys on `browser_act` pointer actions.** `modifiers: ["shift" | "ctrl" | "alt" | "meta"]` holds
+  those keys through a click, double or right click, hover, mouse_down/move/up, drag or scroll: every mouse event
+  carries the CDP modifier bits (`shiftKey`, `ctrlKey`... in the page) and the keys themselves go down before the
+  pointer sequence and up after it, so a tool that listens for the Shift key sees it held. Before this an agent
+  could not shift-click to extend a selection, shift-drag to constrain a shape or ctrl+wheel to zoom a canvas;
+  the result reports `modifiers`. Each entry of a `steps` batch may carry its own. Chrome only.
+- **Drag control for brush strokes and freehand shapes.** `drag` takes `moves` (2 to 200, default 12),
+  `duration_ms` (how long they take in all, at most 10000; 15 ms a step by default), `button` (left, middle or
+  right) and `path`, up to 200 waypoints `{x, y}` that the drag passes through in order before releasing at
+  the last, with the moves spread over the segments by length and at least one landing on every waypoint. The
+  waypoints are in the frame of the `to_ref`/`to_query` element when one is given, else of the source element
+  (a canvas's bitmap pixels, so a stroke on a canvas ref is in its pixels end to end), else viewport px. `dx`/`dy`, `to_x`/`to_y` and `to_ref`/`to_query` work as before. The result says `moves`,
+  `duration_ms` and, with a path, `waypoints`. A CVAT-style lasso or brush stroke was a straight line before.
+- **`docs/fixtures/whiteboard.html`:** a dependency-free drawing page (a 2x CSS-scaled bordered canvas that
+  records pointer events, strokes and polygons, an SVG rect with a draggable vertex, wheel and modifier-key
+  recording) with live tests in `crates/mcp-browser/tests/whiteboard_live.rs`.
+- **`browser_screenshot` reads text: `ocr` and `find`.** A canvas app, an image-based UI or an annotation
+  tool shows its text as pixels: `browser_snapshot` sees one element and `browser_query` finds nothing, so
+  the only way to click "Save" was a screenshot the model read with its own eyes, every turn, guessing a
+  coordinate off the picture. `ocr=true` returns every visible line with `bounds` and `center` in viewport
+  CSS px, and `find="Save"` returns only the lines containing it, best first (whole line, then whole word,
+  then a fragment), each with the `x`,`y` to pass to `browser_act`; no match is `ok` with `count 0` and a
+  hint naming the nearest lines read. Boxes are mapped from image pixels through the capture's scale, so
+  they are right on a 2x display and for a `ref` capture, and the image stays out of the result unless
+  `image=true`. The browser-side twin of the desktop `ocr_region`: same argument names, same result shape.
+  The recogniser is the pure-Rust `ocrs` engine, now in `mcp-vision` behind its `ocr` feature and shared
+  with the Linux desktop backend, so one model download (about 20 MB, on first use into the state
+  directory or `$AGENTCTL_OCR_MODELS`) serves both. Labels side by side on one row, which the recogniser
+  reads as one line, are split where the words are a row height or more apart, so each gets its own
+  centre; this applies to `ocr_region` on Linux too. Fixture: `docs/fixtures/ocr_canvas.html`.
+
 ### Changed
 
 - **Audit key generation uses `rand_core::OsRng` directly.** The audit log signing key was the only thing in
@@ -13,6 +53,34 @@ All notable changes to this project are documented here. The format follows
   `ed25519-dalek` is built on and already in the tree, so `rand`, `rand_chacha` and `ppv-lite86` leave it:
   fewer crates, and one version of `rand_core` whatever `rand` does next. Keys come from the same source as
   before.
+
+### Fixed
+
+- **macOS: `mouse_action move` with a button held posted a plain `MouseMoved`.** `down`, `move`, `up` is how
+  an agent composes a drag `drag_drop` cannot express (a pause mid-path, a hover over the target before the
+  drop, a second button), but the moves went out as `MouseMoved`, so anything that tracks `LeftMouseDragged`,
+  `RightMouseDragged` or `OtherMouseDragged` (Finder, sliders, canvases, text selection) saw a click and an
+  idle pointer; only `drag_drop` sent real drag events. The backend now remembers which buttons it holds and,
+  while one is down, posts the matching `*MouseDragged` event with the button number and pressure set, for
+  `move`, `hover` and the positioning move before `scroll`. The record is released on `up`, when `drag_drop`
+  ends, and when the human-override brake fires, so a takeover never leaves a later move claiming a drag.
+  Linux already carried the held button through the portal and is unchanged.
+- **Canvas coordinates on `browser_act` are bitmap pixels.** The docs said a canvas target's `x` and `y` were
+  its pixel coordinates, but they were added to the bounding box as CSS px, so on a canvas that is CSS-scaled
+  or has a border the click landed on the wrong pixel (a 400-wide canvas styled 800px wide was clicked at
+  bitmap (50, 25) for x 100, y 50). They are now mapped through the content box by `clientWidth / width`,
+  as published canvas regions already were, and a region's offsets count from its own corner in bitmap pixels.
+  `click_at`, `at`, `from`, `to` and `scroll_at` add `pixel` (the bitmap pixel) on a canvas, and `hit` names
+  the pixel under any point that lands on one.
+### Security
+
+- **OCR model files are pinned by SHA-256.** The two `ocrs` models are downloaded once and parsed
+  in-process; before, a modified or substituted file, on disk or from the download, would have been
+  loaded. Every file is now verified against a pinned digest before anything parses it, whether it was
+  just fetched or was already there: a mismatch is refused and named, a bad download or a bad file in the
+  state directory is deleted so the next call fetches afresh, and a file under `AGENTCTL_OCR_MODELS` is
+  left for the operator to replace. `AGENTCTL_OCR_MODELS_UNVERIFIED=1` loads operator-supplied models
+  without the check, for models of their own; it does nothing for the default directory.
 
 ## [0.2.1] - 2026-10-10
 

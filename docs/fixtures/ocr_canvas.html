@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>OCR Canvas</title>
+  <!--
+    A page whose only text is pixels. The DOM holds one <canvas>, so
+    browser_snapshot sees a single element and browser_query finds no "Save";
+    only browser_screenshot with ocr/find can locate the words.
+
+    The canvas is 600x300 CSS px drawn on a 1200x600 backing store (2x), so an
+    image pixel is never a CSS pixel even on a 1x display, and the test knows
+    each word's centre in viewport CSS px (window.__words). Clicks are
+    recorded with the word they landed on (window.__clicks), so a test can
+    click the point OCR returned and check it hit the right word.
+  -->
+  <style>
+    html, body { margin: 0; background: #f0f2f5; overflow: hidden; }
+    canvas { position: absolute; left: 20px; top: 40px; width: 600px; height: 300px;
+             background: #fff; border: 1px solid #333; cursor: pointer; }
+  </style>
+</head>
+<body>
+  <canvas id="page" width="1200" height="600"></canvas>
+  <script>
+    const canvas = document.getElementById('page');
+    const ctx = canvas.getContext('2d');
+    const OFFSET = { x: 20, y: 40 };
+    // Centres in canvas CSS px; the approximate box is for hit-testing clicks.
+    const WORDS = [
+      { text: 'Save',      x: 100, y: 80,  w: 80,  h: 36 },
+      { text: 'Cancel',    x: 300, y: 80,  w: 110, h: 36 },
+      { text: 'Open file', x: 150, y: 200, w: 150, h: 36 },
+      { text: 'Autosave',  x: 450, y: 200, w: 140, h: 36 },
+    ];
+
+    ctx.scale(2, 2);
+    ctx.fillStyle = '#fff';
+    ctx.fillRect(0, 0, 600, 300);
+    ctx.fillStyle = '#111';
+    ctx.font = 'bold 28px Helvetica, Arial, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    for (const w of WORDS) ctx.fillText(w.text, w.x, w.y);
+
+    window.__words = {};
+    for (const w of WORDS) window.__words[w.text] = { x: w.x + OFFSET.x, y: w.y + OFFSET.y };
+    window.__clicks = [];
+    canvas.addEventListener('click', (e) => {
+      const r = canvas.getBoundingClientRect();
+      const x = e.clientX - r.left, y = e.clientY - r.top;
+      const hit = WORDS.find(w => Math.abs(x - w.x) <= w.w / 2 && Math.abs(y - w.y) <= w.h / 2);
+      window.__clicks.push({ x: e.clientX, y: e.clientY, word: hit ? hit.text : null });
+    });
+    window.__ready = true;
+  </script>
+</body>
+</html>

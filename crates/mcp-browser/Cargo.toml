@@ -11,8 +11,9 @@ publish = false
 mcp-types = { path = "../mcp-types" }
 mcp-ssrf = { path = "../mcp-ssrf" }
 mcp-judge = { path = "../mcp-judge" }
-# The coordinate-grid drawer shared with the desktop captures.
-mcp-vision = { path = "../mcp-vision" }
+# The coordinate-grid drawer shared with the desktop captures, and the
+# pure-Rust OCR engine `browser_screenshot ocr/find` reads canvases with.
+mcp-vision = { path = "../mcp-vision", features = ["ocr"] }
 serde.workspace = true
 serde_json.workspace = true
 async-trait.workspace = true

@@ -372,6 +372,9 @@ pub struct MacosBackend {
     /// between steps; it would otherwise keep the button held while the person
     /// moves the mouse. Never reset: see `InputBackend::takeover_generation`.
     takeovers: std::sync::atomic::AtomicU64,
+    /// Which mouse buttons this backend holds down, so a `move` between a
+    /// `down` and an `up` goes out as the drag event it is.
+    held: crate::event::Held,
 }
 
 impl Default for MacosBackend {
@@ -386,6 +389,7 @@ impl MacosBackend {
             state: Mutex::new(State::default()),
             takeovers: std::sync::atomic::AtomicU64::new(0),
             helper_dir: default_helper_dir(),
+            held: crate::event::Held::default(),
         }
     }
 
@@ -747,10 +751,17 @@ impl InputBackend for MacosBackend {
         b: Option<&str>,
         modifiers: &[String],
     ) -> Result<(), InputError> {
-        crate::event::mouse(k, x, y, b, modifiers)
+        crate::event::mouse(&self.held, k, x, y, b, modifiers)
     }
-    async fn scroll_at(&self, x: f64, y: f64, d: ScrollDir, a: i32) -> Result<(), InputError> {
-        crate::event::scroll(x, y, d, a)
+    async fn scroll_at(
+        &self,
+        x: f64,
+        y: f64,
+        d: ScrollDir,
+        a: i32,
+        modifiers: &[String],
+    ) -> Result<(), InputError> {
+        crate::event::scroll(&self.held, x, y, d, a, modifiers)
     }
     async fn pointer_position(&self) -> Result<Option<(f64, f64)>, InputError> {
         crate::event::pointer_position()
@@ -761,12 +772,16 @@ impl InputBackend for MacosBackend {
     fn cancel_pending(&self) {
         self.takeovers
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        // The human has the mouse now; whatever button this backend believed
+        // it was holding is no longer its gesture, and the next `move` must
+        // not go out as a drag of it.
+        self.held.clear();
     }
     fn takeover_generation(&self) -> u64 {
         self.takeovers.load(std::sync::atomic::Ordering::SeqCst)
     }
     async fn hover(&self, x: f64, y: f64) -> Result<(), InputError> {
-        crate::event::hover(x, y)
+        crate::event::hover(&self.held, x, y)
     }
     async fn drag(
         &self,
@@ -778,7 +793,7 @@ impl InputBackend for MacosBackend {
         since_takeover: u64,
     ) -> Result<(), InputError> {
         use tokio::time::{sleep, Duration};
-        crate::event::drag_begin(from, modifiers)?;
+        crate::event::drag_begin(&self.held, from, modifiers)?;
         // Let the press register before motion starts; a drag that begins in
         // the same instant reads as a click to most targets. `hold_ms` adds to
         // that for sources that wait to tell a drag from a click.
@@ -789,7 +804,7 @@ impl InputBackend for MacosBackend {
             // with it still held would leave the human dragging a selection
             // around with their own mouse.
             if self.takeover_generation() != since_takeover {
-                let _ = crate::event::drag_end(last, modifiers);
+                let _ = crate::event::drag_end(&self.held, last, modifiers);
                 return Err(InputError::Failed(
                     "drag aborted: a human took over the pointer".into(),
                 ));
@@ -800,7 +815,7 @@ impl InputBackend for MacosBackend {
         }
         // Settle at the destination so the drop target can highlight and accept.
         sleep(Duration::from_millis(60)).await;
-        crate::event::drag_end(to, modifiers)
+        crate::event::drag_end(&self.held, to, modifiers)
     }
 
     /// Where synthetic input will actually land: the pinned target if the

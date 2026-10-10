@@ -469,7 +469,14 @@ mod tests {
             }
             Ok(())
         }
-        async fn scroll_at(&self, _: f64, _: f64, _: ScrollDir, _: i32) -> Result<(), InputError> {
+        async fn scroll_at(
+            &self,
+            _: f64,
+            _: f64,
+            _: ScrollDir,
+            _: i32,
+            _: &[String],
+        ) -> Result<(), InputError> {
             Ok(())
         }
         async fn hover(&self, _: f64, _: f64) -> Result<(), InputError> {

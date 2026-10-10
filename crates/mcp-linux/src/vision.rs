@@ -8,18 +8,18 @@
 //! published; on another compositor the screenshot's own size stands in for
 //! it, as one display.
 //!
-//! Text recognition is the `ocrs` engine, run in-process on the CPU. Its
-//! two models are downloaded on first use into the agentctl state directory,
-//! the way the macOS backend compiles its helper on first use, and can be
-//! placed there ahead of time on a machine that must not fetch anything.
+//! Text recognition is the `ocrs` engine from `mcp_vision::ocr`, run
+//! in-process on the CPU. Its two models are downloaded on first use into the
+//! agentctl state directory, the way the macOS backend compiles its helper on
+//! first use, and can be placed there ahead of time on a machine that must
+//! not fetch anything.
 
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use mcp_vision::{
-    CaptureOpts, CaptureResult, DisplayInfo, OcrLine, OcrOpts, OcrResult, OcrTarget, VisionBackend,
+    CaptureOpts, CaptureResult, DisplayInfo, OcrOpts, OcrResult, OcrTarget, VisionBackend,
     VisionError,
 };
 
@@ -385,17 +385,20 @@ impl VisionBackend for LinuxBackend {
             .ocr
             .get_or_try_init(|| async {
                 let dir = Ocr::model_dir(&self.helper_dir);
-                Ocr::load(&dir).await.map(Arc::new)
+                tokio::task::spawn_blocking(move || Ocr::load(&dir).map(Arc::new))
+                    .await
+                    .map_err(|e| format!("ocr load task: {e}"))?
             })
             .await
             .map_err(|e| VisionError::Failed(e.clone()))?
             .clone();
         let (w, h) = (img.width, img.height);
         let min_conf = opts.min_confidence;
-        let lines = tokio::task::spawn_blocking(move || engine.recognise(&img))
-            .await
-            .map_err(|e| fail(format!("ocr task: {e}")))?
-            .map_err(VisionError::Failed)?;
+        let lines =
+            tokio::task::spawn_blocking(move || engine.recognise(&img.data, img.width, img.height))
+                .await
+                .map_err(|e| fail(format!("ocr task: {e}")))?
+                .map_err(VisionError::Failed)?;
         Ok(OcrResult {
             lines: lines
                 .into_iter()
@@ -418,154 +421,9 @@ fn e_str(e: mcp_window::WindowError) -> String {
     }
 }
 
-/// Where the models come from, and what they are called on disk.
-pub const MODEL_URLS: [(&str, &str); 2] = [
-    (
-        "text-detection.onnx",
-        "https://ocrs-models.s3-accelerate.amazonaws.com/text-detection.onnx",
-    ),
-    (
-        "text-recognition.onnx",
-        "https://ocrs-models.s3-accelerate.amazonaws.com/text-recognition.onnx",
-    ),
-];
-
-/// The loaded recogniser.
-pub struct Ocr {
-    engine: ocrs::OcrEngine,
-}
-
-impl Ocr {
-    /// Where the models live: `$AGENTCTL_OCR_MODELS` when set (a shared or
-    /// pre-populated directory), else `<state>/ocr`.
-    pub fn model_dir(state_dir: &Path) -> PathBuf {
-        std::env::var_os("AGENTCTL_OCR_MODELS")
-            .map(PathBuf::from)
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or_else(|| state_dir.join("ocr"))
-    }
-
-    /// Both model files, present or fetched.
-    pub fn model_paths(dir: &Path) -> [PathBuf; 2] {
-        [dir.join(MODEL_URLS[0].0), dir.join(MODEL_URLS[1].0)]
-    }
-
-    pub fn models_present(dir: &Path) -> bool {
-        Self::model_paths(dir).iter().all(|p| p.is_file())
-    }
-
-    async fn fetch(dir: &Path) -> Result<(), String> {
-        tokio::fs::create_dir_all(dir)
-            .await
-            .map_err(|e| format!("creating {}: {e}", dir.display()))?;
-        for (name, url) in MODEL_URLS {
-            let dest = dir.join(name);
-            if dest.is_file() {
-                continue;
-            }
-            tracing::info!(url, dest = %dest.display(), "downloading OCR model (first use)");
-            let tmp = dir.join(format!("{name}.part"));
-            let out = tokio::process::Command::new("/usr/bin/curl")
-                .args(["-fsSL", "--max-time", "300", "-o"])
-                .arg(&tmp)
-                .arg(url)
-                .output()
-                .await
-                .map_err(|e| {
-                    format!(
-                        "curl: {e} (place {name} in {} by hand to skip the download)",
-                        dir.display()
-                    )
-                })?;
-            if !out.status.success() {
-                let _ = tokio::fs::remove_file(&tmp).await;
-                return Err(format!(
-                    "downloading {url} failed: {} (place {name} in {} by hand to skip the download)",
-                    String::from_utf8_lossy(&out.stderr).trim(),
-                    dir.display()
-                ));
-            }
-            tokio::fs::rename(&tmp, &dest)
-                .await
-                .map_err(|e| format!("moving {}: {e}", tmp.display()))?;
-        }
-        Ok(())
-    }
-
-    pub async fn load(dir: &Path) -> Result<Ocr, String> {
-        if !Self::models_present(dir) {
-            Self::fetch(dir).await?;
-        }
-        let [det, rec] = Self::model_paths(dir);
-        let dir = dir.to_path_buf();
-        tokio::task::spawn_blocking(move || {
-            let detection_model = rten::Model::load_file(&det).map_err(|e| {
-                format!("loading {}: {e} (delete it to re-download)", det.display())
-            })?;
-            let recognition_model = rten::Model::load_file(&rec).map_err(|e| {
-                format!("loading {}: {e} (delete it to re-download)", rec.display())
-            })?;
-            let engine = ocrs::OcrEngine::new(ocrs::OcrEngineParams {
-                detection_model: Some(detection_model),
-                recognition_model: Some(recognition_model),
-                ..Default::default()
-            })
-            .map_err(|e| format!("ocr engine: {e}"))?;
-            tracing::info!(dir = %dir.display(), "OCR models loaded");
-            Ok(Ocr { engine })
-        })
-        .await
-        .map_err(|e| format!("ocr load task: {e}"))?
-    }
-
-    /// Recognise text lines in an RGB image. Boxes are image pixels.
-    ///
-    /// `ocrs` reports no per-line probability, so `confidence` is 1.0 for
-    /// every line it returns; a `min_confidence` above that filters
-    /// everything, which is the honest outcome of asking for a number the
-    /// engine does not have.
-    pub fn recognise(&self, img: &Rgb) -> Result<Vec<OcrLine>, String> {
-        use ocrs::{ImageSource, TextItem};
-        let source = ImageSource::from_bytes(&img.data, (img.width, img.height))
-            .map_err(|e| format!("ocr input: {e}"))?;
-        let input = self
-            .engine
-            .prepare_input(source)
-            .map_err(|e| format!("ocr prepare: {e}"))?;
-        let words = self
-            .engine
-            .detect_words(&input)
-            .map_err(|e| format!("ocr detect: {e}"))?;
-        let lines = self.engine.find_text_lines(&input, &words);
-        let texts = self
-            .engine
-            .recognize_text(&input, &lines)
-            .map_err(|e| format!("ocr recognise: {e}"))?;
-        let mut out = Vec::new();
-        for line in texts.into_iter().flatten() {
-            let text = line.to_string();
-            if text.trim().is_empty() {
-                continue;
-            }
-            let chars = line.chars();
-            let left = chars.iter().map(|c| c.rect.left()).min().unwrap_or(0);
-            let top = chars.iter().map(|c| c.rect.top()).min().unwrap_or(0);
-            let right = chars.iter().map(|c| c.rect.right()).max().unwrap_or(0);
-            let bottom = chars.iter().map(|c| c.rect.bottom()).max().unwrap_or(0);
-            out.push(OcrLine {
-                text,
-                confidence: 1.0,
-                px: (
-                    left as f64,
-                    top as f64,
-                    (right - left).max(1) as f64,
-                    (bottom - top).max(1) as f64,
-                ),
-            });
-        }
-        Ok(out)
-    }
-}
+/// The recogniser, shared with the browser engine so both read text with the
+/// same models from the same directory.
+pub use mcp_vision::ocr::Ocr;
 
 #[cfg(test)]
 mod tests {
@@ -699,18 +557,5 @@ mod tests {
         assert!((cap.scale_x() - 2.0).abs() < 1e-9);
         assert_eq!(cap.signature.len(), 32 * 16 * 3);
         assert!(cap.base64.starts_with("iVBOR"));
-    }
-
-    #[test]
-    fn model_paths_are_stable_and_absent_by_default() {
-        let dir = std::env::temp_dir().join(format!("agentctl-ocr-{}", std::process::id()));
-        assert!(!Ocr::models_present(&dir));
-        // Without the override the models sit under the state directory.
-        if std::env::var_os("AGENTCTL_OCR_MODELS").is_none() {
-            assert_eq!(Ocr::model_dir(&dir), dir.join("ocr"));
-        }
-        let [a, b] = Ocr::model_paths(&dir);
-        assert!(a.ends_with("text-detection.onnx"));
-        assert!(b.ends_with("text-recognition.onnx"));
     }
 }

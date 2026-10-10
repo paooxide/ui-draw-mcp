@@ -84,8 +84,10 @@ delta with `since` and a follow-up observation costs only what changed. `find_el
 when the question is narrow, and `expect` on an input tool folds act-wait-verify into one call.
 
 For surfaces with no accessibility tree (canvases, games, some Electron apps), `ocr_region` reads the text
-and returns a clickable box for each line. Screen capture remains the last resort; captures deduplicate
-against the previous frame, so polling an unchanged screen costs nothing.
+and returns a clickable box for each line. In the browser, `browser_screenshot` with `ocr` or `find` does
+the same for a page whose text is pixels (a canvas app, an image-based UI), returning each line's centre
+in the CSS px `browser_act` clicks. Screen capture remains the last resort; captures deduplicate against
+the previous frame, so polling an unchanged screen costs nothing.
 
 ---
 
@@ -206,7 +208,10 @@ has no network interception, dialog policy, key presses, device emulation, recor
 returns `UNSUPPORTED`). `browser_capture` arms only the page that is open, not later navigations. Firefox speaks a
 different protocol and is not supported.
 
-- `browser_act` acts on a `ref` or, in one call, a `by`+`query` selector (no separate `browser_query`).
+- `browser_act` acts on a `ref` or, in one call, a `by`+`query` selector (no separate `browser_query`). Its
+  pointer actions are real input with `modifiers` (shift, ctrl, alt, meta) held through them, a `drag` takes
+  `moves`, `duration_ms`, `button` and a `path` of waypoints for brush strokes, and a canvas is addressed in its
+  bitmap pixels, so annotation tools (boxes, polygons, vertex drags, strokes) can be driven.
 - `browser_capture` installs a page hook (persists across navigations) that records fetch/XHR with
   request and response bodies, plus console errors and uncaught exceptions. Bodies can hold secrets, so
   it is Dangerous-tier and off unless enabled.
