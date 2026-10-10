@@ -766,11 +766,11 @@ Read or change a desktop setting. Settings the platform does not expose return U
 
 `browser_act` · standard tier
 
-Act on a DOM node. Target it with 'ref' (from browser_snapshot/query) or 'query' (CSS, visible text, XPath or role=...) plus optional by, within, text, index. x and y act at a point (offsets in the target, else viewport px); the result's hit names what is there. type replaces the field's content. press takes a key or combo (ctrl+a). The result's effects says what changed (url, new_tab, dialog, appeared, disappeared, focus), so no snapshot is needed to see it. A click returns before any navigation it starts: use wait_after='settle'. steps=[{action, ref|query, value}, ...] runs up to 20 in one call.
+Act on a DOM node. Target 'ref' (from browser_snapshot/query) or 'query' (CSS, visible text, XPath or role=...; optional by, within, text, index). x, y act at a point (offsets in the target, canvas bitmap px, or viewport px): hit says what is there. type replaces the field's content; press takes a key or combo (ctrl+a). effects says what changed (url, new_tab, dialog, appeared, disappeared, focus). A click returns before navigation: use wait_after='settle'. steps=[{action, ...}] runs up to 20 acts in one call.
 
 `press` takes a key or a combo in `value`: a named key (Enter, Escape, Tab, Arrow keys, Home, End, PageUp, PageDown, Backspace, Delete, Insert, Space, F1-F12), a character, or modifiers (ctrl, alt, shift, meta/cmd) joined by +, as in ctrl+a or Shift+ArrowDown. It is a real key event to the target, or to the focused node or page with no target; Chrome only. ctrl or cmd with a, c, x, v, z or y edits as a person's shortcut does, also on macOS.
 
-Pointer actions are real input (Chrome only): double_click, triple_click (selects a line), right_click (contextmenu) and hover, and click too, accept `x` and `y`: with a target they are offsets from its top-left corner (for a canvas, its pixel coordinates), without one viewport CSS px; the result's click_at is where it landed, and a point outside the viewport is an error. `scroll` turns the mouse wheel over the target (or the page) by dx and dy, by default one viewport down; `value` may be up, down, left, right, top or bottom. `drag` presses on the target (or at x and y), moves in steps and releases at the destination: the to_ref or to_query element (its centre, or to_x and to_y inside it), else to_x and to_y as viewport points, else dx and dy from the start; the destination must be on screen. Mouse-event drags (sliders, sortable lists, selecting text) and HTML5 draggable elements both work; the result says html5_drag. `mouse_move` (also `hover` with x and y) moves the real pointer to the target or point without clicking, so mouseover, mousemove and CSS :hover fire; `mouse_down` and `mouse_up` press and release a `button` (left, right or middle) at the target or point, so a drag or hold the page implements itself can be composed: mouse_down, then mouse_move to where it ends (moves in between carry the held button), then mouse_up (with no target it releases where the pointer is). Use `drag` for a native draggable element. `hold_ms` (at most 10000) makes a click wait that long between press and release, and a press that long between key down and key up; press_and_hold and long_press are a click with hold_ms (default 800).
+Pointer actions are real input (Chrome only): double_click, triple_click (selects a line), right_click (contextmenu) and hover, and click too, accept `x` and `y`: with a target they are offsets from its top-left corner, without one viewport CSS px. A <canvas> target is addressed in its bitmap pixels, mapped through its content box: a 400-wide canvas styled 800px wide with a border is clicked at bitmap (100, 50) with x 100 and y 50, whatever its CSS size, and a page-published canvas region counts from its own corner. The result's click_at is where it landed in viewport px (with `pixel`, the bitmap pixel, on a canvas), and a point outside the viewport is an error. `modifiers` (an array of shift, ctrl, alt, meta/cmd) are held through any pointer action: every mouse event carries them (shiftKey, ctrlKey...) and the keys themselves go down before and up after, so a tool that listens for the Shift key sees it held; use it for shift-click to extend a selection, ctrl+wheel to zoom a canvas, shift-drag to constrain a shape. `scroll` turns the mouse wheel over the target (or the page) by dx and dy, by default one viewport down; `value` may be up, down, left, right, top or bottom. `drag` presses on the target (or at x and y), moves in steps and releases at the destination: the to_ref or to_query element (its centre, or to_x and to_y inside it), else to_x and to_y as viewport points, else dx and dy from the start; the destination must be on screen. `moves` (2 to 200, default 12) is how many moves it makes, `duration_ms` (at most 10000) how long they take in all (15 ms a step by default) and `button` which button is held (default left). `path` is a list of waypoints ({x, y}, up to 200) the drag passes through in order before releasing at the last, each in the frame of to_x/to_y: offsets inside the to_ref/to_query element when one is given (bitmap pixels on a canvas), else viewport px; the moves are spread over the segments by length with at least one landing on every waypoint. That is a brush stroke, lasso or freehand shape: to draw on a canvas, name it as the target and as to_query so the path is in its pixels. A polygon tool is a batch: click each vertex, then double_click the last. Mouse-event drags (sliders, sortable lists, selecting text, drawing tools) and HTML5 draggable elements both work; the result says html5_drag, moves and duration_ms. `mouse_move` (also `hover` with x and y) moves the real pointer to the target or point without clicking, so mouseover, mousemove and CSS :hover fire; `mouse_down` and `mouse_up` press and release a `button` (left, right or middle) at the target or point, so a drag or hold the page implements itself can be composed: mouse_down, then mouse_move to where it ends (moves in between carry the held button), then mouse_up (with no target it releases where the pointer is). Use `drag` for a native draggable element. `hold_ms` (at most 10000) makes a click wait that long between press and release, and a press that long between key down and key up; press_and_hold and long_press are a click with hold_ms (default 800).
 
 Every action given x and y returns `hit`: the element under that point (tag, id, short text or name, and canvas). A point outside the viewport is an error naming the viewport size, and an input event the browser does not accept makes the call fail rather than report ok.
 
@@ -780,7 +780,7 @@ Spellings such as key, dblclick, triple-click, drag_and_drop, move, mousedown ar
 
 Batches: `steps` is a list of acts (each with its own action, ref or query, value, and so on; target_id comes from the call, and wait_after and timeout_ms are inherited when a step sets none; secret is not, so flag each step that types one). They run in order through the same code as a single act, so each step is checked the same way, and the first that fails ends the batch. At most 20 steps. The result is {ran, total, failed_at (the 0-based step that failed, absent when all succeeded), steps: [{i, ok, ...that step's result}]}; ok is true only when every step succeeded, and a failed batch is an error that still carries this data. `snapshot: "diff"` adds `snapshot`, the page after the last step as a browser_snapshot diff (a full snapshot when this tab has none yet to compare with; "full" always sends the whole page), also after a failure. Take a full browser_snapshot first so the diff has something to compare with. A form is one call: steps type into each field, then click submit.
 
-On Chrome a click is real pointer input (mousedown, mouseup, click, as a person's) and type is a real insertion that replaces the field's content, so React-style controlled fields and menus that open on mousedown work; the result reports input 'cdp', or 'synthetic' with input_reason when the element is covered, off screen, a select/option or a file input. type reports value_after (value_length for a password or secret field). A native <select> is set with select (on the list or one of its options) or a click on an <option>; both report selected and changed, and an option that is missing, disabled or undone by the page is an error. A page-published canvas region (a canvas-child ref from browser_snapshot) supports only click and hover, sent as real mouse input at the region centre; other actions on it return Unsupported.
+On Chrome a click is real pointer input (mousedown, mouseup, click, as a person's) and type is a real insertion that replaces the field's content, so React-style controlled fields and menus that open on mousedown work; the result reports input 'cdp', or 'synthetic' with input_reason when the element is covered, off screen, a select/option or a file input. type reports value_after (value_length for a password or secret field). A native <select> is set with select (on the list or one of its options) or a click on an <option>; both report selected and changed, and an option that is missing, disabled or undone by the page is an error. A page-published canvas region (a canvas-child ref from browser_snapshot) supports click and hover, sent as real mouse input at the region centre (or at x and y, bitmap pixels from its corner), and the pointer actions; the other actions on it return Unsupported.
 
 Query targeting: 'by' is css, xpath, text or role (used when no 'ref'; role takes the role as the query and the accessible name as 'name', see browser_query); with none, the query is tried as CSS and, if it does not parse or matches nothing, as visible text (the result says matched_by), so a plain word such as "Submit" works. The spellings browser_query lists (/ or ( for XPath, text=..., :has-text(..) and so on) are read as what they mean here too, and in 'within', browser_upload and browser_fill_form. Text is case-insensitive, exact matches first, clickable elements preferred. When nothing matches the error says what was tried and lists up to three elements whose text holds a word of the query. The check is made once: act does not wait for an element to appear (use browser_wait). 'within' is an optional CSS/XPath root selector scoping the search, 'text' an optional substring filter to narrow matches, 'index' an optional 0-based match index when the query matches several elements (default 0).
 
@@ -793,30 +793,34 @@ Query targeting: 'by' is css, xpath, text or role (used when no 'ref'; role take
 | Argument | Type | Required | Description |
 |---|---|---|---|
 | `action` | one of: click, double_click, triple_click, right_click, hover, mouse_move, mouse_down, mouse_up, drag, scroll, type, select, focus, scroll_into_view, submit, press |  |  |
-| `button` | one of: left, right, middle |  | mouse_down/mouse_up button (default left) |
-| `by` | one of: css, xpath, text, role |  | how to read 'query' (default: CSS, else visible text) |
+| `button` | one of: left, right, middle |  | mouse_down/up/drag button (default left) |
+| `by` | one of: css, xpath, text, role |  | how to read 'query' (default CSS, else text) |
+| `duration_ms` | number |  | drag: total time of its moves (max 10000) |
 | `dx` | number |  | drag or scroll: x distance in CSS px |
-| `dy` | number |  | drag or scroll: y distance (scroll default: one viewport down) |
-| `hold_ms` | number |  | hold a click's button or a press's key this long (max 10000) |
-| `index` | integer |  | 0-based match index (default 0) |
-| `name` | string |  | with by: role, the accessible name (case-insensitive substring) |
-| `query` | string |  | selector or text to act on, instead of 'ref'; type and press with neither act on the focused element; with by: role, the ARIA role |
+| `dy` | number |  | as dx (scroll default: one viewport down) |
+| `hold_ms` | number |  | hold a click or press this many ms (max 10000) |
+| `index` | integer |  | 0-based match index |
+| `modifiers` | array&lt;one of: shift, ctrl, alt, meta&gt; |  | keys held through a pointer action |
+| `moves` | integer |  | drag: how many moves (2-200, default 12) |
+| `name` | string |  | by: role: the accessible name (substring) |
+| `path` | array&lt;any&gt; |  | drag: waypoints [{x,y},...] in to_x/to_y's frame; releases at the last (max 200) |
+| `query` | string |  | selector or text, instead of 'ref' (by: role: the role); type/press with neither act on the focused element |
 | `ref` | string |  | a ref from browser_query/snapshot |
 | `scroll` | one of: none, nearest, center |  | bring the element into view first (default nearest) |
-| `secret` | boolean |  | value is a secret: kept out of the audit log and the showcase HUD |
-| `snapshot` | one of: none, diff, full |  | with steps: the page after the last step, as a snapshot diff or in full |
-| `steps` | array&lt;object&gt; |  | batch: acts with the fields above, run in order, stopping at the first failure (max 20) |
+| `secret` | boolean |  | value is a secret (not logged) |
+| `snapshot` | one of: none, diff, full |  | with steps: the page after, as a diff or in full |
+| `steps` | array&lt;object&gt; |  | batch: acts with these fields, in order until one fails (max 20) |
 | `target_id` | string |  | tab id (default: active tab) |
-| `text` | string |  | substring filter on the matches |
+| `text` | string |  | substring filter on matches |
 | `timeout_ms` | integer |  | settle bound in ms (default 10000) |
-| `to_query` | string |  | drag destination element (a selector) |
-| `to_ref` | string |  | drag destination element (a ref) |
-| `to_x` | number |  | drag end x: offset in to_ref/to_query, else a viewport point |
-| `to_y` | number |  | drag destination y, as to_x |
-| `value` | string |  | type: the text; select: option text or value; press: key or combo (Enter, ctrl+a, Shift+Tab); scroll: up, down, left, right, top or bottom |
-| `wait_after` | one of: none, settle |  | settle: wait for a started navigation and quiet network (Chrome). Default none |
-| `within` | string |  | root selector scoping the query |
-| `x` | number |  | CSS px: offset from the target's top-left, or a viewport point without one |
+| `to_query` | string |  | drag destination (a selector) |
+| `to_ref` | string |  | drag destination (a ref) |
+| `to_x` | number |  | drag end x: offset in to_ref/to_query, else viewport |
+| `to_y` | number |  | drag end y, as to_x |
+| `value` | string |  | type: the text; select: option text or value; press: key or combo (ctrl+a); scroll: up, down, left, right, top, bottom |
+| `wait_after` | one of: none, settle |  | settle: wait for navigation and quiet network |
+| `within` | string |  | root selector for the query |
+| `x` | number |  | offset from the target's top-left (canvas: bitmap px), else viewport |
 | `y` | number |  | pointer y, as x |
 
 ### browser-assert

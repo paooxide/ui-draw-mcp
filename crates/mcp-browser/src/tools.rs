@@ -1458,7 +1458,8 @@ impl BrowserModule {
             );
         }
         // Real pointer input: the multi-click, scroll, drag and bare mouse
-        // actions, a held click, and a click or hover given coordinates.
+        // actions, a held click, and a click or hover given coordinates or
+        // modifier keys.
         let is_pointer = matches!(
             action,
             "double_click"
@@ -1470,8 +1471,33 @@ impl BrowserModule {
                 | "mouse_down"
                 | "mouse_up"
         ) || (matches!(action, "click" | "hover")
-            && (pointer.x.is_some() || pointer.y.is_some()))
+            && (pointer.x.is_some() || pointer.y.is_some() || pointer.modifiers != 0))
             || (action == "click" && opts.hold_ms > 0);
+        if pointer.modifiers != 0 && !is_pointer {
+            return Envelope::fail(
+                "browser_act",
+                ErrorCode::InvalidArgs,
+                format!(
+                    "modifiers apply to pointer actions (click, drag, scroll, hover and the mouse actions), not '{action}'; for a key combo put them in press's value (ctrl+a)"
+                ),
+            );
+        }
+        if (pointer.moves.is_some() || pointer.duration_ms.is_some())
+            && !matches!(action, "drag" | "mouse_move" | "hover")
+        {
+            return Envelope::fail(
+                "browser_act",
+                ErrorCode::InvalidArgs,
+                format!("moves and duration_ms pace a drag (or a mouse_move with a button held), not '{action}'"),
+            );
+        }
+        if !pointer.path.is_empty() && action != "drag" {
+            return Envelope::fail(
+                "browser_act",
+                ErrorCode::InvalidArgs,
+                format!("path is a drag's waypoints, not '{action}'s"),
+            );
+        }
         // Typing and key presses may go to whatever has focus.
         let found = parse_locator(args);
         let locator = match found {
@@ -3163,6 +3189,16 @@ fn pointer_args(args: &Value) -> Result<crate::backend::PointerArgs<'_>, String>
             index: None,
         })
     };
+    let path = crate::input::parse_drag_path(args.get("path"))?;
+    if !path.is_empty() {
+        for k in ["to_x", "to_y", "dx", "dy"] {
+            if args.get(k).is_some_and(|v| !v.is_null()) {
+                return Err(format!(
+                    "with 'path', drop '{k}': the drag ends at the last path point"
+                ));
+            }
+        }
+    }
     Ok(crate::backend::PointerArgs {
         x: num("x")?,
         y: num("y")?,
@@ -3173,6 +3209,10 @@ fn pointer_args(args: &Value) -> Result<crate::backend::PointerArgs<'_>, String>
         dy: num("dy")?,
         value: str_arg(args, "value"),
         button: crate::input::parse_button(str_arg(args, "button"))?,
+        modifiers: crate::input::parse_modifiers(args.get("modifiers"))?,
+        moves: crate::input::drag_moves(num("moves")?)?,
+        duration_ms: crate::input::drag_duration(num("duration_ms")?)?,
+        path,
     })
 }
 
@@ -3500,35 +3540,39 @@ impl ToolModule for BrowserModule {
                 "browser_act",
                 Category::Browser,
                 Tier::Standard,
-                "Act on a DOM node. Target it with 'ref' (from browser_snapshot/query) or 'query' (CSS, visible text, XPath or role=...) plus optional by, within, text, index. x and y act at a point (offsets in the target, else viewport px); the result's hit names what is there. type replaces the field's content. press takes a key or combo (ctrl+a). The result's effects says what changed (url, new_tab, dialog, appeared, disappeared, focus), so no snapshot is needed to see it. A click returns before any navigation it starts: use wait_after='settle'. steps=[{action, ref|query, value}, ...] runs up to 20 in one call.",
+                "Act on a DOM node. Target 'ref' (from browser_snapshot/query) or 'query' (CSS, visible text, XPath or role=...; optional by, within, text, index). x, y act at a point (offsets in the target, canvas bitmap px, or viewport px): hit says what is there. type replaces the field's content; press takes a key or combo (ctrl+a). effects says what changed (url, new_tab, dialog, appeared, disappeared, focus). A click returns before navigation: use wait_after='settle'. steps=[{action, ...}] runs up to 20 acts in one call.",
                 obj(
                     json!({
                         "target_id": { "type": "string", "description": "tab id (default: active tab)" },
                         "ref": { "type": "string", "description": "a ref from browser_query/snapshot" },
-                        "by": { "type": "string", "enum": ["css", "xpath", "text", "role"], "description": "how to read 'query' (default: CSS, else visible text)" },
-                        "query": { "type": "string", "description": "selector or text to act on, instead of 'ref'; type and press with neither act on the focused element; with by: role, the ARIA role" },
-                        "name": { "type": "string", "description": "with by: role, the accessible name (case-insensitive substring)" },
-                        "within": { "type": "string", "description": "root selector scoping the query" },
-                        "text": { "type": "string", "description": "substring filter on the matches" },
-                        "index": { "type": "integer", "description": "0-based match index (default 0)" },
+                        "by": { "type": "string", "enum": ["css", "xpath", "text", "role"], "description": "how to read 'query' (default CSS, else text)" },
+                        "query": { "type": "string", "description": "selector or text, instead of 'ref' (by: role: the role); type/press with neither act on the focused element" },
+                        "name": { "type": "string", "description": "by: role: the accessible name (substring)" },
+                        "within": { "type": "string", "description": "root selector for the query" },
+                        "text": { "type": "string", "description": "substring filter on matches" },
+                        "index": { "type": "integer", "description": "0-based match index" },
                         "action": { "type": "string", "enum": ["click", "double_click", "triple_click", "right_click", "hover", "mouse_move", "mouse_down", "mouse_up", "drag", "scroll", "type", "select", "focus", "scroll_into_view", "submit", "press"] },
-                        "value": { "type": "string", "description": "type: the text; select: option text or value; press: key or combo (Enter, ctrl+a, Shift+Tab); scroll: up, down, left, right, top or bottom" },
-                        "x": { "type": "number", "description": "CSS px: offset from the target's top-left, or a viewport point without one" },
+                        "value": { "type": "string", "description": "type: the text; select: option text or value; press: key or combo (ctrl+a); scroll: up, down, left, right, top, bottom" },
+                        "x": { "type": "number", "description": "offset from the target's top-left (canvas: bitmap px), else viewport" },
                         "y": { "type": "number", "description": "pointer y, as x" },
-                        "to_ref": { "type": "string", "description": "drag destination element (a ref)" },
-                        "to_query": { "type": "string", "description": "drag destination element (a selector)" },
-                        "to_x": { "type": "number", "description": "drag end x: offset in to_ref/to_query, else a viewport point" },
-                        "to_y": { "type": "number", "description": "drag destination y, as to_x" },
+                        "modifiers": { "type": "array", "items": { "type": "string", "enum": ["shift", "ctrl", "alt", "meta"] }, "description": "keys held through a pointer action" },
+                        "to_ref": { "type": "string", "description": "drag destination (a ref)" },
+                        "to_query": { "type": "string", "description": "drag destination (a selector)" },
+                        "to_x": { "type": "number", "description": "drag end x: offset in to_ref/to_query, else viewport" },
+                        "to_y": { "type": "number", "description": "drag end y, as to_x" },
                         "dx": { "type": "number", "description": "drag or scroll: x distance in CSS px" },
-                        "dy": { "type": "number", "description": "drag or scroll: y distance (scroll default: one viewport down)" },
-                        "hold_ms": { "type": "number", "description": "hold a click's button or a press's key this long (max 10000)" },
-                        "button": { "type": "string", "enum": ["left", "right", "middle"], "description": "mouse_down/mouse_up button (default left)" },
-                        "secret": { "type": "boolean", "description": "value is a secret: kept out of the audit log and the showcase HUD" },
+                        "dy": { "type": "number", "description": "as dx (scroll default: one viewport down)" },
+                        "path": { "type": "array", "description": "drag: waypoints [{x,y},...] in to_x/to_y's frame; releases at the last (max 200)" },
+                        "moves": { "type": "integer", "description": "drag: how many moves (2-200, default 12)" },
+                        "duration_ms": { "type": "number", "description": "drag: total time of its moves (max 10000)" },
+                        "hold_ms": { "type": "number", "description": "hold a click or press this many ms (max 10000)" },
+                        "button": { "type": "string", "enum": ["left", "right", "middle"], "description": "mouse_down/up/drag button (default left)" },
+                        "secret": { "type": "boolean", "description": "value is a secret (not logged)" },
                         "scroll": { "type": "string", "enum": ["none", "nearest", "center"], "description": "bring the element into view first (default nearest)" },
-                        "wait_after": { "type": "string", "enum": ["none", "settle"], "description": "settle: wait for a started navigation and quiet network (Chrome). Default none" },
+                        "wait_after": { "type": "string", "enum": ["none", "settle"], "description": "settle: wait for navigation and quiet network" },
                         "timeout_ms": { "type": "integer", "description": "settle bound in ms (default 10000)" },
-                        "steps": { "type": "array", "description": "batch: acts with the fields above, run in order, stopping at the first failure (max 20)", "items": { "type": "object" } },
-                        "snapshot": { "type": "string", "enum": ["none", "diff", "full"], "description": "with steps: the page after the last step, as a snapshot diff or in full" }
+                        "steps": { "type": "array", "description": "batch: acts with these fields, in order until one fails (max 20)", "items": { "type": "object" } },
+                        "snapshot": { "type": "string", "enum": ["none", "diff", "full"], "description": "with steps: the page after, as a diff or in full" }
                     }),
                     json!([]),
                 ),
@@ -3540,13 +3584,28 @@ impl ToolModule for BrowserModule {
                  does, also on macOS.\n\n\
                  Pointer actions are real input (Chrome only): double_click, triple_click (selects a line), right_click \
                  (contextmenu) and hover, and click too, accept `x` and `y`: with a target they are offsets from its top-left \
-                 corner (for a canvas, its pixel coordinates), without one viewport CSS px; the result's click_at is where \
-                 it landed, and a point outside the viewport is an error. `scroll` turns the mouse wheel over the target (or \
-                 the page) by dx and dy, by default one viewport down; `value` may be up, down, left, right, top or bottom. \
+                 corner, without one viewport CSS px. A <canvas> target is addressed in its bitmap pixels, mapped through \
+                 its content box: a 400-wide canvas styled 800px wide with a border is clicked at bitmap (100, 50) with \
+                 x 100 and y 50, whatever its CSS size, and a page-published canvas region counts from its own corner. \
+                 The result's click_at is where it landed in viewport px (with `pixel`, the bitmap pixel, on a canvas), \
+                 and a point outside the viewport is an error. `modifiers` (an array of shift, ctrl, alt, meta/cmd) are \
+                 held through any pointer action: every mouse event carries them (shiftKey, ctrlKey...) and the keys \
+                 themselves go down before and up after, so a tool that listens for the Shift key sees it held; use it \
+                 for shift-click to extend a selection, ctrl+wheel to zoom a canvas, shift-drag to constrain a shape. \
+                 `scroll` turns the mouse wheel over the target (or the page) by dx and dy, by default one viewport \
+                 down; `value` may be up, down, left, right, top or bottom. \
                  `drag` presses on the target (or at x and y), moves in steps and releases at the destination: the \
                  to_ref or to_query element (its centre, or to_x and to_y inside it), else to_x and to_y as viewport \
-                 points, else dx and dy from the start; the destination must be on screen. Mouse-event drags (sliders, \
-                 sortable lists, selecting text) and HTML5 draggable elements both work; the result says html5_drag. \
+                 points, else dx and dy from the start; the destination must be on screen. `moves` (2 to 200, default \
+                 12) is how many moves it makes, `duration_ms` (at most 10000) how long they take in all (15 ms a step \
+                 by default) and `button` which button is held (default left). `path` is a list of waypoints ({x, y}, \
+                 up to 200) the drag passes through in order before releasing at the last, each in the frame of \
+                 to_x/to_y: offsets inside the to_ref/to_query element when one is given (bitmap pixels on a canvas), \
+                 else viewport px; the moves are spread over the segments by length with at least one landing on every \
+                 waypoint. That is a brush stroke, lasso or freehand shape: to draw on a canvas, name it as the target \
+                 and as to_query so the path is in its pixels. A polygon tool is a batch: click each vertex, then \
+                 double_click the last. Mouse-event drags (sliders, sortable lists, selecting text, drawing tools) \
+                 and HTML5 draggable elements both work; the result says html5_drag, moves and duration_ms. \
                  `mouse_move` (also `hover` with x and y) moves the real pointer to the target or point without clicking, \
                  so mouseover, mousemove and CSS :hover fire; `mouse_down` and `mouse_up` press and release a `button` \
                  (left, right or middle) at the target or point, so a drag or hold the page implements itself can be \
@@ -3582,8 +3641,8 @@ impl ToolModule for BrowserModule {
                  for a password or secret field). A native <select> is set with select (on the list or one of its \
                  options) or a click on an <option>; both report selected and changed, and an option that is missing, \
                  disabled or undone by the page is an error. A page-published canvas region (a canvas-child ref from browser_snapshot) \
-                 supports only click and hover, sent as real mouse input at the region centre; other actions on it return \
-                 Unsupported.\n\n\
+                 supports click and hover, sent as real mouse input at the region centre (or at x and y, bitmap pixels \
+                 from its corner), and the pointer actions; the other actions on it return Unsupported.\n\n\
                  Query targeting: 'by' is css, xpath, text or role (used when no 'ref'; role takes the role as the query and the accessible name as 'name', see browser_query); with none, the query is tried as CSS and, \
                  if it does not parse or matches nothing, as visible text (the result says matched_by), so a plain word \
                  such as \"Submit\" works. The spellings browser_query lists (/ or ( for XPath, text=..., :has-text(..) \
@@ -5625,6 +5684,44 @@ mod forgiving_args_tests {
         let e = pointer_args(&json!({"x": "left"})).unwrap_err();
         assert!(e.contains("'x'") && e.contains("number"), "{e}");
         assert!(pointer_args(&json!({"x": null})).unwrap().x.is_none());
+    }
+
+    /// The drawing-tool arguments: modifier keys, a drag's pacing and button,
+    /// and a path of waypoints.
+    #[test]
+    fn pointer_args_take_modifiers_and_drag_control() {
+        let a = json!({
+            "modifiers": ["shift", "Ctrl"], "moves": "30", "duration_ms": 900, "button": "right",
+            "path": [{"x": 1, "y": 2}, [3, 4]]
+        });
+        let p = pointer_args(&a).unwrap();
+        assert_eq!(p.modifiers, 2 | 8);
+        assert_eq!(p.moves, Some(30));
+        assert_eq!(p.duration_ms, Some(900));
+        assert_eq!(p.button, Some(crate::input::Button::Right));
+        assert_eq!(p.path, vec![(1.0, 2.0), (3.0, 4.0)]);
+        let batch = json!({"steps": [{"action": "click"}]});
+        let none = pointer_args(&batch).unwrap();
+        assert_eq!((none.moves, none.modifiers), (None, 0));
+        assert!(none.path.is_empty());
+        let e = pointer_args(&json!({"moves": 1})).unwrap_err();
+        assert!(e.contains("2 to 200"), "{e}");
+        let e = pointer_args(&json!({"moves": "many"})).unwrap_err();
+        assert!(e.contains("'moves'"), "{e}");
+        let e = pointer_args(&json!({"duration_ms": 10_001})).unwrap_err();
+        assert!(e.contains("duration_ms"), "{e}");
+        let e = pointer_args(&json!({"modifiers": ["hyper"]})).unwrap_err();
+        assert!(e.contains("hyper"), "{e}");
+        let e = pointer_args(&json!({"path": [{"x": 1, "y": 2}], "dx": 5})).unwrap_err();
+        assert!(e.contains("'dx'") && e.contains("path"), "{e}");
+    }
+
+    #[test]
+    fn a_drag_move_count_inside_a_batch_step_is_not_a_nested_batch() {
+        let nested = json!({"target_id": "t", "steps": [{"action": "click", "steps": [{}]}]});
+        assert!(batch_steps(&nested).unwrap_err().contains("nested"));
+        let paced = json!({"target_id": "t", "steps": [{"action": "drag", "query": "#a", "dx": 5, "moves": 30}]});
+        assert!(batch_steps(&paced).is_ok());
     }
 
     fn b(id: u32, tabs: &[&str]) -> BrowserTabs {
