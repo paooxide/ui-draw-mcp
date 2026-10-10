@@ -1,0 +1,16 @@
+{
+  "name": "agentctl",
+  "description": "The agentctl MCP server and its usage skill, from the agentctl repository.",
+  "owner": {
+    "name": "paooxide",
+    "url": "https://github.com/paooxide"
+  },
+  "plugins": [
+    {
+      "name": "agentctl",
+      "source": "./plugins/agentctl",
+      "description": "Grounded control of a real computer through the accessibility tree and the browser, behind a closed-by-default policy.",
+      "version": "0.2.1"
+    }
+  ]
+}

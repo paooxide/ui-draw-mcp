@@ -1,0 +1,19 @@
+{
+  "name": "agentctl",
+  "version": "0.2.1",
+  "description": "Grounded control of a real computer: native apps through the accessibility tree, a browser over DevTools, behind a closed-by-default policy with consent and a signed audit log. Bundles the agentctl MCP server registration and a skill for using it well.",
+  "author": {
+    "name": "paooxide",
+    "url": "https://github.com/paooxide"
+  },
+  "homepage": "https://github.com/paooxide/ui-draw-mcp",
+  "repository": "https://github.com/paooxide/ui-draw-mcp",
+  "license": "Apache-2.0",
+  "keywords": ["computer-use", "accessibility", "desktop-automation", "browser-automation", "mcp", "testing"],
+  "mcpServers": {
+    "agentctl": {
+      "command": "agentctl",
+      "args": ["serve"]
+    }
+  }
+}
