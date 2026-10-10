@@ -33,5 +33,6 @@ dist/
 
 # eval harness
 /eval/.venv/
-/eval/results/traces/
+# Run records stay local: they are not part of a release.
+/eval/results/
 /eval/__pycache__/
