@@ -208,7 +208,7 @@ impl AuditSink {
         fs::create_dir_all(&dir)?;
         let path = dir.join(format!("{session_id}.jsonl"));
         let pub_key_path = dir.join(format!("{session_id}.pub.key"));
-        let signing_key = key.unwrap_or_else(|| SigningKey::generate(&mut rand::rngs::OsRng));
+        let signing_key = key.unwrap_or_else(|| SigningKey::generate(&mut rand_core::OsRng));
         let public_key_hex = hex::encode(signing_key.verifying_key().as_bytes());
         let _ = fs::write(&pub_key_path, &public_key_hex);
         Ok(AuditSink {
@@ -227,7 +227,7 @@ impl AuditSink {
 
     /// Create an in-memory sink with an ephemeral Ed25519 signing keypair (tests).
     pub fn memory() -> Self {
-        let signing_key = SigningKey::generate(&mut rand::rngs::OsRng);
+        let signing_key = SigningKey::generate(&mut rand_core::OsRng);
         let public_key_hex = hex::encode(signing_key.verifying_key().as_bytes());
         AuditSink {
             inner: Mutex::new(Inner::Memory(Vec::new())),
@@ -411,7 +411,7 @@ pub fn generate_signing_key_file(path: &Path) -> Result<String, String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
     }
-    let key = SigningKey::generate(&mut rand::rngs::OsRng);
+    let key = SigningKey::generate(&mut rand_core::OsRng);
     let mut opts = OpenOptions::new();
     opts.write(true).create_new(true);
     #[cfg(unix)]
