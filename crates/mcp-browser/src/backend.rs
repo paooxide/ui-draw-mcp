@@ -113,10 +113,6 @@ pub struct ActOpts {
 /// The `timeout_ms` default of a settle wait.
 pub const ACT_SETTLE_TIMEOUT_MS: u64 = 10_000;
 
-/// A drag moves in this many steps, this many ms apart.
-const DRAG_STEPS: usize = 12;
-const DRAG_STEP_MS: u64 = 15;
-
 impl Default for ActOpts {
     fn default() -> Self {
         ActOpts {
@@ -131,8 +127,9 @@ impl Default for ActOpts {
 /// What a pointer action (`double_click`, `triple_click`, `right_click`,
 /// `scroll`, `drag`, or a click/hover at coordinates) needs beyond what it
 /// acts on. Coordinates are CSS px: offsets from the target's top-left corner
-/// when the action has a target, else viewport points.
-#[derive(Debug, Clone, Copy, Default)]
+/// when the action has a target (bitmap pixels on a canvas), else viewport
+/// points.
+#[derive(Debug, Clone, Default)]
 pub struct PointerArgs<'a> {
     pub x: Option<f64>,
     pub y: Option<f64>,
@@ -145,8 +142,51 @@ pub struct PointerArgs<'a> {
     pub dy: Option<f64>,
     /// A `scroll` direction.
     pub value: Option<&'a str>,
-    /// The button of `mouse_down` / `mouse_up`; left when absent.
+    /// The button of `mouse_down` / `mouse_up` / `drag`; left when absent.
     pub button: Option<crate::input::Button>,
+    /// The CDP `modifiers` bitmask (Alt 1, Ctrl 2, Meta 4, Shift 8) held on
+    /// every pointer event, with the keys themselves pressed around them.
+    pub modifiers: u32,
+    /// How many moves a `drag` (or a `mouse_move` with a button held) makes.
+    pub moves: Option<usize>,
+    /// How long those moves take in all; absent, they are 15 ms apart.
+    pub duration_ms: Option<u64>,
+    /// Waypoints a `drag` passes through, in the frame of `to_x`/`to_y`; it
+    /// releases at the last.
+    pub path: Vec<(f64, f64)>,
+}
+
+/// The box of a pointer target as [`CdpBackend::pointer_geometry`] reports
+/// it: `rect` in viewport CSS px and, for a canvas, how bitmap pixels map onto
+/// it.
+fn rect_of(geom: &Value) -> Option<crate::input::Rect> {
+    let num = |v: &Value, k: &str| v.get(k).and_then(Value::as_f64).unwrap_or(0.0);
+    let r = geom.get("rect")?;
+    let mut rect = crate::input::Rect::new(
+        num(r, "left"),
+        num(r, "top"),
+        num(r, "width"),
+        num(r, "height"),
+    );
+    if let Some(cv) = geom.get("canvas").filter(|c| c.is_object()) {
+        rect.canvas = Some(crate::input::Canvas {
+            sx: cv.get("sx").and_then(Value::as_f64).unwrap_or(1.0),
+            sy: cv.get("sy").and_then(Value::as_f64).unwrap_or(1.0),
+            ox: num(cv, "ox"),
+            oy: num(cv, "oy"),
+        });
+    }
+    Some(rect)
+}
+
+/// A drag as the pointer makes it: press at `from`, move through `route`
+/// (`step_ms` apart) with `button` held, release at its last point.
+struct Drag<'a> {
+    from: (f64, f64),
+    route: &'a [(f64, f64)],
+    button: crate::input::Button,
+    step_ms: u64,
+    modifiers: u32,
 }
 
 /// The state before an action that [`BrowserBackend::act_effects`] compares
@@ -1607,8 +1647,15 @@ impl CdpBackend {
     /// spread over `glide_ms` (a single event when it is 0). These are trusted
     /// events: the page sees `mousemove`/`mouseover`, and CSS `:hover` applies.
     /// Says whether the last one, at `to`, was delivered; a failure part-way
-    /// is not an error of the action (the pointer is decoration).
-    async fn glide_mouse(c: &mut CdpConn, from: (f64, f64), to: (f64, f64), glide_ms: u64) -> bool {
+    /// is not an error of the action (the pointer is decoration). `modifiers`
+    /// is the CDP bitmask of the keys held meanwhile.
+    async fn glide_mouse(
+        c: &mut CdpConn,
+        from: (f64, f64),
+        to: (f64, f64),
+        glide_ms: u64,
+        modifiers: u32,
+    ) -> bool {
         let path = crate::showcase::glide_path(from, to, glide_ms);
         let delay = std::time::Duration::from_millis(glide_ms / path.len().max(1) as u64);
         let last = path.len().saturating_sub(1);
@@ -1616,7 +1663,7 @@ impl CdpBackend {
             let sent = c
                 .call(
                     "Input.dispatchMouseEvent",
-                    json!({ "type": "mouseMoved", "x": x, "y": y, "button": "none", "buttons": 0 }),
+                    json!({ "type": "mouseMoved", "x": x, "y": y, "button": "none", "buttons": 0, "modifiers": modifiers }),
                 )
                 .await;
             if i == last {
@@ -1655,7 +1702,8 @@ impl CdpBackend {
     }
 
     /// One `Input.dispatchMouseEvent`. `buttons` is the mask of buttons held
-    /// after the event (left 1, right 2); `button` names the one it is about.
+    /// after the event (left 1, right 2); `button` names the one it is about;
+    /// `modifiers` is the CDP bitmask of the keys held.
     async fn mouse_event(
         c: &mut CdpConn,
         kind: &str,
@@ -1663,12 +1711,14 @@ impl CdpBackend {
         button: &str,
         buttons: u32,
         click_count: u32,
+        modifiers: u32,
     ) -> Result<(), BrowserError> {
         c.call(
             "Input.dispatchMouseEvent",
             json!({
                 "type": kind, "x": x, "y": y, "button": button,
                 "buttons": buttons, "clickCount": click_count,
+                "modifiers": modifiers,
             }),
         )
         .await?;
@@ -1685,14 +1735,65 @@ impl CdpBackend {
         button: crate::input::Button,
         count: u32,
         hold_ms: u64,
+        modifiers: u32,
     ) -> Result<(), BrowserError> {
-        Self::mouse_event(c, "mouseMoved", at, "none", 0, 0).await?;
+        Self::mouse_event(c, "mouseMoved", at, "none", 0, 0, modifiers).await?;
         for n in 1..=count {
-            Self::mouse_event(c, "mousePressed", at, button.name(), button.mask(), n).await?;
+            Self::mouse_event(
+                c,
+                "mousePressed",
+                at,
+                button.name(),
+                button.mask(),
+                n,
+                modifiers,
+            )
+            .await?;
             if hold_ms > 0 {
                 tokio::time::sleep(std::time::Duration::from_millis(hold_ms)).await;
             }
-            Self::mouse_event(c, "mouseReleased", at, button.name(), 0, n).await?;
+            Self::mouse_event(c, "mouseReleased", at, button.name(), 0, n, modifiers).await?;
+        }
+        Ok(())
+    }
+
+    /// Press modifier keys (as a person would before a shift-click), each
+    /// `rawKeyDown` carrying the keys already down; [`Self::mods_up`] releases
+    /// them.
+    async fn mods_down(
+        c: &mut CdpConn,
+        mods: &[crate::input::Modifier],
+    ) -> Result<(), BrowserError> {
+        let mut held = 0;
+        for m in mods {
+            held |= m.bit;
+            c.call(
+                "Input.dispatchKeyEvent",
+                json!({
+                    "type": "rawKeyDown", "key": m.key, "code": m.code,
+                    "windowsVirtualKeyCode": m.vk,
+                    "modifiers": held,
+                }),
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// Release the modifier keys [`Self::mods_down`] pressed, last first.
+    async fn mods_up(c: &mut CdpConn, mods: &[crate::input::Modifier]) -> Result<(), BrowserError> {
+        let mut held = mods.iter().fold(0, |b, m| b | m.bit);
+        for m in mods.iter().rev() {
+            held &= !m.bit;
+            c.call(
+                "Input.dispatchKeyEvent",
+                json!({
+                    "type": "keyUp", "key": m.key, "code": m.code,
+                    "windowsVirtualKeyCode": m.vk,
+                    "modifiers": held,
+                }),
+            )
+            .await?;
         }
         Ok(())
     }
@@ -1725,8 +1826,9 @@ impl CdpBackend {
     }
 
     /// The element under a viewport point: tag, id, a short name or text, and
-    /// whether it is a canvas. A coordinate action reports it, so a click
-    /// that landed on nothing useful says so.
+    /// whether it is a canvas (then also `pixel`, the bitmap pixel under the
+    /// point). A coordinate action reports it, so a click that landed on
+    /// nothing useful says so.
     async fn hit_at(c: &mut CdpConn, (x, y): (f64, f64)) -> Option<Value> {
         let expr = format!(
             r#"(function(x, y){{
@@ -1738,6 +1840,11 @@ impl CdpBackend {
   }}
   if(!el) return null;
   var o = {{tag: el.tagName.toLowerCase(), canvas: el.tagName === 'CANVAS'}};
+  if(o.canvas){{
+    var r = el.getBoundingClientRect();
+    var sx = el.clientWidth > 0 ? el.width / el.clientWidth : 1, sy = el.clientHeight > 0 ? el.height / el.clientHeight : 1;
+    o.pixel = {{x: Math.round((x - r.left - el.clientLeft) * sx * 100) / 100, y: Math.round((y - r.top - el.clientTop) * sy * 100) / 100}};
+  }}
   if(el.id) o.id = el.id;
   var t = el.getAttribute('aria-label') || '';
   if(!t && el.childElementCount <= 5) t = el.innerText || el.value || el.alt || el.title || '';
@@ -1817,13 +1924,24 @@ impl CdpBackend {
   try {{ el = {resolve}; }} catch(e) {{ return {{ok:false,error:String(e && e.message ? e.message : e)}}; }}
   var out = {{ok:true, vw:document.documentElement.clientWidth, vh:document.documentElement.clientHeight}};
   var se = document.scrollingElement || document.documentElement;
+  // A canvas is addressed in bitmap pixels: its box is the content box
+  // (inside border and padding) and `canvas` says how big a pixel is there.
+  var scale = function(cv){{
+    return {{sx: cv.width > 0 ? cv.clientWidth / cv.width : 1, sy: cv.height > 0 ? cv.clientHeight / cv.height : 1}};
+  }};
   if({has_target}){{
     if(!el) return {{ok:false,error:{not_found}}};
     {scroll_js}
     if(el.__is_canvas_target){{
-      var cb = __canvas_box(el.canvas, el.reg);
+      var cb = __canvas_box(el.canvas, el.reg), rs = scale(el.canvas);
       out.rect = {{left:cb.x, top:cb.y, width:cb.w, height:cb.h}};
+      out.canvas = {{sx:rs.sx, sy:rs.sy, ox:el.reg.x || 0, oy:el.reg.y || 0}};
       out.target = {{tag:'canvas-region', text:''}};
+    }} else if(el.tagName === 'CANVAS'){{
+      var cr = __rect(el), cs = scale(el);
+      out.rect = {{left:cr.left + el.clientLeft, top:cr.top + el.clientTop, width:el.clientWidth, height:el.clientHeight}};
+      out.canvas = {{sx:cs.sx, sy:cs.sy, ox:0, oy:0, width:el.width, height:el.height}};
+      out.target = __target(el);
     }} else {{
       var b = __rect(el);
       out.rect = {{left:b.left, top:b.top, width:b.width, height:b.height}};
@@ -1872,6 +1990,7 @@ impl CdpBackend {
         target: &str,
         to: (f64, f64),
         cfg: &crate::showcase::ShowcaseConfig,
+        modifiers: u32,
     ) -> bool {
         let last = self
             .cursor_pos
@@ -1893,7 +2012,7 @@ impl CdpBackend {
             );
             let _ = Self::eval_value(c, &kick).await;
         }
-        let delivered = Self::glide_mouse(c, from, to, glide_ms).await;
+        let delivered = Self::glide_mouse(c, from, to, glide_ms, modifiers).await;
         if delivered {
             self.cursor_pos
                 .lock()
@@ -1903,23 +2022,300 @@ impl CdpBackend {
         delivered
     }
 
-    /// Press at `from`, move to `to` in small steps with the button held,
-    /// release. Plain mouse listeners (sliders, jQuery UI, text selection)
-    /// hear a person's drag. A native `draggable` element gets no `dragstart`
-    /// or `drop` from mouse events alone: Chrome starts the drag and hands it
-    /// to the embedder, so drags are intercepted (`Input.setInterceptDrags`)
-    /// and played back as drag events. Says whether that happened.
-    async fn drag_pointer(
+    /// The pointer events of one [`Self::act_pointer`] action, given the
+    /// geometry of its target, and the result they make: where it landed
+    /// (`click_at`, `at`, `from`, `to`, `scroll_at`, with the canvas `pixel`
+    /// under a point on a canvas) and `hit`, what was under a point the
+    /// caller named.
+    async fn pointer_sequence(
+        &self,
         c: &mut CdpConn,
-        from: (f64, f64),
-        to: (f64, f64),
-    ) -> Result<bool, BrowserError> {
+        target: &str,
+        action: &str,
+        p: &PointerArgs<'_>,
+        opts: ActOpts,
+        geom: &Value,
+    ) -> Result<Value, BrowserError> {
+        use crate::input::{
+            check_in_viewport, drag_path, drag_route, drag_timing, pixel_on, point_in,
+            scroll_delta, visible_center, Rect,
+        };
+        let failed = BrowserError::Failed;
+        let showcase_cfg = self
+            .showcase
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let num = |v: &Value, k: &str| v.get(k).and_then(Value::as_f64).unwrap_or(0.0);
+        let (vw, vh) = (num(geom, "vw"), num(geom, "vh"));
+        let rect = rect_of(geom);
+        let mut out = json!({ "ok": true, "action": action, "input": "cdp" });
+        if let (Some(t), Some(m)) = (geom.get("target"), out.as_object_mut()) {
+            m.insert("target".into(), t.clone());
+        }
+        let at_json = |(x, y): (f64, f64), frame: Option<Rect>| {
+            let mut j = json!({ "x": x, "y": y });
+            if let Some((px, py)) = pixel_on(frame, (x, y)) {
+                j["pixel"] = json!({ "x": px, "y": py });
+            }
+            j
+        };
+        // A point the caller named is answered with what is under it, so a
+        // click that landed on the wrong thing, or on nothing, says so.
+        let coords = p.x.is_some() || p.y.is_some();
+        let mods = p.modifiers;
+
+        match action {
+            "scroll" => {
+                let at = match (rect, p.x, p.y) {
+                    (Some(r), None, None) => visible_center(r, vw, vh).ok_or_else(|| {
+                        failed(
+                            "the element is outside the viewport; scroll it into view first".into(),
+                        )
+                    })?,
+                    (None, None, None) => (vw / 2.0, vh / 2.0),
+                    _ => point_in(rect, p.x, p.y).map_err(failed)?,
+                };
+                check_in_viewport(at, vw, vh).map_err(failed)?;
+                if let (true, Some(h), Some(m)) =
+                    (coords, Self::hit_at(c, at).await, out.as_object_mut())
+                {
+                    m.insert("hit".into(), h);
+                }
+                let (dx, dy) = scroll_delta(p.value, p.dx, p.dy, (vw, vh)).map_err(failed)?;
+                Self::mouse_event(c, "mouseMoved", at, "none", 0, 0, mods).await?;
+                c.call(
+                    "Input.dispatchMouseEvent",
+                    json!({ "type": "mouseWheel", "x": at.0, "y": at.1, "deltaX": dx, "deltaY": dy, "modifiers": mods }),
+                )
+                .await?;
+                // The wheel scrolls over a few frames: wait for it to stop.
+                let mut now = Self::scroll_positions(c).await;
+                for _ in 0..15 {
+                    tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+                    let next = Self::scroll_positions(c).await;
+                    let still = next == now;
+                    now = next;
+                    if still {
+                        break;
+                    }
+                }
+                let before: Option<Vec<f64>> = geom
+                    .get("scroll")
+                    .and_then(Value::as_array)
+                    .and_then(|a| a.iter().map(Value::as_f64).collect());
+                if let (Some(m), Some(n)) = (out.as_object_mut(), &now) {
+                    m.insert("scroll_at".into(), at_json(at, rect));
+                    m.insert("scroll_x".into(), json!(n[0]));
+                    m.insert("scroll_y".into(), json!(n[1]));
+                    m.insert("scroller_top".into(), json!(n[3]));
+                    m.insert("moved".into(), json!(before.as_ref() != Some(n)));
+                }
+                self.cursor_pos
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(target.to_string(), at);
+            }
+            "hover" | "mouse_move" | "click" | "double_click" | "triple_click" | "right_click"
+            | "mouse_down" | "mouse_up" => {
+                // A button-up with no point lets go where the pointer is.
+                let at = if action == "mouse_up" && rect.is_none() && !coords {
+                    self.cursor_at(target).ok_or_else(|| {
+                        failed("mouse_up needs a point (ref or query, or x and y) when no mouse action has moved the pointer in this tab".into())
+                    })?
+                } else {
+                    point_in(rect, p.x, p.y).map_err(failed)?
+                };
+                check_in_viewport(at, vw, vh).map_err(failed)?;
+                if let (true, Some(h), Some(m)) =
+                    (coords, Self::hit_at(c, at).await, out.as_object_mut())
+                {
+                    m.insert("hit".into(), h);
+                }
+                let held = self.held_button(target);
+                match action {
+                    "hover" | "mouse_move" => {
+                        if let Some(b) = held {
+                            // Moving with a button down is a drag in progress:
+                            // the page gets the steps a person's hand makes.
+                            let from = self.cursor_at(target).unwrap_or(at);
+                            let (moves, step_ms) = drag_timing(p.moves, p.duration_ms, 1);
+                            for pt in drag_path(from, at, moves) {
+                                Self::mouse_event(c, "mouseMoved", pt, b.name(), b.mask(), 0, mods)
+                                    .await?;
+                                tokio::time::sleep(std::time::Duration::from_millis(step_ms)).await;
+                            }
+                        } else if !self.pointer_glide(c, target, at, &showcase_cfg, mods).await {
+                            return Err(failed(format!(
+                                "the pointer move to ({:.1}, {:.1}) was not delivered to the page; nothing happened",
+                                at.0, at.1
+                            )));
+                        }
+                    }
+                    "mouse_down" => {
+                        let b = p.button.unwrap_or_default();
+                        if showcase_cfg.enabled {
+                            self.pointer_glide(c, target, at, &showcase_cfg, mods).await;
+                        }
+                        let mask = held.map_or(0, |h| h.mask());
+                        Self::mouse_event(c, "mouseMoved", at, "none", mask, 0, mods).await?;
+                        Self::mouse_event(c, "mousePressed", at, b.name(), b.mask(), 1, mods)
+                            .await?;
+                        self.set_held_button(target, Some(b));
+                        if let Some(m) = out.as_object_mut() {
+                            m.insert("held".into(), json!(b.name()));
+                        }
+                    }
+                    "mouse_up" => {
+                        let b = p.button.or(held).unwrap_or_default();
+                        if held.is_some() {
+                            // Arrive with the button down, then let go.
+                            Self::mouse_event(c, "mouseMoved", at, b.name(), b.mask(), 0, mods)
+                                .await?;
+                        }
+                        Self::mouse_event(c, "mouseReleased", at, b.name(), 0, 1, mods).await?;
+                        self.set_held_button(target, None);
+                        if let Some(m) = out.as_object_mut() {
+                            m.insert("released".into(), json!(b.name()));
+                        }
+                    }
+                    _ => {
+                        if showcase_cfg.enabled {
+                            self.pointer_glide(c, target, at, &showcase_cfg, mods).await;
+                        }
+                        let (button, count) = match action {
+                            "double_click" => (crate::input::Button::Left, 2),
+                            "triple_click" => (crate::input::Button::Left, 3),
+                            "right_click" => (crate::input::Button::Right, 1),
+                            _ => (crate::input::Button::Left, 1),
+                        };
+                        Self::cdp_clicks(c, at, button, count, opts.hold_ms, mods).await?;
+                        if let (true, Some(m)) = (opts.hold_ms > 0, out.as_object_mut()) {
+                            m.insert("held_ms".into(), json!(opts.hold_ms));
+                        }
+                    }
+                }
+                self.cursor_pos
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(target.to_string(), at);
+                if let Some(m) = out.as_object_mut() {
+                    let key = if action.starts_with("mouse_") {
+                        "at"
+                    } else {
+                        "click_at"
+                    };
+                    m.insert(key.into(), at_json(at, rect));
+                }
+            }
+            "drag" => {
+                let from = point_in(rect, p.x, p.y).map_err(|_| {
+                    failed("drag needs a source: ref or query, or x and y (viewport CSS px)".into())
+                })?;
+                check_in_viewport(from, vw, vh).map_err(failed)?;
+                if let (true, Some(h), Some(m)) =
+                    (coords, Self::hit_at(c, from).await, out.as_object_mut())
+                {
+                    m.insert("hit".into(), h);
+                }
+                // The frame of the destination (and of each `path` point): an
+                // element named by to_ref/to_query, else the viewport. It must
+                // already be on screen: scrolling to it would move the source.
+                let to_rect = match p.to {
+                    Some(dest) => {
+                        let g = Self::pointer_geometry(c, Some(dest), ScrollMode::None, false)
+                            .await
+                            .map_err(|e| match e {
+                                BrowserError::NotFound(m) => {
+                                    BrowserError::NotFound(format!("drag destination: {m}"))
+                                }
+                                other => other,
+                            })?;
+                        rect_of(&g)
+                    }
+                    None => None,
+                };
+                let waypoints: Vec<(f64, f64)> = if !p.path.is_empty() {
+                    p.path
+                        .iter()
+                        .map(|&(x, y)| point_in(to_rect, Some(x), Some(y)).map_err(failed))
+                        .collect::<Result<_, _>>()?
+                } else if to_rect.is_some() {
+                    vec![point_in(to_rect, p.to_x, p.to_y).map_err(failed)?]
+                } else if p.to_x.is_some() || p.to_y.is_some() {
+                    vec![(p.to_x.unwrap_or(from.0), p.to_y.unwrap_or(from.1))]
+                } else if p.dx.is_some() || p.dy.is_some() {
+                    vec![(from.0 + p.dx.unwrap_or(0.0), from.1 + p.dy.unwrap_or(0.0))]
+                } else {
+                    return Err(failed(
+                        "drag needs a destination: to_ref or to_query, to_x and to_y (viewport CSS px), dx and dy, or a path".into(),
+                    ));
+                };
+                for (i, w) in waypoints.iter().enumerate() {
+                    check_in_viewport(*w, vw, vh).map_err(|m| {
+                        if p.path.is_empty() {
+                            failed(format!("drag destination: {m}"))
+                        } else {
+                            failed(format!("drag path point {i}: {m}"))
+                        }
+                    })?;
+                }
+                let (moves, step_ms) = drag_timing(p.moves, p.duration_ms, waypoints.len());
+                let route = drag_route(from, &waypoints, moves);
+                let to = route.last().copied().unwrap_or(from);
+                if showcase_cfg.enabled {
+                    self.pointer_glide(c, target, from, &showcase_cfg, mods)
+                        .await;
+                }
+                let drag = Drag {
+                    from,
+                    route: &route,
+                    button: p.button.unwrap_or_default(),
+                    step_ms,
+                    modifiers: mods,
+                };
+                let html5 = Self::drag_pointer(c, &drag).await?;
+                self.cursor_pos
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(target.to_string(), to);
+                if let Some(m) = out.as_object_mut() {
+                    m.insert("from".into(), at_json(from, rect));
+                    m.insert("to".into(), at_json(to, to_rect));
+                    m.insert("moves".into(), json!(route.len()));
+                    m.insert("duration_ms".into(), json!(step_ms * route.len() as u64));
+                    if p.button.is_some() {
+                        m.insert("button".into(), json!(drag.button.name()));
+                    }
+                    if !p.path.is_empty() {
+                        m.insert("waypoints".into(), json!(waypoints.len()));
+                    }
+                    m.insert("html5_drag".into(), json!(html5));
+                }
+            }
+            other => {
+                return Err(BrowserError::Unsupported(format!(
+                    "'{other}' is not a pointer action"
+                )))
+            }
+        }
+        Ok(out)
+    }
+
+    /// Press at `from`, move through `route` with the button held, release at
+    /// its last point. Plain mouse listeners (sliders, jQuery UI, text
+    /// selection, drawing tools) hear a person's drag. A native `draggable`
+    /// element gets no `dragstart` or `drop` from mouse events alone: Chrome
+    /// starts the drag and hands it to the embedder, so drags are intercepted
+    /// (`Input.setInterceptDrags`) and played back as drag events. Says
+    /// whether that happened.
+    async fn drag_pointer(c: &mut CdpConn, drag: &Drag<'_>) -> Result<bool, BrowserError> {
         let intercept = c
             .call("Input.setInterceptDrags", json!({ "enabled": true }))
             .await
             .is_ok();
         c.keep_events(true);
-        let run = Self::drag_steps(c, from, to, intercept).await;
+        let run = Self::drag_steps(c, drag, intercept).await;
         c.keep_events(false);
         c.take_events();
         if intercept {
@@ -1932,23 +2328,24 @@ impl CdpBackend {
 
     async fn drag_steps(
         c: &mut CdpConn,
-        from: (f64, f64),
-        to: (f64, f64),
+        drag: &Drag<'_>,
         intercept: bool,
     ) -> Result<bool, BrowserError> {
-        let step = std::time::Duration::from_millis(DRAG_STEP_MS);
-        Self::mouse_event(c, "mouseMoved", from, "none", 0, 0).await?;
-        Self::mouse_event(c, "mousePressed", from, "left", 1, 1).await?;
+        let step = std::time::Duration::from_millis(drag.step_ms);
+        let (name, mask, mods) = (drag.button.name(), drag.button.mask(), drag.modifiers);
+        let to = drag.route.last().copied().unwrap_or(drag.from);
+        Self::mouse_event(c, "mouseMoved", drag.from, "none", 0, 0, mods).await?;
+        Self::mouse_event(c, "mousePressed", drag.from, name, mask, 1, mods).await?;
         let mut data: Option<Value> = None;
-        let mut pos = from;
-        for at in crate::input::drag_path(from, to, DRAG_STEPS) {
+        let mut pos = drag.from;
+        for &at in drag.route {
             pos = at;
             if data.is_some() {
-                Self::drag_event(c, "dragOver", at, data.as_ref()).await?;
+                Self::drag_event(c, "dragOver", at, data.as_ref(), mods).await?;
                 tokio::time::sleep(step).await;
                 continue;
             }
-            Self::mouse_event(c, "mouseMoved", at, "left", 1, 0).await?;
+            Self::mouse_event(c, "mouseMoved", at, name, mask, 0, mods).await?;
             if !intercept {
                 tokio::time::sleep(step).await;
                 continue;
@@ -1958,7 +2355,7 @@ impl CdpBackend {
             let mut seen = c.take_events();
             if seen.is_empty() {
                 seen = c
-                    .collect_events(&["Input.dragIntercepted"], DRAG_STEP_MS, 1)
+                    .collect_events(&["Input.dragIntercepted"], drag.step_ms.max(1), 1)
                     .await?;
             }
             data = seen.iter().find_map(|e| {
@@ -1969,17 +2366,17 @@ impl CdpBackend {
             if data.is_some() {
                 // The page's `dragstart` has run and the pointer is over
                 // the element: the first thing the drag enters.
-                Self::drag_event(c, "dragEnter", at, data.as_ref()).await?;
-                Self::drag_event(c, "dragOver", at, data.as_ref()).await?;
+                Self::drag_event(c, "dragEnter", at, data.as_ref(), mods).await?;
+                Self::drag_event(c, "dragOver", at, data.as_ref(), mods).await?;
             }
         }
         if data.is_some() {
-            Self::drag_event(c, "dragOver", pos, data.as_ref()).await?;
-            Self::drag_event(c, "drop", pos, data.as_ref()).await?;
-            Self::mouse_event(c, "mouseReleased", pos, "left", 0, 1).await?;
+            Self::drag_event(c, "dragOver", pos, data.as_ref(), mods).await?;
+            Self::drag_event(c, "drop", pos, data.as_ref(), mods).await?;
+            Self::mouse_event(c, "mouseReleased", pos, name, 0, 1, mods).await?;
             return Ok(true);
         }
-        Self::mouse_event(c, "mouseReleased", to, "left", 0, 1).await?;
+        Self::mouse_event(c, "mouseReleased", to, name, 0, 1, mods).await?;
         Ok(false)
     }
 
@@ -1988,10 +2385,11 @@ impl CdpBackend {
         kind: &str,
         (x, y): (f64, f64),
         data: Option<&Value>,
+        modifiers: u32,
     ) -> Result<(), BrowserError> {
         c.call(
             "Input.dispatchDragEvent",
-            json!({ "type": kind, "x": x, "y": y, "data": data }),
+            json!({ "type": kind, "x": x, "y": y, "data": data, "modifiers": modifiers }),
         )
         .await?;
         Ok(())
@@ -2012,19 +2410,7 @@ impl CdpBackend {
             Some(cmd) if Self::is_mac(c).await => Some(cmd),
             _ => None,
         };
-        let mut held = 0;
-        for m in &combo.mods {
-            held |= m.bit;
-            c.call(
-                "Input.dispatchKeyEvent",
-                json!({
-                    "type": "rawKeyDown", "key": m.key, "code": m.code,
-                    "windowsVirtualKeyCode": m.vk,
-                    "modifiers": held,
-                }),
-            )
-            .await?;
-        }
+        Self::mods_down(c, &combo.mods).await?;
         let k = &combo.key;
         let mut down = json!({
             "type": if k.text.is_some() { "keyDown" } else { "rawKeyDown" },
@@ -2053,19 +2439,7 @@ impl CdpBackend {
             }),
         )
         .await?;
-        for m in combo.mods.iter().rev() {
-            held &= !m.bit;
-            c.call(
-                "Input.dispatchKeyEvent",
-                json!({
-                    "type": "keyUp", "key": m.key, "code": m.code,
-                    "windowsVirtualKeyCode": m.vk,
-                    "modifiers": held,
-                }),
-            )
-            .await?;
-        }
-        Ok(())
+        Self::mods_up(c, &combo.mods).await
     }
 
     /// Whether the browser runs on macOS, where headless Chrome does not act
@@ -5023,7 +5397,7 @@ impl BrowserBackend for CdpBackend {
                         );
                         let _ = Self::eval_value_in(c, &kick, iso).await;
                     }
-                    real_move = Self::glide_mouse(c, from, to, glide_ms).await;
+                    real_move = Self::glide_mouse(c, from, to, glide_ms, 0).await;
                     if real_move {
                         self.cursor_pos
                             .lock()
@@ -5394,20 +5768,13 @@ impl BrowserBackend for CdpBackend {
         p: PointerArgs<'_>,
         opts: ActOpts,
     ) -> Result<Value, BrowserError> {
-        use crate::input::{check_in_viewport, point_in, scroll_delta, visible_center, Rect};
         if target.starts_with("safari-") {
             return Err(BrowserError::Unsupported(format!(
                 "act '{action}' needs the CDP (Chrome) engine; it sends real pointer input, which the WebKit engine cannot"
             )));
         }
-        let failed = BrowserError::Failed;
         let mut c = self.conn(target).await?;
         Self::emulate_focus(&mut c).await;
-        let showcase_cfg = self
-            .showcase
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
         // A click may start a navigation: mark the document it happens on, as
         // `act_opts` does, so a following `wait navigation` can tell.
         let clicks = matches!(
@@ -5438,227 +5805,21 @@ impl BrowserBackend for CdpBackend {
             scrolling,
         )
         .await?;
-        let num = |v: &Value, k: &str| v.get(k).and_then(Value::as_f64).unwrap_or(0.0);
-        let (vw, vh) = (num(&geom, "vw"), num(&geom, "vh"));
-        let rect = geom.get("rect").map(|r| Rect {
-            left: num(r, "left"),
-            top: num(r, "top"),
-            width: num(r, "width"),
-            height: num(r, "height"),
-        });
-        let mut out = json!({ "ok": true, "action": action, "input": "cdp" });
-        if let (Some(t), Some(m)) = (geom.get("target"), out.as_object_mut()) {
-            m.insert("target".into(), t.clone());
-        }
-        let at_json = |(x, y): (f64, f64)| json!({ "x": x, "y": y });
-        // A point the caller named is answered with what is under it, so a
-        // click that landed on the wrong thing, or on nothing, says so.
-        let coords = p.x.is_some() || p.y.is_some();
-
-        match action {
-            "scroll" => {
-                let at = match (rect, p.x, p.y) {
-                    (Some(r), None, None) => visible_center(r, vw, vh).ok_or_else(|| {
-                        failed(
-                            "the element is outside the viewport; scroll it into view first".into(),
-                        )
-                    })?,
-                    (None, None, None) => (vw / 2.0, vh / 2.0),
-                    _ => point_in(rect, p.x, p.y).map_err(failed)?,
-                };
-                check_in_viewport(at, vw, vh).map_err(failed)?;
-                if let (true, Some(h), Some(m)) =
-                    (coords, Self::hit_at(&mut c, at).await, out.as_object_mut())
-                {
-                    m.insert("hit".into(), h);
-                }
-                let (dx, dy) = scroll_delta(p.value, p.dx, p.dy, (vw, vh)).map_err(failed)?;
-                Self::mouse_event(&mut c, "mouseMoved", at, "none", 0, 0).await?;
-                c.call(
-                    "Input.dispatchMouseEvent",
-                    json!({ "type": "mouseWheel", "x": at.0, "y": at.1, "deltaX": dx, "deltaY": dy }),
-                )
-                .await?;
-                // The wheel scrolls over a few frames: wait for it to stop.
-                let mut now = Self::scroll_positions(&mut c).await;
-                for _ in 0..15 {
-                    tokio::time::sleep(std::time::Duration::from_millis(40)).await;
-                    let next = Self::scroll_positions(&mut c).await;
-                    let still = next == now;
-                    now = next;
-                    if still {
-                        break;
-                    }
-                }
-                let before: Option<Vec<f64>> = geom
-                    .get("scroll")
-                    .and_then(Value::as_array)
-                    .and_then(|a| a.iter().map(Value::as_f64).collect());
-                if let (Some(m), Some(n)) = (out.as_object_mut(), &now) {
-                    m.insert("scroll_at".into(), at_json(at));
-                    m.insert("scroll_x".into(), json!(n[0]));
-                    m.insert("scroll_y".into(), json!(n[1]));
-                    m.insert("scroller_top".into(), json!(n[3]));
-                    m.insert("moved".into(), json!(before.as_ref() != Some(n)));
-                }
-                self.cursor_pos
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .insert(target.to_string(), at);
-            }
-            "hover" | "mouse_move" | "click" | "double_click" | "triple_click" | "right_click"
-            | "mouse_down" | "mouse_up" => {
-                // A button-up with no point lets go where the pointer is.
-                let at = if action == "mouse_up" && rect.is_none() && !coords {
-                    self.cursor_at(target).ok_or_else(|| {
-                        failed("mouse_up needs a point (ref or query, or x and y) when no mouse action has moved the pointer in this tab".into())
-                    })?
-                } else {
-                    point_in(rect, p.x, p.y).map_err(failed)?
-                };
-                check_in_viewport(at, vw, vh).map_err(failed)?;
-                if let (true, Some(h), Some(m)) =
-                    (coords, Self::hit_at(&mut c, at).await, out.as_object_mut())
-                {
-                    m.insert("hit".into(), h);
-                }
-                let held = self.held_button(target);
-                match action {
-                    "hover" | "mouse_move" => {
-                        if let Some(b) = held {
-                            // Moving with a button down is a drag in progress:
-                            // the page gets the steps a person's hand makes.
-                            let from = self.cursor_at(target).unwrap_or(at);
-                            for pt in crate::input::drag_path(from, at, DRAG_STEPS) {
-                                Self::mouse_event(&mut c, "mouseMoved", pt, b.name(), b.mask(), 0)
-                                    .await?;
-                                tokio::time::sleep(std::time::Duration::from_millis(DRAG_STEP_MS))
-                                    .await;
-                            }
-                        } else if !self.pointer_glide(&mut c, target, at, &showcase_cfg).await {
-                            return Err(failed(format!(
-                                "the pointer move to ({:.1}, {:.1}) was not delivered to the page; nothing happened",
-                                at.0, at.1
-                            )));
-                        }
-                    }
-                    "mouse_down" => {
-                        let b = p.button.unwrap_or_default();
-                        if showcase_cfg.enabled {
-                            self.pointer_glide(&mut c, target, at, &showcase_cfg).await;
-                        }
-                        let mask = held.map_or(0, |h| h.mask());
-                        Self::mouse_event(&mut c, "mouseMoved", at, "none", mask, 0).await?;
-                        Self::mouse_event(&mut c, "mousePressed", at, b.name(), b.mask(), 1)
-                            .await?;
-                        self.set_held_button(target, Some(b));
-                        if let Some(m) = out.as_object_mut() {
-                            m.insert("held".into(), json!(b.name()));
-                        }
-                    }
-                    "mouse_up" => {
-                        let b = p.button.or(held).unwrap_or_default();
-                        if held.is_some() {
-                            // Arrive with the button down, then let go.
-                            Self::mouse_event(&mut c, "mouseMoved", at, b.name(), b.mask(), 0)
-                                .await?;
-                        }
-                        Self::mouse_event(&mut c, "mouseReleased", at, b.name(), 0, 1).await?;
-                        self.set_held_button(target, None);
-                        if let Some(m) = out.as_object_mut() {
-                            m.insert("released".into(), json!(b.name()));
-                        }
-                    }
-                    _ => {
-                        if showcase_cfg.enabled {
-                            self.pointer_glide(&mut c, target, at, &showcase_cfg).await;
-                        }
-                        let (button, count) = match action {
-                            "double_click" => (crate::input::Button::Left, 2),
-                            "triple_click" => (crate::input::Button::Left, 3),
-                            "right_click" => (crate::input::Button::Right, 1),
-                            _ => (crate::input::Button::Left, 1),
-                        };
-                        Self::cdp_clicks(&mut c, at, button, count, opts.hold_ms).await?;
-                        if let (true, Some(m)) = (opts.hold_ms > 0, out.as_object_mut()) {
-                            m.insert("held_ms".into(), json!(opts.hold_ms));
-                        }
-                    }
-                }
-                self.cursor_pos
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .insert(target.to_string(), at);
-                if let Some(m) = out.as_object_mut() {
-                    let key = if action.starts_with("mouse_") {
-                        "at"
-                    } else {
-                        "click_at"
-                    };
-                    m.insert(key.into(), at_json(at));
-                }
-            }
-            "drag" => {
-                let from = point_in(rect, p.x, p.y).map_err(|_| {
-                    failed("drag needs a source: ref or query, or x and y (viewport CSS px)".into())
-                })?;
-                check_in_viewport(from, vw, vh).map_err(failed)?;
-                if let (true, Some(h), Some(m)) = (
-                    coords,
-                    Self::hit_at(&mut c, from).await,
-                    out.as_object_mut(),
-                ) {
-                    m.insert("hit".into(), h);
-                }
-                let to = if let Some(dest) = p.to {
-                    // The destination must already be on screen: scrolling to
-                    // it would move the source.
-                    let g = Self::pointer_geometry(&mut c, Some(dest), ScrollMode::None, false)
-                        .await
-                        .map_err(|e| match e {
-                            BrowserError::NotFound(m) => {
-                                BrowserError::NotFound(format!("drag destination: {m}"))
-                            }
-                            other => other,
-                        })?;
-                    let r = g.get("rect").map(|r| Rect {
-                        left: num(r, "left"),
-                        top: num(r, "top"),
-                        width: num(r, "width"),
-                        height: num(r, "height"),
-                    });
-                    point_in(r, p.to_x, p.to_y).map_err(failed)?
-                } else if p.to_x.is_some() || p.to_y.is_some() {
-                    (p.to_x.unwrap_or(from.0), p.to_y.unwrap_or(from.1))
-                } else if p.dx.is_some() || p.dy.is_some() {
-                    (from.0 + p.dx.unwrap_or(0.0), from.1 + p.dy.unwrap_or(0.0))
-                } else {
-                    return Err(failed(
-                        "drag needs a destination: to_ref or to_query, to_x and to_y (viewport CSS px), or dx and dy".into(),
-                    ));
-                };
-                check_in_viewport(to, vw, vh)
-                    .map_err(|m| failed(format!("drag destination: {m}")))?;
-                if showcase_cfg.enabled {
-                    self.pointer_glide(&mut c, target, from, &showcase_cfg)
-                        .await;
-                }
-                let html5 = Self::drag_pointer(&mut c, from, to).await?;
-                self.cursor_pos
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .insert(target.to_string(), to);
-                if let Some(m) = out.as_object_mut() {
-                    m.insert("from".into(), at_json(from));
-                    m.insert("to".into(), at_json(to));
-                    m.insert("html5_drag".into(), json!(html5));
-                }
-            }
-            other => {
-                return Err(BrowserError::Unsupported(format!(
-                    "'{other}' is not a pointer action"
-                )))
-            }
+        // The modifier keys go down before the pointer moves and come up after
+        // it, whatever happened in between: a page that watches the keys
+        // themselves (a canvas tool's shift-to-constrain) sees them held, and
+        // every pointer event carries them as well.
+        let mods = crate::input::modifiers_of(p.modifiers);
+        Self::mods_down(&mut c, &mods).await?;
+        let run = self
+            .pointer_sequence(&mut c, target, action, &p, opts, &geom)
+            .await;
+        let released = Self::mods_up(&mut c, &mods).await;
+        let mut out = run?;
+        released?;
+        if let (false, Some(m)) = (mods.is_empty(), out.as_object_mut()) {
+            let names: Vec<&str> = mods.iter().map(|m| m.key).collect();
+            m.insert("modifiers".into(), json!(names));
         }
         if let Some(token) = &nav_token {
             self.set_nav_pending(target, token.clone(), false);
