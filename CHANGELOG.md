@@ -6,6 +6,25 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **Modifier keys on `browser_act` pointer actions.** `modifiers: ["shift" | "ctrl" | "alt" | "meta"]` holds
+  those keys through a click, double or right click, hover, mouse_down/move/up, drag or scroll: every mouse event
+  carries the CDP modifier bits (`shiftKey`, `ctrlKey`... in the page) and the keys themselves go down before the
+  pointer sequence and up after it, so a tool that listens for the Shift key sees it held. Before this an agent
+  could not shift-click to extend a selection, shift-drag to constrain a shape or ctrl+wheel to zoom a canvas;
+  the result reports `modifiers`. Each entry of a `steps` batch may carry its own. Chrome only.
+- **Drag control for brush strokes and freehand shapes.** `drag` takes `moves` (2 to 200, default 12),
+  `duration_ms` (how long they take in all, at most 10000; 15 ms a step by default), `button` (left, middle or
+  right) and `path`, up to 200 waypoints `{x, y}` in the frame of `to_x`/`to_y` (offsets inside the
+  `to_ref`/`to_query` element when one is given, else viewport px) that the drag passes through in order before
+  releasing at the last, with the moves spread over the segments by length and at least one landing on every
+  waypoint. `dx`/`dy`, `to_x`/`to_y` and `to_ref`/`to_query` work as before. The result says `moves`,
+  `duration_ms` and, with a path, `waypoints`. A CVAT-style lasso or brush stroke was a straight line before.
+- **`docs/fixtures/whiteboard.html`:** a dependency-free drawing page (a 2x CSS-scaled bordered canvas that
+  records pointer events, strokes and polygons, an SVG rect with a draggable vertex, wheel and modifier-key
+  recording) with live tests in `crates/mcp-browser/tests/whiteboard_live.rs`.
+
 ### Changed
 
 - **Audit key generation uses `rand_core::OsRng` directly.** The audit log signing key was the only thing in
@@ -13,6 +32,16 @@ All notable changes to this project are documented here. The format follows
   `ed25519-dalek` is built on and already in the tree, so `rand`, `rand_chacha` and `ppv-lite86` leave it:
   fewer crates, and one version of `rand_core` whatever `rand` does next. Keys come from the same source as
   before.
+
+### Fixed
+
+- **Canvas coordinates on `browser_act` are bitmap pixels.** The docs said a canvas target's `x` and `y` were
+  its pixel coordinates, but they were added to the bounding box as CSS px, so on a canvas that is CSS-scaled
+  or has a border the click landed on the wrong pixel (a 400-wide canvas styled 800px wide was clicked at
+  bitmap (50, 25) for x 100, y 50). They are now mapped through the content box by `clientWidth / width`,
+  as published canvas regions already were, and a region's offsets count from its own corner in bitmap pixels.
+  `click_at`, `at`, `from`, `to` and `scroll_at` add `pixel` (the bitmap pixel) on a canvas, and `hit` names
+  the pixel under any point that lands on one.
 
 ## [0.2.1] - 2026-10-10
 

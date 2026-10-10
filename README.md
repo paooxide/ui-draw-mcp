@@ -206,7 +206,10 @@ has no network interception, dialog policy, key presses, device emulation, recor
 returns `UNSUPPORTED`). `browser_capture` arms only the page that is open, not later navigations. Firefox speaks a
 different protocol and is not supported.
 
-- `browser_act` acts on a `ref` or, in one call, a `by`+`query` selector (no separate `browser_query`).
+- `browser_act` acts on a `ref` or, in one call, a `by`+`query` selector (no separate `browser_query`). Its
+  pointer actions are real input with `modifiers` (shift, ctrl, alt, meta) held through them, a `drag` takes
+  `moves`, `duration_ms`, `button` and a `path` of waypoints for brush strokes, and a canvas is addressed in its
+  bitmap pixels, so annotation tools (boxes, polygons, vertex drags, strokes) can be driven.
 - `browser_capture` installs a page hook (persists across navigations) that records fetch/XHR with
   request and response bodies, plus console errors and uncaught exceptions. Bodies can hold secrets, so
   it is Dangerous-tier and off unless enabled.
