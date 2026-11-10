@@ -64,7 +64,13 @@ ones.
    safe) or `hid` (synthetic input, moved the real cursor or needs the app in front).
 4. Verify in the same call with `expect` (`text`, `gone`, `window`, `focused`) instead of a separate
    observation. Without `expect`, call `wait_for` before observing: input is asynchronous, and observing
-   straight after acting reads the previous state.
+   straight after acting reads the previous state. An action's result also carries `effects` when it
+   saw something change (a sheet or dialog opened, a window appeared or was renamed, focus or the front
+   app moved, a pressed control's value changed): read it before taking another `get_ui_tree`. No
+   `effects` means nothing was seen to change, not that nothing did.
+   Several actions that need no look in between (fill these fields, then press Save) go in one
+   `input_steps` call; it stops at the first failure, every step is checked and logged as if called alone,
+   and a step that opens a dialog belongs last, since the next step's `name` would be resolved too early.
 5. Use `keyboard_type`, `keyboard_shortcut` and coordinate `mouse_action` only when there is no
    semantic route. They go to the frontmost window, so confirm focus first. For a drag, `drag_drop` is one
    call; `mouse_action` `down`, `move`, `up` composes one with pauses or a second button. `scroll` with

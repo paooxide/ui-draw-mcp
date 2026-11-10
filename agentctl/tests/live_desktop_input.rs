@@ -929,3 +929,122 @@ async fn under_never_the_accessibility_tools_work_without_taking_the_foreground(
     );
     let _ = setup.call("close_app", json!({ "app": APP })).await;
 }
+
+/// Several actions in one call, against a real document: the steps run in
+/// order through the same gate as single calls, each reports what it did, and
+/// the document shows the result. A step that fails ends the batch and the
+/// ones after it leave the document alone.
+#[tokio::test(flavor = "multi_thread")]
+async fn textedit_input_steps_edit_a_scratch_document_in_one_call() {
+    if !ready() {
+        return;
+    }
+    let c = client("live-input-steps");
+    c.initialize().await;
+    let Some(reff) = scratch_document(&c, "").await else {
+        return;
+    };
+    // The keystroke step goes to whatever is frontmost, so check it is TextEdit
+    // now, as every guarded chord in this file does.
+    if !focused_is_textedit() {
+        eprintln!("skipping: focus moved off {APP}");
+        let _ = c.call("close_app", json!({ "app": APP })).await;
+        return;
+    }
+    let env = c
+        .call(
+            "input_steps",
+            json!({ "steps": [
+                { "tool": "set_value", "args": { "ref": &reff, "text": "hello batch" } },
+                { "tool": "select_text", "args": { "ref": &reff, "text": "batch" } },
+                { "tool": "keyboard_type", "args": { "text": "world", "effects": false } }
+            ]}),
+        )
+        .await;
+    assert!(env.ok, "{env:?}");
+    let data = env.data.unwrap();
+    assert_eq!(data["ran"], json!(3), "{data}");
+    let tools: Vec<_> = data["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["tool"].as_str().unwrap_or_default().to_string())
+        .collect();
+    assert_eq!(tools, ["set_value", "select_text", "keyboard_type"]);
+    let (done, text) = document_shows(&c, |t| t == "hello world").await;
+    assert!(
+        done,
+        "the batch must have left the document as hello world: {text:?}"
+    );
+
+    // The second step cannot find its element: the batch stops there, says
+    // which step it was, and the third step never types.
+    let env = c
+        .call(
+            "input_steps",
+            json!({ "steps": [
+                { "tool": "set_value", "args": { "ref": &reff, "text": "first" } },
+                { "tool": "ui_action", "args": { "ref": "@e99999", "action": "click" } },
+                { "tool": "set_value", "args": { "ref": &reff, "text": "never" } }
+            ]}),
+        )
+        .await;
+    assert!(!env.ok);
+    let data = env.data.unwrap();
+    assert_eq!(data["failed_at"], json!(1), "{data}");
+    let (stopped, text) = document_shows(&c, |t| t == "first").await;
+    assert!(stopped, "step 2 must not have run: {text:?}");
+    let _ = c.call("close_app", json!({ "app": APP })).await;
+}
+
+/// `effects` has to say what the app really did. Cmd+S on a new document
+/// slides a Save sheet off the window; Escape takes it away again. The
+/// answer comes with the call that caused it, with no second look at the tree.
+#[tokio::test(flavor = "multi_thread")]
+async fn effects_report_the_save_sheet_a_shortcut_opens_and_closes() {
+    if !ready() {
+        return;
+    }
+    let c = client("live-effects-sheet");
+    c.initialize().await;
+    c.ok("launch", json!({ "app": APP })).await;
+    if !settle_on_textedit(&c).await || !guarded_key(&c, "cmd+n").await {
+        return;
+    }
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    // Look once so the session is aimed at TextEdit before the action.
+    c.ok("get_ui_tree", json!({ "app": APP })).await;
+    if !focused_is_textedit() {
+        return;
+    }
+    let opened = c.ok("keyboard_shortcut", json!({ "combo": "cmd+s" })).await;
+    let sheet = &opened["effects"]["overlay"];
+    if sheet["kind"] != json!("sheet") {
+        eprintln!("skipping: no sheet was reported (the sheet may take longer than the settle wait here): {opened}");
+        cancel_and_close(&c).await;
+        return;
+    }
+    // The question and its choices come with it: nothing else to ask for.
+    assert!(
+        sheet["buttons"]
+            .as_array()
+            .is_some_and(|b| b.iter().any(|t| t == "Cancel")),
+        "{sheet}"
+    );
+    if !focused_is_textedit() {
+        return;
+    }
+    let closed = c
+        .ok("keyboard_shortcut", json!({ "combo": "Escape" }))
+        .await;
+    assert_eq!(
+        closed["effects"]["overlay_closed"],
+        json!("sheet"),
+        "{closed}"
+    );
+    // Nothing changed, nothing said: moving the caret in a plain document
+    // carries no effects.
+    let quiet = c.ok("keyboard_shortcut", json!({ "combo": "Right" })).await;
+    assert!(quiet.get("effects").is_none(), "{quiet}");
+    let _ = c.call("close_app", json!({ "app": APP })).await;
+}

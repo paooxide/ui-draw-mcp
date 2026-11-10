@@ -45,6 +45,8 @@ mod pointer;
 #[cfg(target_os = "linux")]
 mod portal;
 #[cfg(target_os = "linux")]
+mod probe;
+#[cfg(target_os = "linux")]
 mod roles;
 #[cfg(target_os = "linux")]
 mod vision;

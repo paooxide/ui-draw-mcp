@@ -166,6 +166,56 @@ const EXPECTING: &[&str] = &[
     "select_text",
 ];
 
+/// Tools that report `effects`: those that can change what is on screen. A
+/// scroll, hover or drag moves the view or the pointer and is left out; the
+/// read tools change nothing.
+const EFFECTING: &[&str] = &[
+    "ui_action",
+    "set_value",
+    "ui_fill_form",
+    "keyboard_type",
+    "keyboard_shortcut",
+    "mouse_action",
+    "select_text",
+];
+
+/// The tier `input_steps` is admitted at. A step above it is refused.
+const BATCH_TIER: Tier = Tier::Standard;
+
+/// What the docs say about `input_steps` and `effects`, kept off the wire.
+const BATCH_DETAILS: &str = "`steps` is a list of `{tool, args}`, at most 20. The tools that can run in a batch are ui_action, set_value, \
+    select_text, ui_fill_form, keyboard_type, keyboard_shortcut, mouse_action, scroll, hover, drag_drop and clipboard_write; \
+    anything else, and a step that is not `{tool, args}`, is an INVALID_ARGS error naming the step, before any step runs.\n\n\
+    Each step goes through the same gate as a call made on its own: the policy tier, the role's allowed and denied tools, \
+    consent, the hard invariants, the kill switch, the denial budget and the audit log (every step is its own entry, and a \
+    step flagged `secret` is redacted in it). So a batch can do nothing that the same calls made one at a time could not, \
+    and a step the role or `foreground = \"never\"` refuses ends the batch. Under `never` the whole batch is checked first, \
+    so one refused step means no step ran. A synthetic personal-data token cannot be passed in a batch; type it with its \
+    own call.\n\n\
+    Steps run in order and the first failure stops the batch; the steps after it do not run. The result is {ran, total, \
+    failed_at (the 0-based step that failed, absent when all succeeded), elapsed_ms, steps: [{i, tool, ok, ...that step's \
+    result, error}]}. The batch has 30 seconds: a step still running then is cancelled and the rest are not run. The \
+    kill switch, a human taking the pointer and a client cancel are checked between steps. A key held with \
+    keyboard_shortcut down stays held across the batch, and a step that fails releases held keys as it would alone. \
+    A step that names an element by `name` resolves it against the snapshot at that moment, so an earlier step that \
+    changes the screen can change what the next one finds: use `ref`s from the same get_ui_tree for a run of \
+    steps on one screen, and put a step that opens a dialog last in the batch.";
+
+/// The `effects` an action reports. Appended to the descriptors of the tools that report them.
+const EFFECTS_DETAILS: &str = "`effects` is added to the result of an action when something it changed was seen: `app` (the frontmost \
+    application changed), `focus` ({role, name} of the newly focused element), `appeared` and `disappeared` (titles of \
+    the target application's windows, at most 5 each), `retitled` ({from, to} when one window was renamed), `overlay` \
+    ({kind: sheet|dialog|alert|popover|menu, title, text, buttons} of one that opened) and `overlay_closed`, and `value` \
+    or `checked` of the element a `ui_action` pressed by `ref`. It is read from a small fixed set of facts before and \
+    after the action, about 120 ms apart, not from a new snapshot, and without raising a window or moving focus, so it \
+    works under `foreground = \"never\"`. A fact the platform cannot read is left out, never guessed. No `effects` means \
+    nothing was seen to change among those facts, which is not proof that nothing did: an app may react later, and a \
+    change inside a window's own contents is not among them. Linux reads the window list, dialogs and the frontmost \
+    application only. `effects: false` skips the reads and the wait, and `expect` replaces it with its own delta.";
+
+const EFFECTS_SEE_ALSO: &str = "The result carries `effects` when the action changed something that was seen (a sheet or window opened, \
+    focus moved, ...); see ui_action for what it holds and what its absence means. `effects: false` skips it.";
+
 pub struct InputModule {
     backend: Arc<dyn InputBackend>,
     arena: Arc<Mutex<SnapshotArena>>,
@@ -188,6 +238,15 @@ pub struct InputModule {
     /// refuses every later call, `up` included, so a held key could never be
     /// released through the tools once it trips; this is how it still is.
     halt: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+    /// Reads the facts `effects` compares. `None` where nothing can, in which
+    /// case no result carries `effects`.
+    probe: Option<Arc<dyn crate::effects::UiProbe>>,
+    /// The way back into the server's gate for the steps of `input_steps`.
+    /// `None` refuses the batch: running a step any other way would skip the
+    /// checks a call on its own gets.
+    relay: Option<Arc<crate::steps::StepRelay>>,
+    /// Wall time a batch may spend; [`crate::steps::MAX_BATCH_MS`] outside tests.
+    batch_ms: u64,
 }
 
 /// What the module holds down.
@@ -246,7 +305,30 @@ impl InputModule {
                 watching: false,
             })),
             halt: None,
+            probe: None,
+            relay: None,
+            batch_ms: crate::steps::MAX_BATCH_MS,
         }
+    }
+
+    /// Shorten the batch's time, so a test need not wait 30 s.
+    #[cfg(test)]
+    fn with_batch_limit(mut self, ms: u64) -> Self {
+        self.batch_ms = ms;
+        self
+    }
+
+    /// Attach the reader of the facts behind `effects` (composition root only).
+    pub fn with_probe(mut self, p: Arc<dyn crate::effects::UiProbe>) -> Self {
+        self.probe = Some(p);
+        self
+    }
+
+    /// Attach the handle that carries `input_steps` back through the server's
+    /// gate (composition root only).
+    pub fn with_steps(mut self, r: Arc<crate::steps::StepRelay>) -> Self {
+        self.relay = Some(r);
+        self
     }
 
     /// Say how to tell the kill switch is engaged (composition root only), so
@@ -855,6 +937,202 @@ impl InputModule {
                 "the field may be read-only or may validate input; try keyboard_type",
             )
         })
+    }
+
+    // ---- effects ------------------------------------------------------------
+
+    /// The facts to compare against, read before the action.
+    async fn facts_before(&self, tool: &str, args: &Value) -> EffectState {
+        let facts = match &self.probe {
+            Some(p) => p.probe(None).await,
+            None => crate::effects::UiFacts::default(),
+        };
+        let element = match self.effect_element(tool, args) {
+            Some((node, secure)) => self
+                .backend
+                .read_element(node)
+                .await
+                .ok()
+                .map(|reading| (node, crate::effects::ElementFacts { reading, secure })),
+            None => None,
+        };
+        EffectState { facts, element }
+    }
+
+    /// The element a `ui_action` pressed by `ref`, for the actions that do not
+    /// read their target back themselves. A lookup by `name` is left out: the
+    /// element it means is only known once the action has run.
+    fn effect_element(&self, tool: &str, args: &Value) -> Option<(u64, bool)> {
+        if tool != "ui_action" {
+            return None;
+        }
+        let action = SemanticAction::parse(&snake(args.get("action")?.as_str()?))?;
+        let reads_itself = matches!(
+            action,
+            SemanticAction::Check
+                | SemanticAction::Uncheck
+                | SemanticAction::Toggle
+                | SemanticAction::Increment
+                | SemanticAction::Decrement
+                | SemanticAction::Select
+        );
+        if reads_itself {
+            return None;
+        }
+        let reff = parse_ref(args.get("ref").filter(|v| !v.is_null())?)?;
+        let arena = self.arena.lock().unwrap_or_else(|e| e.into_inner());
+        let info = arena.resolve_latest(&reff).ok()?;
+        Some((info.node_id?, info.secure))
+    }
+
+    /// Wait for the app to react, read the facts again and add what differs
+    /// to the result as `effects`. Adds nothing when nothing differs.
+    async fn attach_effects(&self, env: &mut Envelope, before: EffectState) {
+        let Some(probe) = &self.probe else { return };
+        tokio::time::sleep(std::time::Duration::from_millis(crate::effects::SETTLE_MS)).await;
+        let known = before.facts.overlays.clone().unwrap_or_default();
+        let after = probe.probe(Some(&known)).await;
+        let element_after = match &before.element {
+            Some((node, was)) => self.backend.read_element(*node).await.ok().map(|reading| {
+                crate::effects::ElementFacts {
+                    reading,
+                    secure: was.secure,
+                }
+            }),
+            None => None,
+        };
+        let element = match (&before.element, &element_after) {
+            (Some((_, b)), Some(a)) => Some((b, a)),
+            _ => None,
+        };
+        let Some(fx) = crate::effects::diff_facts(&before.facts, &after, element) else {
+            return;
+        };
+        if let Some(Value::Object(d)) = env.data.as_mut() {
+            d.insert("effects".into(), fx);
+        }
+    }
+
+    // ---- input_steps --------------------------------------------------------
+
+    /// Run a batch. The steps are validated first, all of them, and then each
+    /// goes back through the server's gate (see [`crate::steps`]); nothing here
+    /// runs a step directly.
+    async fn input_steps(&self, args: &Value, ctx: &CallCtx) -> Envelope {
+        use crate::steps::parse_steps;
+        let tool = "input_steps";
+        let own = self.descriptors();
+        let steps = match parse_steps(
+            args,
+            &|t| own.iter().find(|d| d.name == t).map(|d| d.tier),
+            BATCH_TIER,
+        ) {
+            Ok(s) => s,
+            Err(m) => return Envelope::fail(tool, ErrorCode::InvalidArgs, m),
+        };
+        let Some(dispatch) = self.relay.as_ref().and_then(|r| r.get()) else {
+            return Envelope::fail_with(
+                tool,
+                ErrorCode::UnsupportedOs,
+                "input_steps is not connected to this server's gate, so it will not run steps",
+                "call the tools one at a time",
+            );
+        };
+        let since = self.backend.takeover_generation();
+        let started = std::time::Instant::now();
+        let deadline =
+            tokio::time::Instant::now() + std::time::Duration::from_millis(self.batch_ms);
+        let mut rows: Vec<Value> = Vec::with_capacity(steps.len());
+        let mut ran = 0usize;
+        let mut failed: Option<(usize, ErrorCode, String, Option<String>)> = None;
+
+        for (i, step) in steps.iter().enumerate() {
+            // Between steps the batch asks, before the gate does, whether it
+            // should go on at all.
+            let halted = self.halt.as_ref().is_some_and(|h| h());
+            let why = if halted {
+                Some((ErrorCode::Timeout, "the kill switch is engaged"))
+            } else if self.backend.takeover_generation() != since {
+                Some((ErrorCode::Timeout, "a human took over the pointer"))
+            } else if ctx.cancel.is_cancelled() {
+                Some((ErrorCode::Timeout, "the call was cancelled"))
+            } else if tokio::time::Instant::now() >= deadline {
+                Some((
+                    ErrorCode::Timeout,
+                    "the batch ran out of time before this step",
+                ))
+            } else {
+                None
+            };
+            if let Some((code, why)) = why {
+                rows.push(json!({
+                    "i": i, "tool": step.tool, "ok": false, "skipped": true,
+                    "error": { "code": code, "message": why },
+                }));
+                failed = Some((
+                    i,
+                    code,
+                    format!("stopped before step {i} ({}): {why}", step.tool),
+                    Some(format!("steps from {i} on did not run; send them again when it is safe to continue")),
+                ));
+                break;
+            }
+
+            let env = watch(&*dispatch, step, ctx, deadline).await;
+            ran += 1;
+            let mut row = serde_json::Map::new();
+            row.insert("i".into(), json!(i));
+            row.insert("tool".into(), json!(step.tool));
+            if let Some(Value::Object(d)) = &env.data {
+                row.extend(d.clone());
+            }
+            row.insert("ok".into(), json!(env.ok));
+            if let Some(e) = &env.error {
+                row.insert(
+                    "error".into(),
+                    json!({ "code": e.code, "message": e.message }),
+                );
+            }
+            rows.push(Value::Object(row));
+            if !env.ok {
+                let (code, msg, hint) = env
+                    .error
+                    .map_or((ErrorCode::ActionFailed, String::new(), None), |e| {
+                        (e.code, e.message, e.suggestion)
+                    });
+                failed = Some((
+                    i,
+                    code,
+                    format!("step {i} ({}) failed: {msg}", step.tool),
+                    hint,
+                ));
+                break;
+            }
+        }
+
+        let mut data = serde_json::Map::new();
+        data.insert("ran".into(), json!(ran));
+        data.insert("total".into(), json!(steps.len()));
+        if let Some((i, ..)) = &failed {
+            data.insert("failed_at".into(), json!(i));
+        }
+        data.insert(
+            "elapsed_ms".into(),
+            json!(started.elapsed().as_millis() as u64),
+        );
+        data.insert("steps".into(), Value::Array(rows));
+        match failed {
+            None => Envelope::ok(tool, Value::Object(data)),
+            Some((i, code, msg, hint)) => Envelope::fail_with_data(
+                tool,
+                code,
+                msg,
+                hint.unwrap_or_else(|| {
+                    format!("steps before {i} ran; fix step {i} and send it and the rest again")
+                }),
+                Value::Object(data),
+            ),
+        }
     }
 
     // ---- tools --------------------------------------------------------------
@@ -2224,7 +2502,7 @@ fn expect_schema() -> serde_json::Value {
 #[async_trait]
 impl ToolModule for InputModule {
     fn descriptors(&self) -> Vec<ToolDescriptor> {
-        vec![
+        let mut tools = vec![
             ToolDescriptor::new(
                 "ui_action",
                 Category::Input,
@@ -2499,7 +2777,47 @@ impl ToolModule for InputModule {
                     "speed":{"type":"string","enum":["cinematic","demo","snappy","instant","off"],"description":"speed preset (cinematic: 350ms, demo: 200ms, snappy: 100ms, instant: 0ms)"},
                     "duration_ms":{"type":"integer","description":"custom duration in milliseconds, 0-2000"}}}),
             ).idempotent(true),
-        ]
+            ToolDescriptor::new(
+                "input_steps",
+                Category::Input,
+                BATCH_TIER,
+                "Run up to 20 input actions in one call, in order, stopping at the first that fails. Each step is {tool, args}: the tool's name and the arguments you would give it alone. Every step is checked, allowed and logged exactly as if you had called it yourself.",
+                json!({"type":"object","properties":{
+                    "steps":{"type":"array","description":"actions to run in order (max 20)","items":{"type":"object","properties":{
+                        "tool":{"type":"string","enum":crate::steps::BATCHABLE},
+                        "args":{"type":"object","description":"the tool's own arguments"}
+                    },"required":["tool"]}}
+                },"required":["steps"]}),
+            ).details(BATCH_DETAILS),
+        ];
+        // The same optional switch on every tool that reports `effects`, added
+        // here so the wording cannot drift between them.
+        for t in tools
+            .iter_mut()
+            .filter(|t| EFFECTING.contains(&t.name.as_str()))
+        {
+            if let Some(props) = t
+                .input_schema
+                .get_mut("properties")
+                .and_then(Value::as_object_mut)
+            {
+                props.insert(
+                    "effects".into(),
+                    json!({"type":"boolean","description":"false: do not report what changed (saves a short wait)"}),
+                );
+            }
+            // The full account once, on the tool an agent reaches for first.
+            let fx = if t.name == "ui_action" {
+                EFFECTS_DETAILS
+            } else {
+                EFFECTS_SEE_ALSO
+            };
+            t.details = Some(match t.details.take() {
+                Some(d) => format!("{d}\n\n{fx}"),
+                None => fx.to_string(),
+            });
+        }
+        tools
     }
 
     async fn call(&self, name: &str, args: Value, ctx: &CallCtx) -> Envelope {
@@ -2542,8 +2860,23 @@ impl ToolModule for InputModule {
             (Some(_), Some(v)) => v.before(),
             _ => None,
         };
+        // `effects` is validated with the rest of the arguments, so a typo is
+        // refused before the action instead of discovered after it. An `expect`
+        // brings its own delta, which makes the second report redundant.
+        let reporting = if EFFECTING.contains(&name) {
+            match crate::effects::wanted(&args) {
+                Ok(on) => on && spec.is_none() && effects_apply(name, &args),
+                Err(m) => return Envelope::fail(name, ErrorCode::InvalidArgs, m),
+            }
+        } else {
+            false
+        };
+        let seen_before = match (&self.probe, reporting) {
+            (Some(_), true) => Some(self.facts_before(name, &args).await),
+            _ => None,
+        };
 
-        let env = match name {
+        let mut env = match name {
             "ui_action" => self.ui_action(&args).await,
             "set_value" => self.set_value(&args).await,
             "select_text" => self.select_text(&args).await,
@@ -2558,8 +2891,12 @@ impl ToolModule for InputModule {
             "clipboard_read" => self.clipboard_read(&args).await,
             "clipboard_write" => self.clipboard_write(&args).await,
             "input_showcase" => self.input_showcase(&args).await,
+            "input_steps" => self.input_steps(&args, ctx).await,
             other => Envelope::fail(other, ErrorCode::InvalidArgs, "unknown tool"),
         };
+        if let (Some(before), true) = (seen_before, env.ok) {
+            self.attach_effects(&mut env, before).await;
+        }
 
         let mut env = match (spec, self.verifier.as_ref()) {
             (Some(spec), Some(v)) => {
@@ -2568,9 +2905,12 @@ impl ToolModule for InputModule {
             }
             _ => env,
         };
-        // `down` and `up` settle their own holds.
-        let manages_holds = name == "keyboard_shortcut"
-            && !matches!(shortcut_action(&args), Ok(HoldAction::Press) | Err(_));
+        // `down` and `up` settle their own holds, and so does each step of a
+        // batch: one that reached the module and failed has released them, and
+        // one the gate refused never touched them, as when called alone.
+        let manages_holds = name == "input_steps"
+            || (name == "keyboard_shortcut"
+                && !matches!(shortcut_action(&args), Ok(HoldAction::Press) | Err(_)));
         if !env.ok && !manages_holds {
             self.release_after_failure(&mut env).await;
         }
@@ -2581,6 +2921,10 @@ impl ToolModule for InputModule {
     /// gone. Synchronous because it runs on shutdown paths, so the release is
     /// handed to the runtime and waited for a bounded time.
     fn shutdown(&self) {
+        // The dispatcher holds a server that holds this module.
+        if let Some(r) = &self.relay {
+            r.release();
+        }
         let keys = lock_ledger(&self.ledger).keys.take_all();
         if keys.is_empty() {
             return;
@@ -2606,6 +2950,56 @@ impl ToolModule for InputModule {
                     rt.block_on(release);
                 }
             }
+        }
+    }
+}
+
+/// What was read before an action, to compare with after it.
+struct EffectState {
+    facts: crate::effects::UiFacts,
+    element: Option<(u64, crate::effects::ElementFacts)>,
+}
+
+/// Whether this call is the kind that reports `effects`: a shortcut that only
+/// presses (holding or releasing a key changes nothing on its own) and a
+/// pointer action that clicks (a move, a press or a release alone does not).
+fn effects_apply(tool: &str, args: &Value) -> bool {
+    match tool {
+        "keyboard_shortcut" => matches!(shortcut_action(args), Ok(HoldAction::Press)),
+        "mouse_action" => matches!(
+            args.get("type")
+                .and_then(Value::as_str)
+                .map(snake)
+                .as_deref(),
+            Some("click" | "double" | "triple" | "right_click")
+        ),
+        _ => true,
+    }
+}
+
+/// Run one step through the gate, watching for a cancel and the batch's time.
+///
+/// The call is not dropped when either happens: the dispatcher is asked to
+/// stop and the step is awaited, so an action is never abandoned half done
+/// (a key left down, a drag left pressed) and what it returns is reported.
+async fn watch(
+    dispatch: &dyn crate::steps::StepDispatch,
+    step: &crate::steps::Step,
+    ctx: &CallCtx,
+    deadline: tokio::time::Instant,
+) -> Envelope {
+    let mut call = dispatch.dispatch(&step.tool, step.args.clone());
+    let mut stopping = false;
+    loop {
+        match tokio::time::timeout(WATCH_EVERY, &mut call).await {
+            Ok(env) => return env,
+            Err(_) if !stopping => {
+                if ctx.cancel.is_cancelled() || tokio::time::Instant::now() >= deadline {
+                    stopping = true;
+                    dispatch.cancel();
+                }
+            }
+            Err(_) => {}
         }
     }
 }
@@ -5256,6 +5650,24 @@ mod tests {
                 Refused,
             ),
             ("input_showcase", json!({"enabled":true}), Refused),
+            // A batch is as refused as its least safe step, and is refused
+            // whole: the set_value before the keystroke must not run.
+            (
+                "input_steps",
+                json!({"steps":[
+                    {"tool":"set_value","args":{"ref":"@e4","text":"x"}},
+                    {"tool":"keyboard_type","args":{"text":"y"}}
+                ]}),
+                Refused,
+            ),
+            (
+                "input_steps",
+                json!({"steps":[
+                    {"tool":"set_value","args":{"ref":"@e4","text":"x"}},
+                    {"tool":"ui_action","args":{"ref":"@e4","action":"click"}}
+                ]}),
+                Runs,
+            ),
         ]
     }
 
@@ -5499,5 +5911,562 @@ mod tests {
                 assert!(r.suggestion().contains("no background-safe equivalent"));
             }
         }
+    }
+
+    // ---- input_steps --------------------------------------------------------
+
+    /// Hands a step to the module the way the server does once its checks have
+    /// passed. It decides nothing, and it is here for the batch's own
+    /// mechanics only (order, stopping, the limits): that a step meets the
+    /// real gate is proven against the real server in
+    /// `agentctl/tests/input_steps.rs`.
+    struct Direct {
+        module: std::sync::OnceLock<Arc<InputModule>>,
+        /// Runs after every step, to stage something that happens mid-batch.
+        after: Box<dyn Fn(usize) + Send + Sync>,
+        steps: std::sync::atomic::AtomicUsize,
+        cancelled: std::sync::atomic::AtomicBool,
+        /// Makes the named tool wait until it is cancelled.
+        hang_on: Option<&'static str>,
+    }
+
+    #[async_trait]
+    impl crate::steps::StepDispatch for Direct {
+        async fn dispatch(&self, tool: &str, args: Value) -> Envelope {
+            if self.hang_on == Some(tool) {
+                while !self.cancelled.load(std::sync::atomic::Ordering::SeqCst) {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+                return Envelope::fail(tool, ErrorCode::Timeout, "cancelled");
+            }
+            let ctx = CallCtx::new("t", mcp_types::CancelToken::new());
+            let env = self.module.get().unwrap().call(tool, args, &ctx).await;
+            let n = self.steps.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            (self.after)(n);
+            env
+        }
+        fn cancel(&self) {
+            self.cancelled
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    fn direct(
+        after: impl Fn(usize) + Send + Sync + 'static,
+        hang_on: Option<&'static str>,
+    ) -> Arc<Direct> {
+        Arc::new(Direct {
+            module: std::sync::OnceLock::new(),
+            after: Box::new(after),
+            steps: Default::default(),
+            cancelled: Default::default(),
+            hang_on,
+        })
+    }
+
+    /// A module whose batches run through `d`.
+    fn batching(
+        d: &Arc<Direct>,
+        tune: impl FnOnce(InputModule) -> InputModule,
+    ) -> (Arc<InputModule>, Arc<MockBackend>) {
+        let (module, backend, _) = test_module();
+        let relay = crate::steps::StepRelay::new();
+        relay.bind(d.clone());
+        let module = Arc::new(tune(module.with_steps(relay)));
+        d.module.set(module.clone()).ok().expect("set once");
+        (module, backend)
+    }
+
+    #[tokio::test]
+    async fn a_batch_runs_its_steps_in_order_and_reports_each() {
+        let d = direct(|_| {}, None);
+        let (module, backend) = batching(&d, |m| m);
+        let env = call(
+            &module,
+            "input_steps",
+            json!({"steps": [
+                {"tool": "set_value", "args": {"ref": "@e1", "text": "alice"}},
+                {"tool": "keyboard_shortcut", "args": {"combo": "cmd+s"}},
+                {"tool": "ui_action", "args": {"ref": "@e4", "action": "click"}}
+            ]}),
+        )
+        .await;
+        assert!(env.ok, "{env:?}");
+        let data = env.data.unwrap();
+        assert_eq!(data["ran"], 3);
+        assert_eq!(data["total"], 3);
+        assert!(data.get("failed_at").is_none());
+        let rows = data["steps"].as_array().unwrap();
+        let tools: Vec<_> = rows.iter().map(|r| r["tool"].as_str().unwrap()).collect();
+        assert_eq!(tools, ["set_value", "keyboard_shortcut", "ui_action"]);
+        assert!(rows.iter().all(|r| r["ok"] == true));
+        assert_eq!(rows[1]["pressed"], "cmd+s");
+        assert_eq!(backend.values.lock().unwrap().len(), 1);
+        assert_eq!(backend.keys.lock().unwrap().as_slice(), ["cmd+s"]);
+        assert_eq!(backend.actions.lock().unwrap().len(), 1);
+    }
+
+    /// The semantics of `browser_act` `steps`: the first failure ends the
+    /// batch, says which step it was, and nothing after it runs.
+    #[tokio::test]
+    async fn the_first_failing_step_ends_the_batch_and_later_steps_never_run() {
+        let d = direct(|_| {}, None);
+        let (module, backend) = batching(&d, |m| m);
+        let env = call(
+            &module,
+            "input_steps",
+            json!({"steps": [
+                {"tool": "set_value", "args": {"ref": "@e1", "text": "alice"}},
+                {"tool": "ui_action", "args": {"ref": "@e999", "action": "click"}},
+                {"tool": "keyboard_shortcut", "args": {"combo": "cmd+s"}}
+            ]}),
+        )
+        .await;
+        assert!(!env.ok);
+        let err = env.error.as_ref().unwrap();
+        assert_eq!(err.code, ErrorCode::NotFound);
+        assert!(
+            err.message.starts_with("step 1 (ui_action) failed"),
+            "{}",
+            err.message
+        );
+        let data = env.data.unwrap();
+        assert_eq!(data["failed_at"], 1);
+        assert_eq!(data["ran"], 2);
+        assert_eq!(data["total"], 3);
+        assert_eq!(data["steps"].as_array().unwrap().len(), 2);
+        assert_eq!(data["steps"][1]["ok"], false);
+        assert_eq!(data["steps"][1]["error"]["code"], "NOT_FOUND");
+        assert!(backend.keys.lock().unwrap().is_empty(), "step 2 ran");
+        assert_eq!(backend.values.lock().unwrap().len(), 1, "step 0 did run");
+    }
+
+    #[tokio::test]
+    async fn a_bad_batch_is_refused_whole_before_any_step_runs() {
+        let d = direct(|_| {}, None);
+        let (module, backend) = batching(&d, |m| m);
+        for (args, want) in [
+            (
+                json!({"steps": [
+                    {"tool": "set_value", "args": {"ref": "@e1", "text": "x"}},
+                    {"tool": "exec", "args": {"command": "ls"}}
+                ]}),
+                "step 1",
+            ),
+            (
+                json!({"steps": [
+                    {"tool": "set_value", "args": {"ref": "@e1", "text": "x"}},
+                    {"tool": "input_steps", "args": {"steps": []}}
+                ]}),
+                "step 1",
+            ),
+            (
+                json!({"steps": [
+                    {"tool": "set_value", "args": {"ref": "@e1", "text": "x"}},
+                    "scroll"
+                ]}),
+                "step 1",
+            ),
+            (
+                json!({"steps": vec![json!({"tool": "scroll"}); 21]}),
+                "1 to 20",
+            ),
+        ] {
+            let env = call(&module, "input_steps", args.clone()).await;
+            let err = env.error.expect("refused");
+            assert_eq!(err.code, ErrorCode::InvalidArgs, "{args}");
+            assert!(err.message.contains(want), "{args}: {}", err.message);
+        }
+        assert!(untouched(&backend), "a refused batch reached the backend");
+    }
+
+    /// With nothing to carry a step back through the gate, a batch does not
+    /// run: executing the step itself would skip the checks.
+    #[tokio::test]
+    async fn a_batch_with_no_way_back_through_the_gate_runs_nothing() {
+        let (module, backend, _) = test_module();
+        let env = call(
+            &module,
+            "input_steps",
+            json!({"steps": [{"tool": "set_value", "args": {"ref": "@e1", "text": "x"}}]}),
+        )
+        .await;
+        assert!(!env.ok);
+        assert!(env.error.unwrap().message.contains("not connected"));
+        assert!(untouched(&backend));
+    }
+
+    #[tokio::test]
+    async fn a_cancel_between_steps_stops_the_batch() {
+        let ctx = CallCtx::new("t", mcp_types::CancelToken::new());
+        let token = ctx.cancel.clone();
+        let d = direct(move |_| token.cancel(), None);
+        let (module, backend) = batching(&d, |m| m);
+        let env = module
+            .call(
+                "input_steps",
+                json!({"steps": [
+                    {"tool": "set_value", "args": {"ref": "@e1", "text": "x"}},
+                    {"tool": "keyboard_shortcut", "args": {"combo": "cmd+s"}}
+                ]}),
+                &ctx,
+            )
+            .await;
+        assert!(!env.ok);
+        let data = env.data.unwrap();
+        assert_eq!(data["ran"], 1);
+        assert_eq!(data["failed_at"], 1);
+        assert_eq!(data["steps"][1]["skipped"], true);
+        assert!(backend.keys.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_kill_switch_engaging_between_steps_stops_the_batch() {
+        let halted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = halted.clone();
+        let d = direct(
+            move |_| flag.store(true, std::sync::atomic::Ordering::SeqCst),
+            None,
+        );
+        let probe = halted.clone();
+        let (module, backend) = batching(&d, move |m| {
+            m.with_halt_probe(Arc::new(move || {
+                probe.load(std::sync::atomic::Ordering::SeqCst)
+            }))
+        });
+        let env = call(
+            &module,
+            "input_steps",
+            json!({"steps": [
+                {"tool": "set_value", "args": {"ref": "@e1", "text": "x"}},
+                {"tool": "keyboard_shortcut", "args": {"combo": "cmd+s"}}
+            ]}),
+        )
+        .await;
+        let err = env.error.as_ref().expect("stopped");
+        assert!(err.message.contains("kill switch"), "{}", err.message);
+        assert_eq!(env.data.unwrap()["ran"], 1);
+        assert!(backend.keys.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_human_taking_the_pointer_between_steps_stops_the_batch() {
+        let slot: Arc<std::sync::OnceLock<Arc<MockBackend>>> = Arc::default();
+        let s2 = slot.clone();
+        let d = direct(
+            move |_| {
+                s2.get()
+                    .unwrap()
+                    .takeovers
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            },
+            None,
+        );
+        let (module, backend) = batching(&d, |m| m);
+        slot.set(backend.clone()).ok();
+        let env = call(
+            &module,
+            "input_steps",
+            json!({"steps": [
+                {"tool": "set_value", "args": {"ref": "@e1", "text": "x"}},
+                {"tool": "keyboard_shortcut", "args": {"combo": "cmd+s"}}
+            ]}),
+        )
+        .await;
+        assert!(env.error.unwrap().message.contains("took over the pointer"));
+        assert!(backend.keys.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_batch_has_a_wall_time_and_a_step_still_running_is_cancelled() {
+        let d = direct(|_| {}, Some("scroll"));
+        let (module, backend) = batching(&d, |m| m.with_batch_limit(150));
+        let started = std::time::Instant::now();
+        let env = call(
+            &module,
+            "input_steps",
+            json!({"steps": [
+                {"tool": "scroll", "args": {"direction": "down"}},
+                {"tool": "keyboard_shortcut", "args": {"combo": "cmd+s"}}
+            ]}),
+        )
+        .await;
+        assert!(!env.ok);
+        // Cancelled by the batch, not left to hang.
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert!(d.cancelled.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(backend.keys.lock().unwrap().is_empty(), "the next step ran");
+        assert_eq!(env.data.unwrap()["failed_at"], 0);
+    }
+
+    /// The rule that a failed input call lets go of held keys holds per step.
+    #[tokio::test]
+    async fn a_failed_step_releases_the_keys_held_before_it() {
+        let d = direct(|_| {}, None);
+        let (module, backend) = batching(&d, |m| m);
+        let env = call(
+            &module,
+            "input_steps",
+            json!({"steps": [
+                {"tool": "keyboard_shortcut", "args": {"combo": "shift", "action": "down"}},
+                {"tool": "ui_action", "args": {"ref": "@e999", "action": "click"}}
+            ]}),
+        )
+        .await;
+        assert!(!env.ok);
+        assert_eq!(
+            events(&backend),
+            ["down:shift", "up:shift"],
+            "the failing step let go of what the first held"
+        );
+    }
+
+    #[test]
+    fn the_batchable_tools_are_all_tools_of_this_module_and_the_rest_are_decided() {
+        let (module, _, _) = test_module();
+        let all: Vec<String> = module.descriptors().into_iter().map(|d| d.name).collect();
+        for t in crate::steps::BATCHABLE {
+            assert!(all.iter().any(|a| a == t), "{t} is not a tool");
+        }
+        // Everything left out is left out on purpose; a new tool has to be
+        // put on one side or the other.
+        let left_out = [
+            "get_selection",
+            "clipboard_read",
+            "input_showcase",
+            "input_steps",
+        ];
+        for a in &all {
+            assert!(
+                crate::steps::BATCHABLE.contains(&a.as_str()) || left_out.contains(&a.as_str()),
+                "{a} is neither batchable nor deliberately left out"
+            );
+        }
+        let batch = module
+            .descriptors()
+            .into_iter()
+            .find(|d| d.name == "input_steps")
+            .unwrap();
+        assert_eq!(batch.tier, Tier::Standard);
+        assert!(
+            module
+                .descriptors()
+                .iter()
+                .filter(|d| crate::steps::BATCHABLE.contains(&d.name.as_str()))
+                .all(|d| d.tier == batch.tier),
+            "a batchable tool above the batch's tier would never run"
+        );
+    }
+
+    // ---- effects ------------------------------------------------------------
+
+    /// Hands out the facts it was given, one reading per call, and notes what
+    /// it was asked. Scripts what the module is *told*; what a real app shows
+    /// is read in `mcp-macos`'s own tests.
+    struct Scripted {
+        readings: std::sync::Mutex<Vec<crate::effects::UiFacts>>,
+        asked: std::sync::Mutex<Vec<Option<Vec<crate::effects::Overlay>>>>,
+    }
+
+    #[async_trait]
+    impl crate::effects::UiProbe for Scripted {
+        async fn probe(
+            &self,
+            describe_new: Option<&[crate::effects::Overlay]>,
+        ) -> crate::effects::UiFacts {
+            self.asked
+                .lock()
+                .unwrap()
+                .push(describe_new.map(<[_]>::to_vec));
+            let mut r = self.readings.lock().unwrap();
+            if r.len() > 1 {
+                r.remove(0)
+            } else {
+                r[0].clone()
+            }
+        }
+    }
+
+    fn scripted(readings: Vec<crate::effects::UiFacts>) -> Arc<Scripted> {
+        Arc::new(Scripted {
+            readings: std::sync::Mutex::new(readings),
+            asked: Default::default(),
+        })
+    }
+
+    fn windows(titles: &[&str]) -> crate::effects::UiFacts {
+        crate::effects::UiFacts {
+            windows: Some(titles.iter().map(|t| t.to_string()).collect()),
+            overlays: Some(Vec::new()),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn an_action_reports_what_changed_and_only_that() {
+        let (module, backend, _) = test_module();
+        let probe = scripted(vec![windows(&["Untitled"]), windows(&["notes.txt"])]);
+        let module = module.with_probe(probe.clone());
+        backend.script(104, vec![shown("same")]);
+        let env = call(
+            &module,
+            "ui_action",
+            json!({"ref": "@e4", "action": "click"}),
+        )
+        .await;
+        assert!(env.ok, "{env:?}");
+        let data = env.data.unwrap();
+        assert_eq!(
+            data["effects"],
+            json!({"retitled": {"from": "Untitled", "to": "notes.txt"}})
+        );
+        // Read twice, and the second reading was told what was already open.
+        let asked = probe.asked.lock().unwrap();
+        assert_eq!(asked.len(), 2);
+        assert_eq!(asked[0], None);
+        assert_eq!(asked[1], Some(Vec::new()));
+    }
+
+    #[tokio::test]
+    async fn an_action_that_changed_nothing_has_no_effects_key() {
+        let (module, _, _) = test_module();
+        let module = module.with_probe(scripted(vec![windows(&["a"])]));
+        let env = call(
+            &module,
+            "ui_action",
+            json!({"ref": "@e4", "action": "click"}),
+        )
+        .await;
+        assert!(env.ok);
+        assert!(env.data.unwrap().get("effects").is_none());
+    }
+
+    #[tokio::test]
+    async fn effects_false_reads_nothing_and_a_typo_is_refused_before_the_action() {
+        let (module, backend, _) = test_module();
+        let probe = scripted(vec![windows(&["a"]), windows(&["b"])]);
+        let module = module.with_probe(probe.clone());
+        let env = call(
+            &module,
+            "ui_action",
+            json!({"ref": "@e4", "action": "click", "effects": false}),
+        )
+        .await;
+        assert!(env.ok);
+        assert!(probe.asked.lock().unwrap().is_empty(), "the probe was read");
+        assert!(env.data.unwrap().get("effects").is_none());
+        let bad = call(
+            &module,
+            "ui_action",
+            json!({"ref": "@e4", "action": "click", "effects": "no"}),
+        )
+        .await;
+        assert_eq!(bad.error.unwrap().code, ErrorCode::InvalidArgs);
+        assert_eq!(
+            backend.actions.lock().unwrap().len(),
+            1,
+            "only the first acted"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_action_pays_for_no_second_reading() {
+        let (module, _, _) = test_module();
+        let probe = scripted(vec![windows(&["a"]), windows(&["b"])]);
+        let module = module.with_probe(probe.clone());
+        let env = call(
+            &module,
+            "ui_action",
+            json!({"ref": "@e999", "action": "click"}),
+        )
+        .await;
+        assert!(!env.ok);
+        assert_eq!(probe.asked.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn only_actions_that_can_change_the_screen_are_read_around() {
+        let (module, _, _) = test_module();
+        let probe = scripted(vec![windows(&["a"]), windows(&["b"])]);
+        let module = module.with_probe(probe.clone());
+        for (tool, args) in [
+            (
+                "keyboard_shortcut",
+                json!({"combo": "shift", "action": "down"}),
+            ),
+            (
+                "keyboard_shortcut",
+                json!({"combo": "shift", "action": "up"}),
+            ),
+            ("mouse_action", json!({"type": "move", "x": 1, "y": 1})),
+            ("scroll", json!({"direction": "down", "x": 1, "y": 1})),
+            ("hover", json!({"x": 1, "y": 1})),
+            ("clipboard_write", json!({"data": "x"})),
+        ] {
+            let env = call(&module, tool, args.clone()).await;
+            assert!(env.ok, "{tool} {args}: {env:?}");
+        }
+        assert!(probe.asked.lock().unwrap().is_empty());
+        assert!(effects_apply(
+            "keyboard_shortcut",
+            &json!({"combo": "cmd+s"})
+        ));
+        assert!(effects_apply(
+            "mouse_action",
+            &json!({"type": "right_click"})
+        ));
+        assert!(!effects_apply("mouse_action", &json!({"type": "down"})));
+        assert!(!effects_apply("mouse_action", &json!({"type": "up"})));
+    }
+
+    #[tokio::test]
+    async fn a_pressed_elements_new_value_is_reported_unless_it_is_a_password() {
+        let (module, backend, _) = test_module();
+        let module = module.with_probe(scripted(vec![windows(&["a"])]));
+        backend.script(101, vec![shown("one"), shown("two")]);
+        let env = call(
+            &module,
+            "ui_action",
+            json!({"ref": "@e1", "action": "click"}),
+        )
+        .await;
+        assert_eq!(env.data.unwrap()["effects"], json!({"value": "two"}));
+        backend.script(102, vec![shown("hunter2"), shown("hunter3")]);
+        let env = call(
+            &module,
+            "ui_action",
+            json!({"ref": "@e2", "action": "click"}),
+        )
+        .await;
+        assert!(env.ok);
+        assert!(env.data.unwrap().get("effects").is_none());
+    }
+
+    /// A batch step reports its own effects like a lone call does.
+    #[tokio::test]
+    async fn each_step_of_a_batch_carries_its_own_effects() {
+        let d = direct(|_| {}, None);
+        let (module, _) = {
+            let (m, b, _) = test_module();
+            let relay = crate::steps::StepRelay::new();
+            relay.bind(d.clone());
+            let m = Arc::new(
+                m.with_steps(relay)
+                    .with_probe(scripted(vec![windows(&["a"]), windows(&["b"])])),
+            );
+            d.module.set(m.clone()).ok().expect("once");
+            (m, b)
+        };
+        let env = call(
+            &module,
+            "input_steps",
+            json!({"steps": [{"tool": "ui_action", "args": {"ref": "@e4", "action": "click"}}]}),
+        )
+        .await;
+        assert!(env.ok, "{env:?}");
+        assert_eq!(
+            env.data.unwrap()["steps"][0]["effects"],
+            json!({"retitled": {"from": "a", "to": "b"}})
+        );
     }
 }

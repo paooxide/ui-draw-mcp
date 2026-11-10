@@ -58,6 +58,8 @@ pub(crate) const TOOLS: &[(&str, Stance)] = &[
     ("clipboard_read", Stance::Background),
     ("clipboard_write", Stance::Background),
     ("input_showcase", Stance::Refused),
+    // A batch is as background-safe as its least safe step: see `by_args`.
+    ("input_steps", Stance::ByArgs),
 ];
 
 const POINTER: &str = "move the real pointer";
@@ -167,6 +169,29 @@ fn by_args(backend: &dyn InputBackend, tool: &str, args: &Value) -> Option<Refus
                 .and_then(Value::as_str)
                 .is_some_and(|o| !o.is_empty());
             action_refusal(backend, tool, &name, action, option)
+        }
+        "input_steps" => {
+            // Every step is judged as it would be alone, before the first one
+            // runs: a refusal is static, so checking up front means a refused
+            // step never lets the ones before it act. A step this module
+            // would not run in a batch is not judged here; the batch's own
+            // validation names it.
+            args.get("steps")
+                .and_then(Value::as_array)?
+                .iter()
+                .enumerate()
+                .find_map(|(i, step)| {
+                    let inner = step.get("tool").and_then(Value::as_str)?;
+                    if !crate::steps::BATCHABLE.contains(&inner) {
+                        return None;
+                    }
+                    let none = Value::Object(Default::default());
+                    let r = tool_refusal(backend, inner, step.get("args").unwrap_or(&none))?;
+                    Some(Refusal {
+                        what: format!("input_steps step {i} ({})", r.what),
+                        ..r
+                    })
+                })
         }
         "ui_fill_form" => {
             let fields = args.get("fields").and_then(Value::as_array)?;

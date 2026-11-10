@@ -8,6 +8,49 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- **`input_steps` runs up to 20 desktop input actions in one call.** An agent filling a dialog spent a model
+  turn on every click and keystroke; `browser_act` `steps` removed that for the browser and the desktop had
+  nothing like it. A step is `{tool, args}`, the tool being `ui_action`, `set_value`, `select_text`,
+  `ui_fill_form`, `keyboard_type`, `keyboard_shortcut`, `mouse_action`, `scroll`, `hover`, `drag_drop` or
+  `clipboard_write`; anything else (`exec`, a browser tool, `input_steps` itself, the two read tools) is an
+  `INVALID_ARGS` error naming the step, and so is a malformed step, before any step runs. Steps run in order
+  and the first failure ends the batch with `failed_at`; the result is `{ran, total, failed_at, elapsed_ms,
+  steps: [{i, tool, ok, ...that step's result, error}]}`. It is not a way around a check: each step is handed
+  back to the server's own `dispatch_call` (through a second `Server` over the same input engine, policy and
+  audit log), so the policy tier, the role's allowed and denied tools, consent, the hard invariants, the
+  kill switch and the denial budget apply to every step as they do to a call made alone, and every step has
+  its own audit entry (a `secret: true` step is redacted there). Under `foreground = "never"` the whole batch
+  is checked first, so one refused step means no step ran. The kill switch, a human taking the pointer and a
+  client cancel are checked between steps; the batch has 30 seconds, and a step still running at the end is
+  cancelled. A synthetic personal-data token cannot be passed in a batch (the batch is not a token sink); type
+  it with its own call. Held keys follow the existing rule per step. Limits: a step that names an element by
+  `name` resolves it against the snapshot as it is at that moment, so after a step that changes the screen
+  use a `ref` or end the batch there. A batch on a server nobody wired (`bind_input_steps`) is refused, not
+  run unchecked. Unverified: the live TextEdit test (`textedit_input_steps_edit_a_scratch_document_in_one_call`)
+  is written but has not been run, and nothing here has run on Linux.
+
+- **Desktop actions report `effects`, what they changed, in the same call.** `ui_action`, `set_value`,
+  `keyboard_type`, `keyboard_shortcut` (press), `mouse_action` clicks, `select_text`, `ui_fill_form` and each
+  step of `input_steps` add `effects` to their result when something changed, with only the fields that did:
+  `app` (the frontmost application), `focus` (`{role, name}`), `appeared` and `disappeared` (titles of the
+  target application's windows, at most 5 each), `retitled` (`{from, to}`), `overlay` (`{kind, title, text,
+  buttons}` of a sheet, dialog, alert, popover or menu that opened; the desktop twin of the browser's
+  `effects.overlay`) and `overlay_closed`, and `value` or `checked` of the element a `ui_action` pressed by
+  `ref`. Before, the agent called `get_ui_tree` after each action to find out. It is not a snapshot diff: a
+  fixed set of attribute reads before and after (about 1 to 4 ms each once an app has been read, 15 to 150 ms the
+  first time; measured on macOS with the accessibility API only), a 120 ms settle between them, and a pure
+  comparison. Reading raises no window and moves no focus, so it works under `foreground = "never"`. A fact
+  that could not be read is left out, never guessed, and a fact missing from either reading is not compared.
+  Nothing is emitted when nothing changed, so a missing `effects` means nothing was seen to change among
+  those facts, which is not proof that nothing did: an app may react after the wait, and a change inside a
+  window's contents is not among them. Text is clipped (names 60 characters, a value 80). `effects: false`
+  skips the reads and the wait, and a call with `expect` keeps its own delta. Limits: a sheet is found only as
+  a direct child of a window (where a TextEdit save panel sits), an app that exposes no accessibility windows
+  (Chrome until its accessibility is on) reports none, and a `ui_action` named by `name` has no `value` or
+  `checked`. On Linux the window list, dialogs and frontmost application are read from AT-SPI and `focus` is
+  not; that code type-checks but has not been run. The live test
+  (`effects_report_the_save_sheet_a_shortcut_opens_and_closes`) is written and has not been run.
+
 - **`foreground = "never"` (`[input]` table, or `AGENTCTL_FOREGROUND=never`) refuses every tool that would
   take your pointer, keyboard or foreground.** The default, `"allow"`, changes nothing. With `never`,
   `mouse_action`, `scroll`, `hover`, `drag_drop`, `keyboard_type`, `keyboard_shortcut` (press or hold) and

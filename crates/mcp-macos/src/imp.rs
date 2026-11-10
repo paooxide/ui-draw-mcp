@@ -2103,6 +2103,152 @@ impl WindowBackend for MacosBackend {
     }
 }
 
+// ---- the facts behind `effects` ---------------------------------------------
+
+/// How long one read may wait on an app that is not answering. A probe runs
+/// twice around every input action, so a stuck app must cost a fraction of a
+/// second, not the system default of several.
+const PROBE_TIMEOUT_S: f32 = 0.25;
+
+/// Windows examined for sheets and dialogs. A sheet is on an app's front
+/// windows; a long tail of palettes would only add cost.
+const PROBE_WINDOWS: usize = 12;
+
+/// The kind of overlay a window or a window's child is, if it is one.
+///
+/// Sheets are children of the window they slide from (a save panel is the last
+/// entry of the window's `AXChildren`; `AXSheets` reports nothing for it), and
+/// alerts and dialogs are windows of their own. Floating palettes carry the
+/// `AXSystemFloatingWindow` subrole and are not decisions to make, so they are
+/// not overlays here, unlike in `list_dialogs`.
+unsafe fn overlay_kind(el: CFTypeRef, is_window: bool) -> Option<&'static str> {
+    let role = copy_attr_string(el, "AXRole")?;
+    if role == "AXSheet" {
+        return Some("sheet");
+    }
+    if role == "AXPopover" && !is_window {
+        return Some("popover");
+    }
+    if !is_window {
+        return None;
+    }
+    match copy_attr_string(el, "AXSubrole").as_deref() {
+        Some("AXSystemDialog") => Some("alert"),
+        Some("AXDialog") => Some("dialog"),
+        _ => None,
+    }
+}
+
+impl MacosBackend {
+    /// Read the facts `effects` compares, passively: attribute reads only, no
+    /// action, no raise, and the sticky target is left as it was.
+    ///
+    /// The application read is the one the session is driving: the pinned
+    /// target, else the app of the last snapshot, else the frontmost app.
+    unsafe fn read_facts(&self, describe_new: Option<&[mcp_input::Overlay]>) -> mcp_input::UiFacts {
+        use mcp_input::{Focus, Overlay, UiFacts};
+        let mut facts = UiFacts::default();
+        if AXIsProcessTrusted() == 0 {
+            return facts;
+        }
+        let front = frontmost_pid();
+        facts.frontmost = front.and_then(|pid| app_element(pid)).and_then(|a| {
+            AXUIElementSetMessagingTimeout(a.as_CFTypeRef(), PROBE_TIMEOUT_S);
+            copy_attr_string(a.as_CFTypeRef(), "AXTitle").filter(|n| !n.is_empty())
+        });
+        let pid = {
+            let st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            st.target.as_ref().map(|t| t.pid).or(st.pid)
+        }
+        .or(front);
+        let Some(app) = pid.and_then(|p| app_element(p)) else {
+            return facts;
+        };
+        let app_ref = app.as_CFTypeRef();
+        AXUIElementSetMessagingTimeout(app_ref, PROBE_TIMEOUT_S);
+
+        facts.focus = copy_attr(app_ref, "AXFocusedUIElement").and_then(|f| {
+            let r = f.as_CFTypeRef();
+            Some(Focus {
+                role: mcp_a11y::normalize_role(&copy_attr_string(r, "AXRole")?),
+                name: ["AXTitle", "AXDescription"]
+                    .iter()
+                    .find_map(|a| copy_attr_string(r, a).filter(|s| !s.is_empty())),
+            })
+        });
+
+        // `AXWindows` that cannot be read is not an app without windows.
+        let wins: Option<Vec<CFType>> = copy_attr(app_ref, "AXWindows")
+            .and_then(|v| v.downcast::<CFArray>())
+            .map(|arr| {
+                arr.get_all_values()
+                    .into_iter()
+                    .map(|p| CFType::wrap_under_get_rule(p))
+                    .collect()
+            });
+        let mut overlays: Vec<Overlay> = Vec::new();
+        let mut found: Vec<(&'static str, CFType)> = Vec::new();
+        // Open menus hang off the application, not a window.
+        for child in copy_children(app_ref) {
+            if copy_attr_string(child.as_CFTypeRef(), "AXRole").as_deref() == Some("AXMenu") {
+                found.push(("menu", child));
+            }
+        }
+        let mut titles = Vec::new();
+        if let Some(wins) = &wins {
+            for w in wins.iter().take(PROBE_WINDOWS) {
+                let wr = w.as_CFTypeRef();
+                match overlay_kind(wr, true) {
+                    // Reported as an overlay, not also as a window.
+                    Some(kind) => found.push((kind, w.clone())),
+                    None => titles.push(copy_attr_string(wr, "AXTitle").unwrap_or_default()),
+                }
+                for c in copy_children(wr) {
+                    if let Some(kind) = overlay_kind(c.as_CFTypeRef(), false) {
+                        found.push((kind, c));
+                    }
+                }
+            }
+            // Past the examined windows only titles are read.
+            for w in wins.iter().skip(PROBE_WINDOWS) {
+                titles.push(copy_attr_string(w.as_CFTypeRef(), "AXTitle").unwrap_or_default());
+            }
+            facts.windows = Some(titles);
+        }
+        for (kind, el) in found {
+            let r = el.as_CFTypeRef();
+            let mut o = Overlay {
+                kind: kind.to_string(),
+                title: copy_attr_string(r, "AXTitle").filter(|t| !t.is_empty()),
+                text: None,
+                buttons: Vec::new(),
+            };
+            // The contents are read once, when the overlay first shows.
+            if describe_new
+                .is_some_and(|known| !known.iter().any(|k| k.kind == o.kind && k.title == o.title))
+            {
+                let (buttons, text, _) = dialog_details(r);
+                o.buttons = buttons;
+                o.text = text.into_iter().next();
+            }
+            overlays.push(o);
+        }
+        // Menus and windows are readable or the app is not; a failed window
+        // read means the overlay list is incomplete too.
+        if wins.is_some() {
+            facts.overlays = Some(overlays);
+        }
+        facts
+    }
+}
+
+#[async_trait]
+impl mcp_input::UiProbe for MacosBackend {
+    async fn probe(&self, describe_new: Option<&[mcp_input::Overlay]>) -> mcp_input::UiFacts {
+        unsafe { self.read_facts(describe_new) }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2127,6 +2273,36 @@ mod tests {
                 matches!(code, ErrorCode::PermDenied | ErrorCode::NotFound),
                 "unexpected: {code:?}"
             );
+        }
+    }
+
+    /// The facts behind `effects`, read from whatever is on screen: attribute
+    /// reads only, so it neither raises a window nor changes the session's
+    /// target, and it answers promptly (a probe runs twice around every
+    /// action). Without the Accessibility grant it reads nothing, which is an
+    /// answer too.
+    #[tokio::test]
+    async fn the_facts_behind_effects_are_read_passively_and_quickly() {
+        use mcp_input::UiProbe;
+        let b = MacosBackend::new();
+        let started = std::time::Instant::now();
+        let facts = b.probe(None).await;
+        let again = b.probe(Some(&[])).await;
+        let spent = started.elapsed();
+        assert!(
+            b.current_target().is_none(),
+            "reading set the sticky target"
+        );
+        assert!(
+            spent < std::time::Duration::from_secs(3),
+            "two readings took {spent:?}"
+        );
+        if permissions().accessibility {
+            assert!(facts.frontmost.is_some(), "{facts:?}");
+            // Two readings of an idle screen agree on what is open.
+            assert_eq!(facts.frontmost, again.frontmost);
+        } else {
+            assert_eq!(facts, mcp_input::UiFacts::default());
         }
     }
 

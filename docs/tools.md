@@ -8,7 +8,7 @@ Tiers gate what an agent may call: `read` and `standard` tools are available ins
 enabled category, while a `dangerous` tool additionally has to be named in
 `policy.enable`. Enabling a category never enables its dangerous tools.
 
-**126 tools across 12 categories.**
+**127 tools across 12 categories.**
 
 | Tool | Category | Tier | Summary |
 |---|---|---|---|
@@ -26,6 +26,7 @@ enabled category, while a `dangerous` tool additionally has to be named in
 | [`get_selection`](#get-selection) | input | standard | Read the text selected in an element (ref or name), or in the focused element when none is given, without changing it. |
 | [`hover`](#hover) | input | standard | Move the pointer over an element (ref or name) or point (reveals tooltips/hover menus). |
 | [`input_showcase`](#input-showcase) | input | standard | Glide the real mouse pointer along a smooth Bezier curve to each point instead of jumping there, for demos, screencasts and presentations. |
+| [`input_steps`](#input-steps) | input | standard | Run up to 20 input actions in one call, in order, stopping at the first that fails. |
 | [`keyboard_shortcut`](#keyboard-shortcut) | input | standard | Press a key or chord, e.g. |
 | [`keyboard_type`](#keyboard-type) | input | standard | Type Unicode text into the focused window. |
 | [`mouse_action`](#mouse-action) | input | standard | Coordinate pointer action. |
@@ -375,6 +376,22 @@ Glide the real mouse pointer along a smooth Bezier curve to each point instead o
 | `enabled` | boolean |  | enable or disable smooth gliding |
 | `speed` | one of: cinematic, demo, snappy, instant, off |  | speed preset (cinematic: 350ms, demo: 200ms, snappy: 100ms, instant: 0ms) |
 
+### input-steps
+
+`input_steps` · standard tier
+
+Run up to 20 input actions in one call, in order, stopping at the first that fails. Each step is {tool, args}: the tool's name and the arguments you would give it alone. Every step is checked, allowed and logged exactly as if you had called it yourself.
+
+`steps` is a list of `{tool, args}`, at most 20. The tools that can run in a batch are ui_action, set_value, select_text, ui_fill_form, keyboard_type, keyboard_shortcut, mouse_action, scroll, hover, drag_drop and clipboard_write; anything else, and a step that is not `{tool, args}`, is an INVALID_ARGS error naming the step, before any step runs.
+
+Each step goes through the same gate as a call made on its own: the policy tier, the role's allowed and denied tools, consent, the hard invariants, the kill switch, the denial budget and the audit log (every step is its own entry, and a step flagged `secret` is redacted in it). So a batch can do nothing that the same calls made one at a time could not, and a step the role or `foreground = "never"` refuses ends the batch. Under `never` the whole batch is checked first, so one refused step means no step ran. A synthetic personal-data token cannot be passed in a batch; type it with its own call.
+
+Steps run in order and the first failure stops the batch; the steps after it do not run. The result is {ran, total, failed_at (the 0-based step that failed, absent when all succeeded), elapsed_ms, steps: [{i, tool, ok, ...that step's result, error}]}. The batch has 30 seconds: a step still running then is cancelled and the rest are not run. The kill switch, a human taking the pointer and a client cancel are checked between steps. A key held with keyboard_shortcut down stays held across the batch, and a step that fails releases held keys as it would alone. A step that names an element by `name` resolves it against the snapshot at that moment, so an earlier step that changes the screen can change what the next one finds: use `ref`s from the same get_ui_tree for a run of steps on one screen, and put a step that opens a dialog last in the batch.
+
+| Argument | Type | Required | Description |
+|---|---|---|---|
+| `steps` | array&lt;object&gt; | yes | actions to run in order (max 20) |
+
 ### keyboard-shortcut
 
 `keyboard_shortcut` · standard tier
@@ -385,10 +402,13 @@ Modifiers then exactly one key, joined by `+` (or `-` when there is no `+`). Cas
 
 `action: "down"` takes the same names but also a lone modifier (`shift`, `cmd+shift`) or one key, and leaves them down across later calls: every click, drag, scroll and chord until the matching `action: "up"` carries the held modifiers, whatever `modifiers` the call itself names. Holding a key already held renews its time limit and presses nothing. At most 6 keys are held at once. A key is released by `up` (with no `combo`, all of them), after 30 s unless renewed (the result's `auto_release_ms`), when any other input call fails (the error says so), when the kill switch trips or a human takes the mouse, and when the server stops. `keyboard_type` ignores held modifiers: the text carries its own case. On macOS a held modifier is applied to the events agentctl posts and is not a physical key press, so it cannot stay latched in the system; other software that polls the keyboard state does not see it. On Linux it is a real key press.
 
+The result carries `effects` when the action changed something that was seen (a sheet or window opened, focus moved, ...); see ui_action for what it holds and what its absence means. `effects: false` skips it.
+
 | Argument | Type | Required | Description |
 |---|---|---|---|
 | `action` | one of: press, down, up |  | press (default) taps the chord; down holds the key or modifiers; up releases them (no combo: everything held) |
 | `combo` | string |  |  |
+| `effects` | boolean |  | false: do not report what changed (saves a short wait) |
 | `expect` | object |  | optional: wait for this to become true after the action, and return what changed |
 | `expect.app` | string |  | which application to observe |
 | `expect.element` | string |  | synonym for text |
@@ -409,8 +429,11 @@ Target an element by `ref` (`@e12`; `e12` and `12` also work) or by `name`, with
 
 With a target, the element's value is read before and after. The result carries `value_after` (never for a `secret` or a password field) and `changed`; typing into a text field that then shows the same value is an error. Without a target, the keystrokes go wherever focus is and nothing is read back.
 
+The result carries `effects` when the action changed something that was seen (a sheet or window opened, focus moved, ...); see ui_action for what it holds and what its absence means. `effects: false` skips it.
+
 | Argument | Type | Required | Description |
 |---|---|---|---|
+| `effects` | boolean |  | false: do not report what changed (saves a short wait) |
 | `expect` | object |  | optional: wait for this to become true after the action, and return what changed |
 | `expect.app` | string |  | which application to observe |
 | `expect.element` | string |  | synonym for text |
@@ -436,10 +459,13 @@ Target an element by `ref` (`@e12`; `e12` and `12` also work) or by `name`, with
 
 `x` and `y` may be numbers or numeric strings. Every point, absolute or element-relative, is checked against the allowed window bounds when `clamp_input_to_allowed` is on. The result's `at` is the screen point that was used. Set `glide: true` or `speed` to glide the pointer along a Bezier curve for demos.
 
+The result carries `effects` when the action changed something that was seen (a sheet or window opened, focus moved, ...); see ui_action for what it holds and what its absence means. `effects: false` skips it.
+
 | Argument | Type | Required | Description |
 |---|---|---|---|
 | `button` | string |  | left\|right\|middle |
 | `duration_ms` | integer |  | custom gliding duration in milliseconds, 0-2000 |
+| `effects` | boolean |  | false: do not report what changed (saves a short wait) |
 | `expect` | object |  | optional: wait for this to become true after the action, and return what changed |
 | `expect.app` | string |  | which application to observe |
 | `expect.element` | string |  | synonym for text |
@@ -492,9 +518,12 @@ Offsets count characters (Unicode scalar values) from 0 with `end` exclusive, on
 
 The result carries `start`, `end`, `length` and `text` as the element reports them after the change (`text` is cut at 2000 characters, with `truncated`), and `input: ax`. If the element reports a different range than was asked for (some editors snap to words or ignore the request), the call fails and says what it reports. macOS sets `AXSelectedTextRange`; an element where that is not settable is an `UNSUPPORTED_OS` error. There is no pointer fallback: dragging to select is not attempted, so use `drag_drop` or shift-click with `mouse_action` for those. Linux uses the AT-SPI Text interface (`set_selection`). Password fields are refused. Which apps honour the selection has not been verified beyond TextEdit.
 
+The result carries `effects` when the action changed something that was seen (a sheet or window opened, focus moved, ...); see ui_action for what it holds and what its absence means. `effects: false` skips it.
+
 | Argument | Type | Required | Description |
 |---|---|---|---|
 | `all` | boolean |  | select everything |
+| `effects` | boolean |  | false: do not report what changed (saves a short wait) |
 | `end` | integer |  | offset after the last character; equal to start places the caret |
 | `expect` | object |  | optional: wait for this to become true after the action, and return what changed |
 | `expect.app` | string |  | which application to observe |
@@ -524,8 +553,11 @@ Target an element by `ref` (`@e12`; `e12` and `12` also work) or by `name`, with
 
 The element is read before and after the write. The result carries `value_after` (never for a `secret` or a password field), `changed`, and `reformatted` when the field shows something other than what was written (a number field turning 1000 into 1,000 is fine). A field that keeps its old value and does not show the new text is an error, not an `ok`. `verified: false` means the platform could not read the value back.
 
+The result carries `effects` when the action changed something that was seen (a sheet or window opened, focus moved, ...); see ui_action for what it holds and what its absence means. `effects: false` skips it.
+
 | Argument | Type | Required | Description |
 |---|---|---|---|
+| `effects` | boolean |  | false: do not report what changed (saves a short wait) |
 | `expect` | object |  | optional: wait for this to become true after the action, and return what changed |
 | `expect.app` | string |  | which application to observe |
 | `expect.element` | string |  | synonym for text |
@@ -559,9 +591,12 @@ macOS opens a popup button with the accessibility press and presses its menu ite
 
 Every result carries `input`: `ax` when the accessibility API acted (no pointer, the app can stay in the background) or `hid` when synthetic system input was needed (the real cursor moved). `right_click` and `double_click` are an accessibility press on macOS, which has no distinct double or secondary press; on Linux `right_click` clicks at the element's centre, so it is `hid`. `input` is absent when nothing needed doing (checking a checked box).
 
+`effects` is added to the result of an action when something it changed was seen: `app` (the frontmost application changed), `focus` ({role, name} of the newly focused element), `appeared` and `disappeared` (titles of the target application's windows, at most 5 each), `retitled` ({from, to} when one window was renamed), `overlay` ({kind: sheet|dialog|alert|popover|menu, title, text, buttons} of one that opened) and `overlay_closed`, and `value` or `checked` of the element a `ui_action` pressed by `ref`. It is read from a small fixed set of facts before and after the action, about 120 ms apart, not from a new snapshot, and without raising a window or moving focus, so it works under `foreground = "never"`. A fact the platform cannot read is left out, never guessed. No `effects` means nothing was seen to change among those facts, which is not proof that nothing did: an app may react later, and a change inside a window's own contents is not among them. Linux reads the window list, dialogs and the frontmost application only. `effects: false` skips the reads and the wait, and `expect` replaces it with its own delta.
+
 | Argument | Type | Required | Description |
 |---|---|---|---|
 | `action` | one of: click, double_click, right_click, focus, toggle, check, uncheck, expand, collapse, select, scroll_into_view, show_menu, increment, decrement, pick | yes |  |
+| `effects` | boolean |  | false: do not report what changed (saves a short wait) |
 | `expect` | object |  | optional: wait for this to become true after the action, and return what changed |
 | `expect.app` | string |  | which application to observe |
 | `expect.element` | string |  | synonym for text |
@@ -586,8 +621,11 @@ Target an element by `ref` (`@e12`; `e12` and `12` also work) or by `name`, with
 
 Fields are applied in order and the call stops at the first failure, reporting `filled` and the `results` so far. Each result carries what that field's tool would: `value_after`, `selected`, `checked` and `changed`. A field named by `name` resolves with the same ranking as `ui_action`, so two fields with similar labels are told apart by exactness and then document order.
 
+The result carries `effects` when the action changed something that was seen (a sheet or window opened, focus moved, ...); see ui_action for what it holds and what its absence means. `effects: false` skips it.
+
 | Argument | Type | Required | Description |
 |---|---|---|---|
+| `effects` | boolean |  | false: do not report what changed (saves a short wait) |
 | `expect` | object |  | optional: wait for this to become true after the action, and return what changed |
 | `expect.app` | string |  | which application to observe |
 | `expect.element` | string |  | synonym for text |

@@ -153,6 +153,11 @@ pub struct Wiring {
     /// The judge, built once here so the policy kernel and the engines that
     /// consult it share one set of counters.
     pub judge: Option<Arc<mcp_policy::mcp_judge::Judge>>,
+    /// The input engine and the handle `input_steps` runs its steps through.
+    /// The handle is bound once the policy exists (see
+    /// [`crate::bind_input_steps`]); until then, and wherever there is no
+    /// input engine, a batch is refused.
+    pub steps: Option<(Arc<dyn ToolModule>, Arc<mcp_input::StepRelay>)>,
 }
 
 /// A probe for the input engine: whether the STOP file exists.
@@ -364,10 +369,17 @@ pub fn build_stack(cfg: &PolicyConfig) -> (Vec<Arc<dyn ToolModule>>, Wiring) {
             arena.clone(),
         ));
         let activity = mcp_input::Activity::new();
+        let steps = mcp_input::StepRelay::new();
         let glide_preset = demo_glide_preset(&engines.demo_speed);
         let mut input = InputModule::new(input_backend.clone(), arena, input_policy)
             .with_verifier(verifier)
             .with_activity(activity.clone())
+            // What an action changed is read from the same backend that reads
+            // the tree: attribute reads only, so it is safe whatever
+            // `foreground` says.
+            .with_probe(backend.clone())
+            // Each step of `input_steps` goes back through the server's gate.
+            .with_steps(steps.clone())
             // A call that names an element before anything was observed
             // takes its own snapshot instead of asking for one.
             .with_observer(backend.clone())
@@ -384,7 +396,9 @@ pub fn build_stack(cfg: &PolicyConfig) -> (Vec<Arc<dyn ToolModule>>, Wiring) {
             .with_judge(judge.clone())
             .with_foreground(cfg.foreground);
         modules.push(Arc::new(a11y));
-        modules.push(Arc::new(input));
+        let input = Arc::new(input);
+        wiring.steps = Some((input.clone(), steps));
+        modules.push(input);
         modules.push(Arc::new(vision));
         modules.push(Arc::new(window));
         // `play_audio` is bounded by the same roots as the filesystem engine:
@@ -438,10 +452,17 @@ pub fn build_stack(cfg: &PolicyConfig) -> (Vec<Arc<dyn ToolModule>>, Wiring) {
             arena.clone(),
         ));
         let activity = mcp_input::Activity::new();
+        let steps = mcp_input::StepRelay::new();
         let glide_preset = demo_glide_preset(&engines.demo_speed);
         let mut input = InputModule::new(input_backend.clone(), arena, input_policy)
             .with_verifier(verifier)
             .with_activity(activity.clone())
+            // What an action changed is read from the same backend that reads
+            // the tree: attribute reads only, so it is safe whatever
+            // `foreground` says.
+            .with_probe(backend.clone())
+            // Each step of `input_steps` goes back through the server's gate.
+            .with_steps(steps.clone())
             // A call that names an element before anything was observed
             // takes its own snapshot instead of asking for one.
             .with_observer(backend.clone())
@@ -458,7 +479,9 @@ pub fn build_stack(cfg: &PolicyConfig) -> (Vec<Arc<dyn ToolModule>>, Wiring) {
             .with_judge(judge.clone())
             .with_foreground(cfg.foreground);
         modules.push(Arc::new(a11y));
-        modules.push(Arc::new(input));
+        let input = Arc::new(input);
+        wiring.steps = Some((input.clone(), steps));
+        modules.push(input);
         modules.push(Arc::new(vision));
         modules.push(Arc::new(window));
         let desktop_backend = Arc::new(LinuxDesktop::new());
