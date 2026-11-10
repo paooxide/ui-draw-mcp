@@ -51,7 +51,7 @@ tokio = { version = "1", features = [
 ] }
 toml = "0.8"
 regex = "1"
-sha2 = "0.10"
+sha2 = "0.11"
 ed25519-dalek = { version = "2.1", default-features = false, features = ["std", "rand_core"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
 hex = "0.4"

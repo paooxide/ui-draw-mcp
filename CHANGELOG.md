@@ -37,6 +37,8 @@ All notable changes to this project are documented here. The format follows
   async-executor 1.14.1 in place of the yanked 1.14.0. The "unmaintained" notices for `zvariant`,
   `zvariant_derive` and `zbus_names` (folded into the zbus repository, not vulnerable, Linux only) are ignored
   by id in `deny.toml` until zbus, ashpd and atspi release against the merged crate.
+- **sha2 0.11** for the audit log's hash chain and the OCR model pins (digests are unchanged), with libc,
+  serde_json and wl-clipboard-rs patch updates.
 
 ## [0.3.0] - 2026-10-10
 
