@@ -8,6 +8,7 @@
 mod backend;
 mod choose;
 mod combo;
+mod foreground;
 pub mod glide;
 mod hold;
 mod human_override;
@@ -21,6 +22,7 @@ pub use backend::{
 };
 pub use choose::{list_options, missing_message, pick_option, same_option, OptionItem, Pick};
 pub use combo::{parse_combo, parse_hold, Combo, Os, KEY_NAMES};
+pub use foreground::{tool_refusal, ForegroundInput};
 pub use glide::{bezier_interpolate, execute_glide, GlideConfig, GlidePreset};
 pub use hold::{HeldKeys, HOLD_MAX_MS, MAX_HELD_KEYS};
 pub use human_override::{Activity, ActivityGuard, Detector, OverrideConfig, SetPoint, Verdict};

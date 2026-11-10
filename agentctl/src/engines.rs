@@ -346,12 +346,17 @@ pub fn build_stack(cfg: &PolicyConfig) -> (Vec<Arc<dyn ToolModule>>, Wiring) {
             bypass,
             terminal_apps,
             judge: Some(judge.clone()),
+            foreground: cfg.foreground,
             ..InputPolicy::default()
         };
+        // Everything that can post input or raise a window is handed the
+        // guarded form of the backend; perception keeps the plain one.
+        let input_backend = guard_input(backend.clone(), cfg.foreground);
+        let window_backend = guard_window(backend.clone(), cfg.foreground);
         // The postcondition verifier shares the wait evaluator with wait_for,
         // so `expect` and an explicit wait cannot disagree about when the UI
         // has settled.
-        let evaluator = mcp_window::WaitEvaluator::new(backend.clone(), backend.clone())
+        let evaluator = mcp_window::WaitEvaluator::new(window_backend.clone(), backend.clone())
             .with_judge(judge.clone());
         let verifier = Arc::new(mcp_input::Verifier::new(
             evaluator,
@@ -360,7 +365,7 @@ pub fn build_stack(cfg: &PolicyConfig) -> (Vec<Arc<dyn ToolModule>>, Wiring) {
         ));
         let activity = mcp_input::Activity::new();
         let glide_preset = demo_glide_preset(&engines.demo_speed);
-        let mut input = InputModule::new(backend.clone(), arena, input_policy)
+        let mut input = InputModule::new(input_backend.clone(), arena, input_policy)
             .with_verifier(verifier)
             .with_activity(activity.clone())
             // A call that names an element before anything was observed
@@ -375,8 +380,9 @@ pub fn build_stack(cfg: &PolicyConfig) -> (Vec<Arc<dyn ToolModule>>, Wiring) {
             input = input.with_glide(glide_preset.into());
         }
         let vision = VisionModule::new(backend.clone(), engines.vision);
-        let window = WindowModule::new(backend.clone(), backend.clone(), allowed_apps)
-            .with_judge(judge.clone());
+        let window = WindowModule::new(window_backend, backend.clone(), allowed_apps)
+            .with_judge(judge.clone())
+            .with_foreground(cfg.foreground);
         modules.push(Arc::new(a11y));
         modules.push(Arc::new(input));
         modules.push(Arc::new(vision));
@@ -389,7 +395,7 @@ pub fn build_stack(cfg: &PolicyConfig) -> (Vec<Arc<dyn ToolModule>>, Wiring) {
             desktop_backend.clone(),
             audio_roots,
         )));
-        wiring.input = Some(backend.clone());
+        wiring.input = Some(input_backend);
         wiring.activity = Some(activity);
         wiring.desktop = Some(desktop_backend);
     }
@@ -417,9 +423,14 @@ pub fn build_stack(cfg: &PolicyConfig) -> (Vec<Arc<dyn ToolModule>>, Wiring) {
             bypass,
             terminal_apps,
             judge: Some(judge.clone()),
+            foreground: cfg.foreground,
             ..InputPolicy::default()
         };
-        let evaluator = mcp_window::WaitEvaluator::new(backend.clone(), backend.clone())
+        // Everything that can post input or raise a window is handed the
+        // guarded form of the backend; perception keeps the plain one.
+        let input_backend = guard_input(backend.clone(), cfg.foreground);
+        let window_backend = guard_window(backend.clone(), cfg.foreground);
+        let evaluator = mcp_window::WaitEvaluator::new(window_backend.clone(), backend.clone())
             .with_judge(judge.clone());
         let verifier = Arc::new(mcp_input::Verifier::new(
             evaluator,
@@ -428,7 +439,7 @@ pub fn build_stack(cfg: &PolicyConfig) -> (Vec<Arc<dyn ToolModule>>, Wiring) {
         ));
         let activity = mcp_input::Activity::new();
         let glide_preset = demo_glide_preset(&engines.demo_speed);
-        let mut input = InputModule::new(backend.clone(), arena, input_policy)
+        let mut input = InputModule::new(input_backend.clone(), arena, input_policy)
             .with_verifier(verifier)
             .with_activity(activity.clone())
             // A call that names an element before anything was observed
@@ -443,8 +454,9 @@ pub fn build_stack(cfg: &PolicyConfig) -> (Vec<Arc<dyn ToolModule>>, Wiring) {
             input = input.with_glide(glide_preset.into());
         }
         let vision = VisionModule::new(backend.clone(), engines.vision);
-        let window = WindowModule::new(backend.clone(), backend.clone(), allowed_apps)
-            .with_judge(judge.clone());
+        let window = WindowModule::new(window_backend, backend.clone(), allowed_apps)
+            .with_judge(judge.clone())
+            .with_foreground(cfg.foreground);
         modules.push(Arc::new(a11y));
         modules.push(Arc::new(input));
         modules.push(Arc::new(vision));
@@ -454,11 +466,40 @@ pub fn build_stack(cfg: &PolicyConfig) -> (Vec<Arc<dyn ToolModule>>, Wiring) {
             desktop_backend.clone(),
             audio_roots,
         )));
-        wiring.input = Some(backend.clone());
+        wiring.input = Some(input_backend);
         wiring.activity = Some(activity);
         wiring.desktop = Some(desktop_backend);
     }
     (modules, wiring)
+}
+
+/// The input backend the engines get: the platform backend itself, or with
+/// `foreground = "never"` that backend behind the wrapper that refuses every
+/// synthetic-input method. With `allow` nothing is wrapped, so behaviour is
+/// exactly what it was before the setting existed.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn guard_input(
+    backend: Arc<dyn mcp_input::InputBackend>,
+    foreground: mcp_types::Foreground,
+) -> Arc<dyn mcp_input::InputBackend> {
+    if foreground.is_never() {
+        Arc::new(mcp_input::ForegroundInput::new(backend))
+    } else {
+        backend
+    }
+}
+
+/// As [`guard_input`], for the window backend.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn guard_window(
+    backend: Arc<dyn mcp_window::WindowBackend>,
+    foreground: mcp_types::Foreground,
+) -> Arc<dyn mcp_window::WindowBackend> {
+    if foreground.is_never() {
+        Arc::new(mcp_window::ForegroundWindow::new(backend))
+    } else {
+        backend
+    }
 }
 
 /// What `browser_upload` resolves each path through: the fs engine's jail, so

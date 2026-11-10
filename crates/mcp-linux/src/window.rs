@@ -54,6 +54,7 @@ fn input_to_window(e: InputError) -> WindowError {
         InputError::Unsupported(m) => WindowError::Unsupported(m),
         InputError::InvalidArgs(m) => WindowError::Failed(m),
         InputError::Failed(m) => WindowError::Failed(m),
+        InputError::Refused(m) => WindowError::Refused(m),
     }
 }
 
@@ -535,6 +536,12 @@ impl WindowBackend for LinuxBackend {
                 ))
             }
         }
+    }
+
+    /// Every action that can run here first brings the window forward, and
+    /// `maximize` then sends a key chord. Move and resize are unsupported.
+    fn control_takes_foreground(&self, action: WindowAction) -> bool {
+        !matches!(action, WindowAction::Move | WindowAction::Resize)
     }
 
     async fn menu_open(&self, app: Option<&str>, path: &[String]) -> Result<(), WindowError> {

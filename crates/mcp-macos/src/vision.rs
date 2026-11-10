@@ -343,6 +343,8 @@ fn win_to_vision(e: WindowError) -> VisionError {
         WindowError::PermissionDenied(m) => VisionError::PermissionDenied(m),
         WindowError::NotFound(m) => VisionError::NotFound(m),
         WindowError::Unsupported(m) => VisionError::Unsupported(m),
-        WindowError::Failed(m) => VisionError::Failed(m),
+        // Only the foreground wrapper refuses, and capture does not go
+        // through it; mapped rather than left to fall out of the match.
+        WindowError::Failed(m) | WindowError::Refused(m) => VisionError::Failed(m),
     }
 }

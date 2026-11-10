@@ -42,13 +42,18 @@ fn ready() -> bool {
 }
 
 fn client(name: &str) -> InProcClient {
+    client_with(name, mcp_types::Foreground::Allow)
+}
+
+fn client_with(name: &str, foreground: mcp_types::Foreground) -> InProcClient {
     let mut cfg = test_policy(&[
         Category::Vision,
         Category::Input,
         Category::Window,
         Category::System,
     ]);
-    cfg.allowed_apps = vec![APP.to_string()];
+    cfg.allowed_apps = vec![APP.to_string(), "Finder".to_string()];
+    cfg.foreground = foreground;
     let server = agentctl::build_server(cfg, AuditSink::memory(), Arc::new(NoConsent), name)
         .expect("server builds");
     InProcClient::new(server)
@@ -797,4 +802,130 @@ async fn textedit_ui_action_names_the_actions_an_element_lacks() {
         .await;
     assert_eq!(focus["input"], json!("ax"), "{focus}");
     let _ = c.call("close_app", json!({ "app": APP })).await;
+}
+
+/// The app that owns the frontmost window right now, read by a backend that
+/// has pinned nothing.
+fn frontmost() -> Option<String> {
+    use mcp_input::InputBackend;
+    mcp_macos::MacosBackend::new().input_target()
+}
+
+/// With `foreground = "never"`, the accessibility tools act on a TextEdit
+/// document that is in the background, and the user's frontmost app and
+/// pointer stay where they were; the pointer and keyboard tools are refused.
+///
+/// The document is set up under `allow` (that needs TextEdit forward), then
+/// Finder is brought forward and a second server, configured `never`, does the
+/// work. Nothing in the second half may change who is frontmost, so the test
+/// reads it again after every step, not once at the end.
+#[tokio::test(flavor = "multi_thread")]
+async fn under_never_the_accessibility_tools_work_without_taking_the_foreground() {
+    if !ready() {
+        return;
+    }
+    use mcp_input::InputBackend;
+    let setup = client("live-never-setup");
+    setup.initialize().await;
+    let text = "alpha beta gamma";
+    if scratch_document(&setup, text).await.is_none() {
+        return;
+    }
+    // Put something else in front: this is the user's app.
+    let _ = setup.call("focus_app", json!({ "app": "Finder" })).await;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !frontmost().is_some_and(|f| f.contains("Finder")) {
+        if Instant::now() > deadline {
+            eprintln!("skipping: Finder never became frontmost; cannot show TextEdit stays behind");
+            let _ = setup.call("close_app", json!({ "app": APP })).await;
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+    let before = frontmost();
+    let backend = mcp_macos::MacosBackend::new();
+    let pointer_before = backend.pointer_position().await.ok().flatten();
+
+    let c = client_with("live-never", mcp_types::Foreground::Never);
+    c.initialize().await;
+    let still_behind = |step: &str| {
+        assert_eq!(
+            frontmost(),
+            before,
+            "{step} changed which app is frontmost under foreground = never"
+        );
+    };
+
+    // `app` targets TextEdit for the lookup without raising it.
+    let found = c
+        .ok(
+            "find_elements",
+            json!({ "app": APP, "role": "text field", "limit": 5 }),
+        )
+        .await;
+    let reff = found["elements"][0]["ref"]
+        .as_str()
+        .expect("TextEdit's text area")
+        .to_string();
+    still_behind("find_elements");
+
+    let set = c
+        .ok(
+            "set_value",
+            json!({ "ref": &reff, "text": "alpha beta gamma delta" }),
+        )
+        .await;
+    assert_eq!(set["input"], json!("ax"), "{set}");
+    still_behind("set_value");
+
+    let selected = c
+        .ok("select_text", json!({ "ref": &reff, "text": "gamma" }))
+        .await;
+    assert_eq!(selected["input"], json!("ax"), "{selected}");
+    assert_eq!(selected["text"], json!("gamma"), "{selected}");
+    still_behind("select_text");
+
+    let acted = c
+        .ok(
+            "ui_action",
+            json!({ "ref": &reff, "action": "scroll_into_view" }),
+        )
+        .await;
+    assert_eq!(acted["input"], json!("ax"), "{acted}");
+    still_behind("ui_action");
+
+    // What the document shows is what was written, read back separately.
+    let shown = c.ok("get_selection", json!({ "ref": &reff })).await;
+    assert_eq!(shown["text"], json!("gamma"), "{shown}");
+
+    // Everything that would have used the pointer, the keyboard or the front
+    // is refused, and refused before it does anything.
+    for (tool, args) in [
+        (
+            "mouse_action",
+            json!({ "type": "click", "x": 100, "y": 100 }),
+        ),
+        ("mouse_action", json!({ "type": "click", "ref": &reff })),
+        ("keyboard_type", json!({ "text": "x", "ref": &reff })),
+        ("keyboard_shortcut", json!({ "combo": "cmd+a" })),
+        ("ui_action", json!({ "ref": &reff, "action": "focus" })),
+        ("focus_app", json!({ "app": APP })),
+        ("control_window", json!({ "action": "focus" })),
+    ] {
+        let env = c.call(tool, args.clone()).await;
+        assert!(!env.ok, "{tool} {args} ran under never");
+        assert_eq!(
+            env.error.expect("refusal").code,
+            ErrorCode::PolicyDenied,
+            "{tool} {args}"
+        );
+        still_behind(tool);
+    }
+
+    let pointer_after = backend.pointer_position().await.ok().flatten();
+    assert_eq!(
+        pointer_before, pointer_after,
+        "the pointer moved under foreground = never"
+    );
+    let _ = setup.call("close_app", json!({ "app": APP })).await;
 }

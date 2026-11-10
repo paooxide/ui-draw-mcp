@@ -172,6 +172,10 @@ pub struct PolicyConfig {
     pub human_override_px: u32,
     /// How long after an action the server still counts as driving.
     pub human_override_grace_ms: u64,
+    /// Whether tools may take the user's pointer, keyboard or foreground. Set
+    /// here or by `AGENTCTL_FOREGROUND` only: no tool, argument or role can
+    /// change it, and `access = "bypass"` does not loosen it.
+    pub foreground: mcp_types::Foreground,
     /// Shells `pty_spawn` may start, by absolute path.
     pub allowed_shells: Vec<String>,
     pub max_pty_sessions: usize,
@@ -279,6 +283,7 @@ impl Default for PolicyConfig {
             human_override: true,
             human_override_px: 12,
             human_override_grace_ms: 1_500,
+            foreground: mcp_types::Foreground::Allow,
             allowed_shells: ["/bin/zsh", "/bin/bash", "/bin/sh"]
                 .iter()
                 .map(|s| s.to_string())
@@ -387,6 +392,7 @@ impl PolicyConfig {
                 "human_override": self.human_override,
                 "human_override_px": self.human_override_px,
                 "human_override_grace_ms": self.human_override_grace_ms,
+                "foreground": self.foreground.as_str(),
             },
             "fs": { "roots": paths(&self.fs_roots) },
             "terminal": {

@@ -125,6 +125,9 @@ pub enum WindowError {
     NotFound(String),
     Unsupported(String),
     Failed(String),
+    /// Refused by the operator's `foreground = "never"` before anything was
+    /// done. Mapped to `POLICY_DENIED`: a policy decided this, not the OS.
+    Refused(String),
 }
 
 /// Platform window/app/menu backend.
@@ -135,6 +138,23 @@ pub trait WindowBackend: Send + Sync {
     /// Names of running apps.
     async fn list_apps(&self) -> Result<Vec<String>, WindowError>;
     async fn launch(&self, app: &str) -> Result<(), WindowError>;
+    /// Start `app` without asking the OS to bring it forward. A platform with
+    /// no such request says so, and `foreground = "never"` then refuses the
+    /// launch rather than activate the app.
+    ///
+    /// The app may still raise itself once it is running; this only declines
+    /// to ask.
+    async fn launch_in_background(&self, _app: &str) -> Result<(), WindowError> {
+        Err(WindowError::Refused(
+            mcp_types::Refusal::new(
+                "launch",
+                "start an app and bring it to the front: agentctl has no way to launch one \
+                 without activating it on this platform",
+                None,
+            )
+            .one_line(),
+        ))
+    }
     async fn close_app(&self, target: &str) -> Result<(), WindowError>;
     async fn control_window(
         &self,
@@ -143,6 +163,10 @@ pub trait WindowBackend: Send + Sync {
         action: WindowAction,
         bounds: Option<Rect>,
     ) -> Result<(), WindowError>;
+    /// Whether [`WindowBackend::control_window`] brings the window forward to
+    /// do `action` on this platform. Required, with no default, so a backend
+    /// cannot be added without answering; answer `true` when unsure.
+    fn control_takes_foreground(&self, action: WindowAction) -> bool;
     /// Open a menu-bar menu by title path (does not click a leaf).
     async fn menu_open(&self, app: Option<&str>, path: &[String]) -> Result<(), WindowError>;
     /// Open and click a menu item by title path.

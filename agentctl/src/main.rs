@@ -1469,6 +1469,25 @@ fn print_audit_help() {
     );
 }
 
+/// What `foreground` means for this session, in one line for `doctor`.
+fn foreground_summary(cfg: &mcp_policy::PolicyConfig) -> String {
+    match cfg.foreground {
+        mcp_types::Foreground::Allow => {
+            "allow (tools may move the pointer, type and bring apps forward)".to_string()
+        }
+        mcp_types::Foreground::Never => {
+            let mut s = String::from(
+                "never (no synthetic pointer, key or scroll input; no app or window brought \
+                 forward; launch does not activate)",
+            );
+            if cfg.demo {
+                s.push_str("; demo has no effect, since no pointer move is allowed");
+            }
+            s
+        }
+    }
+}
+
 fn doctor() {
     let cfg = config_or_exit();
     println!("agentctl doctor");
@@ -1506,6 +1525,7 @@ fn doctor() {
         cfg.human_override_px,
         cfg.human_override_grace_ms
     );
+    println!("  foreground:      {}", foreground_summary(&cfg));
     match cfg.access {
         Some(a) => println!(
             "  access profile:  {} (all categories on; {})",
@@ -1738,6 +1758,17 @@ fn print_help() {
 #[cfg(test)]
 mod test_cmd_tests {
     use super::*;
+
+    #[test]
+    fn doctor_reports_the_foreground_mode_and_that_demo_is_inert_under_never() {
+        let mut cfg = mcp_policy::PolicyConfig::default();
+        assert!(foreground_summary(&cfg).starts_with("allow"));
+        cfg.foreground = mcp_types::Foreground::Never;
+        let never = foreground_summary(&cfg);
+        assert!(never.starts_with("never") && !never.contains("demo"));
+        cfg.demo = true;
+        assert!(foreground_summary(&cfg).contains("demo has no effect"));
+    }
 
     #[test]
     fn demo_speed_flag_accepts_known_speeds_in_both_spellings() {

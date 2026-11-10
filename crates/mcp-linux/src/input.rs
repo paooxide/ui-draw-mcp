@@ -300,6 +300,10 @@ impl InputBackend for LinuxBackend {
         Ok(route_of(action))
     }
 
+    fn route_for(&self, action: SemanticAction) -> Route {
+        route_of(action)
+    }
+
     async fn read_element(&self, node_id: u64) -> Result<Reading, InputError> {
         let conn = self.conn().await.map_err(InputError::Failed)?;
         let nref = self.node_ref(node_id)?;

@@ -335,7 +335,9 @@ impl VisionBackend for LinuxBackend {
             mcp_window::WindowError::NotFound(m) => VisionError::NotFound(m),
             mcp_window::WindowError::PermissionDenied(m) => VisionError::PermissionDenied(m),
             mcp_window::WindowError::Unsupported(m) => VisionError::Unsupported(m),
-            mcp_window::WindowError::Failed(m) => VisionError::Failed(m),
+            mcp_window::WindowError::Failed(m) | mcp_window::WindowError::Refused(m) => {
+                VisionError::Failed(m)
+            }
         })?;
         let b = win.bounds.ok_or_else(|| {
             VisionError::Unsupported(format!("window '{}' reports no bounds", win.title))
@@ -417,7 +419,8 @@ fn e_str(e: mcp_window::WindowError) -> String {
         mcp_window::WindowError::PermissionDenied(m)
         | mcp_window::WindowError::NotFound(m)
         | mcp_window::WindowError::Unsupported(m)
-        | mcp_window::WindowError::Failed(m) => m,
+        | mcp_window::WindowError::Failed(m)
+        | mcp_window::WindowError::Refused(m) => m,
     }
 }
 

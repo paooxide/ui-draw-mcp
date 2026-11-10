@@ -35,6 +35,10 @@ pub struct InputPolicy {
     pub destructive_patterns: Vec<String>,
     /// The judge, consulted after the patterns and only able to add a flag.
     pub judge: Option<std::sync::Arc<mcp_policy::mcp_judge::Judge>>,
+    /// `never` refuses every call that would move the real pointer, post
+    /// synthetic keys or scroll events, or bring an app forward. See
+    /// [`crate::foreground`].
+    pub foreground: mcp_types::Foreground,
 }
 
 /// Apps whose keystrokes may be shell input.
@@ -143,6 +147,7 @@ impl Default for InputPolicy {
             bypass: false,
             destructive_patterns: mcp_policy::default_destructive_patterns(),
             judge: None,
+            foreground: mcp_types::Foreground::Allow,
         }
     }
 }
@@ -2498,6 +2503,13 @@ impl ToolModule for InputModule {
     }
 
     async fn call(&self, name: &str, args: Value, ctx: &CallCtx) -> Envelope {
+        // First, before the activity marker, the `expect` parse or a snapshot:
+        // a refused call must not have touched anything, not even to look.
+        if self.policy.foreground.is_never() {
+            if let Some(refusal) = crate::foreground::tool_refusal(&*self.backend, name, &args) {
+                return refusal.envelope(name);
+            }
+        }
         // Read before anything can await: a takeover from here on is this
         // call's to honour, whenever its first pointer move happens to be.
         let since = self.backend.takeover_generation();
@@ -2626,6 +2638,7 @@ fn input_err(tool: &str, e: InputError) -> Envelope {
         InputError::Unsupported(m) => (ErrorCode::UnsupportedOs, m),
         InputError::InvalidArgs(m) => (ErrorCode::InvalidArgs, m),
         InputError::Failed(m) => (ErrorCode::ActionFailed, m),
+        InputError::Refused(m) => (ErrorCode::PolicyDenied, m),
     };
     Envelope::fail(tool, code, msg)
 }
@@ -2808,6 +2821,9 @@ mod tests {
                 .unwrap()
                 .push((node_id, action, option.map(|s| s.to_string())));
             Ok(self.route.lock().unwrap().unwrap_or(Route::Ax))
+        }
+        fn route_for(&self, _: SemanticAction) -> Route {
+            self.route.lock().unwrap().unwrap_or(Route::Ax)
         }
         async fn set_value(&self, node_id: u64, text: &str) -> Result<(), InputError> {
             self.values
@@ -5057,6 +5073,430 @@ mod tests {
                     d.input_schema["properties"].get(p).is_some(),
                     "{n} lacks {p}"
                 );
+            }
+        }
+    }
+
+    // ---- foreground = "never" ------------------------------------------------
+
+    fn never_module() -> (InputModule, Arc<MockBackend>) {
+        let (module, backend, _) = test_module();
+        let module = InputModule {
+            policy: InputPolicy {
+                foreground: mcp_types::Foreground::Never,
+                ..module.policy.clone()
+            },
+            ..module
+        };
+        (module, backend)
+    }
+
+    /// True when nothing at all reached the backend that acts: no action, no
+    /// write, no pointer event, no key, no scroll, no typing.
+    fn untouched(b: &MockBackend) -> bool {
+        b.actions.lock().unwrap().is_empty()
+            && b.values.lock().unwrap().is_empty()
+            && b.moves.lock().unwrap().is_empty()
+            && b.keys.lock().unwrap().is_empty()
+            && b.pointer.lock().unwrap().is_empty()
+            && b.drags.lock().unwrap().is_empty()
+            && b.key_events.lock().unwrap().is_empty()
+            && b.scrolls.lock().unwrap().is_empty()
+            && b.typed.lock().unwrap().is_empty()
+    }
+
+    #[derive(Clone, Copy, PartialEq, Debug)]
+    enum Want {
+        /// Refused with POLICY_DENIED before the backend is touched.
+        Refused,
+        /// Not this setting's business: whatever it returns, it is not a
+        /// foreground refusal.
+        Runs,
+    }
+
+    /// One row per way each tool can be called. A tool with no row here fails
+    /// `every_input_tool_has_a_foreground_decision`, so adding a tool forces a
+    /// decision about the foreground instead of inheriting one.
+    fn foreground_cases() -> Vec<(&'static str, Value, Want)> {
+        use Want::{Refused, Runs};
+        let e = |r: &str| json!({ "ref": r });
+        let with = |r: &str, extra: Value| merge(e(r), extra);
+        vec![
+            ("ui_action", with("@e4", json!({"action":"click"})), Runs),
+            (
+                "ui_action",
+                with("@e4", json!({"action":"double_click"})),
+                Runs,
+            ),
+            (
+                "ui_action",
+                with("@e4", json!({"action":"right_click"})),
+                Runs,
+            ),
+            ("ui_action", with("@e3", json!({"action":"toggle"})), Runs),
+            ("ui_action", with("@e3", json!({"action":"check"})), Runs),
+            (
+                "ui_action",
+                with("@e4", json!({"action":"scroll_into_view"})),
+                Runs,
+            ),
+            (
+                "ui_action",
+                with("@e4", json!({"action":"increment"})),
+                Runs,
+            ),
+            ("ui_action", with("@e4", json!({"action":"pick"})), Runs),
+            ("ui_action", with("@e4", json!({"action":"select"})), Runs),
+            ("ui_action", with("@e4", json!({"action":"nonsense"})), Runs),
+            ("ui_action", with("@e1", json!({"action":"focus"})), Refused),
+            ("ui_action", with("@e1", json!({"action":"Focus"})), Refused),
+            (
+                "ui_action",
+                with("@e4", json!({"action":"show_menu"})),
+                Refused,
+            ),
+            (
+                "ui_action",
+                with("@e5", json!({"action":"select","option":"Dark"})),
+                Refused,
+            ),
+            ("set_value", with("@e1", json!({"text":"hello"})), Runs),
+            ("select_text", with("@e1", json!({"start":0,"end":1})), Runs),
+            ("get_selection", e("@e1"), Runs),
+            ("get_selection", json!({}), Runs),
+            ("clipboard_read", json!({}), Runs),
+            ("clipboard_write", json!({"data":"x"}), Runs),
+            (
+                "ui_fill_form",
+                json!({"fields":[{"ref":"@e1","value":"a"},{"ref":"@e3","value":true}],
+                       "submit":{"ref":"@e4"}}),
+                Runs,
+            ),
+            // The refused field is last: the earlier, harmless one must not
+            // have been written by the time the call is refused.
+            (
+                "ui_fill_form",
+                json!({"fields":[{"ref":"@e1","value":"a"},{"ref":"@e1","action":"focus"}]}),
+                Refused,
+            ),
+            (
+                "ui_fill_form",
+                json!({"fields":[{"ref":"@e1","value":"a"},
+                                 {"ref":"@e5","action":"select","value":"Dark"}]}),
+                Refused,
+            ),
+            (
+                "ui_fill_form",
+                json!({"fields":[{"ref":"@e1","value":"a"}],
+                       "submit":{"ref":"@e4","action":"show_menu"}}),
+                Refused,
+            ),
+            ("keyboard_type", json!({"text":"hi"}), Refused),
+            ("keyboard_type", with("@e1", json!({"text":"hi"})), Refused),
+            ("keyboard_shortcut", json!({"combo":"cmd+s"}), Refused),
+            (
+                "keyboard_shortcut",
+                json!({"combo":"cmd+s","action":"press"}),
+                Refused,
+            ),
+            (
+                "keyboard_shortcut",
+                json!({"combo":"shift","action":"down"}),
+                Refused,
+            ),
+            (
+                "keyboard_shortcut",
+                json!({"combo":"shift","action":"DOWN"}),
+                Refused,
+            ),
+            ("keyboard_shortcut", json!({"action":"up"}), Runs),
+            (
+                "keyboard_shortcut",
+                json!({"combo":"shift","action":"bogus"}),
+                Runs,
+            ),
+            (
+                "mouse_action",
+                json!({"type":"click","x":10,"y":10}),
+                Refused,
+            ),
+            (
+                "mouse_action",
+                with("@e4", json!({"type":"click"})),
+                Refused,
+            ),
+            (
+                "mouse_action",
+                json!({"type":"move","x":10,"y":10,"glide":true}),
+                Refused,
+            ),
+            ("mouse_action", json!({"type":"down","x":1,"y":1}), Refused),
+            (
+                "mouse_action",
+                json!({"type":"triple","x":1,"y":1}),
+                Refused,
+            ),
+            (
+                "mouse_action",
+                json!({"type":"right_click","x":1,"y":1}),
+                Refused,
+            ),
+            ("scroll", json!({"direction":"down","x":5,"y":5}), Refused),
+            ("scroll", with("@e1", json!({"direction":"up"})), Refused),
+            ("hover", json!({"x":5,"y":5}), Refused),
+            ("hover", with("@e4", json!({"glide":true})), Refused),
+            (
+                "drag_drop",
+                json!({"from":{"x":1,"y":1},"to":{"x":50,"y":50}}),
+                Refused,
+            ),
+            (
+                "drag_drop",
+                json!({"from":{"x":1,"y":1},"path":[{"x":5,"y":5},{"x":9,"y":9}]}),
+                Refused,
+            ),
+            ("input_showcase", json!({"enabled":true}), Refused),
+        ]
+    }
+
+    #[tokio::test]
+    async fn every_input_tool_has_a_foreground_decision() {
+        let (module, _) = never_module();
+        let advertised: Vec<String> = module.descriptors().into_iter().map(|d| d.name).collect();
+        let classified: Vec<&str> = crate::foreground::TOOLS.iter().map(|(n, _)| *n).collect();
+        for name in &advertised {
+            assert!(
+                classified.contains(&name.as_str()),
+                "{name} is advertised but has no entry in foreground::TOOLS: decide whether it \
+                 can run with foreground = \"never\" (it is refused until somebody does)"
+            );
+            assert!(
+                foreground_cases().iter().any(|(t, _, _)| t == name),
+                "{name} has no case in foreground_cases"
+            );
+        }
+        for name in &classified {
+            assert!(
+                advertised.iter().any(|a| a == name),
+                "foreground::TOOLS lists {name}, which is not a tool"
+            );
+        }
+        // A tool classified as always-refused must be refused in every case.
+        for (tool, stance) in crate::foreground::TOOLS {
+            if *stance == crate::foreground::Stance::Refused {
+                for (t, args, want) in foreground_cases() {
+                    assert!(
+                        t != *tool || want == Want::Refused,
+                        "{tool} is classified Refused but {args} expects to run"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn under_never_every_synthetic_input_call_is_refused_before_anything_happens() {
+        for (tool, args, want) in foreground_cases() {
+            let (module, backend) = never_module();
+            let env = call(&module, tool, args.clone()).await;
+            let denied = env
+                .error
+                .as_ref()
+                .is_some_and(|e| e.code == ErrorCode::PolicyDenied);
+            match want {
+                Want::Refused => {
+                    assert!(!env.ok && denied, "{tool} {args} was not refused: {env:?}");
+                    let err = env.error.unwrap();
+                    assert!(
+                        err.message.contains("foreground = \"never\"")
+                            && err.message.contains(tool),
+                        "{tool}: the refusal must say what and why: {}",
+                        err.message
+                    );
+                    assert!(
+                        err.suggestion.is_some_and(|s| !s.is_empty()),
+                        "{tool}: the refusal must teach"
+                    );
+                    assert!(untouched(&backend), "{tool} {args} reached the backend");
+                }
+                Want::Runs => assert!(!denied, "{tool} {args} was refused: {env:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn the_default_refuses_nothing() {
+        // `allow` is what every existing user has: the same calls, none of
+        // them touched by this setting.
+        assert_eq!(
+            InputPolicy::default().foreground,
+            mcp_types::Foreground::Allow
+        );
+        for (tool, args, _) in foreground_cases() {
+            let (module, _, _) = test_module();
+            let env = call(&module, tool, args.clone()).await;
+            assert!(
+                env.error
+                    .as_ref()
+                    .is_none_or(|e| e.code != ErrorCode::PolicyDenied),
+                "{tool} {args} was refused under allow: {env:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_accessibility_tools_still_act_under_never() {
+        let (module, backend) = never_module();
+        backend.script(101, vec![shown("old"), shown("hello")]);
+        let env = call(&module, "set_value", json!({"ref":"@e1","text":"hello"})).await;
+        assert!(env.ok, "{env:?}");
+        assert_eq!(env.data.as_ref().unwrap()["input"], "ax");
+        assert_eq!(backend.values.lock().unwrap().len(), 1);
+        let env = call(&module, "ui_action", json!({"ref":"@e4","action":"click"})).await;
+        assert!(env.ok, "{env:?}");
+        assert_eq!(env.data.as_ref().unwrap()["input"], "ax");
+        // Nothing synthetic: no keys, pointer, scroll or typing.
+        assert!(backend.keys.lock().unwrap().is_empty());
+        assert!(backend.pointer.lock().unwrap().is_empty());
+        assert!(backend.typed.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_right_click_that_needs_the_pointer_on_this_platform_is_refused() {
+        // Linux has no accessibility right click; its backend reports `Hid`
+        // for it before acting, and that is what `never` must catch.
+        let (module, backend) = never_module();
+        *backend.route.lock().unwrap() = Some(Route::Hid);
+        let env = call(
+            &module,
+            "ui_action",
+            json!({"ref":"@e4","action":"right_click"}),
+        )
+        .await;
+        assert_eq!(env.error.unwrap().code, ErrorCode::PolicyDenied);
+        assert!(untouched(&backend));
+        // Every other action is reported as `Hid` by this backend too, so each
+        // is refused for that reason, not by name.
+        for a in ["click", "toggle", "expand", "scroll_into_view"] {
+            let env = call(&module, "ui_action", json!({"ref":"@e4","action":a})).await;
+            assert_eq!(env.error.unwrap().code, ErrorCode::PolicyDenied, "{a}");
+        }
+        assert!(untouched(&backend));
+    }
+
+    #[tokio::test]
+    async fn the_backend_wrapper_holds_even_when_the_tool_layer_is_skipped() {
+        // A module built with `allow` has no tool-layer check at all, as a
+        // future tool without a decision would not; the wrapper still posts
+        // nothing.
+        let backend = Arc::new(MockBackend::default());
+        let guarded = Arc::new(crate::ForegroundInput::new(backend.clone()));
+        let (module, _, arena) = test_module();
+        let module = InputModule::new(guarded.clone(), arena, module.policy.clone());
+        for (tool, args, want) in foreground_cases() {
+            if want != Want::Refused {
+                continue;
+            }
+            // The tool layer would have refused these; here they get as far as
+            // the backend, which must.
+            let env = call(&module, tool, args.clone()).await;
+            if tool == "input_showcase" {
+                continue; // configuration, not a backend call
+            }
+            assert!(
+                !env.ok,
+                "{tool} {args} succeeded through the wrapper: {env:?}"
+            );
+            if tool == "ui_fill_form" {
+                // Its harmless first field is written before the refused one
+                // is reached, which is why the tool layer scans the whole
+                // form first; the refused action itself must not have run.
+                assert!(backend.actions.lock().unwrap().is_empty(), "{args}");
+                backend.values.lock().unwrap().clear();
+            }
+            assert!(
+                untouched(&backend),
+                "{tool} {args} reached the real backend"
+            );
+        }
+        // A release never fails, and posts nothing: nothing was pressed.
+        guarded.key_up("shift").await.unwrap();
+        assert!(untouched(&backend));
+    }
+
+    #[tokio::test]
+    async fn the_wrapper_refuses_each_synthetic_method_and_forwards_the_rest() {
+        let backend = Arc::new(MockBackend::default());
+        let g = crate::ForegroundInput::new(backend.clone());
+        let refused = |r: Result<(), InputError>| matches!(r, Err(InputError::Refused(_)));
+        assert!(refused(g.type_text("x").await));
+        assert!(refused(g.key_combo("cmd+s").await));
+        assert!(refused(g.key_down("a").await));
+        assert!(refused(
+            g.mouse(MouseKind::Click, 1.0, 1.0, None, &[]).await
+        ));
+        assert!(refused(
+            g.scroll_at(1.0, 1.0, ScrollDir::Down, 1, &[]).await
+        ));
+        assert!(refused(g.hover(1.0, 1.0).await));
+        assert!(refused(g.drag((0.0, 0.0), &[(1.0, 1.0)], &[], 0, 0).await));
+        assert!(matches!(
+            g.choose_option(1, "x").await,
+            Err(InputError::Refused(_))
+        ));
+        for a in [SemanticAction::Focus, SemanticAction::ShowMenu] {
+            assert!(matches!(
+                g.perform(1, a, None).await,
+                Err(InputError::Refused(_))
+            ));
+        }
+        assert!(untouched(&backend));
+        // What is background-safe goes through.
+        assert_eq!(
+            g.perform(1, SemanticAction::Click, None).await.unwrap(),
+            Route::Ax
+        );
+        g.set_value(1, "v").await.unwrap();
+        g.read_element(1).await.unwrap();
+        g.clipboard_write(ClipFormat::Text, "c").await.unwrap();
+        g.clipboard_read(ClipFormat::Text).await.unwrap();
+        assert_eq!(backend.actions.lock().unwrap().len(), 1);
+        assert_eq!(backend.values.lock().unwrap().len(), 1);
+        // The sensors the human-override watcher reads are the inner ones.
+        assert_eq!(g.platform(), "mock");
+        assert_eq!(g.input_target().as_deref(), Some("TestApp"));
+        g.cancel_pending();
+        assert_eq!(g.takeover_generation(), 1);
+        assert_eq!(backend.takeover_generation(), 1);
+        assert_eq!(g.route_for(SemanticAction::Click), Route::Ax);
+    }
+
+    #[test]
+    fn the_refusals_name_the_background_alternative_each_tool_has() {
+        let b = MockBackend::default();
+        let said = |tool: &str, args: Value| {
+            let r = crate::foreground::tool_refusal(&b, tool, &args).expect("refused");
+            format!("{} | {}", r.message(), r.suggestion())
+        };
+        assert!(
+            said("mouse_action", json!({"type":"click","ref":"@e4"})).contains("ui_action click")
+        );
+        assert!(said("keyboard_type", json!({"text":"x","ref":"@e1"})).contains("set_value"));
+        assert!(said("scroll", json!({"direction":"down"})).contains("scroll_into_view"));
+        assert!(said("ui_action", json!({"ref":"@e1","action":"focus"})).contains("select_text"));
+        for none in [
+            (
+                "drag_drop",
+                json!({"from":{"x":1,"y":1},"to":{"x":2,"y":2}}),
+            ),
+            ("hover", json!({"x":1,"y":1})),
+            ("mouse_action", json!({"type":"move","x":1,"y":1})),
+        ] {
+            let r = crate::foreground::tool_refusal(&b, none.0, &none.1).unwrap();
+            // A tool with a partial alternative says so; one with none says that.
+            if none.0 != "drag_drop" {
+                assert!(r.instead.is_none(), "{}", none.0);
+                assert!(r.suggestion().contains("no background-safe equivalent"));
             }
         }
     }

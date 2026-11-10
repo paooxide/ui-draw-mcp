@@ -212,6 +212,9 @@ pub enum InputError {
     /// is not valid base64).
     InvalidArgs(String),
     Failed(String),
+    /// Refused by the operator's `foreground = "never"` before anything was
+    /// done. Mapped to `POLICY_DENIED`: a policy decided this, not the OS.
+    Refused(String),
 }
 
 /// Platform input backend: semantic AX actions, keyboard, coordinate pointer,
@@ -227,6 +230,14 @@ pub trait InputBackend: Send + Sync {
         action: SemanticAction,
         option: Option<&str>,
     ) -> Result<Route, InputError>;
+    /// The route [`InputBackend::perform`] will take for `action`, known before
+    /// it runs. `foreground = "never"` has to refuse a pointer click *before*
+    /// it is posted, and the route a call reports only exists afterwards.
+    ///
+    /// Required, with no default, so a backend cannot be added without saying
+    /// which of its actions need the pointer. It must agree with what
+    /// `perform` returns; answer [`Route::Hid`] when unsure.
+    fn route_for(&self, action: SemanticAction) -> Route;
     /// Choose the entry named `option` from a popup button or combo box, or
     /// from the popup an entry belongs to when `node_id` is itself an entry.
     ///

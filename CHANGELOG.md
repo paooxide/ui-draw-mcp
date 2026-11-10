@@ -8,6 +8,27 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- **`foreground = "never"` (`[input]` table, or `AGENTCTL_FOREGROUND=never`) refuses every tool that would
+  take your pointer, keyboard or foreground.** The default, `"allow"`, changes nothing. With `never`,
+  `mouse_action`, `scroll`, `hover`, `drag_drop`, `keyboard_type`, `keyboard_shortcut` (press or hold) and
+  `input_showcase` are refused with `POLICY_DENIED` before anything runs, as are `ui_action` `focus`,
+  `show_menu` and `select` with an `option`, a `ui_fill_form` containing any of those, `menu_open`,
+  `menu_invoke`, `focus_app` with an app, and `control_window` `focus` and `restore`. Each refusal says what
+  was refused, that `foreground = "never"` is why, and the tool that does the job in the background where one
+  exists (`ui_action click` for a click on a ref, `set_value` for typing into a field, `scroll_into_view` or
+  `increment` for scrolling; `drag_drop` and `hover` have none). `set_value`, `select_text`, `get_selection`,
+  the other `ui_action` actions, the clipboard and the window and menu reads keep working and never call the
+  step that raises an app. `launch` runs `open -g` on macOS and is refused on Linux, which has no way to
+  start an app without activating it. The check is made twice: in each tool, first, so a refused call has not
+  taken a snapshot or raised a consent dialog; and in a wrapper around the platform backend, so a tool added
+  later still posts nothing. Only the config file or the environment sets it; the environment can add `never`
+  but not remove it, an unknown value is a startup error, and no role, access profile or tool argument
+  changes it. `agentctl doctor` reports the mode. The three `ui_action` actions, `menu_open`, `menu_invoke`
+  and `control_window restore` are refused because it is not verified that they leave the app behind, not
+  because they are known to raise it. What `never` does not cover: an app raising itself in answer to an
+  accessibility action, a launched app taking focus anyway, a headed browser driven by `browser_*` tools
+  (the engine brings tabs forward), and anything run through `exec` or `pty_*`. See `docs/threat-model.md`.
+
 - **`browser_act` and `browser_fill_form` say when an action left a dialog or layer in the way.** In a recorded
   MiniWoB++ `login-user-popup` run, focusing the username raised a popup (OK / Cancel) over the form and
   disabled it; `browser_fill_form` still returned `submitted: true`, and the model answered DONE on a form

@@ -87,6 +87,7 @@ gate would have refused.
 | argv execution | `mcp-proc` | Shell metacharacter injection. No shell unless `allow_shell` is on. |
 | Redaction | `mcp-policy::Redactor` | Secrets in results *and* in the audit log. |
 | No plaintext secret read | `mcp-sec` | Exfiltration of keychain values. The capability does not exist. |
+| Foreground refusal (`input.foreground = "never"`) | Tool layer: `mcp-input::tool_refusal`, `mcp-window::tool_refusal`; backend boundary: `mcp-input::ForegroundInput`, `mcp-window::ForegroundWindow`, wired in `agentctl::engines` | Agentctl itself taking the user's pointer, keyboard or foreground while they work. See the note below the table. Config or `AGENTCTL_FOREGROUND` only; roles, `access` profiles and tool arguments cannot change it, and the environment can add `never` but not remove it. |
 | Pinned-target raise-or-refuse | `mcp-macos::ensure_target_frontmost` | Keystrokes landing in the wrong window. Refuses to type if it cannot raise the intended app. |
 | Frame cap | `mcp-core::DEFAULT_MAX_FRAME_BYTES` | Memory exhaustion before any policy runs. |
 | HTTP: loopback bind, bearer token, `Origin` refusal | `mcp-core::http` | Network reachability, unauthenticated access, and drive-by requests from the operator's own browser. |
@@ -95,6 +96,34 @@ gate would have refused.
 | PII token sinks | `Policy::check_token_sink`, before the gate | A tokenized value (`<SSN_1>`) being de-tokenized into a URL, command, file or request. Plaintext is restored only for local input tools; a token anywhere else is refused whatever the profile. Off unless `policy.anonymize`. |
 | Roles | `mcp-policy::role` | One session doing more than its job needs. A role narrows visible tools, can add consent and lower the denial budget; it can never widen, raise or disable anything, and an unknown role setting is a config error. |
 | Audit log | `mcp-policy::AuditSink` | Nothing, but it is how you find out what happened. Records are hash-chained and Ed25519-signed; with an operator key (`policy.audit_signing_key`, 0600 or the server will not start) `audit verify --pubkey` detects a deleted, reordered, edited or re-signed record. |
+
+**What `foreground = "never"` guarantees, and what it does not.** With `never`, agentctl's own desktop tools
+post no synthetic pointer, key or scroll event, hold no key, and ask no app or window to come to the front.
+Each tool that would is refused with `POLICY_DENIED` before it runs, and the same refusal sits at the
+backend boundary, so a tool added later still posts nothing. `launch` asks the OS not to activate the app
+(`open -g` on macOS) and is refused where the platform has no such request (Linux). The accessibility tools
+(`set_value`, `select_text`, the other `ui_action` actions, `get_ui_tree`, the window and menu reads)
+keep working and never raise anything themselves. Actions that open a menu or popup, set keyboard focus, or
+un-minimise a window (`ui_action` `focus`, `show_menu`, `select` with an option; `menu_open`,
+`menu_invoke`; `control_window` `focus` and `restore`) are refused because it is **not verified** that an
+app does not bring itself forward in response; this is a precaution, not a measured fact. It does not
+promise:
+
+- That an application stays behind. An app may raise itself in answer to an accessibility action it
+  accepted, and a launched app may take focus despite the request not to activate it.
+- Anything about the browser engine. `browser_*` tools drive Chrome over DevTools, not through system input,
+  so they never move the pointer, but a visible (headed) browser is another matter: the engine calls
+  `Page.bringToFront` on the first connection to a tab, `browser_tabs` `open` and `activate` bring a tab
+  forward, and a headed `browser_launch` starts a visible window. None of that is gated by `foreground`.
+  It is out of scope here because covering it means changing how the browser engine connects to every tab,
+  a separate change; until then, `headless` is the way to keep a browser out of the user's way.
+- Anything about programs the agent starts. `exec` and `pty_*` run arbitrary commands, and a command can
+  open an app or send keys (`open`, `osascript`); the command allowlist, not `foreground`, limits that.
+- The clipboard. `clipboard_write` changes what the user will paste; it moves nothing and is not refused.
+- The OS choosing a new frontmost app after `close_app` ends the one that was in front.
+
+The refusal appears in the audit log as an ordinary `POLICY_DENIED` result for the tool; the log records the
+code, not the message.
 
 Full mapping to OWASP categories is in [`architecture.md`](architecture.md) §8.
 

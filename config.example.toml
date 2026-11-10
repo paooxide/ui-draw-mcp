@@ -131,6 +131,24 @@ human_override_px = 12
 # How long after an action agentctl still counts as driving, so a divergence
 # between two calls is not missed.
 human_override_grace_ms = 1500
+# Whether tools may take your pointer, keyboard or foreground.
+#   "allow"  (default) every tool may move the pointer, type and bring apps forward.
+#   "never"  no tool moves the real pointer, posts synthetic key or scroll events,
+#            holds a key, or brings an app or window to the front. Each one is
+#            refused before it runs, with the background-safe alternative if
+#            there is one (ui_action and set_value act through accessibility
+#            without moving anything). `launch` starts apps without activating
+#            them (macOS) or is refused (Linux). This is for letting an agent
+#            work while you use the machine.
+#
+# It does not stop an app from raising itself in response to an accessibility
+# action, does not cover a visible browser driven by browser_* tools, and does
+# not limit what `exec` can run. See docs/threat-model.md.
+#
+# Only this file or AGENTCTL_FOREGROUND can set it: no tool, role or access
+# profile can. The environment can add "never" but cannot remove it. Any other
+# value is a startup error. `agentctl doctor` shows the mode in effect.
+foreground = "allow"
 # Apps whose typed input is screened for destructive shell commands.
 # Editors are included by default because their *integrated terminals* run the
 # same shell: the accessibility API cannot tell an editor pane from a terminal

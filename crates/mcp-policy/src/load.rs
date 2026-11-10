@@ -117,6 +117,7 @@ const KNOWN_KEYS: &[&str] = &[
     "http.token",
     "input.demo",
     "input.demo_speed",
+    "input.foreground",
     "input.human_override",
     "input.human_override_grace_ms",
     "input.human_override_px",
@@ -181,6 +182,27 @@ fn boolean(key: &str, s: &str) -> Result<bool, String> {
         "false" => Ok(false),
         other => Err(format!("{key} must be true or false, not '{other}'")),
     }
+}
+
+/// `allow` or `never`. Anything else is an error: this setting restricts, so
+/// a misspelling read as `allow` would drop the restriction without a word.
+fn parse_foreground(source: &str, value: &str) -> Result<mcp_types::Foreground, String> {
+    mcp_types::Foreground::parse(value)
+        .ok_or_else(|| format!("unknown {source} '{value}' (expected \"allow\" or \"never\")"))
+}
+
+/// The file's setting after the environment's `AGENTCTL_FOREGROUND`: `never`
+/// from either source wins, and an invalid value is an error from either.
+fn tighten_foreground(
+    from_file: mcp_types::Foreground,
+    env: &str,
+) -> Result<mcp_types::Foreground, String> {
+    let from_env = parse_foreground("AGENTCTL_FOREGROUND", env)?;
+    Ok(if from_env.is_never() || from_file.is_never() {
+        mcp_types::Foreground::Never
+    } else {
+        mcp_types::Foreground::Allow
+    })
 }
 
 fn parse_value(s: &str) -> Result<Val, String> {
@@ -379,6 +401,9 @@ impl PolicyConfig {
                 ("http.allowed_origins", Val::List(v)) => cfg.http_allowed_origins = v.clone(),
                 ("memory.store", Val::Str(s)) => cfg.memory_store = PathBuf::from(s),
                 ("memory.max_recipes", Val::Int(i)) if *i >= 0 => cfg.max_recipes = *i as usize,
+                ("input.foreground", Val::Str(s)) => {
+                    cfg.foreground = parse_foreground(key, s)?;
+                }
                 ("input.human_override", Val::Str(s)) => cfg.human_override = boolean(key, s)?,
                 ("input.human_override_px", Val::Int(i)) if *i > 0 => {
                     cfg.human_override_px = *i as u32
@@ -609,6 +634,13 @@ impl PolicyConfig {
             || std::env::var_os("AGENTCTL_NO_PII").is_some()
         {
             cfg.anonymize = false;
+        }
+
+        // The environment can add the restriction but never remove it, so a
+        // launcher that sets this cannot be undone by a config file edit, and
+        // a stray `allow` in the environment cannot undo the file's `never`.
+        if let Ok(v) = std::env::var("AGENTCTL_FOREGROUND") {
+            cfg.foreground = tighten_foreground(cfg.foreground, &v)?;
         }
 
         if let Ok(v) = std::env::var("AGENTCTL_DEMO") {
@@ -933,6 +965,71 @@ mod tests {
         assert!(err.contains("max_denials"), "{err}");
         // Unknown keys stay tolerated for forward compatibility.
         assert!(PolicyConfig::from_toml_str("[policy]\nsome_future_key = 1\n").is_ok());
+    }
+
+    #[test]
+    fn foreground_defaults_to_allow_and_never_is_read_from_the_input_table() {
+        // The default is the contract that existing users see no change.
+        assert_eq!(
+            PolicyConfig::default().foreground,
+            mcp_types::Foreground::Allow
+        );
+        assert_eq!(
+            PolicyConfig::from_toml_str("").unwrap().foreground,
+            mcp_types::Foreground::Allow
+        );
+        let cfg = PolicyConfig::from_toml_str("[input]\nforeground = \"never\"\n").unwrap();
+        assert_eq!(cfg.foreground, mcp_types::Foreground::Never);
+        let cfg = PolicyConfig::from_toml_str("[input]\nforeground = \"allow\"\n").unwrap();
+        assert_eq!(cfg.foreground, mcp_types::Foreground::Allow);
+    }
+
+    #[test]
+    fn an_unknown_foreground_value_is_a_config_error_not_allow() {
+        for bad in ["Never", "NEVER", "deny", "polite", "", "yes", "true"] {
+            let err = PolicyConfig::from_toml_str(&format!("[input]\nforeground = \"{bad}\"\n"))
+                .unwrap_err();
+            assert!(
+                err.contains("input.foreground") && err.contains("allow") && err.contains("never"),
+                "{bad:?}: {err}"
+            );
+        }
+        // Not a string at all: a bare word, a boolean, a number.
+        for bad in ["never", "true", "1", "[\"never\"]"] {
+            assert!(
+                PolicyConfig::from_toml_str(&format!("[input]\nforeground = {bad}\n")).is_err(),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_environment_can_add_never_but_not_remove_it() {
+        use mcp_types::Foreground::{Allow, Never};
+        assert_eq!(tighten_foreground(Allow, "never").unwrap(), Never);
+        assert_eq!(tighten_foreground(Never, "never").unwrap(), Never);
+        assert_eq!(tighten_foreground(Never, "allow").unwrap(), Never);
+        assert_eq!(tighten_foreground(Allow, "allow").unwrap(), Allow);
+        let err = tighten_foreground(Allow, "nevr").unwrap_err();
+        assert!(
+            err.contains("AGENTCTL_FOREGROUND") && err.contains("nevr"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn no_access_profile_and_no_role_loosens_or_sets_foreground() {
+        for access in ["ask", "auto", "bypass"] {
+            let cfg = PolicyConfig::from_toml_str(&format!(
+                "[policy]\naccess = \"{access}\"\n[input]\nforeground = \"never\"\n"
+            ))
+            .unwrap();
+            assert_eq!(cfg.foreground, mcp_types::Foreground::Never, "{access}");
+        }
+        // A role is a narrowing of tools; it has no foreground setting, and a
+        // misspelt role setting is an error rather than a silent no-op.
+        let err = PolicyConfig::from_toml_str("[roles.qa2]\nforeground = \"allow\"\n").unwrap_err();
+        assert!(err.contains("roles.qa2.foreground"), "{err}");
     }
 
     #[test]

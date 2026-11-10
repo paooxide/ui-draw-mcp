@@ -16,6 +16,7 @@ pub struct WindowModule {
     evaluator: WaitEvaluator,
     allowed_apps: Vec<String>,
     judge: Option<Arc<mcp_judge::Judge>>,
+    foreground: mcp_types::Foreground,
 }
 
 impl WindowModule {
@@ -29,7 +30,16 @@ impl WindowModule {
             backend,
             allowed_apps,
             judge: None,
+            foreground: mcp_types::Foreground::Allow,
         }
+    }
+
+    /// Apply the operator's `foreground` setting (composition root only).
+    /// With `never`, calls that would bring something forward are refused
+    /// before they reach the backend, and `launch` asks not to activate.
+    pub fn with_foreground(mut self, foreground: mcp_types::Foreground) -> Self {
+        self.foreground = foreground;
+        self
     }
 
     /// Give `wait_for`'s evaluator the judge that answers a `judge` condition,
@@ -76,7 +86,12 @@ impl WindowModule {
                 format!("app '{app}' is not in policy.allowed_apps"),
             );
         }
-        match self.backend.launch(&app).await {
+        let started = if self.foreground.is_never() {
+            self.backend.launch_in_background(&app).await
+        } else {
+            self.backend.launch(&app).await
+        };
+        match started {
             Ok(()) => Envelope::ok("launch", json!({ "ok": true })),
             Err(e) => win_err("launch", e),
         }
@@ -437,6 +452,11 @@ impl ToolModule for WindowModule {
     }
 
     async fn call(&self, name: &str, args: Value, ctx: &CallCtx) -> Envelope {
+        if self.foreground.is_never() {
+            if let Some(refusal) = crate::foreground::tool_refusal(&*self.backend, name, &args) {
+                return refusal.envelope(name);
+            }
+        }
         match name {
             "list_windows" => self.list_windows(&args).await,
             "list_apps" => self.list_apps().await,
@@ -473,6 +493,7 @@ fn win_err(tool: &str, e: WindowError) -> Envelope {
         WindowError::NotFound(m) => (ErrorCode::NotFound, m),
         WindowError::Unsupported(m) => (ErrorCode::UnsupportedOs, m),
         WindowError::Failed(m) => (ErrorCode::ActionFailed, m),
+        WindowError::Refused(m) => (ErrorCode::PolicyDenied, m),
     };
     Envelope::fail(tool, code, msg)
 }

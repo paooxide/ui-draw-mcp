@@ -800,6 +800,13 @@ impl InputBackend for MacosBackend {
         }
     }
 
+    /// Every action is an accessibility action or attribute write; `perform`
+    /// returns [`Route::Ax`] for all of them, including `right_click` and
+    /// `double_click`, which are an `AXPress`.
+    fn route_for(&self, _action: SemanticAction) -> Route {
+        Route::Ax
+    }
+
     async fn selection(&self, node_id: Option<u64>) -> Result<Selection, InputError> {
         unsafe {
             if let Some(id) = node_id {
@@ -1946,6 +1953,17 @@ impl WindowBackend for MacosBackend {
         }
     }
 
+    /// `open -g`: launch without bringing the app to the foreground. The app
+    /// can still activate itself once it is running.
+    async fn launch_in_background(&self, app: &str) -> Result<(), WindowError> {
+        let out = run("open", &["-g", "-a", app])?;
+        if out.status.success() {
+            Ok(())
+        } else {
+            Err(WindowError::NotFound(format!("could not launch '{app}'")))
+        }
+    }
+
     async fn close_app(&self, target: &str) -> Result<(), WindowError> {
         let out = run("pkill", &["-ix", target])?;
         if out.status.success() {
@@ -1993,6 +2011,13 @@ impl WindowBackend for MacosBackend {
                 WindowAction::Maximize => maximize_window(wref),
             }
         }
+    }
+
+    /// Focus raises the window and un-minimising brings it back to the front.
+    /// Every other action is an attribute write or a button press on the
+    /// window and leaves the app where it was.
+    fn control_takes_foreground(&self, action: WindowAction) -> bool {
+        matches!(action, WindowAction::Focus | WindowAction::Restore)
     }
 
     async fn menu_open(&self, _app: Option<&str>, path: &[String]) -> Result<(), WindowError> {
@@ -2246,6 +2271,51 @@ mod tests {
     }
 
     /// Releasing the pin clears the target so calls track the frontmost app again.
+    /// `foreground = "never"` trusts this answer to refuse a pointer click
+    /// before it is posted, so it must agree with what `perform` returns: it
+    /// returns `Ax` on every path.
+    #[test]
+    fn every_semantic_action_is_an_accessibility_route_on_macos() {
+        let b = MacosBackend::new();
+        for name in [
+            "click",
+            "double_click",
+            "right_click",
+            "focus",
+            "toggle",
+            "check",
+            "uncheck",
+            "expand",
+            "collapse",
+            "select",
+            "scroll_into_view",
+            "show_menu",
+            "increment",
+            "decrement",
+            "pick",
+        ] {
+            let action = SemanticAction::parse(name).expect(name);
+            assert_eq!(b.route_for(action), Route::Ax, "{name}");
+        }
+    }
+
+    #[test]
+    fn only_focus_and_restore_take_the_foreground_in_a_macos_window_action() {
+        let b = MacosBackend::new();
+        for (name, takes) in [
+            ("focus", true),
+            ("restore", true),
+            ("minimize", false),
+            ("maximize", false),
+            ("close", false),
+            ("move", false),
+            ("resize", false),
+        ] {
+            let action = WindowAction::parse(name).expect(name);
+            assert_eq!(b.control_takes_foreground(action), takes, "{name}");
+        }
+    }
+
     #[tokio::test]
     async fn focus_app_none_releases_the_pin() {
         let backend = MacosBackend::new();
