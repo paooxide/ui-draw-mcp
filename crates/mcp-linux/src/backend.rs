@@ -32,6 +32,10 @@ pub struct State {
     pub windows: Vec<WindowRef>,
     /// Pointer positions this backend set, newest last.
     pub pointer_sets: Vec<mcp_input::SetPoint>,
+    /// Modifiers held down by `key_down`. A pointer action or chord that
+    /// names one of them must neither press it again nor let go of it when it
+    /// finishes, or `shift` held across clicks would end at the first click.
+    pub held_mods: Vec<crate::keys::Modifier>,
 }
 
 /// Applications whose text is a scrollback: keep value tails, not heads.

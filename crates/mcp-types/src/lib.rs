@@ -8,6 +8,7 @@
 pub mod args;
 mod context;
 mod descriptor;
+pub mod drag;
 mod envelope;
 mod module;
 

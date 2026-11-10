@@ -6,6 +6,31 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **`drag_drop` takes `path`.** Up to 200 waypoints `{x, y}` (the argument and limit of `browser_act drag`) that
+  the drag passes through in order, releasing at the last, with the moves (`steps`, 2 to 100, default 20) spread
+  over the segments by length and at least one landing on every waypoint. Give no `to` with a path. Waypoints
+  are in the frame of `from`: offsets from the element's top-left when it is a ref or name, else absolute screen
+  points. Every waypoint is checked against the allowed window bounds as the endpoints are, and one outside
+  denies the whole drag before the button goes down. Before, a desktop drag was a straight line, so a brush
+  stroke, a lasso or a curved slider path could not be drawn. The result reports `waypoints`. The path maths
+  now lives in `mcp-types` and is shared with the browser engine.
+- **`keyboard_shortcut` takes `action`: `press` (default), `down` or `up`.** `down` holds a lone modifier
+  (`shift`, `cmd+shift`) or one key, in the same key names `press` takes, and keeps it down across later calls:
+  every click, drag, scroll and chord until `up` carries the held modifiers, whatever `modifiers` the call
+  names. `up` releases the named keys, or everything held when no `combo` is given. Before, Shift could only
+  be held inside a single `modifiers` argument, so a multi-step selection or a press-and-hold was impossible.
+  At most 6 keys are held at once; holding one already held renews its time limit. An unknown key is
+  `INVALID_ARGS` before anything is pressed. A key is released by `up`; automatically after 30 seconds unless
+  renewed (the result's `auto_release_ms`); when any other input call fails (the error says which keys were
+  released); when the STOP file appears or a human takes the mouse, although every later call is refused by
+  then; and when the server stops. On macOS a held modifier is stamped on the flags of the events agentctl
+  posts, not pressed as a key, so it cannot stay latched in the system if the process dies; software that
+  reads the keyboard state rather than event flags does not see it, and `keyboard_type` ignores it. A held
+  ordinary key is a real key-down. On Linux every held key is a real press through the portal. A crash or
+  `SIGKILL` cannot run the release, which on Linux can leave a held key down.
+
 ## [0.3.0] - 2026-10-10
 
 ### Added

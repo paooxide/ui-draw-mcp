@@ -375,6 +375,8 @@ pub struct MacosBackend {
     /// Which mouse buttons this backend holds down, so a `move` between a
     /// `down` and an `up` goes out as the drag event it is.
     held: crate::event::Held,
+    /// Keys held down across calls; their modifiers ride on every event.
+    keys: crate::event::HeldKeys,
 }
 
 impl Default for MacosBackend {
@@ -390,6 +392,7 @@ impl MacosBackend {
             takeovers: std::sync::atomic::AtomicU64::new(0),
             helper_dir: default_helper_dir(),
             held: crate::event::Held::default(),
+            keys: crate::event::HeldKeys::default(),
         }
     }
 
@@ -741,7 +744,20 @@ impl InputBackend for MacosBackend {
     }
     async fn key_combo(&self, combo: &str) -> Result<(), InputError> {
         unsafe { self.ensure_target_frontmost()? };
-        crate::event::key_combo(combo)
+        crate::event::key_combo(combo, self.keys.flags())
+    }
+    async fn key_down(&self, key: &str) -> Result<(), InputError> {
+        // Only an ordinary key is typed into the frontmost app, so only it
+        // needs the target raised; a modifier is a flag on later events.
+        if !crate::event::is_modifier(key) {
+            unsafe { self.ensure_target_frontmost()? };
+        }
+        crate::event::key_down(&self.keys, key)
+    }
+    async fn key_up(&self, key: &str) -> Result<(), InputError> {
+        // Never conditional on where focus is: a release that can be refused
+        // is a stuck key.
+        crate::event::key_up(&self.keys, key)
     }
     async fn mouse(
         &self,
@@ -751,7 +767,8 @@ impl InputBackend for MacosBackend {
         b: Option<&str>,
         modifiers: &[String],
     ) -> Result<(), InputError> {
-        crate::event::mouse(&self.held, k, x, y, b, modifiers)
+        let modifiers = self.keys.with_modifiers(modifiers);
+        crate::event::mouse(&self.held, k, x, y, b, &modifiers)
     }
     async fn scroll_at(
         &self,
@@ -761,7 +778,8 @@ impl InputBackend for MacosBackend {
         a: i32,
         modifiers: &[String],
     ) -> Result<(), InputError> {
-        crate::event::scroll(&self.held, x, y, d, a, modifiers)
+        let modifiers = self.keys.with_modifiers(modifiers);
+        crate::event::scroll(&self.held, x, y, d, a, &modifiers)
     }
     async fn pointer_position(&self) -> Result<Option<(f64, f64)>, InputError> {
         crate::event::pointer_position()
@@ -776,30 +794,39 @@ impl InputBackend for MacosBackend {
         // it was holding is no longer its gesture, and the next `move` must
         // not go out as a drag of it.
         self.held.clear();
+        // Keys too: whoever has the mouse now should not find Shift still on.
+        crate::event::release_all(&self.keys);
     }
     fn takeover_generation(&self) -> u64 {
         self.takeovers.load(std::sync::atomic::Ordering::SeqCst)
     }
     async fn hover(&self, x: f64, y: f64) -> Result<(), InputError> {
-        crate::event::hover(&self.held, x, y)
+        let modifiers = self.keys.with_modifiers(&[]);
+        crate::event::hover(&self.held, x, y, &modifiers)
     }
     async fn drag(
         &self,
         from: (f64, f64),
-        to: (f64, f64),
+        route: &[(f64, f64)],
         modifiers: &[String],
-        steps: u32,
         hold_ms: u64,
         since_takeover: u64,
     ) -> Result<(), InputError> {
         use tokio::time::{sleep, Duration};
+        let Some(&to) = route.last() else {
+            return Err(InputError::InvalidArgs(
+                "a drag needs somewhere to go".into(),
+            ));
+        };
+        let modifiers = self.keys.with_modifiers(modifiers);
+        let modifiers = &modifiers[..];
         crate::event::drag_begin(&self.held, from, modifiers)?;
         // Let the press register before motion starts; a drag that begins in
         // the same instant reads as a click to most targets. `hold_ms` adds to
         // that for sources that wait to tell a drag from a click.
         sleep(Duration::from_millis(30 + hold_ms)).await;
         let mut last = from;
-        for p in crate::event::drag_path(from, to, steps) {
+        for &p in route {
             // A cancelled drag must release the button where it is. Returning
             // with it still held would leave the human dragging a selection
             // around with their own mouse.

@@ -216,7 +216,15 @@ pub trait InputBackend: Send + Sync {
         modifiers: &[String],
     ) -> Result<(), InputError>;
     async fn hover(&self, x: f64, y: f64) -> Result<(), InputError>;
-    /// Press at `from`, travel to `to` in `steps` intermediate moves, release.
+    /// Press at `from`, move to each point of `route` in order, release on the
+    /// last one.
+    ///
+    /// `route` is never empty and is already spaced: the tool layer spreads
+    /// the moves (a straight line, or a path through waypoints) so the
+    /// backends only play them back. The steps are not decoration: a press
+    /// followed by a single jump is what a teleport looks like, and drag
+    /// targets that track motion (Finder drags, sliders, canvases, reorderable
+    /// lists) ignore it.
     ///
     /// `since_takeover` is [`InputBackend::takeover_generation`] as read when
     /// the call started; the drag aborts (releasing the button) if it has
@@ -225,19 +233,27 @@ pub trait InputBackend: Send + Sync {
     /// `hold_ms` is how long the button stays down before the first move, on
     /// top of the short settle every drag gets. Drag sources that wait to see
     /// whether a press is a click (Finder icons, list rows) need it.
-    ///
-    /// The steps are not decoration: a press followed by a single jump is what
-    /// a teleport looks like, and drag targets that track motion — Finder
-    /// drags, sliders, canvases, reorderable lists — ignore it.
     async fn drag(
         &self,
         from: (f64, f64),
-        to: (f64, f64),
+        route: &[(f64, f64)],
         modifiers: &[String],
-        steps: u32,
         hold_ms: u64,
         since_takeover: u64,
     ) -> Result<(), InputError>;
+    /// Press `key` (a canonical name from [`crate::parse_hold`]: a modifier or
+    /// one key) and leave it down until [`InputBackend::key_up`].
+    ///
+    /// While any key is down, every pointer, scroll and key-chord event this
+    /// backend posts carries the held modifiers, so a click while Shift is
+    /// held is a shift-click whatever modifiers the call itself named. Holding
+    /// a key that is already down is not an error.
+    async fn key_down(&self, key: &str) -> Result<(), InputError>;
+    /// Release a key pressed with [`InputBackend::key_down`]. Releasing one
+    /// that is not down is not an error. Must not refuse for any reason other
+    /// than a failure to post the event: a release that can be vetoed is a
+    /// stuck key.
+    async fn key_up(&self, key: &str) -> Result<(), InputError>;
     async fn clipboard_read(&self, format: ClipFormat) -> Result<ClipData, InputError>;
     /// The application that will receive synthetic input *right now*.
     ///

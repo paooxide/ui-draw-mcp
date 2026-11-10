@@ -155,6 +155,12 @@ pub struct Wiring {
     pub judge: Option<Arc<mcp_policy::mcp_judge::Judge>>,
 }
 
+/// A probe for the input engine: whether the STOP file exists.
+fn stop_file_probe(file: &std::path::Path) -> Arc<dyn Fn() -> bool + Send + Sync> {
+    let file = file.to_path_buf();
+    Arc::new(move || file.exists())
+}
+
 /// Where agentctl keeps state beside the config: the kill switch's directory.
 fn state_dir(cfg: &PolicyConfig) -> std::path::PathBuf {
     cfg.kill_switch_file
@@ -359,7 +365,12 @@ pub fn build_stack(cfg: &PolicyConfig) -> (Vec<Arc<dyn ToolModule>>, Wiring) {
             .with_activity(activity.clone())
             // A call that names an element before anything was observed
             // takes its own snapshot instead of asking for one.
-            .with_observer(backend.clone());
+            .with_observer(backend.clone())
+            // Keys held across calls must come up when the STOP file appears,
+            // although every later call, `up` included, is refused by then.
+            // A human taking the mouse reaches the engine through the
+            // backend's takeover count instead.
+            .with_halt_probe(stop_file_probe(&cfg.kill_switch_file));
         if engines.demo {
             input = input.with_glide(glide_preset.into());
         }
@@ -422,7 +433,12 @@ pub fn build_stack(cfg: &PolicyConfig) -> (Vec<Arc<dyn ToolModule>>, Wiring) {
             .with_activity(activity.clone())
             // A call that names an element before anything was observed
             // takes its own snapshot instead of asking for one.
-            .with_observer(backend.clone());
+            .with_observer(backend.clone())
+            // Keys held across calls must come up when the STOP file appears,
+            // although every later call, `up` included, is refused by then.
+            // A human taking the mouse reaches the engine through the
+            // backend's takeover count instead.
+            .with_halt_probe(stop_file_probe(&cfg.kill_switch_file));
         if engines.demo {
             input = input.with_glide(glide_preset.into());
         }

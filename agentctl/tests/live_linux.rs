@@ -455,3 +455,65 @@ async fn clipboard_round_trips_and_is_restored() {
             .await;
     }
 }
+
+/// A held Shift turns later arrow chords into a selection and `up` ends it:
+/// two shifted Lefts select "bc" and typing replaces them. Same shape as the
+/// macOS test; on Linux the hold is a real key press at the compositor.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_held_shift_selects_across_chords_and_up_lets_go() {
+    if !live() || !live_gui_enabled() {
+        eprintln!("skipping: set AGENTCTL_LIVE_GUI=1 to run the acting half");
+        return;
+    }
+    if !std::path::Path::new("/usr/share/applications/org.gnome.TextEditor.desktop").exists() {
+        eprintln!("skipping: GNOME Text Editor is not installed");
+        return;
+    }
+    trace();
+    let c = client("linux-hold");
+    c.ok("launch", json!({ "app": EDITOR })).await;
+    if !settle_on(&c, EDITOR).await {
+        let _ = c.call("close_app", json!({ "app": EDITOR })).await;
+        return;
+    }
+    let typed = c.call("keyboard_type", json!({ "text": "abc" })).await;
+    if !typed.ok {
+        eprintln!("skipping: keyboard_type refused: {:?}", typed.error);
+        let _ = c.call("close_app", json!({ "app": EDITOR })).await;
+        return;
+    }
+    let down = c
+        .call(
+            "keyboard_shortcut",
+            json!({ "combo": "shift", "action": "down" }),
+        )
+        .await;
+    if down.ok {
+        for _ in 0..2 {
+            let _ = c
+                .call("keyboard_shortcut", json!({ "combo": "Left" }))
+                .await;
+        }
+    }
+    // Always let go, whatever happened above.
+    let up = c.call("keyboard_shortcut", json!({ "action": "up" })).await;
+    assert!(up.ok, "{up:?}");
+    assert!(down.ok, "{down:?}");
+    let _ = c.call("keyboard_type", json!({ "text": "X" })).await;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut seen = false;
+    while Instant::now() < deadline {
+        let tree = c.ok("get_ui_tree", json!({ "app": EDITOR })).await;
+        let text = tree["text"].as_str().unwrap_or_default();
+        if text.contains("aX") && !text.contains("abX") {
+            seen = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    let _ = c.call("close_app", json!({ "app": EDITOR })).await;
+    assert!(
+        seen,
+        "two shifted Lefts must select \"bc\" and typing replace it"
+    );
+}
