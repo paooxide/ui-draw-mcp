@@ -8,6 +8,16 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- **`browser_act` and `browser_fill_form` say when an action left a dialog or layer in the way.** In a recorded
+  MiniWoB++ `login-user-popup` run, focusing the username raised a popup (OK / Cancel) over the form and
+  disabled it; `browser_fill_form` still returned `submitted: true`, and the model answered DONE on a form
+  that was never submitted. `effects.overlay` (`{text, ref, covers}`) now appears on an act, on each of its
+  `steps` and on a fill when a dialog or positioned layer is on top of controls that were clickable before the
+  action and were not under it (`covers` counts up to 40 of them, left out when 0), when a modal dialog opened
+  (`<dialog>` shown with `showModal()`, or `aria-modal`), or when a new layer fills a quarter of the viewport.
+  A toast or menu beside the controls is not reported, and nothing is added when there is nothing to say. On
+  `browser_fill_form` it is the only effect reported.
+
 - **`ui_action` gains `show_menu`, `increment`, `decrement` and `pick`; `scroll_to_visible` is accepted for
   `scroll_into_view`.** They act through the accessibility API on the element itself (AXShowMenu, AXIncrement,
   AXDecrement, AXPick), so they need neither the pointer nor the app in front. On macOS the element's own
@@ -68,6 +78,27 @@ All notable changes to this project are documented here. The format follows
   reads the keyboard state rather than event flags does not see it, and `keyboard_type` ignores it. A held
   ordinary key is a real key-down. On Linux every held key is a real press through the portal. A crash or
   `SIGKILL` cannot run the release, which on Linux can leave a held key down.
+
+### Fixed
+
+- **`browser_fill_form` no longer reports `submitted: true` for a submit that did not happen.** It clicked the
+  submit control with a script `click()`, which a disabled control ignores and a person could not make on a
+  control under a dialog. It now looks first: a disabled control, or one with a dialog or positioned layer
+  over its centre, is not clicked, and the result is `submitted: false` with `submit_blocked` (`disabled`, or
+  `covered by "<text of the layer>"`). The fields are still filled and the call still succeeds.
+- **A plain-word query clicked the instruction sentence instead of the inbox row.** On MiniWoB++ `email-inbox`,
+  `browser_act` `click query:"Gilli"` (no `by`) matched the sender's name twice, in the task's instruction and
+  in the row, and clicked the instruction. A text match counted as clickable only when it was, or sat inside,
+  a link, button, input, role or `onclick`; the row is a `div` with a pointer cursor and a script handler, so
+  both matches tied and document order picked the sentence. Matches now rank control, then text a pointer
+  cursor or a `tabindex` marks as clickable (the cursor is inherited, so the words inside a row show it), then
+  prose. Exact before partial and visible before hidden still come first, `index` walks the same order, and
+  `matches` is the same count.
+- **`within` searched only the first element its selector matched.** `within:".email-thread"` (one match per
+  row) answered NOT_FOUND for text that was in the second row. `within`, as a CSS selector or an XPath, now
+  scopes the search to every element it matches, in document order, for `css`, `xpath`, `text`, `role` and the
+  no-`by` fallback; `index` and `matches` count across all of them. A `within` that matches nothing is still
+  an error and never widens the search.
 
 ### Security
 

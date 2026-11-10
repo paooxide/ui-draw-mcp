@@ -753,8 +753,38 @@ pub(crate) fn page_effects(page: &serde_json::Value) -> Fx {
     {
         fx.insert("focus".into(), json!(f));
     }
+    if let Some(o) = overlay_effect(page) {
+        fx.insert("overlay".into(), o);
+    }
     fx
 }
+
+/// A new layer in the way, from the facts the page script collected
+/// (`overlays`: text, ref, how many controls it now covers, whether it is
+/// modal, the share of the viewport it fills). It is in the way when it covers
+/// a control that was clickable before, is modal (the page behind it is inert
+/// whatever it covers), or fills a quarter of the viewport; a toast or a menu
+/// beside the controls is not. The first such layer is reported, as
+/// `{text, ref, covers}`, with `covers` left out when it is 0.
+pub(crate) fn overlay_effect(page: &serde_json::Value) -> Option<serde_json::Value> {
+    use serde_json::{json, Value};
+    let facts = page.get("overlays")?.as_array()?;
+    let o = facts.iter().find(|o| {
+        o.get("covers").and_then(Value::as_u64).unwrap_or(0) > 0
+            || o.get("modal").and_then(Value::as_bool) == Some(true)
+            || o.get("area").and_then(Value::as_f64).unwrap_or(0.0) >= OVERLAY_AREA
+    })?;
+    let text = |k: &str| o.get(k).and_then(Value::as_str).unwrap_or("");
+    let mut out = json!({ "text": clip(text("text"), 100), "ref": text("ref") });
+    let covers = o.get("covers").and_then(Value::as_u64).unwrap_or(0);
+    if covers > 0 {
+        out["covers"] = json!(covers);
+    }
+    Some(out)
+}
+
+/// The share of the viewport a layer fills to count as in the way by size alone.
+const OVERLAY_AREA: f64 = 0.25;
 
 #[cfg(test)]
 mod tests {
@@ -1115,6 +1145,32 @@ mod tests {
         );
         assert_eq!(location_of(&a, "A"), Some(home));
         assert_eq!(location_of(&a, "Z"), None);
+    }
+
+    #[test]
+    fn an_overlay_is_reported_when_it_covers_controls_or_is_modal_or_large() {
+        use serde_json::json;
+        let covering = json!({ "overlays": [
+            { "text": "Toast", "ref": "/a", "covers": 0, "modal": false, "area": 0.01 },
+            { "text": "Session  expiring. OK Cancel", "ref": "//div[@id='popup']", "covers": 3, "modal": false, "area": 0.02 },
+        ]});
+        let o = overlay_effect(&covering).expect("the covering layer, not the toast");
+        assert_eq!(o["text"], "Session expiring. OK Cancel");
+        assert_eq!(o["ref"], "//div[@id='popup']");
+        assert_eq!(o["covers"], 3);
+        let modal = json!({ "overlays": [{ "text": "Sure?", "ref": "/d", "covers": 0, "modal": true, "area": 0.05 }]});
+        let o = overlay_effect(&modal).expect("a modal blocks the page");
+        assert!(o.get("covers").is_none(), "no covers when 0: {o}");
+        let large = json!({ "overlays": [{ "text": "Cookies", "ref": "/c", "covers": 0, "modal": false, "area": 0.4 }]});
+        assert!(overlay_effect(&large).is_some());
+        let small = json!({ "overlays": [{ "text": "Toast", "ref": "/t", "covers": 0, "modal": false, "area": 0.05 }]});
+        assert!(overlay_effect(&small).is_none());
+        assert!(overlay_effect(&json!({})).is_none());
+        // Reaches the effects only through page_effects, and not for a new document.
+        assert!(page_effects(&covering).contains_key("overlay"));
+        let mut nav = covering.clone();
+        nav["navigated"] = json!(true);
+        assert!(page_effects(&nav).is_empty());
     }
 
     #[test]

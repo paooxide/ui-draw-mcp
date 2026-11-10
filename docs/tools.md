@@ -826,7 +826,7 @@ Read or change a desktop setting. Settings the platform does not expose return U
 
 `browser_act` · standard tier
 
-Act on a DOM node. Target 'ref' (from browser_snapshot/query) or 'query' (CSS, visible text, XPath or role=...; optional by, within, text, index). x, y act at a point (offsets in the target, canvas bitmap px, or viewport px): hit says what is there. type replaces the field's content; press takes a key or combo (ctrl+a). effects says what changed (url, new_tab, dialog, appeared, disappeared, focus). A click returns before navigation: use wait_after='settle'. steps=[{action, ...}] runs up to 20 acts in one call.
+Act on a DOM node. Target 'ref' (from browser_snapshot/query) or 'query' (CSS, visible text, XPath or role=...; optional by, within, text, index). x, y act at a point (offsets in the target, canvas bitmap px, or viewport px): hit says what is there. type replaces the field's content; press takes a key or combo (ctrl+a). effects says what changed (url, new_tab, dialog, appeared, disappeared, focus, overlay). A click returns before navigation: use wait_after='settle'. steps=[{action, ...}] runs up to 20 acts in one call.
 
 `press` takes a key or a combo in `value`: a named key (Enter, Escape, Tab, Arrow keys, Home, End, PageUp, PageDown, Backspace, Delete, Insert, Space, F1-F12), a character, or modifiers (ctrl, alt, shift, meta/cmd) joined by +, as in ctrl+a or Shift+ArrowDown. It is a real key event to the target, or to the focused node or page with no target; Chrome only. ctrl or cmd with a, c, x, v, z or y edits as a person's shortcut does, also on macOS.
 
@@ -834,7 +834,7 @@ Pointer actions are real input (Chrome only): double_click, triple_click (select
 
 Every action given x and y returns `hit`: the element under that point (tag, id, short text or name, and canvas). A point outside the viewport is an error naming the viewport size, and an input event the browser does not accept makes the call fail rather than report ok.
 
-Each result carries `effects` with only what the action changed, so the next call needs no snapshot to learn it: `url` and `title` when they changed, `new_tab` ({target_id, url}) for a tab or popup it opened, `dialog` ({type, message, answered}) for an alert, confirm or prompt it raised, `appeared` and `disappeared` (up to 5 each, such as 'dialog "Session expired" ref=...': dialogs, menus, listboxes, toasts, overlays and interactive elements that became visible or went away) and `focus` for the newly focused element. A navigation reports url and title only. Chrome only; effects are read about 120 ms after the action unless wait_after is settle.
+Each result carries `effects` with only what the action changed, so the next call needs no snapshot to learn it: `url` and `title` when they changed, `new_tab` ({target_id, url}) for a tab or popup it opened, `dialog` ({type, message, answered}) for an alert, confirm or prompt it raised, `appeared` and `disappeared` (up to 5 each, such as 'dialog "Session expired" ref=...': dialogs, menus, listboxes, toasts, overlays and interactive elements that became visible or went away), `focus` for the newly focused element, and `overlay` ({text, ref, covers}) when a dialog or layer now sits over controls that were clickable (covers counts them), so a click on the page behind it will not land. A navigation reports url and title only. Chrome only; effects are read about 120 ms after the action unless wait_after is settle.
 
 Spellings such as key, dblclick, triple-click, drag_and_drop, move, mousedown are accepted.
 
@@ -1075,7 +1075,7 @@ Offloads extraction parsing from the LLM. The schema maps field names to rules {
 
 Fill several form fields (input, select, checkbox, radio) in one call and optionally submit.
 
-Eliminates round-trips for registration or checkout forms. `fields` is an array of [{ref or selector, by, value, type, secret}]; `submit` is an optional submit trigger: {ref or selector}.
+Eliminates round-trips for registration or checkout forms. `fields` is an array of [{ref or selector, by, value, type, secret}]; `submit` is an optional submit trigger: {ref or selector}. `submitted` is false, with `submit_blocked`, when the trigger was disabled or covered; `effects.overlay` names a dialog now over the page.
 
 | Argument | Type | Required | Description |
 |---|---|---|---|

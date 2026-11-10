@@ -218,6 +218,29 @@ def plain_word_email(env):
     return expect_reward(env, f"forwarded to {rcpt}")
 
 
+@check("login-user-popup", "overlay in the way", "login-user-popup")
+def overlay_report(env):
+    """A popup raised by focusing a field says so; fill_form does not claim a submit the popup blocked."""
+    for seed in range(12):  # the task raises its popup on the username, the password or not at all, by seed
+        goal = env.open("login-user-popup", seed)
+        user, pw = re.findall(r'"(.+?)"', goal)[:2]
+        fields = [{"selector": "#username", "value": user}, {"selector": "#password", "value": pw}]
+        r = env.tool("browser_fill_form", {"target_id": env.tid, "fields": fields, "submit": {"selector": "#subbtn"}})
+        if env.page.evaluate("!!document.querySelector('#popup')"):
+            break
+    else:
+        raise Fail("no seed in 0..11 raised the popup")
+    d = r.get("data") or {}
+    expect(r.get("ok") and d.get("submitted") is False and d.get("submit_blocked"), f"fill_form claimed a submit the popup blocked: {r}")
+    ov = (d.get("effects") or {}).get("overlay") or {}
+    expect("Cancel" in ov.get("text", "") and ov.get("ref"), f"no overlay naming the popup in fill_form: {r}")
+    r = env.act(action="click", query="Cancel")
+    expect(r.get("ok"), f"cancel click: {r}")
+    r = env.tool("browser_fill_form", {"target_id": env.tid, "fields": fields, "submit": {"selector": "#subbtn"}})
+    expect(r.get("ok") and r["data"].get("submitted") is True and "submit_blocked" not in r["data"], f"refill after cancelling: {r}")
+    return expect_reward(env, f"seed {seed}: submit blocked ({d['submit_blocked']}), overlay {ov['text'][:40]!r}, then cancelled and submitted")
+
+
 @check("aliases-and-teaching", "aliases, teaching errors", "click-button")
 def aliases_and_teaching(env):
     """Aliases are accepted; a wrong action name lists the valid ones; a near-miss query lists similar elements."""
