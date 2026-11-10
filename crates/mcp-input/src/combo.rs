@@ -276,6 +276,34 @@ pub fn parse_combo(input: &str, os: Os) -> Result<Combo, String> {
     Ok(Combo { modifiers, key })
 }
 
+/// The keys a hold (`keyboard_shortcut` with `action` `down` or `up`) names:
+/// modifiers first, then at most one key, each in canonical form.
+///
+/// Unlike [`parse_combo`] a lone modifier is fine, since holding Shift is the
+/// main reason to hold anything. The key vocabulary is the same, so a name
+/// that presses also holds.
+pub fn parse_hold(input: &str, os: Os) -> Result<Vec<String>, String> {
+    let s = input.trim();
+    if s.is_empty() {
+        return Err("empty key".into());
+    }
+    let (tokens, _) = tokenize(s)?;
+    let mut mods: Vec<&'static str> = Vec::new();
+    for t in &tokens {
+        match modifier(&t.to_lowercase(), os) {
+            Some(m) if !mods.contains(&m) => mods.push(m),
+            Some(_) => {}
+            None => {
+                let c = parse_combo(input, os)?;
+                let mut out: Vec<String> = c.modifiers.iter().map(|m| m.to_string()).collect();
+                out.push(c.key);
+                return Ok(out);
+            }
+        }
+    }
+    Ok(mods.iter().map(|m| m.to_string()).collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -487,6 +515,22 @@ mod tests {
             let n = c.split('+').count();
             assert_eq!(n, c.matches('+').count() + 1, "{c}");
             assert!(c.split('+').all(|seg| !seg.is_empty()), "{c}");
+        }
+    }
+
+    #[test]
+    fn a_hold_takes_a_lone_modifier_or_a_chord_in_the_shared_vocabulary() {
+        let hold = |s: &str, os| parse_hold(s, os).unwrap_or_else(|e| panic!("{s}: {e}"));
+        assert_eq!(hold("Shift", Os::Mac), ["shift"]);
+        assert_eq!(hold("cmd+shift", Os::Mac), ["cmd", "shift"]);
+        assert_eq!(hold("shift+shift", Os::Mac), ["shift"]);
+        assert_eq!(hold("a", Os::Mac), ["a"]);
+        assert_eq!(hold("Control+Space", Os::Mac), ["ctrl", "space"]);
+        assert_eq!(hold("cmd", Os::Linux), ["ctrl"]);
+        assert_eq!(hold("mod", Os::Mac), ["cmd"]);
+        assert_eq!(hold("ctrl-a", Os::Mac), ["ctrl", "a"]);
+        for bad in ["", "nope", "a+b", "cmd+nope", "cmd++x"] {
+            assert!(parse_hold(bad, Os::Mac).is_err(), "{bad} must be refused");
         }
     }
 }

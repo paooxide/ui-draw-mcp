@@ -295,7 +295,7 @@ Write the clipboard. For 'image', 'data' is a base64 PNG; for 'files', it is a n
 
 Press-move-release drag from one point/element to another. The pointer travels in 'steps' intermediate moves so targets that track motion register the drag.
 
-Each end is `from`/`to` as an object (`{ref}`, `{name}` with an optional `role`, or `{x, y}`), or the flat `from_ref`/`from_x`/... spelling. With a ref or name, `x` and `y` are offsets in points from the element's top-left (default its centre); otherwise absolute screen coordinates. Both points are checked against the allowed window bounds. `hold_ms` keeps the button down before the first move, for drag sources (Finder icons, list rows) that wait to tell a drag from a click.
+Each end is `from`/`to` as an object (`{ref}`, `{name}` with an optional `role`, or `{x, y}`), or the flat `from_ref`/`from_x`/... spelling. With a ref or name, `x` and `y` are offsets in points from the element's top-left (default its centre); otherwise absolute screen coordinates. Both points are checked against the allowed window bounds. `path` is up to 200 waypoints `{x, y}` (the same argument as `browser_act drag`) for brush strokes and freehand shapes: the drag presses at `from`, passes through each waypoint in order and releases at the last, so give no `to`. Waypoints are in the frame of `from`: offsets from its top-left when it is a ref or name, else absolute screen points. `steps` moves are spread over the segments by length, at least one landing on every waypoint; every waypoint is checked against the allowed window bounds before anything moves. The result's `waypoints` is the number of path points and `steps` the moves made. `hold_ms` keeps the button down before the first move, for drag sources (Finder icons, list rows) that wait to tell a drag from a click.
 
 | Argument | Type | Required | Description |
 |---|---|---|---|
@@ -311,6 +311,7 @@ Each end is `from`/`to` as an object (`{ref}`, `{name}` with an optional `role`,
 | `from_y` | number |  |  |
 | `hold_ms` | integer |  | hold the button this long before moving, 0-2000 |
 | `modifiers` | array&lt;one of: cmd, shift, opt, alt, ctrl, fn&gt; |  |  |
+| `path` | array&lt;object&gt; |  | up to 200 waypoints to pass through in order, releasing at the last; replaces 'to'. Offsets from the 'from' element's top-left when it is a ref/name, else screen points |
 | `steps` | integer |  | intermediate moves, 2-100 (default 20) |
 | `to` | object |  | where to release: same forms as from |
 | `to.name` | string |  | element name or label, instead of ref; best match wins |
@@ -360,13 +361,16 @@ Glide the real mouse pointer along a smooth Bezier curve to each point instead o
 
 `keyboard_shortcut` · standard tier
 
-Press a key or chord, e.g. Return, Escape, cmd+s, Control+A, cmd+shift+z.
+Press a key or chord, e.g. Return, Escape, cmd+s, Control+A, cmd+shift+z. action down holds keys (e.g. shift across several clicks) until action up; held keys auto-release after 30 s.
 
 Modifiers then exactly one key, joined by `+` (or `-` when there is no `+`). Case does not matter: `Control+A`, `ctrl-a` and `CTRL+a` are one chord. Modifiers: cmd/command, ctrl/control, shift, alt/opt/option, fn, super/meta/win; `mod` (also `cmdorctrl`, `primary`) is Command on macOS and Control on Linux, and on Linux `cmd` means Control. Keys: letters, digits, return/enter, tab, space, escape/esc, delete/backspace (erases backwards), forwarddelete/del, insert, home, end, pageup/page_up/pgup, pagedown/page_down/pgdn, up/down/left/right (also ArrowUp...), F1-F20, punctuation as the character or its name (minus, equal, plus, comma, period, slash, backslash, semicolon, quote, grave, leftbracket, rightbracket), and a literal `+` as `plus` or a trailing `cmd++`. More than one key is an error, never a silent drop. The result's `pressed` is the canonical chord that was sent.
 
+`action: "down"` takes the same names but also a lone modifier (`shift`, `cmd+shift`) or one key, and leaves them down across later calls: every click, drag, scroll and chord until the matching `action: "up"` carries the held modifiers, whatever `modifiers` the call itself names. Holding a key already held renews its time limit and presses nothing. At most 6 keys are held at once. A key is released by `up` (with no `combo`, all of them), after 30 s unless renewed (the result's `auto_release_ms`), when any other input call fails (the error says so), when the kill switch trips or a human takes the mouse, and when the server stops. `keyboard_type` ignores held modifiers: the text carries its own case. On macOS a held modifier is applied to the events agentctl posts and is not a physical key press, so it cannot stay latched in the system; other software that polls the keyboard state does not see it. On Linux it is a real key press.
+
 | Argument | Type | Required | Description |
 |---|---|---|---|
-| `combo` | string | yes |  |
+| `action` | one of: press, down, up |  | press (default) taps the chord; down holds the key or modifiers; up releases them (no combo: everything held) |
+| `combo` | string |  |  |
 | `expect` | object |  | optional: wait for this to become true after the action, and return what changed |
 | `expect.app` | string |  | which application to observe |
 | `expect.element` | string |  | synonym for text |

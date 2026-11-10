@@ -7,13 +7,15 @@ use mcp_a11y::{
     SnapshotArena, SnapshotRequest,
 };
 use mcp_types::args::{as_f64, i64_arg, u64_arg};
+use mcp_types::drag::{drag_route, parse_drag_path};
 use mcp_types::{CallCtx, Category, Envelope, ErrorCode, Tier, ToolDescriptor, ToolModule};
 use serde_json::{json, Value};
 
 use crate::backend::{
     ClipFormat, InputBackend, InputError, MouseKind, Reading, ScrollDir, SemanticAction,
 };
-use crate::combo::{parse_combo, Os};
+use crate::combo::{parse_combo, parse_hold, Os};
+use crate::hold::{mono_ms, HeldKeys};
 
 /// Per-action policy the input engine enforces (the tier/category gate already
 /// ran in `mcp-core`; these are the input-specific checks).
@@ -172,6 +174,49 @@ pub struct InputModule {
     observer: Option<Arc<dyn A11yBackend>>,
     /// Configured cursor glide for demo/showcase movements.
     glide: Mutex<crate::glide::GlideConfig>,
+    /// Keys held across calls, shared with the watchdog that releases them.
+    ledger: Arc<Mutex<Ledger>>,
+    /// Whether the kill switch is engaged, for the watchdog. The switch also
+    /// refuses every later call, `up` included, so a held key could never be
+    /// released through the tools once it trips; this is how it still is.
+    halt: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+}
+
+/// What the module holds down.
+struct Ledger {
+    keys: HeldKeys,
+    /// Whether a watchdog task is running. Kept under the same lock as the
+    /// keys so a `down` can never find the watchdog gone just as it exits.
+    watching: bool,
+}
+
+/// How often the watchdog looks for a trip or an expiry.
+const WATCH_EVERY: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Why every held key must go now, if it must.
+fn release_reason(halted: bool, taken_over: bool) -> Option<&'static str> {
+    match (halted, taken_over) {
+        (true, _) => Some("the kill switch is engaged"),
+        (_, true) => Some("a human took over the pointer"),
+        _ => None,
+    }
+}
+
+/// Release `keys`, last pressed first, trying every one even if some fail.
+/// Returns the first failure.
+async fn release_keys(backend: &dyn InputBackend, keys: &[String]) -> Option<InputError> {
+    let mut first = None;
+    for k in keys.iter().rev() {
+        if let Err(e) = backend.key_up(k).await {
+            tracing::error!(key = %k, error = ?e, "could not release a held key");
+            first.get_or_insert(e);
+        }
+    }
+    first
+}
+
+fn lock_ledger(l: &Mutex<Ledger>) -> std::sync::MutexGuard<'_, Ledger> {
+    l.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 impl InputModule {
@@ -188,7 +233,26 @@ impl InputModule {
             activity: None,
             observer: None,
             glide: Mutex::new(crate::glide::GlideConfig::default()),
+            ledger: Arc::new(Mutex::new(Ledger {
+                keys: HeldKeys::default(),
+                watching: false,
+            })),
+            halt: None,
         }
+    }
+
+    /// Say how to tell the kill switch is engaged (composition root only), so
+    /// held keys are released when it trips.
+    pub fn with_halt_probe(mut self, halted: Arc<dyn Fn() -> bool + Send + Sync>) -> Self {
+        self.halt = Some(halted);
+        self
+    }
+
+    /// Shorten how long a key may stay held, so a test need not wait 30 s.
+    #[cfg(test)]
+    fn with_hold_limit(self, ms: u64) -> Self {
+        lock_ledger(&self.ledger).keys = HeldKeys::with_ttl(ms);
+        self
     }
 
     /// Attach the driving-activity marker (composition root only).
@@ -1032,8 +1096,14 @@ impl InputModule {
         Envelope::ok(tool, t.annotate(data))
     }
 
-    async fn keyboard_shortcut(&self, args: &Value) -> Envelope {
+    async fn keyboard_shortcut(&self, args: &Value, since: u64) -> Envelope {
         let tool = "keyboard_shortcut";
+        match shortcut_action(args) {
+            Ok(HoldAction::Press) => {}
+            Ok(HoldAction::Down) => return self.keys_down(args, since).await,
+            Ok(HoldAction::Up) => return self.keys_up(args).await,
+            Err(m) => return Envelope::fail(tool, ErrorCode::InvalidArgs, m),
+        }
         let Some(combo) = args.get("combo").and_then(Value::as_str) else {
             return Envelope::fail(tool, ErrorCode::InvalidArgs, "missing 'combo'");
         };
@@ -1052,6 +1122,198 @@ impl InputModule {
         match self.backend.key_combo(&parsed).await {
             Ok(()) => Envelope::ok(tool, json!({ "ok": true, "pressed": parsed })),
             Err(e) => input_err(tool, e),
+        }
+    }
+
+    /// `action: "down"`: press the keys and leave them down.
+    ///
+    /// Each key goes in the ledger before it is pressed, so there is no moment
+    /// at which a key is down and nothing knows to release it.
+    async fn keys_down(&self, args: &Value, since: u64) -> Envelope {
+        let tool = "keyboard_shortcut";
+        let Some(combo) = args.get("combo").and_then(Value::as_str) else {
+            return Envelope::fail(
+                tool,
+                ErrorCode::InvalidArgs,
+                "missing 'combo': the key or keys to hold",
+            );
+        };
+        let os = Os::from_platform(self.backend.platform());
+        let keys = match parse_hold(combo, os) {
+            Ok(k) => k,
+            Err(msg) => {
+                return Envelope::fail_with(
+                    tool,
+                    ErrorCode::InvalidArgs,
+                    msg,
+                    "e.g. shift, cmd+shift, a",
+                )
+            }
+        };
+        let (fresh, start_watchdog, limit) = {
+            let mut l = lock_ledger(&self.ledger);
+            if let Err(m) = l.keys.check_room(&keys) {
+                return Envelope::fail(tool, ErrorCode::InvalidArgs, m);
+            }
+            let now = mono_ms();
+            let fresh: Vec<String> = keys
+                .iter()
+                .filter(|k| l.keys.hold(k, now))
+                .cloned()
+                .collect();
+            let start = !l.watching;
+            l.watching = true;
+            (fresh, start, l.keys.ttl_ms())
+        };
+        if start_watchdog {
+            self.spawn_watchdog(since);
+        }
+        for (i, k) in fresh.iter().enumerate() {
+            if let Err(e) = self.backend.key_down(k).await {
+                {
+                    let mut l = lock_ledger(&self.ledger);
+                    for k in &fresh {
+                        l.keys.release(k);
+                    }
+                }
+                // The key that failed may be half down; release it too.
+                release_keys(&*self.backend, &fresh[..=i]).await;
+                return input_err(tool, e);
+            }
+        }
+        if self.backend.takeover_generation() != since {
+            let all = lock_ledger(&self.ledger).keys.take_all();
+            release_keys(&*self.backend, &all).await;
+            return Envelope::fail(
+                tool,
+                ErrorCode::ActionFailed,
+                "a human took over the pointer; held keys were released",
+            );
+        }
+        Envelope::ok(
+            tool,
+            json!({
+                "ok": true,
+                "held": lock_ledger(&self.ledger).keys.names(),
+                "pressed": fresh,
+                "auto_release_ms": limit,
+            }),
+        )
+    }
+
+    /// `action: "up"`: release the named keys, or every held key when none
+    /// is named.
+    async fn keys_up(&self, args: &Value) -> Envelope {
+        let tool = "keyboard_shortcut";
+        let named = match args.get("combo").filter(|v| !v.is_null()) {
+            None => None,
+            Some(c) => {
+                let os = Os::from_platform(self.backend.platform());
+                match c.as_str().map(|c| parse_hold(c, os)) {
+                    Some(Ok(k)) => Some(k),
+                    Some(Err(msg)) => {
+                        return Envelope::fail_with(
+                            tool,
+                            ErrorCode::InvalidArgs,
+                            msg,
+                            "e.g. shift, cmd+shift, a; omit 'combo' to release everything held",
+                        )
+                    }
+                    None => {
+                        return Envelope::fail(
+                            tool,
+                            ErrorCode::InvalidArgs,
+                            "'combo' must be a string",
+                        )
+                    }
+                }
+            }
+        };
+        let (released, not_held) = {
+            let mut l = lock_ledger(&self.ledger);
+            match named {
+                None => (l.keys.take_all(), Vec::new()),
+                Some(keys) => keys.into_iter().partition(|k| l.keys.release(k)),
+            }
+        };
+        let failure = release_keys(&*self.backend, &released).await;
+        if let Some(e) = failure {
+            return input_err(tool, e);
+        }
+        Envelope::ok(
+            tool,
+            json!({
+                "ok": true,
+                "released": released,
+                "not_held": not_held,
+                "held": lock_ledger(&self.ledger).keys.names(),
+            }),
+        )
+    }
+
+    /// Release held keys when the kill switch trips, a human takes the
+    /// pointer, or a key outlives its time limit, until nothing is held.
+    ///
+    /// `baseline` is the takeover generation as read when the first key's call
+    /// began, so a takeover that landed since is seen.
+    fn spawn_watchdog(&self, baseline: u64) {
+        let backend = self.backend.clone();
+        let ledger = self.ledger.clone();
+        let halt = self.halt.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(WATCH_EVERY).await;
+                let reason = release_reason(
+                    halt.as_ref().is_some_and(|h| h()),
+                    backend.takeover_generation() != baseline,
+                );
+                let (keys, done) = {
+                    let mut l = lock_ledger(&ledger);
+                    let keys = match reason {
+                        Some(_) => l.keys.take_all(),
+                        None => l.keys.take_expired(mono_ms()),
+                    };
+                    let done = l.keys.is_empty();
+                    if done {
+                        l.watching = false;
+                    }
+                    (keys, done)
+                };
+                if !keys.is_empty() {
+                    tracing::warn!(
+                        ?keys,
+                        reason = reason.unwrap_or("held past the time limit"),
+                        "releasing held keys"
+                    );
+                    release_keys(&*backend, &keys).await;
+                }
+                if done {
+                    break;
+                }
+            }
+        });
+    }
+
+    /// After a failed call, let go of whatever is held and say so. A held
+    /// Shift that outlives the step it was for changes what the next step
+    /// does, so a failure ends the hold rather than leaving it for a retry
+    /// that no longer means what it did.
+    async fn release_after_failure(&self, env: &mut Envelope) {
+        let keys = lock_ledger(&self.ledger).keys.take_all();
+        if keys.is_empty() {
+            return;
+        }
+        let failure = release_keys(&*self.backend, &keys).await;
+        if let Some(err) = env.error.as_mut() {
+            err.message.push_str(&format!(
+                " (held keys released: {}{})",
+                keys.join(", "),
+                if failure.is_some() {
+                    "; a release failed"
+                } else {
+                    ""
+                }
+            ));
         }
     }
 
@@ -1242,23 +1504,53 @@ impl InputModule {
 
     async fn drag_drop(&self, args: &Value, since: u64) -> Envelope {
         let tool = "drag_drop";
+        let path = match parse_drag_path(args.get("path")) {
+            Ok(p) => p,
+            Err(m) => return Envelope::fail(tool, ErrorCode::InvalidArgs, m),
+        };
         let from_spec = match endpoint(tool, args, "from") {
             Ok(s) => s,
             Err(e) => return e,
         };
-        let to_spec = match endpoint(tool, args, "to") {
-            Ok(s) => s,
-            Err(e) => return e,
+        // With a path the drag ends at its last point; a second destination
+        // would be one the drag silently ignored.
+        let to_spec = if path.is_empty() {
+            match endpoint(tool, args, "to") {
+                Ok(s) => Some(s),
+                Err(e) => return e,
+            }
+        } else {
+            if let Some(k) = ["to", "to_ref", "to_name", "to_role", "to_x", "to_y"]
+                .into_iter()
+                .find(|k| args.get(k).is_some_and(|v| !v.is_null()))
+            {
+                return Envelope::fail(
+                    tool,
+                    ErrorCode::InvalidArgs,
+                    format!("with 'path', drop '{k}': the drag ends at the last path point"),
+                );
+            }
+            None
         };
         let (from, from_target) = match self.parse_point(tool, &from_spec).await {
             Ok(p) => p,
             Err(e) => return e,
         };
-        let (to, to_target) = match self.parse_point(tool, &to_spec).await {
-            Ok(p) => p,
-            Err(e) => return e,
+        let (to, to_target) = match &to_spec {
+            Some(spec) => match self.parse_point(tool, spec).await {
+                Ok((p, t)) => (Some(p), t),
+                Err(e) => return e,
+            },
+            None => (None, None),
         };
-        for (x, y) in [from, to] {
+        // Waypoints sit in the frame of the start: offsets from the element
+        // when it was named, else absolute, the same as `from` itself.
+        let origin = from_target
+            .as_ref()
+            .and_then(|t| t.bounds)
+            .map_or((0.0, 0.0), |b| (b.x, b.y));
+        let waypoints = drag_waypoints(to, &path, origin);
+        for &(x, y) in std::iter::once(&from).chain(&waypoints) {
             if let Some(deny) = self.clamp_check(tool, x, y) {
                 return deny;
             }
@@ -1269,29 +1561,32 @@ impl InputModule {
         };
         // Enough intermediate moves that a drop target sees motion, capped so a
         // caller cannot turn one gesture into thousands of synthetic events.
-        let steps = u64_arg(args, "steps").unwrap_or(20).clamp(2, 100) as u32;
+        let steps = u64_arg(args, "steps").unwrap_or(20).clamp(2, 100) as usize;
         let hold_ms = u64_arg(args, "hold_ms").unwrap_or(0).min(MAX_HOLD_MS);
+        let route = drag_route(from, &waypoints, steps);
+        let end = *waypoints.last().unwrap_or(&from);
         match self
             .backend
-            .drag(from, to, &modifiers, steps, hold_ms, since)
+            .drag(from, &route, &modifiers, hold_ms, since)
             .await
         {
             Ok(()) => {
-                let end = |p: (f64, f64), t: Option<Target>| match t {
+                let at = |p: (f64, f64), t: Option<Target>| match t {
                     Some(t) => t.annotate(json!({ "x": p.0, "y": p.1 })),
                     None => json!({ "x": p.0, "y": p.1 }),
                 };
-                Envelope::ok(
-                    tool,
-                    json!({
-                        "ok": true,
-                        "from": end(from, from_target),
-                        "to": end(to, to_target),
-                        "steps": steps,
-                        "hold_ms": hold_ms,
-                        "modifiers": modifiers,
-                    }),
-                )
+                let mut data = json!({
+                    "ok": true,
+                    "from": at(from, from_target),
+                    "to": at(end, to_target),
+                    "steps": route.len(),
+                    "hold_ms": hold_ms,
+                    "modifiers": modifiers,
+                });
+                if !path.is_empty() {
+                    data["waypoints"] = json!(path.len());
+                }
+                Envelope::ok(tool, data)
             }
             Err(e) => input_err(tool, e),
         }
@@ -1384,6 +1679,21 @@ const MAX_CANDIDATES: usize = 5;
 /// them: about 0.4s in all, enough for a run-loop turn or two.
 const SETTLE_READS: usize = 10;
 const SETTLE_GAP: std::time::Duration = std::time::Duration::from_millis(40);
+/// The points a drag passes through after the press: its `path` shifted by
+/// `origin`, else just the destination.
+fn drag_waypoints(
+    to: Option<(f64, f64)>,
+    path: &[(f64, f64)],
+    origin: (f64, f64),
+) -> Vec<(f64, f64)> {
+    if path.is_empty() {
+        return to.into_iter().collect();
+    }
+    path.iter()
+        .map(|p| (origin.0 + p.0, origin.1 + p.1))
+        .collect()
+}
+
 /// Longest a drag may hold the button before moving.
 const MAX_HOLD_MS: u64 = 2_000;
 
@@ -1736,9 +2046,10 @@ impl ToolModule for InputModule {
                 "keyboard_shortcut",
                 Category::Input,
                 Tier::Standard,
-                "Press a key or chord, e.g. Return, Escape, cmd+s, Control+A, cmd+shift+z.",
+                "Press a key or chord, e.g. Return, Escape, cmd+s, Control+A, cmd+shift+z. action down holds keys (e.g. shift across several clicks) until action up; held keys auto-release after 30 s.",
                 json!({"type":"object","properties":{"combo":{"type":"string"},
-                    "expect": expect_schema()},"required":["combo"]}),
+                    "action":{"type":"string","enum":["press","down","up"],"description":"press (default) taps the chord; down holds the key or modifiers; up releases them (no combo: everything held)"},
+                    "expect": expect_schema()},"required":[]}),
             ).details("Modifiers then exactly one key, joined by `+` (or `-` when there is no `+`). Case does not \
                 matter: `Control+A`, `ctrl-a` and `CTRL+a` are one chord. Modifiers: cmd/command, ctrl/control, \
                 shift, alt/opt/option, fn, super/meta/win; `mod` (also `cmdorctrl`, `primary`) is Command on macOS \
@@ -1748,7 +2059,17 @@ impl ToolModule for InputModule {
                 punctuation as the character or its name (minus, equal, plus, comma, period, slash, backslash, \
                 semicolon, quote, grave, leftbracket, rightbracket), and a literal `+` as `plus` or a trailing \
                 `cmd++`. More than one key is an error, never a silent drop. The result's `pressed` is the \
-                canonical chord that was sent."),
+                canonical chord that was sent.\n\n\
+                `action: \"down\"` takes the same names but also a lone modifier (`shift`, `cmd+shift`) or one key, \
+                and leaves them down across later calls: every click, drag, scroll and chord until the matching \
+                `action: \"up\"` carries the held modifiers, whatever `modifiers` the call itself names. Holding \
+                a key already held renews its time limit and presses nothing. At most 6 keys are held at once. \
+                A key is released by `up` (with no `combo`, all of them), after 30 s unless renewed (the result's \
+                `auto_release_ms`), when any other input call fails (the error says so), when the kill switch \
+                trips or a human takes the mouse, and when the server stops. `keyboard_type` ignores held \
+                modifiers: the text carries its own case. On macOS a held modifier is applied to the events \
+                agentctl posts and is not a physical key press, so it cannot stay latched in the system; \
+                other software that polls the keyboard state does not see it. On Linux it is a real key press."),
             ToolDescriptor::new(
                 "mouse_action",
                 Category::Input,
@@ -1812,12 +2133,19 @@ impl ToolModule for InputModule {
                     "to_ref":{"type":"string"},"to_name":{"type":"string"},"to_x":{"type":"number"},"to_y":{"type":"number"},
                     "steps":{"type":"integer","description":"intermediate moves, 2-100 (default 20)"},
                     "hold_ms":{"type":"integer","description":"hold the button this long before moving, 0-2000"},
+                    "path":{"type":"array","description":"up to 200 waypoints to pass through in order, releasing at the last; replaces 'to'. Offsets from the 'from' element's top-left when it is a ref/name, else screen points","items":{"type":"object","properties":{"x":{"type":"number"},"y":{"type":"number"}}}},
                     "modifiers":{"type":"array","items":{"type":"string","enum":["cmd","shift","opt","alt","ctrl","fn"]}}},
                     "required":[]}),
             ).details("Each end is `from`/`to` as an object (`{ref}`, `{name}` with an optional `role`, or \
                 `{x, y}`), or the flat `from_ref`/`from_x`/... spelling. With a ref or name, `x` and `y` are offsets \
                 in points from the element's top-left (default its centre); otherwise absolute screen coordinates. \
-                Both points are checked against the allowed window bounds. `hold_ms` keeps the button down before \
+                Both points are checked against the allowed window bounds. `path` is up to 200 waypoints `{x, y}` \
+                (the same argument as `browser_act drag`) for brush strokes and freehand shapes: the drag presses at \
+                `from`, passes through each waypoint in order and releases at the last, so give no `to`. Waypoints \
+                are in the frame of `from`: offsets from its top-left when it is a ref or name, else absolute \
+                screen points. `steps` moves are spread over the segments by length, at least one landing on every \
+                waypoint; every waypoint is checked against the allowed window bounds before anything moves. The \
+                result's `waypoints` is the number of path points and `steps` the moves made. `hold_ms` keeps the button down before \
                 the first move, for drag sources (Finder icons, list rows) that wait to tell a drag from a click."),
             ToolDescriptor::new(
                 "clipboard_read",
@@ -1890,7 +2218,7 @@ impl ToolModule for InputModule {
             "set_value" => self.set_value(&args).await,
             "ui_fill_form" => self.ui_fill_form(&args).await,
             "keyboard_type" => self.keyboard_type(&args).await,
-            "keyboard_shortcut" => self.keyboard_shortcut(&args).await,
+            "keyboard_shortcut" => self.keyboard_shortcut(&args, since).await,
             "mouse_action" => self.mouse_action(&args, &ctx.cancel, since).await,
             "scroll" => self.scroll(&args).await,
             "hover" => self.hover(&args, &ctx.cancel, since).await,
@@ -1901,13 +2229,73 @@ impl ToolModule for InputModule {
             other => Envelope::fail(other, ErrorCode::InvalidArgs, "unknown tool"),
         };
 
-        match (spec, self.verifier.as_ref()) {
+        let mut env = match (spec, self.verifier.as_ref()) {
             (Some(spec), Some(v)) => {
                 let verified = v.verify(&spec, before, ctx).await;
                 crate::postcondition::attach(env, name, verified)
             }
             _ => env,
+        };
+        // `down` and `up` settle their own holds.
+        let manages_holds = name == "keyboard_shortcut"
+            && !matches!(shortcut_action(&args), Ok(HoldAction::Press) | Err(_));
+        if !env.ok && !manages_holds {
+            self.release_after_failure(&mut env).await;
         }
+        env
+    }
+
+    /// Server stop: nothing may stay down once the process that pressed it is
+    /// gone. Synchronous because it runs on shutdown paths, so the release is
+    /// handed to the runtime and waited for a bounded time.
+    fn shutdown(&self) {
+        let keys = lock_ledger(&self.ledger).keys.take_all();
+        if keys.is_empty() {
+            return;
+        }
+        let backend = self.backend.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let release = async move {
+            release_keys(&*backend, &keys).await;
+            let _ = tx.send(());
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(rt) => {
+                rt.spawn(release);
+                // Two seconds is long for a key-up and short enough that a
+                // wedged backend cannot hold the process open.
+                let _ = rx.recv_timeout(std::time::Duration::from_secs(2));
+            }
+            Err(_) => {
+                if let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    rt.block_on(release);
+                }
+            }
+        }
+    }
+}
+
+/// What `keyboard_shortcut` was asked to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HoldAction {
+    Press,
+    Down,
+    Up,
+}
+
+/// The `action` of a `keyboard_shortcut`: `press` unless it says otherwise.
+fn shortcut_action(args: &Value) -> Result<HoldAction, String> {
+    match args.get("action").filter(|v| !v.is_null()) {
+        None => Ok(HoldAction::Press),
+        Some(v) => match v.as_str().map(str::to_ascii_lowercase).as_deref() {
+            Some("press") => Ok(HoldAction::Press),
+            Some("down") => Ok(HoldAction::Down),
+            Some("up") => Ok(HoldAction::Up),
+            _ => Err("'action' must be press, down or up".into()),
+        },
     }
 }
 
@@ -2019,6 +2407,12 @@ mod tests {
         /// Every pointer event, in order, of any kind.
         pointer: std::sync::Mutex<Vec<(MouseKind, f64, f64)>>,
         drags: std::sync::Mutex<Vec<Drag>>,
+        /// The full route of each drag, parallel to `drags`.
+        routes: std::sync::Mutex<Vec<Vec<(f64, f64)>>>,
+        /// Key presses and releases in order, as `down:shift` / `up:shift`.
+        key_events: std::sync::Mutex<Vec<String>>,
+        /// Makes the next `key_down` of this key fail, to exercise the cleanup.
+        fail_key_down: std::sync::Mutex<Option<String>>,
         scrolls: std::sync::Mutex<Vec<(f64, f64, i32)>>,
         /// The modifiers handed to each scroll, in the same order as `scrolls`.
         scroll_modifiers: std::sync::Mutex<Vec<Vec<String>>>,
@@ -2158,13 +2552,28 @@ mod tests {
         async fn drag(
             &self,
             from: (f64, f64),
-            to: (f64, f64),
+            route: &[(f64, f64)],
             _modifiers: &[String],
-            steps: u32,
             hold_ms: u64,
             _since_takeover: u64,
         ) -> Result<(), InputError> {
-            self.drags.lock().unwrap().push((from, to, steps, hold_ms));
+            let to = *route.last().expect("a drag route is never empty");
+            self.drags
+                .lock()
+                .unwrap()
+                .push((from, to, route.len() as u32, hold_ms));
+            self.routes.lock().unwrap().push(route.to_vec());
+            Ok(())
+        }
+        async fn key_down(&self, key: &str) -> Result<(), InputError> {
+            if self.fail_key_down.lock().unwrap().as_deref() == Some(key) {
+                return Err(InputError::Failed(format!("cannot press {key}")));
+            }
+            self.key_events.lock().unwrap().push(format!("down:{key}"));
+            Ok(())
+        }
+        async fn key_up(&self, key: &str) -> Result<(), InputError> {
+            self.key_events.lock().unwrap().push(format!("up:{key}"));
             Ok(())
         }
         async fn clipboard_read(&self, format: ClipFormat) -> Result<ClipData, InputError> {
@@ -3597,5 +4006,447 @@ mod tests {
             .details
             .as_deref()
             .is_some_and(|t| t.contains("cmdorctrl")));
+    }
+
+    // ---- drag_drop path -----------------------------------------------------
+
+    #[test]
+    fn waypoints_are_the_path_shifted_into_the_frame_or_just_the_end() {
+        assert_eq!(
+            drag_waypoints(Some((9.0, 9.0)), &[], (100.0, 200.0)),
+            [(9.0, 9.0)]
+        );
+        assert_eq!(
+            drag_waypoints(None, &[(1.0, 2.0), (3.0, 4.0)], (100.0, 200.0)),
+            [(101.0, 202.0), (103.0, 204.0)]
+        );
+        assert_eq!(
+            drag_waypoints(None, &[(1.0, 2.0)], (0.0, 0.0)),
+            [(1.0, 2.0)]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_drag_path_passes_every_waypoint_in_order_and_reports_them() {
+        let (module, backend, arena) = test_module();
+        let way = [(110.0, 10.0), (110.0, 110.0), (10.0, 110.0)];
+        let env = call(
+            &module,
+            "drag_drop",
+            json!({
+                "from": { "x": 10, "y": 10 },
+                "path": [{ "x": 110, "y": 10 }, [110, 110], { "x": "10", "y": "110" }],
+                "steps": 12,
+            }),
+        )
+        .await;
+        assert!(env.ok, "{env:?}");
+        let d = env.data.unwrap();
+        assert_eq!(d["waypoints"], 3);
+        assert_eq!(d["steps"], 12);
+        assert_eq!(d["to"]["x"], 10.0);
+        assert_eq!(d["to"]["y"], 110.0);
+        {
+            let routes = backend.routes.lock().unwrap();
+            let route = &routes[0];
+            let hits: Vec<_> = way
+                .iter()
+                .map(|w| {
+                    route
+                        .iter()
+                        .position(|p| p == w)
+                        .expect("waypoint landed on")
+                })
+                .collect();
+            assert!(hits.windows(2).all(|h| h[0] < h[1]), "in order: {hits:?}");
+            assert_eq!(route.last(), Some(&(10.0, 110.0)), "released at the last");
+        }
+
+        // Named element: waypoints are offsets from its top-left, like `from`.
+        install(
+            &arena,
+            vec![(
+                "@e1",
+                el("canvas", "Canvas", 1, Some((100.0, 200.0, 300.0, 300.0))),
+            )],
+        );
+        let env = call(
+            &module,
+            "drag_drop",
+            json!({ "from": { "ref": "@e1", "x": 5, "y": 5 }, "path": [[20, 30], [40, 60]] }),
+        )
+        .await;
+        assert!(env.ok, "{env:?}");
+        let drags = backend.drags.lock().unwrap();
+        assert_eq!((drags[1].0, drags[1].1), ((105.0, 205.0), (140.0, 260.0)));
+        assert!(backend.routes.lock().unwrap()[1].contains(&(120.0, 230.0)));
+    }
+
+    #[tokio::test]
+    async fn a_drag_without_a_path_reports_no_waypoints() {
+        let (module, _, _) = test_module();
+        let env = call(
+            &module,
+            "drag_drop",
+            json!({ "from": { "x": 1, "y": 1 }, "to": { "x": 2, "y": 2 } }),
+        )
+        .await;
+        assert!(env.data.unwrap().get("waypoints").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_bad_path_is_refused_before_anything_moves() {
+        let (module, backend, _) = test_module();
+        let from = json!({ "x": 1, "y": 1 });
+        let too_many: Vec<_> = (0..201).map(|i| json!({ "x": i, "y": 0 })).collect();
+        for (why, args) in [
+            ("empty", json!({ "from": from, "path": [] })),
+            ("not points", json!({ "from": from, "path": [{ "x": 1 }] })),
+            ("too many", json!({ "from": from, "path": too_many })),
+            (
+                "a second destination",
+                json!({ "from": from, "path": [{ "x": 5, "y": 5 }], "to": { "x": 9, "y": 9 } }),
+            ),
+            (
+                "a flat second destination",
+                json!({ "from": from, "path": [{ "x": 5, "y": 5 }], "to_x": 9 }),
+            ),
+        ] {
+            let env = call(&module, "drag_drop", args).await;
+            assert_eq!(env.error.expect(why).code, ErrorCode::InvalidArgs, "{why}");
+        }
+        assert!(backend.drags.lock().unwrap().is_empty());
+    }
+
+    /// Every waypoint goes through the same bounds check as the endpoints, not
+    /// only the last one: a stroke that wanders out of the window is refused
+    /// whole, before the button goes down.
+    #[tokio::test]
+    async fn a_waypoint_outside_the_allowed_bounds_denies_the_whole_drag() {
+        let backend = Arc::new(MockBackend::default());
+        let arena = Arc::new(Mutex::new(SnapshotArena::new()));
+        with_button(&arena);
+        let module = InputModule::new(backend.clone(), arena, InputPolicy::default());
+        let env = call(
+            &module,
+            "drag_drop",
+            json!({ "from": { "ref": "@e1" }, "path": [[5, 5], [9999, 5], [10, 10]] }),
+        )
+        .await;
+        assert_eq!(env.error.unwrap().code, ErrorCode::PolicyDenied);
+        assert!(backend.drags.lock().unwrap().is_empty());
+        let env = call(
+            &module,
+            "drag_drop",
+            json!({ "from": { "ref": "@e1" }, "path": [[5, 5], [10, 10]] }),
+        )
+        .await;
+        assert!(env.ok, "{env:?}");
+    }
+
+    // ---- held keys ----------------------------------------------------------
+
+    fn events(b: &MockBackend) -> Vec<String> {
+        b.key_events.lock().unwrap().clone()
+    }
+
+    async fn until(mut done: impl FnMut() -> bool) -> bool {
+        for _ in 0..60 {
+            if done() {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        done()
+    }
+
+    fn bare(backend: &Arc<MockBackend>) -> InputModule {
+        let arena = Arc::new(Mutex::new(SnapshotArena::new()));
+        InputModule::new(backend.clone(), arena, InputPolicy::default())
+    }
+
+    #[test]
+    fn what_ends_a_hold_is_decided_in_one_place() {
+        assert_eq!(release_reason(false, false), None);
+        assert!(release_reason(true, false).unwrap().contains("kill switch"));
+        assert!(release_reason(false, true).unwrap().contains("human"));
+        assert!(release_reason(true, true).is_some());
+    }
+
+    #[test]
+    fn the_shortcut_action_defaults_to_press() {
+        assert_eq!(shortcut_action(&json!({})), Ok(HoldAction::Press));
+        assert_eq!(
+            shortcut_action(&json!({ "action": null })),
+            Ok(HoldAction::Press)
+        );
+        assert_eq!(
+            shortcut_action(&json!({ "action": "Down" })),
+            Ok(HoldAction::Down)
+        );
+        assert_eq!(
+            shortcut_action(&json!({ "action": "up" })),
+            Ok(HoldAction::Up)
+        );
+        assert!(shortcut_action(&json!({ "action": "hold" })).is_err());
+        assert!(shortcut_action(&json!({ "action": 3 })).is_err());
+    }
+
+    #[tokio::test]
+    async fn a_key_is_held_across_calls_until_it_is_released() {
+        let backend = Arc::new(MockBackend::default());
+        let module = bare(&backend);
+        let env = call(
+            &module,
+            "keyboard_shortcut",
+            json!({ "combo": "Shift", "action": "down" }),
+        )
+        .await;
+        assert!(env.ok, "{env:?}");
+        let d = env.data.unwrap();
+        assert_eq!(d["held"], json!(["shift"]));
+        assert_eq!(d["auto_release_ms"], 30_000);
+
+        // Another call in between does not disturb it; a chord still presses.
+        let env = call(&module, "keyboard_shortcut", json!({ "combo": "cmd+s" })).await;
+        assert!(env.ok);
+        assert_eq!(*backend.keys.lock().unwrap(), ["cmd+s"]);
+
+        // Re-sending a held key presses nothing new.
+        let env = call(
+            &module,
+            "keyboard_shortcut",
+            json!({ "combo": "cmd+shift", "action": "down" }),
+        )
+        .await;
+        assert_eq!(env.data.as_ref().unwrap()["pressed"], json!(["cmd"]));
+        assert_eq!(env.data.unwrap()["held"], json!(["shift", "cmd"]));
+        assert_eq!(events(&backend), ["down:shift", "down:cmd"]);
+
+        let env = call(
+            &module,
+            "keyboard_shortcut",
+            json!({ "combo": "shift", "action": "up" }),
+        )
+        .await;
+        let d = env.data.unwrap();
+        assert_eq!(
+            (&d["released"], &d["held"]),
+            (&json!(["shift"]), &json!(["cmd"]))
+        );
+        let env = call(
+            &module,
+            "keyboard_shortcut",
+            json!({ "combo": "shift", "action": "up" }),
+        )
+        .await;
+        assert_eq!(env.data.unwrap()["not_held"], json!(["shift"]));
+        assert_eq!(events(&backend), ["down:shift", "down:cmd", "up:shift"]);
+
+        // No combo: everything still held.
+        let env = call(&module, "keyboard_shortcut", json!({ "action": "up" })).await;
+        assert_eq!(env.data.unwrap()["released"], json!(["cmd"]));
+        assert_eq!(events(&backend).last().unwrap(), "up:cmd");
+        let env = call(&module, "keyboard_shortcut", json!({ "action": "up" })).await;
+        assert_eq!(env.data.unwrap()["released"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn an_unknown_key_or_action_presses_nothing() {
+        let backend = Arc::new(MockBackend::default());
+        let module = bare(&backend);
+        for args in [
+            json!({ "combo": "shift+nope", "action": "down" }),
+            json!({ "combo": "a+b", "action": "down" }),
+            json!({ "action": "down" }),
+            json!({ "combo": "shift", "action": "hold" }),
+        ] {
+            let env = call(&module, "keyboard_shortcut", args.clone()).await;
+            assert_eq!(
+                env.error.expect("refused").code,
+                ErrorCode::InvalidArgs,
+                "{args}"
+            );
+        }
+        let env = call(
+            &module,
+            "keyboard_shortcut",
+            json!({ "combo": "nope", "action": "up" }),
+        )
+        .await;
+        assert_eq!(env.error.unwrap().code, ErrorCode::InvalidArgs);
+        assert!(events(&backend).is_empty());
+    }
+
+    #[tokio::test]
+    async fn no_more_than_the_cap_may_be_held() {
+        let backend = Arc::new(MockBackend::default());
+        let module = bare(&backend);
+        for k in ["a", "b", "c", "d", "e", "f"] {
+            let env = call(
+                &module,
+                "keyboard_shortcut",
+                json!({ "combo": k, "action": "down" }),
+            )
+            .await;
+            assert!(env.ok, "{k}: {env:?}");
+        }
+        let env = call(
+            &module,
+            "keyboard_shortcut",
+            json!({ "combo": "g", "action": "down" }),
+        )
+        .await;
+        let err = env.error.unwrap();
+        assert_eq!(err.code, ErrorCode::InvalidArgs);
+        assert!(err.message.contains("at most 6"), "{}", err.message);
+        assert!(!events(&backend).contains(&"down:g".to_string()));
+        // The refused call did not release what was already held.
+        assert_eq!(events(&backend).len(), 6);
+        call(&module, "keyboard_shortcut", json!({ "action": "up" })).await;
+    }
+
+    #[tokio::test]
+    async fn a_key_that_fails_mid_sequence_releases_the_ones_before_it() {
+        let backend = Arc::new(MockBackend::default());
+        *backend.fail_key_down.lock().unwrap() = Some("b".into());
+        let module = bare(&backend);
+        let env = call(
+            &module,
+            "keyboard_shortcut",
+            json!({ "combo": "cmd+b", "action": "down" }),
+        )
+        .await;
+        assert_eq!(env.error.unwrap().code, ErrorCode::ActionFailed);
+        assert_eq!(events(&backend), ["down:cmd", "up:b", "up:cmd"]);
+        let env = call(&module, "keyboard_shortcut", json!({ "action": "up" })).await;
+        assert_eq!(
+            env.data.unwrap()["released"],
+            json!([]),
+            "nothing left held"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_call_releases_what_is_held_and_says_so() {
+        let backend = Arc::new(MockBackend::default());
+        let module = bare(&backend);
+        call(
+            &module,
+            "keyboard_shortcut",
+            json!({ "combo": "shift", "action": "down" }),
+        )
+        .await;
+        let env = call(&module, "mouse_action", json!({ "type": "nonsense" })).await;
+        let err = env.error.unwrap();
+        assert!(
+            err.message.contains("held keys released: shift"),
+            "{}",
+            err.message
+        );
+        assert_eq!(events(&backend), ["down:shift", "up:shift"]);
+        // A failure while nothing is held adds nothing.
+        let env = call(&module, "mouse_action", json!({ "type": "nonsense" })).await;
+        assert!(!env.error.unwrap().message.contains("released"));
+    }
+
+    #[tokio::test]
+    async fn a_human_taking_the_pointer_releases_held_keys() {
+        let backend = Arc::new(MockBackend::default());
+        let module = bare(&backend);
+        call(
+            &module,
+            "keyboard_shortcut",
+            json!({ "combo": "shift+a", "action": "down" }),
+        )
+        .await;
+        backend.cancel_pending();
+        assert!(
+            until(|| events(&backend).len() == 4).await,
+            "{:?}",
+            events(&backend)
+        );
+        assert_eq!(events(&backend)[2..], ["up:a", "up:shift"]);
+    }
+
+    #[tokio::test]
+    async fn the_kill_switch_releases_held_keys_though_every_call_is_refused() {
+        let backend = Arc::new(MockBackend::default());
+        let tripped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = tripped.clone();
+        let module = bare(&backend).with_halt_probe(Arc::new(move || {
+            flag.load(std::sync::atomic::Ordering::SeqCst)
+        }));
+        call(
+            &module,
+            "keyboard_shortcut",
+            json!({ "combo": "shift", "action": "down" }),
+        )
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        assert_eq!(events(&backend), ["down:shift"], "no trip, no release");
+        tripped.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(until(|| events(&backend).len() == 2).await);
+        assert_eq!(events(&backend)[1], "up:shift");
+    }
+
+    #[tokio::test]
+    async fn a_key_is_released_when_its_time_is_up() {
+        let backend = Arc::new(MockBackend::default());
+        let module = bare(&backend).with_hold_limit(150);
+        let env = call(
+            &module,
+            "keyboard_shortcut",
+            json!({ "combo": "shift", "action": "down" }),
+        )
+        .await;
+        assert_eq!(env.data.unwrap()["auto_release_ms"], 150);
+        assert!(until(|| events(&backend).len() == 2).await);
+        assert_eq!(events(&backend)[1], "up:shift");
+        let env = call(&module, "keyboard_shortcut", json!({ "action": "up" })).await;
+        assert_eq!(env.data.unwrap()["released"], json!([]));
+        // The watchdog ends with the last key, and the next hold starts a new one.
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        call(
+            &module,
+            "keyboard_shortcut",
+            json!({ "combo": "cmd", "action": "down" }),
+        )
+        .await;
+        assert!(until(|| events(&backend).len() == 4).await);
+        assert_eq!(events(&backend)[3], "up:cmd");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stopping_the_server_releases_held_keys() {
+        let backend = Arc::new(MockBackend::default());
+        let module = bare(&backend);
+        call(
+            &module,
+            "keyboard_shortcut",
+            json!({ "combo": "cmd+shift", "action": "down" }),
+        )
+        .await;
+        module.shutdown();
+        assert_eq!(events(&backend)[2..], ["up:shift", "up:cmd"]);
+        // Idempotent.
+        module.shutdown();
+        assert_eq!(events(&backend).len(), 4);
+    }
+
+    #[test]
+    fn the_shortcut_descriptor_offers_hold_and_release_within_the_budget() {
+        let (module, _, _) = test_module();
+        let all = module.descriptors();
+        let key = all.iter().find(|d| d.name == "keyboard_shortcut").unwrap();
+        assert_eq!(
+            key.input_schema["properties"]["action"]["enum"],
+            json!(["press", "down", "up"])
+        );
+        assert_eq!(key.input_schema["required"], json!([]));
+        let drag = all.iter().find(|d| d.name == "drag_drop").unwrap();
+        assert!(drag.input_schema["properties"]["path"]["description"]
+            .as_str()
+            .is_some_and(|d| d.contains("200")));
     }
 }

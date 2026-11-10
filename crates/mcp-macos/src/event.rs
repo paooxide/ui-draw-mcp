@@ -139,9 +139,10 @@ pub fn type_chunk(chunk: &str) -> Result<(), InputError> {
 }
 
 /// Press a chord in the canonical form `mcp_input::parse_combo` produces:
-/// modifiers, then one key, joined by `+`.
-pub fn key_combo(combo: &str) -> Result<(), InputError> {
-    let mut flags = CGEventFlags::empty();
+/// modifiers, then one key, joined by `+`. `held` are the modifiers already
+/// held down by `key_down`, which the chord carries too.
+pub fn key_combo(combo: &str, held: CGEventFlags) -> Result<(), InputError> {
+    let mut flags = held;
     let mut key: Option<(CGKeyCode, bool)> = None;
     for seg in combo.split('+') {
         match seg {
@@ -196,6 +197,130 @@ pub fn modifier_flags(modifiers: &[String]) -> CGEventFlags {
         }
     }
     flags
+}
+
+/// Whether `name` is a modifier rather than a key with a keycode.
+pub(crate) fn is_modifier(name: &str) -> bool {
+    matches!(
+        name,
+        "cmd"
+            | "command"
+            | "meta"
+            | "super"
+            | "shift"
+            | "opt"
+            | "option"
+            | "alt"
+            | "ctrl"
+            | "control"
+            | "fn"
+    )
+}
+
+/// Keys held down across calls (`keyboard_shortcut` `action: "down"`).
+///
+/// A held *modifier* is not posted as a key event at all: it is remembered
+/// and stamped on the flags of every event this backend posts afterwards,
+/// which is how a `modifiers: ["shift"]` click already works. That keeps it
+/// out of the system's HID modifier state, so a crash or kill between `down`
+/// and `up` cannot leave Shift or Command latched for the person using the
+/// machine. The cost is that software reading the keyboard state directly,
+/// rather than an event's flags, does not see it. A held ordinary key is a
+/// real key-down event, released by `key_up`.
+#[derive(Debug, Default)]
+pub struct HeldKeys {
+    keys: Mutex<Vec<String>>,
+}
+
+impl HeldKeys {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<String>> {
+        self.keys.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn add(&self, key: &str) {
+        let mut g = self.lock();
+        if !g.iter().any(|k| k == key) {
+            g.push(key.to_string());
+        }
+    }
+
+    fn remove(&self, key: &str) {
+        self.lock().retain(|k| k != key);
+    }
+
+    /// The flags of the held modifiers.
+    pub fn flags(&self) -> CGEventFlags {
+        modifier_flags(&self.lock())
+    }
+
+    /// `modifiers` plus the held modifiers, so a pointer event carries both.
+    pub fn with_modifiers(&self, modifiers: &[String]) -> Vec<String> {
+        let mut out = modifiers.to_vec();
+        for k in self.lock().iter().filter(|k| is_modifier(k)) {
+            if !out.contains(k) {
+                out.push(k.clone());
+            }
+        }
+        out
+    }
+
+    /// Everything held, newest last.
+    pub fn held(&self) -> Vec<String> {
+        self.lock().clone()
+    }
+}
+
+/// Hold `key` down. Nothing is posted for a modifier (see [`HeldKeys`]).
+pub fn key_down(held: &HeldKeys, key: &str) -> Result<(), InputError> {
+    if is_modifier(key) {
+        held.add(key);
+        return Ok(());
+    }
+    let (keycode, needs_shift) = keycode_for(key)
+        .ok_or_else(|| InputError::Unsupported(format!("no macOS keycode for '{key}'")))?;
+    let mut flags = held.flags();
+    if needs_shift {
+        flags |= CGEventFlags::CGEventFlagShift;
+    }
+    let down =
+        CGEvent::new_keyboard_event(source()?, keycode, true).map_err(|_| fail("key down"))?;
+    down.set_flags(flags);
+    down.post(CGEventTapLocation::HID);
+    held.add(key);
+    Ok(())
+}
+
+/// Release `key`. Forgotten even when the release cannot be posted, so the
+/// record never claims a key is down that this backend has given up on.
+pub fn key_up(held: &HeldKeys, key: &str) -> Result<(), InputError> {
+    let was_held = held.held().iter().any(|k| k == key);
+    // Cleared first, so the key-up carries the modifiers still held without
+    // counting itself.
+    held.remove(key);
+    if is_modifier(key) || !was_held {
+        return Ok(());
+    }
+    let Some((keycode, needs_shift)) = keycode_for(key) else {
+        return Ok(());
+    };
+    let mut flags = held.flags();
+    if needs_shift {
+        flags |= CGEventFlags::CGEventFlagShift;
+    }
+    let up = CGEvent::new_keyboard_event(source()?, keycode, false).map_err(|_| fail("key up"))?;
+    up.set_flags(flags);
+    up.post(CGEventTapLocation::HID);
+    Ok(())
+}
+
+/// Release everything held, last pressed first. For the paths that cannot
+/// await: a human took the mouse, or the server is stopping.
+pub fn release_all(held: &HeldKeys) {
+    for k in held.held().iter().rev() {
+        if let Err(e) = key_up(held, k) {
+            tracing::error!(key = %k, error = ?e, "could not release a held key");
+        }
+    }
 }
 
 /// A mouse button, as the backend tracks it. Its own type because
@@ -472,17 +597,6 @@ pub fn drag_end(held: &Held, pt: (f64, f64), modifiers: &[String]) -> Result<(),
     r
 }
 
-/// Interpolate `steps` points from `from` to `to`, exclusive of the start.
-pub fn drag_path(from: (f64, f64), to: (f64, f64), steps: u32) -> Vec<(f64, f64)> {
-    let steps = steps.max(1);
-    (1..=steps)
-        .map(|i| {
-            let t = i as f64 / steps as f64;
-            (from.0 + (to.0 - from.0) * t, from.1 + (to.1 - from.1) * t)
-        })
-        .collect()
-}
-
 /// Wheel deltas in lines for a direction: `(vertical, horizontal)`, positive
 /// meaning up and left as CoreGraphics counts them. A page is ten lines.
 pub fn scroll_deltas(dir: ScrollDir, amount: i32) -> (i32, i32) {
@@ -530,8 +644,8 @@ pub fn scroll(
     Ok(())
 }
 
-pub fn hover(held: &Held, x: f64, y: f64) -> Result<(), InputError> {
-    post_motion(held, CGPoint::new(x, y), CGEventFlags::empty())
+pub fn hover(held: &Held, x: f64, y: f64, modifiers: &[String]) -> Result<(), InputError> {
+    post_motion(held, CGPoint::new(x, y), modifier_flags(modifiers))
 }
 
 pub fn clipboard_read_text() -> Result<Option<String>, InputError> {
@@ -710,28 +824,6 @@ mod tests {
         );
     }
 
-    /// The path must end exactly on the destination — a drop one pixel short
-    /// lands on whatever is next to the target.
-    #[test]
-    fn drag_path_is_monotonic_and_ends_on_target() {
-        let path = drag_path((0.0, 0.0), (100.0, 50.0), 10);
-        assert_eq!(path.len(), 10);
-        assert_eq!(path[9], (100.0, 50.0));
-        for w in path.windows(2) {
-            assert!(w[1].0 > w[0].0 && w[1].1 > w[0].1, "path must advance");
-        }
-    }
-
-    /// A drag between two identical points still has to emit motion: some
-    /// targets only begin tracking on the first drag event.
-    #[test]
-    fn zero_length_drag_still_emits_a_move() {
-        let path = drag_path((5.0, 5.0), (5.0, 5.0), 4);
-        assert_eq!(path.len(), 4);
-        assert!(path.iter().all(|p| *p == (5.0, 5.0)));
-        assert_eq!(drag_path((0.0, 0.0), (1.0, 1.0), 0).len(), 1);
-    }
-
     /// Every key the shared parser can emit must have a keycode here, or a
     /// chord that parses cleanly dies at the last step with "no keycode".
     #[test]
@@ -880,14 +972,14 @@ mod tests {
 
     #[test]
     fn a_second_key_in_a_chord_is_refused_before_anything_is_posted() {
-        let e = key_combo("a+b").unwrap_err();
+        let e = key_combo("a+b", CGEventFlags::empty()).unwrap_err();
         assert!(matches!(e, InputError::InvalidArgs(_)), "{e:?}");
         assert!(matches!(
-            key_combo("cmd").unwrap_err(),
+            key_combo("cmd", CGEventFlags::empty()).unwrap_err(),
             InputError::Unsupported(_)
         ));
         assert!(matches!(
-            key_combo("cmd+nosuchkey").unwrap_err(),
+            key_combo("cmd+nosuchkey", CGEventFlags::empty()).unwrap_err(),
             InputError::Unsupported(_)
         ));
     }
@@ -1153,5 +1245,41 @@ mod pointer_tests {
         if let Ok(Some((x, y))) = pointer_position() {
             assert!(x.is_finite() && y.is_finite());
         }
+    }
+
+    /// A held modifier is a flag on later events, not a key press: nothing is
+    /// posted, so nothing can be left latched in the system.
+    #[test]
+    fn a_held_modifier_rides_on_later_events_and_posts_nothing() {
+        let held = HeldKeys::default();
+        assert!(held.flags().is_empty());
+        key_down(&held, "shift").unwrap();
+        key_down(&held, "cmd").unwrap();
+        key_down(&held, "shift").unwrap();
+        assert_eq!(held.held(), ["shift", "cmd"]);
+        let f = held.flags();
+        assert!(f.contains(CGEventFlags::CGEventFlagShift));
+        assert!(f.contains(CGEventFlags::CGEventFlagCommand));
+        // A call's own modifiers and the held ones both reach the event.
+        assert_eq!(
+            held.with_modifiers(&["opt".into(), "shift".into()]),
+            ["opt", "shift", "cmd"]
+        );
+        key_up(&held, "shift").unwrap();
+        assert_eq!(held.flags(), CGEventFlags::CGEventFlagCommand);
+        release_all(&held);
+        assert!(held.held().is_empty() && held.flags().is_empty());
+        // Releasing what is not held is quiet.
+        key_up(&held, "shift").unwrap();
+    }
+
+    #[test]
+    fn a_key_with_no_keycode_is_refused_before_anything_is_held() {
+        let held = HeldKeys::default();
+        assert!(matches!(
+            key_down(&held, "nosuchkey").unwrap_err(),
+            InputError::Unsupported(_)
+        ));
+        assert!(held.held().is_empty());
     }
 }

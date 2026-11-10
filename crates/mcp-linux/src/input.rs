@@ -61,8 +61,11 @@ impl LinuxBackend {
     }
 
     async fn press_modifiers(&self, mods: &[Modifier], down: bool) -> Result<(), InputError> {
+        // A modifier held by `key_down` is already down and stays down.
+        let held = self.lock().held_mods.clone();
+        let mods: Vec<Modifier> = mods.iter().copied().filter(|m| !held.contains(m)).collect();
         let order: Vec<Modifier> = if down {
-            mods.to_vec()
+            mods
         } else {
             mods.iter().rev().copied().collect()
         };
@@ -474,6 +477,50 @@ impl InputBackend for LinuxBackend {
         r.and(released)
     }
 
+    async fn key_down(&self, key: &str) -> Result<(), InputError> {
+        // `fn` is a hardware modifier the compositor never sees.
+        if key == "fn" {
+            return Ok(());
+        }
+        let sym = match Modifier::parse(key) {
+            Some(m) => m.keysym(),
+            None => keys::keysym_for(key)
+                .ok_or_else(|| InputError::Unsupported(format!("no keysym for '{key}'")))?,
+        };
+        self.portal.ensure_ready().await?;
+        self.ensure_target_active().await?;
+        self.portal.key(sym, true).await?;
+        if let Some(m) = Modifier::parse(key) {
+            let mut st = self.lock();
+            if !st.held_mods.contains(&m) {
+                st.held_mods.push(m);
+            }
+        }
+        Ok(())
+    }
+
+    async fn key_up(&self, key: &str) -> Result<(), InputError> {
+        if key == "fn" {
+            return Ok(());
+        }
+        let modifier = Modifier::parse(key);
+        let Some(sym) = modifier
+            .map(Modifier::keysym)
+            .or_else(|| keys::keysym_for(key))
+        else {
+            return Ok(());
+        };
+        // Forgotten before the release is sent: if it fails the record must
+        // not claim a key is down that this backend has given up on, and a
+        // later chord must be free to press and release it.
+        if let Some(m) = modifier {
+            self.lock().held_mods.retain(|h| *h != m);
+        }
+        // No check of where focus is: a release that can be refused is a
+        // stuck key.
+        self.portal.key(sym, false).await
+    }
+
     async fn mouse(
         &self,
         kind: MouseKind,
@@ -560,12 +607,16 @@ impl InputBackend for LinuxBackend {
     async fn drag(
         &self,
         from: (f64, f64),
-        to: (f64, f64),
+        route: &[(f64, f64)],
         modifiers: &[String],
-        steps: u32,
         hold_ms: u64,
         since_takeover: u64,
     ) -> Result<(), InputError> {
+        if route.is_empty() {
+            return Err(InputError::InvalidArgs(
+                "a drag needs somewhere to go".into(),
+            ));
+        }
         let mods = keys::pointer_modifiers(modifiers).map_err(InputError::Failed)?;
         self.portal.pointer_abs(from.0, from.1).await?;
         self.note_pointer(from.0, from.1);
@@ -574,30 +625,29 @@ impl InputBackend for LinuxBackend {
         self.portal.button(0x110, true).await?;
         // `hold_ms` is for drag sources that wait to tell a drag from a click.
         sleep(Duration::from_millis(30 + hold_ms)).await;
-        let steps = steps.clamp(1, 200);
-        let mut last = from;
-        for i in 1..=steps {
+        // However the moves end, the button and modifiers are let go below: a
+        // failed move must not leave the person's button held.
+        let mut moved = Ok(());
+        for &p in route {
             if self.takeover_generation() != since_takeover {
-                let _ = self.portal.button(0x110, false).await;
-                let _ = self.press_modifiers(&mods, false).await;
-                return Err(InputError::Failed(
+                moved = Err(InputError::Failed(
                     "drag aborted: a human took over the pointer".into(),
                 ));
+                break;
             }
-            let t = i as f64 / steps as f64;
-            let p = (from.0 + (to.0 - from.0) * t, from.1 + (to.1 - from.1) * t);
-            self.portal.pointer_abs(p.0, p.1).await?;
+            if let Err(e) = self.portal.pointer_abs(p.0, p.1).await {
+                moved = Err(e);
+                break;
+            }
             self.note_pointer(p.0, p.1);
-            last = p;
             sleep(Duration::from_millis(8)).await;
         }
-        if last != to {
-            self.portal.pointer_abs(to.0, to.1).await?;
+        if moved.is_ok() {
+            sleep(Duration::from_millis(60)).await;
         }
-        sleep(Duration::from_millis(60)).await;
-        let r = self.portal.button(0x110, false).await;
-        self.press_modifiers(&mods, false).await?;
-        r
+        let released = self.portal.button(0x110, false).await;
+        let mods_up = self.press_modifiers(&mods, false).await;
+        moved.and(released).and(mods_up)
     }
 
     async fn clipboard_read(&self, format: ClipFormat) -> Result<ClipData, InputError> {

@@ -436,3 +436,167 @@ async fn shortcut_spellings_work_in_textedit_and_two_keys_are_refused() {
     );
     let _ = c.call("close_app", json!({ "app": APP })).await;
 }
+
+/// The document's text as the accessibility tree shows it, polled for a
+/// moment because an app applies keystrokes on its own run loop.
+async fn document_shows(c: &InProcClient, want: impl Fn(&str) -> bool) -> (bool, String) {
+    let mut text = String::new();
+    for _ in 0..20 {
+        let tree = c.ok("get_ui_tree", json!({ "app": APP })).await;
+        text = tree["text"].as_str().unwrap_or_default().to_string();
+        if want(&text) {
+            return (true, text);
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+    (false, text)
+}
+
+/// A held Shift turns later arrow chords into a selection, and releasing it
+/// ends that: the one after `up` moves the caret and selects nothing.
+///
+/// With Shift held, two Lefts select "bc" and typing replaces them ("aX");
+/// after `up`, Left only moves the caret, so typing inserts ("aZX"). A Shift
+/// that was never held, or never let go, gives a different document.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_held_shift_selects_across_chords_and_up_lets_go() {
+    if !ready() {
+        return;
+    }
+    let c = client("live-hold");
+    c.initialize().await;
+    c.ok("launch", json!({ "app": APP })).await;
+    if !settle_on_textedit(&c).await {
+        return;
+    }
+    if !guarded_key(&c, "cmd+n").await {
+        return;
+    }
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    if !focused_is_textedit() {
+        eprintln!("skipping: focus moved off {APP}");
+        return;
+    }
+    c.ok("keyboard_type", json!({ "text": "abc" })).await;
+
+    let down = c
+        .ok(
+            "keyboard_shortcut",
+            json!({ "combo": "shift", "action": "down" }),
+        )
+        .await;
+    assert_eq!(down["held"], json!(["shift"]), "{down}");
+    assert_eq!(down["auto_release_ms"], json!(30_000), "{down}");
+    let mut ok = true;
+    for _ in 0..2 {
+        ok &= guarded_key(&c, "Left").await;
+    }
+    // Let go before anything else can fail, so a refused step cannot leave
+    // Shift held.
+    let up = c
+        .ok(
+            "keyboard_shortcut",
+            json!({ "combo": "shift", "action": "up" }),
+        )
+        .await;
+    assert_eq!(up["released"], json!(["shift"]), "{up}");
+    assert_eq!(up["held"], json!([]), "{up}");
+    if !ok || !focused_is_textedit() {
+        eprintln!("skipping the rest: focus moved off {APP}");
+        let _ = c.call("close_app", json!({ "app": APP })).await;
+        return;
+    }
+    c.ok("keyboard_type", json!({ "text": "X" })).await;
+    let (selected, text) = document_shows(&c, |t| t.contains("aX") && !t.contains("abX")).await;
+    assert!(
+        selected,
+        "two shifted Lefts must select \"bc\": document shows {text:?}"
+    );
+
+    if guarded_key(&c, "Left").await {
+        c.ok("keyboard_type", json!({ "text": "Z" })).await;
+        let (released, text) = document_shows(&c, |t| t.contains("aZX")).await;
+        assert!(
+            released,
+            "Shift must be up after `up`: document shows {text:?}"
+        );
+    }
+    let _ = c.call("close_app", json!({ "app": APP })).await;
+}
+
+/// A drag with a `path` presses at the start, passes through the waypoints
+/// and releases at the last: dragging along a line of text selects it, and
+/// typing then replaces the selection.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_drag_path_selects_a_line_of_text_and_reports_its_waypoints() {
+    if !ready() {
+        return;
+    }
+    let c = client("live-drag-path");
+    c.initialize().await;
+    c.ok("launch", json!({ "app": APP })).await;
+    if !settle_on_textedit(&c).await {
+        return;
+    }
+    if !guarded_key(&c, "cmd+n").await {
+        return;
+    }
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    if !focused_is_textedit() {
+        eprintln!("skipping: focus moved off {APP}");
+        return;
+    }
+    let found = c
+        .ok(
+            "find_elements",
+            json!({ "app": APP, "role": "text field", "limit": 5 }),
+        )
+        .await;
+    let Some(area) = found["elements"].as_array().and_then(|e| e.first()) else {
+        eprintln!("skipping: no text area found ({})", found["hint"]);
+        let _ = c.call("close_app", json!({ "app": APP })).await;
+        return;
+    };
+    let reff = area["ref"].as_str().unwrap().to_string();
+    c.ok("keyboard_type", json!({ "text": "wordwordword" }))
+        .await;
+    if !focused_is_textedit() {
+        eprintln!("skipping: focus moved off {APP}");
+        return;
+    }
+
+    // Offsets from the text area's top-left, along the first line and out
+    // past its end.
+    let drag = c
+        .ok(
+            "drag_drop",
+            json!({
+                "from": { "ref": &reff, "x": 3, "y": 10 },
+                "path": [{ "x": 60, "y": 10 }, { "x": 200, "y": 10 }],
+            }),
+        )
+        .await;
+    assert_eq!(drag["waypoints"], json!(2), "{drag}");
+
+    // A path outside the window is refused whole, before anything moves.
+    let outside = c
+        .call(
+            "drag_drop",
+            json!({ "from": { "ref": &reff, "x": 3, "y": 10 }, "path": [{ "x": 60, "y": 10 }, { "x": 99999, "y": 10 }] }),
+        )
+        .await;
+    assert_eq!(outside.error.unwrap().code, ErrorCode::PolicyDenied);
+
+    if !focused_is_textedit() {
+        eprintln!("skipping typing: focus moved off {APP}");
+        let _ = c.call("close_app", json!({ "app": APP })).await;
+        return;
+    }
+    c.ok("keyboard_type", json!({ "text": "Q" })).await;
+    let (replaced, text) = document_shows(&c, |t| t.contains('Q') && !t.contains("wordword")).await;
+    assert!(
+        replaced,
+        "the dragged line must have been selected and replaced: document shows {text:?}"
+    );
+    let _ = c.call("close_app", json!({ "app": APP })).await;
+}
