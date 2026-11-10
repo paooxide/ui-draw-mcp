@@ -8,8 +8,8 @@ mod tools;
 mod wait;
 
 pub use backend::{
-    DialogInfo, DialogScope, MenuItemInfo, Rect, WindowAction, WindowBackend, WindowError,
-    WindowInfo,
+    target_source, window_at, window_index_error, DialogInfo, DialogScope, MenuItemInfo, Rect,
+    TargetInfo, TargetSource, WindowAction, WindowBackend, WindowError, WindowInfo, WindowState,
 };
 pub use foreground::{tool_refusal, ForegroundWindow};
 pub use tools::WindowModule;

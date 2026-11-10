@@ -36,12 +36,12 @@ enabled category, while a `dangerous` tool additionally has to be named in
 | [`ui_action`](#ui-action) | input | standard | Perform a semantic action on an element by ref or name (accessibility action, no cursor, app need not be frontmost). |
 | [`ui_fill_form`](#ui-fill-form) | input | standard | Fill multiple native UI fields (text fields, checkboxes, switches, popups, radios) in one call, and optionally submit and verify postconditions. |
 | [`close_app`](#close-app) | window | standard | Quit an application by name. |
-| [`control_window`](#control-window) | window | standard | Focus/move/resize/minimize/maximize/restore/close a window. |
-| [`focus_app`](#focus-app) | window | standard | Pin this session to an application: bring it forward and make every later get_ui_tree/action target it instead of whatever happens to be frontmost. |
+| [`control_window`](#control-window) | window | standard | Focus/move/resize/minimize/maximize/restore/close a window of 'app' (else the pinned app, else the frontmost) whose title contains 'title' (else its main window). |
+| [`focus_app`](#focus-app) | window | standard | Pin this session to an application so every later get_ui_tree/action targets it instead of whatever happens to be frontmost. |
 | [`handle_dialogs`](#handle-dialogs) | window | read | List open dialogs, sheets, popovers and menus, with their buttons, message text and which button Return/Escape activates. |
 | [`launch`](#launch) | window | standard | Launch or bring forward an application by name (allowlist-gated). |
 | [`list_apps`](#list-apps) | window | read | List the applications that are running, by the name launch, focus_app, list_windows and get_ui_tree expect. |
-| [`list_windows`](#list-windows) | window | read | List open windows: title, position, size, minimised state. |
+| [`list_windows`](#list-windows) | window | read | List open windows: title, position, size and state (onscreen, minimized, or offscreen: another Space or a hidden app). |
 | [`menu_invoke`](#menu-invoke) | window | standard | Open and click a menu item by title path, e.g. |
 | [`menu_list`](#menu-list) | window | read | Enumerate an app's menu bar: titles, enabled state, and the keyboard equivalent of each item. |
 | [`menu_open`](#menu-open) | window | standard | Open a menu-bar menu by title path, e.g. |
@@ -166,10 +166,11 @@ Capture a display (or a region) as a PNG image. Large captures are downscaled fo
 
 `capture_window` · read tier
 
-Capture a single window as a PNG image: prefer this over capture_screen when you only care about one app; fewer pixels means proportionally fewer tokens. grid=true labels the image in screen points (the window's own position included), what mouse_action takes.
+Capture a single window as a PNG image: prefer this over capture_screen when you only care about one app; fewer pixels means proportionally fewer tokens. window_id is the window's id in list_windows for 'app' (else the pinned app, else the frontmost one); the result's window names the app it was read against. This captures the screen area: on macOS a window that is minimized, on another Space or covered by another app's window is refused, not returned as that app's pixels; elsewhere a covered window shows what covers it. grid=true labels the image in screen points (the window's own position included), what mouse_action takes.
 
 | Argument | Type | Required | Description |
 |---|---|---|---|
+| `app` | string |  | the application whose window list window_id is from (default: the pinned app, else the frontmost) |
 | `detail` | one of: low, balanced, full |  |  |
 | `force` | boolean |  |  |
 | `grid` | boolean |  | draw a labelled coordinate grid on the image, labelled in screen points (what mouse_action takes, the window's position included); the result gives scale (image px per point), grid_step and origin |
@@ -241,6 +242,7 @@ Read text off the screen, with a box for each line in screen coordinates. The fa
 
 | Argument | Type | Required | Description |
 |---|---|---|---|
+| `app` | string |  | with window_id: the application whose window list the id is from |
 | `display` | integer |  | which display, when no region or window is given |
 | `exact` | boolean |  | with find: only a line that is exactly the text, not one that contains it (default false) |
 | `find` | string |  | return only the lines containing this text (case-insensitive, whitespace-collapsed), best match first, each with x,y (the centre, in screen points, for mouse_action) and bounds, instead of all the text |
@@ -252,7 +254,7 @@ Read text off the screen, with a box for each line in screen coordinates. The fa
 | `region.w` | number |  |  |
 | `region.x` | number |  |  |
 | `region.y` | number |  |  |
-| `window_id` | integer |  | read one window (id from list_windows); results are still in screen coordinates |
+| `window_id` | integer |  | read one window (its id in list_windows, for 'app' else the pinned app, else the frontmost one); results are still in screen coordinates |
 
 ### ui-extract
 
@@ -658,7 +660,7 @@ Quit an application by name.
 
 `control_window` · standard tier
 
-Focus/move/resize/minimize/maximize/restore/close a window.
+Focus/move/resize/minimize/maximize/restore/close a window of 'app' (else the pinned app, else the frontmost) whose title contains 'title' (else its main window). The result's target says which app it acted on.
 
 | Argument | Type | Required | Description |
 |---|---|---|---|
@@ -675,11 +677,12 @@ Focus/move/resize/minimize/maximize/restore/close a window.
 
 `focus_app` · standard tier
 
-Pin this session to an application: bring it forward and make every later get_ui_tree/action target it instead of whatever happens to be frontmost. Call once before driving an app. Omit 'app' to release the pin.
+Pin this session to an application so every later get_ui_tree/action targets it instead of whatever happens to be frontmost. By default it also brings the app forward; activate=false pins it without raising it or touching its windows, to drive an app that stays in the background (the only form foreground="never" allows). Omit 'app' to release the pin.
 
 | Argument | Type | Required | Description |
 |---|---|---|---|
-| `app` | string |  |  |
+| `activate` | boolean |  | false: pin without bringing the app forward (default true) |
+| `app` | string |  | application name, as list_apps reports it |
 
 ### handle-dialogs
 
@@ -715,7 +718,7 @@ No arguments.
 
 `list_windows` · read tier
 
-List open windows: title, position, size, minimised state. With no 'app', lists every application's windows: start here to see what is open. With 'app', lists just that one. After focus_app has pinned an application, omitting 'app' means the pinned one. Desktop furniture (the Dock, menu bar, overlays) is left out.
+List open windows: title, position, size and state (onscreen, minimized, or offscreen: another Space or a hidden app). With no 'app', lists every application's windows: start here to see what is open. With 'app', lists just that one, running or not frontmost. After focus_app has pinned an application, omitting 'app' means the pinned one. Desktop furniture (the Dock, menu bar, overlays) is left out. A window's id is its place in its own application's list: pass it with that app to capture_window or ocr_region. The result's target names the application a list is of.
 
 | Argument | Type | Required | Description |
 |---|---|---|---|
@@ -759,7 +762,7 @@ Open a menu-bar menu by title path, e.g. ["File"].
 
 `wait_for` · read tier
 
-Block until the UI settles: text appears, a window appears, text is gone, or an element takes focus. Synthetic input is asynchronous, so observing straight after acting reads the previous state: wait first. Several conditions must all hold at once.
+Block until the UI settles: text appears, a window appears, text is gone, or an element takes focus. Synthetic input is asynchronous, so observing straight after acting reads the previous state: wait first. Several conditions must all hold at once. 'app' watches that application without pinning it.
 
 | Argument | Type | Required | Description |
 |---|---|---|---|

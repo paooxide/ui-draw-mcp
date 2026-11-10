@@ -14,8 +14,8 @@ use mcp_types::Refusal;
 use serde_json::Value;
 
 use crate::backend::{
-    DialogInfo, DialogScope, MenuItemInfo, Rect, WindowAction, WindowBackend, WindowError,
-    WindowInfo,
+    DialogInfo, DialogScope, MenuItemInfo, Rect, TargetInfo, WindowAction, WindowBackend,
+    WindowError, WindowInfo,
 };
 
 /// How a tool stands under `foreground = "never"`.
@@ -55,9 +55,9 @@ const UNVERIFIED_RESTORE: &str = "un-minimise a window, which brings it to the f
                                   verified to be background-safe, so it is refused)";
 const UNVERIFIED_MENU: &str = "open a menu in another app's menu bar, which may bring that app \
                                forward (not verified to be background-safe, so it is refused)";
-const NOT_NEEDED: &str = "not needed: get_ui_tree with `app` reads that app without raising it, \
-                          and ui_action, set_value and select_text act on its refs while it \
-                          stays behind";
+const NOT_NEEDED: &str = "focus_app with `activate: false` pins the app without raising it, \
+                          get_ui_tree with `app` reads it the same way, and ui_action, \
+                          set_value and select_text act on its refs while it stays behind";
 const MENU_INSTEAD: &str = "menu_list reads a menu's items and shortcuts without opening \
                             anything; ui_action click on the control that does the same thing";
 
@@ -83,11 +83,13 @@ fn by_args(backend: &dyn WindowBackend, tool: &str, args: &Value) -> Option<Refu
             let action = WindowAction::parse(name)?;
             action_refusal(backend, action)
         }
-        // `app` pins and raises; no `app` only releases the pin.
-        "focus_app" => args
-            .get("app")
-            .is_some_and(|a| !a.is_null())
-            .then(|| Refusal::new(tool, FRONT, Some(NOT_NEEDED))),
+        // `app` pins and, unless `activate` is the boolean false, raises; no
+        // `app` only releases the pin. Anything but a plain `false` counts as
+        // the raising form, so a value the module will reject is refused here
+        // first rather than guessed to be the quiet one.
+        "focus_app" => (args.get("app").is_some_and(|a| !a.is_null())
+            && args.get("activate") != Some(&Value::Bool(false)))
+        .then(|| Refusal::new(tool, FRONT, Some(NOT_NEEDED))),
         _ => None,
     }
 }
@@ -191,6 +193,15 @@ impl WindowBackend for ForegroundWindow {
             None => self.inner.focus_app(None).await,
         }
     }
+    async fn pin_app(&self, app: &str) -> Result<TargetInfo, WindowError> {
+        self.inner.pin_app(app).await
+    }
+    async fn describe_target(&self, app: Option<&str>) -> Result<TargetInfo, WindowError> {
+        self.inner.describe_target(app).await
+    }
+    async fn pinned(&self) -> Option<TargetInfo> {
+        self.inner.pinned().await
+    }
     fn platform(&self) -> &'static str {
         self.inner.platform()
     }
@@ -290,6 +301,30 @@ mod tests {
             self.note(&format!("focus_app {}", app.unwrap_or("-")));
             Ok(app.map(str::to_string))
         }
+        async fn pin_app(&self, app: &str) -> Result<TargetInfo, WindowError> {
+            self.note(&format!("pin_app {app}"));
+            Ok(TargetInfo {
+                app: app.to_string(),
+                pid: Some(1),
+                from: crate::backend::TargetSource::Named,
+            })
+        }
+        // Resolution is a read the module makes before every call; it is not
+        // recorded, so a test of what reached the backend sees only the work.
+        async fn describe_target(&self, app: Option<&str>) -> Result<TargetInfo, WindowError> {
+            Ok(TargetInfo {
+                app: app.unwrap_or("Frontmost").to_string(),
+                pid: Some(1),
+                from: if app.is_some() {
+                    crate::backend::TargetSource::Named
+                } else {
+                    crate::backend::TargetSource::Frontmost
+                },
+            })
+        }
+        async fn pinned(&self) -> Option<TargetInfo> {
+            None
+        }
         fn platform(&self) -> &'static str {
             "recorder"
         }
@@ -338,6 +373,28 @@ mod tests {
             ("focus_app", json!({}), Runs),
             ("focus_app", json!({"app": null}), Runs),
             ("focus_app", app.clone(), Refused),
+            (
+                "focus_app",
+                json!({"app":"TextEdit","activate":true}),
+                Refused,
+            ),
+            // Anything that is not a plain `false` is the raising form.
+            (
+                "focus_app",
+                json!({"app":"TextEdit","activate":"false"}),
+                Refused,
+            ),
+            (
+                "focus_app",
+                json!({"app":"TextEdit","activate":null}),
+                Refused,
+            ),
+            (
+                "focus_app",
+                json!({"app":"TextEdit","activate":false}),
+                Runs,
+            ),
+            ("focus_app", json!({"activate":false}), Runs),
             ("control_window", json!({"action":"focus"}), Refused),
             ("control_window", json!({"action":"restore"}), Refused),
             ("control_window", json!({"action":"minimize"}), Runs),
@@ -492,6 +549,15 @@ mod tests {
             async fn focus_app(&self, a: Option<&str>) -> Result<Option<String>, WindowError> {
                 self.0.focus_app(a).await
             }
+            async fn pin_app(&self, a: &str) -> Result<TargetInfo, WindowError> {
+                self.0.pin_app(a).await
+            }
+            async fn describe_target(&self, a: Option<&str>) -> Result<TargetInfo, WindowError> {
+                self.0.describe_target(a).await
+            }
+            async fn pinned(&self) -> Option<TargetInfo> {
+                self.0.pinned().await
+            }
             fn platform(&self) -> &'static str {
                 "plain"
             }
@@ -553,11 +619,40 @@ mod tests {
         );
     }
 
+    /// Under `never` the only way to pin an app is the form that does not
+    /// raise it, and it works through both layers.
+    #[tokio::test]
+    async fn the_quiet_pin_runs_under_never_and_through_the_wrapper() {
+        let rec = Arc::new(Recorder::default());
+        let m = module(&rec, Foreground::Never);
+        let env = call(&m, "focus_app", json!({"app":"TextEdit","activate":false})).await;
+        assert!(env.ok, "{env:?}");
+        assert_eq!(rec.calls(), ["pin_app TextEdit"]);
+
+        let rec = Arc::new(Recorder::default());
+        let g = Arc::new(ForegroundWindow::new(rec.clone()));
+        let m = WindowModule::new(g, Arc::new(NoTree), vec!["TextEdit".into()]);
+        assert!(
+            call(&m, "focus_app", json!({"app":"TextEdit","activate":false}))
+                .await
+                .ok
+        );
+        assert_eq!(rec.calls(), ["pin_app TextEdit"]);
+        // The raising form never reaches the backend through the wrapper.
+        assert!(!call(&m, "focus_app", json!({"app":"TextEdit"})).await.ok);
+        assert_eq!(rec.calls(), ["pin_app TextEdit"]);
+    }
+
     #[test]
     fn the_refusals_name_the_alternative() {
         let rec = Recorder::default();
         let r = tool_refusal(&rec, "focus_app", &json!({"app":"TextEdit"})).unwrap();
         assert!(r.suggestion().contains("get_ui_tree") && r.suggestion().contains("set_value"));
+        assert!(
+            r.suggestion().contains("activate: false"),
+            "the refusal must name the form that is allowed: {}",
+            r.suggestion()
+        );
         let r = tool_refusal(&rec, "menu_open", &json!({"path":["File"]})).unwrap();
         assert!(r.suggestion().contains("menu_list"));
         assert!(tool_refusal(&rec, "no_such_tool", &json!({})).is_some());

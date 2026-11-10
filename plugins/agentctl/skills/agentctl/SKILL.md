@@ -55,7 +55,13 @@ ones.
 ## Desktop apps
 
 1. `launch` (or `focus_app`) the application. `focus_app` pins the session to it, so later observations
-   and actions target it rather than whatever happens to be in front.
+   and actions target it rather than whatever happens to be in front. To work on an app that stays in the
+   background, pin it with `focus_app` and `activate: false`: that raises nothing, and it is the only form
+   accepted when the operator has set `foreground = "never"`. `list_windows` with `app` lists that app's
+   windows, and a `window_id` means a window of one app, so pass the same `app` with it to `capture_window`
+   or `ocr_region`. Results name the `app` and `pid` they used (`target` says whether it was named, pinned
+   or the frontmost app): check it is the one you meant. A window that is minimised, on another Space or
+   covered by another app's window cannot be captured on macOS and says so; read it with `get_ui_tree`.
 2. `find_elements` for the control, or `get_ui_tree` with `skeleton: true` if you need the layout.
 3. Act semantically: `ui_action` (click, check, select with `option`, expand...) on a `ref`, `set_value`
    for text fields, `select_text` to select text, `ui_fill_form` for several fields at once,

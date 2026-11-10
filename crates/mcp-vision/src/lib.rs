@@ -18,7 +18,7 @@ mod tools;
 
 pub use backend::{
     CaptureOpts, CaptureResult, Detail, DisplayInfo, OcrLine, OcrOpts, OcrResult, OcrTarget,
-    VisionBackend, VisionError,
+    VisionBackend, VisionError, WindowSubject,
 };
 pub use config::VisionConfig;
 pub use tools::VisionModule;

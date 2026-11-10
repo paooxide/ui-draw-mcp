@@ -103,7 +103,8 @@ Each tool that would is refused with `POLICY_DENIED` before it runs, and the sam
 backend boundary, so a tool added later still posts nothing. `launch` asks the OS not to activate the app
 (`open -g` on macOS) and is refused where the platform has no such request (Linux). The accessibility tools
 (`set_value`, `select_text`, the other `ui_action` actions, `get_ui_tree`, the window and menu reads)
-keep working and never raise anything themselves. Actions that open a menu or popup, set keyboard focus, or
+keep working and never raise anything themselves; so does `focus_app` with `activate: false`, which pins an app
+as the target of later calls and writes nothing to it. Actions that open a menu or popup, set keyboard focus, or
 un-minimise a window (`ui_action` `focus`, `show_menu`, `select` with an option; `menu_open`,
 `menu_invoke`; `control_window` `focus` and `restore`) are refused because it is **not verified** that an
 app does not bring itself forward in response; this is a precaution, not a measured fact. It does not
@@ -133,7 +134,7 @@ Full mapping to OWASP categories is in [`architecture.md`](architecture.md) §8.
 |---|---|---|---|
 | vision | Screenshot a password manager; read a secure field | Secure fields are marked and their values never returned; capture needs the Screen Recording grant | A screenshot of a *visible* secret is still a screenshot. Vision is a read of the screen; that is what it is for. |
 | input | Type `rm -rf /` into a terminal; click "Allow" on a system dialog | Destructive-keystroke gate on the live input target; consent dialogs are separate native windows the agent cannot see | The gate is a backstop, not containment (§7) |
-| window | Close an app with unsaved work; drive an app not on the allowlist | `allowed_apps`; `close_app` is gated | Data loss inside an allowed app is possible by design |
+| window | Close an app with unsaved work; drive an app not on the allowlist | `allowed_apps`, which `launch`, `focus_app` and every window or capture tool that names an `app` (`list_windows`, `control_window`, `menu_*`, `handle_dialogs`, `wait_for`, `capture_window`, `ocr_region`) must meet, by the name given and by the app it resolves to; `close_app` is gated | Data loss inside an allowed app is possible by design. `get_ui_tree`, `find_elements` and `ui_extract` with `app` read an app that `allowed_apps` does not list: the list does not bound perception |
 | desktop | Speak a file's contents aloud to exfiltrate it; power off mid-task | `play_audio` is bounded by the filesystem roots; `power_control` is dangerous-tier | `notify_user` text is attacker-controlled and could mimic a system prompt (§7) |
 | browser | Navigate to cloud metadata; read cookies; `eval` arbitrary JS; attach a local file to an attacker's form | `browser_eval`/`browser_cookies`/`browser_network`/`browser_upload` are dangerous-tier; `browser_upload` reads only through the filesystem jail (roots and credential deny-list); cookie values redacted; JS dialogs dismissed by default | `browser_navigate` is origin-prefix checked, **not** IP-guarded (§7) |
 | terminal | Arbitrary code execution | argv-only, `allowed_commands` allowlist, `allow_shell` off; PTY writes are gated identically | With `allow_shell = true` this is arbitrary execution, as configured |

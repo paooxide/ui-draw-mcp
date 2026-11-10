@@ -1048,3 +1048,148 @@ async fn effects_report_the_save_sheet_a_shortcut_opens_and_closes() {
     assert!(quiet.get("effects").is_none(), "{quiet}");
     let _ = c.call("close_app", json!({ "app": APP })).await;
 }
+
+/// A TextEdit document in the background is found, addressed and read while
+/// another application stays frontmost: pinned without activating it, its
+/// windows listed with the pin and by name, its text area found and written,
+/// its text selected, and a window read by the id the list gave. The
+/// frontmost application and the pointer are read again after every step.
+///
+/// What must hold: every answer names TextEdit and its pid, a window id is
+/// read against TextEdit and not against Finder (which is in front), an id
+/// TextEdit does not have is an error that names it, and a window that
+/// Finder's window covers is refused instead of being photographed as
+/// Finder's pixels. Whether the window is covered depends on where the two
+/// windows sit, so the capture accepts either honest outcome.
+///
+/// Not run by default: it needs `AGENTCTL_LIVE_GUI=1`. The setup raises
+/// TextEdit and then Finder, as the other tests here do; the part under test
+/// runs under `foreground = "never"`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_background_app_is_pinned_listed_and_read_by_window_id_without_taking_the_foreground() {
+    if !ready() {
+        return;
+    }
+    use mcp_input::InputBackend;
+    let setup = client("live-bg-setup");
+    setup.initialize().await;
+    if scratch_document(&setup, "alpha beta gamma").await.is_none() {
+        return;
+    }
+    let _ = setup.call("focus_app", json!({ "app": "Finder" })).await;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !frontmost().is_some_and(|f| f.contains("Finder")) {
+        if Instant::now() > deadline {
+            eprintln!("skipping: Finder never became frontmost; cannot show TextEdit stays behind");
+            let _ = setup.call("close_app", json!({ "app": APP })).await;
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+    let before = frontmost();
+    let backend = mcp_macos::MacosBackend::new();
+    let pointer_before = backend.pointer_position().await.ok().flatten();
+
+    let c = client_with("live-bg", mcp_types::Foreground::Never);
+    c.initialize().await;
+    let unchanged = |step: &str| {
+        assert_eq!(frontmost(), before, "{step} changed the frontmost app");
+    };
+
+    // Pin without raising. The raising form is refused under never.
+    let pinned = c
+        .ok("focus_app", json!({ "app": APP, "activate": false }))
+        .await;
+    assert_eq!(pinned["activated"], json!(false), "{pinned}");
+    assert!(pinned["target"].as_str().is_some_and(|t| t.contains(APP)));
+    let pid = pinned["pid"].as_u64().expect("TextEdit's pid");
+    unchanged("focus_app activate=false");
+    let raised = c.call("focus_app", json!({ "app": APP })).await;
+    assert_eq!(raised.error.expect("refused").code, ErrorCode::PolicyDenied);
+    unchanged("the refused focus_app");
+
+    // Its windows, with the pin and by name: the same list, all TextEdit's.
+    let with_pin = c.ok("list_windows", json!({})).await;
+    assert_eq!(with_pin["target"]["from"], json!("pinned"), "{with_pin}");
+    assert_eq!(with_pin["target"]["pid"], json!(pid), "{with_pin}");
+    let by_name = c.ok("list_windows", json!({ "app": APP })).await;
+    assert_eq!(with_pin["windows"], by_name["windows"]);
+    let windows = with_pin["windows"].as_array().expect("windows");
+    assert!(!windows.is_empty(), "TextEdit has its scratch document");
+    for (i, w) in windows.iter().enumerate() {
+        assert_eq!(w["app"], json!(APP), "{w}");
+        assert_eq!(w["pid"], json!(pid), "{w}");
+        assert_eq!(w["id"], json!(i), "{w}");
+        assert!(w["state"].is_string(), "{w}");
+    }
+    unchanged("list_windows");
+
+    // Its text area, found with no app named: the pin decides.
+    let found = c
+        .ok("find_elements", json!({ "role": "text field", "limit": 5 }))
+        .await;
+    assert_eq!(found["app"], json!(APP), "{found}");
+    assert_eq!(found["target"], json!("pinned"), "{found}");
+    assert_eq!(found["pid"], json!(pid), "{found}");
+    let reff = found["elements"][0]["ref"]
+        .as_str()
+        .expect("text area")
+        .to_string();
+    unchanged("find_elements");
+
+    let set = c
+        .ok(
+            "set_value",
+            json!({ "ref": &reff, "text": "alpha beta gamma delta" }),
+        )
+        .await;
+    assert_eq!(
+        (set["input"].as_str(), set["app"].as_str()),
+        (Some("ax"), Some(APP))
+    );
+    unchanged("set_value");
+    let selected = c
+        .ok("select_text", json!({ "ref": &reff, "text": "delta" }))
+        .await;
+    assert_eq!(selected["text"], json!("delta"), "{selected}");
+    assert_eq!(selected["app"], json!(APP), "{selected}");
+    unchanged("select_text");
+
+    // A window-id read, against TextEdit and not against Finder in front.
+    let capture = c
+        .call(
+            "capture_window",
+            json!({ "window_id": 0, "app": APP, "detail": "low" }),
+        )
+        .await;
+    match (&capture.ok, &capture.error, &capture.data) {
+        (true, _, Some(d)) => {
+            assert_eq!(d["window"]["app"], json!(APP), "{d}");
+            assert_eq!(d["window"]["pid"], json!(pid), "{d}");
+        }
+        (_, Some(e), _) => assert!(
+            e.message.contains("covered by")
+                || e.message.contains("not on screen")
+                || e.message.contains("minimised")
+                || e.message.to_lowercase().contains("screen recording"),
+            "an unexplained refusal: {}",
+            e.message
+        ),
+        _ => panic!("neither a capture nor an error: {capture:?}"),
+    }
+    unchanged("capture_window");
+    let missing = c
+        .call("capture_window", json!({ "window_id": 99, "app": APP }))
+        .await;
+    let err = missing.error.expect("TextEdit has no window 99");
+    assert_eq!(err.code, ErrorCode::NotFound);
+    assert!(err.message.contains(APP), "{}", err.message);
+    unchanged("capture_window out of range");
+
+    assert_eq!(
+        pointer_before,
+        backend.pointer_position().await.ok().flatten(),
+        "the pointer moved"
+    );
+    let _ = setup.call("close_app", json!({ "app": APP })).await;
+}

@@ -19,6 +19,9 @@ mod ax_actions;
 mod chunk;
 #[cfg(target_os = "macos")]
 mod event;
+#[cfg(any(target_os = "macos", test))]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+mod geometry;
 #[cfg(target_os = "macos")]
 mod imp;
 #[cfg(target_os = "macos")]

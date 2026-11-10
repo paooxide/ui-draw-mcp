@@ -143,8 +143,84 @@ All notable changes to this project are documented here. The format follows
   ordinary key is a real key-down. On Linux every held key is a real press through the portal. A crash or
   `SIGKILL` cannot run the release, which on Linux can leave a held key down.
 
+- **`focus_app` with `activate: false` pins an app without raising it, and every window id says which app it
+  belongs to.** Driving an app that stays in the background had one door: `get_ui_tree` with `app` pinned it
+  as a side effect, and `focus_app`, the tool named for pinning, always raised it, so under
+  `foreground = "never"` there was no refused-or-working way to say "this is the app". `focus_app {app,
+  activate: false}` sets the same pin and writes nothing to the app (no `AXFrontmost`, no window touched); its
+  result is `{target, pid, activated: false}`. Under `never` that form is allowed and the raising form
+  (`activate` absent, `true`, or anything that is not the boolean `false`) is refused with a suggestion
+  naming it. `list_windows` with `app` lists a named app whether or not it is frontmost, and each window now
+  carries `pid` and a `state`: `onscreen`, `minimized`, or `offscreen` (another Space, or the app is hidden;
+  the window server lists these, the accessibility tree of the app does not). `capture_window` and
+  `ocr_region` take `app` with `window_id` (the app whose list the id is from; default the pinned app, else
+  the frontmost), and their results carry `window: {app, pid, title, from}`. `list_windows`, `get_ui_tree`,
+  `find_elements`, `ui_extract`, `control_window`, `menu_open`, `menu_invoke`, `menu_list` and
+  `handle_dialogs` results name the application they used and why (`target`/`from` is `named`, `pinned` or
+  `frontmost`, so a call that named no app shows whether it got the pin or whatever was in front);
+  `ui_action`, `set_value`, `select_text` and `get_selection` by ref say the `app` the ref belongs to. A
+  `list_windows` with no app and nothing pinned says `scope: "all_apps"`. An app name that matches no running
+  application, and a `window_id` the app does not have, are errors that name the app (and, for the id, how
+  many windows it has); none falls back to another app. `capture_window` and `ocr_region` on macOS capture
+  the screen area, so a window that is minimised, off screen, or covered by 5% or more of its area by other
+  applications' windows (read from the window server) is now an error that says which, instead of an image
+  of whatever is on screen there; on Linux a covered window cannot be told and shows what covers it.
+  Unverified: the live test (`a_background_app_is_pinned_listed_and_read_by_window_id_without_taking_the_foreground`)
+  is written and has not been run; nothing here has run on Linux, which type-checks only; no capture was
+  taken, so the `screencapture` half of a window read, and a window on another Space (none was open when
+  this was written), are untested.
+
+### Changed
+
+- **Window, menu, dialog and capture calls that name an `app` act on it without pinning it.** `list_windows`,
+  `menu_list`, `handle_dialogs` and the rest resolved `app` through the call that pins, so reading one app's
+  menu silently changed which app a later call with no `app` acted on. Only `focus_app` and the
+  `get_ui_tree` family (`get_ui_tree`, `find_elements`, `ui_extract`) pin now. `wait_for` with `app` watches
+  it without pinning it (see Fixed). A flow that named an app in `list_windows` or `menu_list` and then
+  called `get_ui_tree` with no `app` expecting it now reads the pinned or frontmost app, and the result's
+  `target` says so.
+- **A `window_id` is the window's place in its own application's list, the same in `list_windows` with or
+  without `app`.** `list_windows { app }` numbered windows by the app's accessibility order and `list_windows`
+  with no app by the window server's, so one window had two ids, and `capture_window` read either against the
+  frontmost app's accessibility windows. Both lists now come from the window server (the same windows and
+  numbering whether or not Accessibility is granted; titles it redacts are filled from the app when
+  Accessibility is granted). For an app whose windows the two orders agree on, ids are unchanged; where they
+  differed, `list_windows { app }` ids now match the no-app list. Windows under 120x80 points and untitled
+  surfaces (when titles are readable) are not listed, as they were not in the no-app list. `minimized` is
+  true only for a window the app reports minimised.
+- **`allowed_apps` applies to every window tool that names an app.** It gated `launch` and `focus_app`. It now
+  also gates `list_windows`, `control_window`, `menu_open`, `menu_invoke`, `menu_list`, `handle_dialogs`,
+  `wait_for`, `capture_window` and `ocr_region` when they name an `app`, by the name given and by the
+  application it resolves to. It still does not gate `get_ui_tree`, `find_elements` or `ui_extract` with
+  `app`, which read an app the list does not cover; that is unchanged and recorded in
+  `docs/threat-model.md`.
+
 ### Fixed
 
+- **`control_window`, `menu_open` and `menu_invoke` acted on the frontmost app whatever `app` said.** The
+  argument was accepted and discarded (`_app`), so `control_window { app: "TextEdit", action: "close" }` closed
+  a window of the app in front, and `menu_invoke { app, path }` pressed a menu item in it. They now act on the
+  named app, or the pinned one, or the frontmost, and the result's `target` says which. A title that matches
+  none of the app's windows is an error naming the app and how many windows it has.
+- **`capture_window` and `ocr_region` with a `window_id` read the frontmost app's accessibility windows, never
+  the app the id came from.** With TextEdit pinned behind Terminal, `window_id: 0` was Terminal's first
+  window, and the capture was of Terminal. They also photographed whatever was on screen at the window's
+  coordinates, so a window covered by another app's came back as that app's pixels. See Added for the id and
+  the refusal. Seen on the development Mac: Finder's only window listed as `onscreen` and covered 100% by
+  Terminal, which a capture would have returned as Finder's.
+- **`wait_for` with `app` pinned that app and replaced the elements `@eN` refs pointed at.** Its polls took
+  ordinary snapshots, so `wait_for { app: "Finder", ... }` between `get_ui_tree` of TextEdit and `ui_action
+  @e5` left `@e5` resolving in Finder's tree, where an element with the same role and name would be acted on.
+  The polls are now passive reads: nothing is pinned and the last walk's refs are kept. An `expect` clause is
+  not passive (it installs what it last saw), so it is unchanged.
+- **An app whose windows were all minimised or on another Space could not be named unless its process name
+  matched exactly.** Name resolution looked only at on-screen window owners, then `pgrep -x`. It now also
+  looks at off-screen owners, exact before substring.
+- **Linux: a `window_id` from one app's list could resolve to a window of another app.** Ids indexed the last
+  `list_windows` result, and an id past the end re-listed every app and returned that list's entry. Ids are
+  now each window's place in its own app's list and are read against the app named, else the pinned one, else
+  the active one, with an error naming the app and its window count past the end. Naming an app in a window
+  or menu call also pinned it there, as on macOS, and no longer does. Type-checks only; not run.
 - **`browser_fill_form` no longer reports `submitted: true` for a submit that did not happen.** It clicked the
   submit control with a script `click()`, which a disabled control ignores and a person could not make on a
   control under a dialog. It now looks first: a disabled control, or one with a dialog or positioned layer

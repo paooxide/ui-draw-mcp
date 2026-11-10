@@ -69,3 +69,42 @@ async fn the_default_is_allow_and_the_same_call_is_not_a_foreground_refusal() {
     let code = env.error.expect("no such element").code;
     assert_ne!(code, ErrorCode::PolicyDenied);
 }
+
+/// The quiet pin is how a background app is driven under `never`: it must not
+/// be a foreground refusal, the raising form must name it, and the allowlist
+/// holds either way. A pin reads and changes nothing on screen, so this is
+/// safe to run on a live desktop whether or not TextEdit is open.
+#[tokio::test]
+async fn under_never_the_quiet_pin_is_allowed_and_the_raising_one_names_it() {
+    let (c, _) = client(Foreground::Never, "fg-never-pin");
+
+    let env = c.call("focus_app", json!({"app":"TextEdit"})).await;
+    let err = env.error.expect("the raising form is refused");
+    assert_eq!(err.code, ErrorCode::PolicyDenied);
+    assert!(
+        err.suggestion
+            .as_deref()
+            .unwrap_or_default()
+            .contains("activate: false"),
+        "{err:?}"
+    );
+
+    let env = c
+        .call("focus_app", json!({"app":"TextEdit","activate":false}))
+        .await;
+    if let Some(err) = env.error {
+        // Not running, or no Accessibility permission: an answer about the
+        // app, not a foreground refusal.
+        assert!(
+            !err.message.contains("foreground = \"never\""),
+            "the quiet pin was refused as a foreground change: {err:?}"
+        );
+    }
+
+    let env = c
+        .call("focus_app", json!({"app":"Safari","activate":false}))
+        .await;
+    let err = env.error.expect("outside allowed_apps");
+    assert_eq!(err.code, ErrorCode::PolicyDenied);
+    assert!(err.message.contains("allowed_apps"), "{err:?}");
+}

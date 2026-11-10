@@ -15,8 +15,8 @@ use async_trait::async_trait;
 use atspi::{AccessibilityConnection, Interface, ObjectRefOwned, Role, State};
 use mcp_input::{InputBackend, InputError};
 use mcp_window::{
-    DialogInfo, DialogScope, MenuItemInfo, Rect, WindowAction, WindowBackend, WindowError,
-    WindowInfo,
+    DialogInfo, DialogScope, MenuItemInfo, Rect, TargetInfo, TargetSource, WindowAction,
+    WindowBackend, WindowError, WindowInfo, WindowState,
 };
 use tokio::time::sleep;
 
@@ -127,30 +127,56 @@ fn entries() -> Vec<launch::DesktopEntry> {
     launch::all_entries(&launch::application_dirs())
 }
 
+/// A window as `list_windows` reports it. AT-SPI knows a window is minimised
+/// (iconified) and nothing of workspaces, so a window is never `offscreen`
+/// here: claiming it on a guess would refuse a capture that works.
+fn window_info(w: &a11y::WindowRef) -> WindowInfo {
+    let minimized = w.states.contains(State::Iconified);
+    WindowInfo {
+        id: w.index,
+        app: Some(w.app_name.clone()),
+        pid: w.pid,
+        title: Some(w.title.clone()).filter(|t| !t.is_empty()),
+        bounds: w.bounds.map(to_rect),
+        minimized,
+        state: if minimized {
+            WindowState::Minimized
+        } else {
+            WindowState::Onscreen
+        },
+    }
+}
+
 impl LinuxBackend {
-    async fn refresh_windows(
+    /// The windows of `app`, or of every application when none is given.
+    async fn windows_for(
         &self,
         app: Option<&AppInfo>,
     ) -> Result<Vec<a11y::WindowRef>, WindowError> {
         let conn = self.conn().await.map_err(WindowError::PermissionDenied)?;
-        let ws = match app {
-            Some(a) => a11y::windows_of(&conn, a).await.map_err(fail)?,
-            None => a11y::all_windows(&conn).await.map_err(fail)?,
-        };
-        self.lock().windows = ws.clone();
-        Ok(ws)
+        match app {
+            Some(a) => a11y::windows_of(&conn, a).await.map_err(fail),
+            None => a11y::all_windows(&conn).await.map_err(fail),
+        }
     }
 
-    /// A window by the id `list_windows` reported, re-listing if needed.
-    pub(crate) async fn window_by_id(&self, id: u32) -> Result<a11y::WindowRef, WindowError> {
-        let cached = self.lock().windows.get(id as usize).cloned();
-        if let Some(w) = cached {
-            return Ok(w);
-        }
-        let ws = self.refresh_windows(None).await?;
-        ws.get(id as usize).cloned().ok_or_else(|| {
-            WindowError::NotFound(format!("no window with id {id}; call list_windows first"))
-        })
+    /// One window by its id in the window list of the application `app` names,
+    /// else the pinned one, else the active one; nothing is pinned. An id the
+    /// application does not have is an error naming it and how many windows
+    /// it has, never a window of another application.
+    pub(crate) async fn window_by_id(
+        &self,
+        id: u32,
+        app: Option<&str>,
+    ) -> Result<(AppInfo, TargetSource, a11y::WindowRef), WindowError> {
+        let (target, from) = self.peek_target(app).await.map_err(WindowError::NotFound)?;
+        let ws = self.windows_for(Some(&target)).await?;
+        let pid = ws.first().and_then(|w| w.pid);
+        let count = ws.len();
+        let win = ws.into_iter().nth(id as usize).ok_or_else(|| {
+            WindowError::NotFound(mcp_window::window_index_error(&target.name, pid, id, count))
+        })?;
+        Ok((target, from, win))
     }
 
     async fn pick_window(
@@ -158,7 +184,7 @@ impl LinuxBackend {
         app: &AppInfo,
         title: Option<&str>,
     ) -> Result<a11y::WindowRef, WindowError> {
-        let ws = self.refresh_windows(Some(app)).await?;
+        let ws = self.windows_for(Some(app)).await?;
         if ws.is_empty() {
             return Err(WindowError::NotFound(format!(
                 "'{}' has no windows",
@@ -184,7 +210,7 @@ impl LinuxBackend {
 
     async fn wait_active(&self, app: &AppInfo, want: bool, tries: u32) -> bool {
         for _ in 0..tries {
-            if let Ok(ws) = self.refresh_windows(Some(app)).await {
+            if let Ok(ws) = self.windows_for(Some(app)).await {
                 let active = ws.iter().any(|w| w.states.contains(State::Active));
                 if active == want {
                     return true;
@@ -226,8 +252,9 @@ impl LinuxBackend {
 
     /// Resolve `app` for a window operation without pinning it.
     async fn app_for(&self, app: Option<&str>) -> Result<AppInfo, WindowError> {
-        self.resolve_target(app)
+        self.peek_target(app)
             .await
+            .map(|(a, _)| a)
             .map_err(WindowError::NotFound)
     }
 }
@@ -344,22 +371,14 @@ impl WindowBackend for LinuxBackend {
     async fn list_windows(&self, app_name: Option<&str>) -> Result<Vec<WindowInfo>, WindowError> {
         // With no app named and no pinned target, answer about the whole
         // desktop, so "what is open?" is not silently narrowed.
-        let app = match app_name {
-            Some(_) => Some(self.app_for(app_name).await?),
-            None => self.pinned_target().await,
+        let named = app_name.is_some_and(|a| !a.trim().is_empty());
+        let app = if named {
+            Some(self.app_for(app_name).await?)
+        } else {
+            self.pinned_target().await
         };
-        let ws = self.refresh_windows(app.as_ref()).await?;
-        Ok(ws
-            .iter()
-            .enumerate()
-            .map(|(i, w)| WindowInfo {
-                id: i as u32,
-                app: Some(w.app_name.clone()),
-                title: Some(w.title.clone()).filter(|t| !t.is_empty()),
-                bounds: w.bounds.map(to_rect),
-                minimized: w.states.contains(State::Iconified),
-            })
-            .collect())
+        let ws = self.windows_for(app.as_ref()).await?;
+        Ok(ws.iter().map(window_info).collect())
     }
 
     /// Applications with windows, named as a person would.
@@ -491,10 +510,7 @@ impl WindowBackend for LinuxBackend {
                 self.key_combo("alt+f4").await.map_err(input_to_window)?;
                 for _ in 0..20 {
                     sleep(Duration::from_millis(100)).await;
-                    let ws = self
-                        .refresh_windows(Some(&target))
-                        .await
-                        .unwrap_or_default();
+                    let ws = self.windows_for(Some(&target)).await.unwrap_or_default();
                     if !ws.iter().any(|w| w.obj == win.obj) {
                         return Ok(());
                     }
@@ -739,10 +755,13 @@ impl WindowBackend for LinuxBackend {
             self.clear_target();
             return Ok(None);
         };
-        let target = self.app_for(Some(name)).await?;
+        let (target, _) = self
+            .resolve_target(Some(name))
+            .await
+            .map_err(WindowError::NotFound)?;
         let conn = self.conn().await.map_err(WindowError::PermissionDenied)?;
         let already = self
-            .refresh_windows(Some(&target))
+            .windows_for(Some(&target))
             .await?
             .iter()
             .any(|w| w.states.contains(State::Active));
@@ -758,6 +777,41 @@ impl WindowBackend for LinuxBackend {
             }
         }
         Ok(Some(target.name))
+    }
+
+    /// The pin of `focus_app` without asking the application to present
+    /// itself: only the session's target changes.
+    async fn pin_app(&self, app: &str) -> Result<TargetInfo, WindowError> {
+        let (target, _) = self
+            .resolve_target(Some(app))
+            .await
+            .map_err(WindowError::NotFound)?;
+        let conn = self.conn().await.map_err(WindowError::PermissionDenied)?;
+        Ok(TargetInfo {
+            pid: a11y::pid_of(&conn, &target.obj).await,
+            app: target.name,
+            from: TargetSource::Named,
+        })
+    }
+
+    async fn describe_target(&self, app: Option<&str>) -> Result<TargetInfo, WindowError> {
+        let (target, from) = self.peek_target(app).await.map_err(WindowError::NotFound)?;
+        let conn = self.conn().await.map_err(WindowError::PermissionDenied)?;
+        Ok(TargetInfo {
+            pid: a11y::pid_of(&conn, &target.obj).await,
+            app: target.name,
+            from,
+        })
+    }
+
+    async fn pinned(&self) -> Option<TargetInfo> {
+        let target = self.pinned_target().await?;
+        let conn = self.conn().await.ok()?;
+        Some(TargetInfo {
+            pid: a11y::pid_of(&conn, &target.obj).await,
+            app: target.name,
+            from: TargetSource::Pinned,
+        })
     }
 
     fn platform(&self) -> &'static str {

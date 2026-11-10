@@ -67,6 +67,7 @@ impl A11yModule {
                 .and_then(mcp_types::args::as_u64)
                 .map(|n| n as usize),
             surface: str_arg(args, "surface"),
+            passive: false,
         };
 
         let raw = match self.backend.snapshot(&req).await {
@@ -138,6 +139,7 @@ impl A11yModule {
             "truncated": truncated,
             "skeleton": used_skeleton,
         });
+        note_target(&mut data, &raw);
         // In delta mode the full text is the thing being avoided, so it is sent
         // only when asked for. Refs in the delta resolve against the snapshot
         // just installed, so they remain actionable either way.
@@ -190,6 +192,7 @@ impl A11yModule {
             root_ref: None,
             max_depth: None,
             surface: str_arg(args, "surface"),
+            passive: false,
         };
         let raw = match self.backend.snapshot(&req).await {
             Ok(r) => r,
@@ -292,6 +295,7 @@ impl A11yModule {
             "partial": raw.partial,
             "elements": hits,
         });
+        note_target(&mut data, &raw);
         if !ranking.is_null() {
             data["ranking"] = ranking;
         }
@@ -376,6 +380,7 @@ impl A11yModule {
             root_ref: str_arg(args, "root"),
             max_depth: None,
             surface: str_arg(args, "surface"),
+            passive: false,
         };
 
         let raw = match self.backend.snapshot(&req).await {
@@ -404,9 +409,28 @@ impl A11yModule {
 
         let mode = str_arg(args, "mode");
         let schema = args.get("schema");
-        let extracted = crate::extract::extract_data(&raw.root, mode.as_deref(), schema);
+        let mut extracted = crate::extract::extract_data(&raw.root, mode.as_deref(), schema);
+        // Beside the extraction's own `type` and `data`; a custom schema's
+        // fields are inside `data`, so nothing of theirs can be replaced.
+        if let Some(obj) = extracted.as_object_mut() {
+            let mut source = json!({ "app": raw.app });
+            note_target(&mut source, &raw);
+            obj.insert("source".into(), source);
+        }
 
         Envelope::ok(tool, extracted)
+    }
+}
+
+/// Add the process and the reason this application was the one read, so a
+/// caller that gave no `app` can see whether it got the pinned application or
+/// whichever was frontmost.
+fn note_target(data: &mut Value, raw: &crate::RawSnapshot) {
+    if let Some(t) = &raw.target {
+        if let Some(pid) = t.pid {
+            data["pid"] = json!(pid);
+        }
+        data["target"] = json!(t.from);
     }
 }
 
@@ -578,6 +602,7 @@ mod tests {
                 window: Some("Sign in".into()),
                 terminal_app: false,
                 partial: false,
+                target: None,
             })
         }
         fn platform(&self) -> &'static str {
@@ -668,5 +693,83 @@ mod tests {
             let text = serde_json::to_string(&env).unwrap();
             assert!(!text.contains(SECRET), "{property} leaked: {text}");
         }
+    }
+}
+
+#[cfg(test)]
+mod target_tests {
+    use super::*;
+    use crate::{BackendError, RawSnapshot, SnapshotRequest, SnapshotTarget, UiNode};
+    use std::sync::Mutex;
+
+    /// Reports the application it was asked for and why, and keeps the request.
+    struct Reporting {
+        seen: Mutex<Vec<SnapshotRequest>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::A11yBackend for Reporting {
+        async fn snapshot(&self, req: &SnapshotRequest) -> Result<RawSnapshot, BackendError> {
+            self.seen.lock().unwrap().push(req.clone());
+            Ok(RawSnapshot {
+                root: UiNode {
+                    role: "application".into(),
+                    children: vec![UiNode {
+                        role: "button".into(),
+                        name: Some("Save".into()),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+                app: Some("TextEdit".into()),
+                window: None,
+                terminal_app: false,
+                partial: false,
+                target: Some(SnapshotTarget {
+                    pid: Some(4242),
+                    from: if req.app.is_some() { "named" } else { "pinned" },
+                }),
+            })
+        }
+        fn platform(&self) -> &'static str {
+            "fake"
+        }
+    }
+
+    fn ctx() -> CallCtx {
+        CallCtx::new("t", mcp_types::CancelToken::new())
+    }
+
+    /// A call that named no app has to say which one it read, or the agent
+    /// cannot tell the app it asked about from the one that was in front.
+    #[tokio::test]
+    async fn every_snapshot_tool_says_which_app_it_read_and_why() {
+        let b = Arc::new(Reporting {
+            seen: Mutex::new(Vec::new()),
+        });
+        let module = A11yModule::new(b.clone(), 10_000);
+        for (args, from) in [(json!({}), "pinned"), (json!({"app":"TextEdit"}), "named")] {
+            for tool in ["get_ui_tree", "find_elements"] {
+                let mut args = args.clone();
+                args["name"] = json!("Save");
+                let d = module
+                    .call(tool, args, &ctx())
+                    .await
+                    .data
+                    .unwrap_or_else(|| panic!("{tool} returned no data"));
+                assert_eq!(d["app"], "TextEdit", "{tool}");
+                assert_eq!(d["pid"], 4242, "{tool}");
+                assert_eq!(d["target"], from, "{tool}");
+            }
+        }
+        let d = module
+            .call("ui_extract", json!({"mode":"form"}), &ctx())
+            .await
+            .data
+            .unwrap();
+        assert_eq!(d["source"]["app"], "TextEdit");
+        assert_eq!(d["source"]["pid"], 4242);
+        // The tools read to act on: none of these is a passive read.
+        assert!(b.seen.lock().unwrap().iter().all(|r| !r.passive));
     }
 }

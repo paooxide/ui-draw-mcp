@@ -14,6 +14,20 @@ pub struct DisplayInfo {
     pub primary: bool,
 }
 
+/// The window a capture or a text read was of, and the application it was
+/// read against. A `window_id` is an index into one application's window list,
+/// so the result names that application: a caller that mixed up two lists sees
+/// it here rather than in a picture of the wrong window.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct WindowSubject {
+    pub app: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+    pub title: Option<String>,
+    /// `named`, `pinned` or `frontmost`: how the application was chosen.
+    pub from: String,
+}
+
 /// A captured image (PNG, base64), plus everything an agent needs to map a
 /// point it read off the image back to a screen coordinate for `mouse_action`.
 ///
@@ -43,6 +57,8 @@ pub struct CaptureResult {
     /// thumbnail scale that noise averages out: measured mean-absolute
     /// difference between two idle captures is ~0.002/255.
     pub signature: Vec<u8>,
+    /// Set when the image is of one window.
+    pub window: Option<WindowSubject>,
 }
 
 impl CaptureResult {
@@ -121,9 +137,17 @@ pub trait VisionBackend: Send + Sync {
         region: Option<(f64, f64, f64, f64)>,
         opts: CaptureOpts,
     ) -> Result<CaptureResult, VisionError>;
+    /// One window, by its index in the window list of `app` (else of the
+    /// pinned application, else of the frontmost one). Never of another
+    /// application: an id the application does not have is `NotFound`.
+    ///
+    /// A backend that captures by screen region must refuse a window that is
+    /// not on screen or is covered by another application's, rather than
+    /// return that application's pixels as this window's.
     async fn capture_window(
         &self,
         window_id: u32,
+        app: Option<&str>,
         opts: CaptureOpts,
     ) -> Result<CaptureResult, VisionError>;
     fn platform(&self) -> &'static str;
@@ -145,14 +169,15 @@ pub trait VisionBackend: Send + Sync {
 }
 
 /// What to read text from.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub enum OcrTarget {
     /// A whole display (`None` = the main one).
     Display(Option<u32>),
     /// A screen rectangle, in points.
     Region((f64, f64, f64, f64)),
-    /// One window, by the id `list_windows` reports.
-    Window(u32),
+    /// One window, by the id `list_windows` reports for `app` (else the
+    /// pinned application, else the frontmost one).
+    Window { id: u32, app: Option<String> },
 }
 
 /// Recognition options.
@@ -185,6 +210,8 @@ pub struct OcrResult {
     pub origin: (f64, f64),
     /// Size, in screen coordinates, of the area the image covers.
     pub screen_size: (f64, f64),
+    /// Set when the text was read from one window.
+    pub window: Option<WindowSubject>,
 }
 
 impl OcrResult {
@@ -220,6 +247,7 @@ mod tests {
             screen_size: screen,
             original: (w, h),
             signature: Vec::new(),
+            window: None,
         }
     }
 

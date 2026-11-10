@@ -34,6 +34,9 @@ pub struct VisionModule {
     backend: Arc<dyn VisionBackend>,
     cfg: VisionConfig,
     state: Mutex<CaptureState>,
+    /// `policy.allowed_apps`, for a call that names an application. Empty
+    /// until the composition root sets it, which refuses every named one.
+    allowed_apps: Vec<String>,
 }
 
 /// Mean absolute difference (0-255) between two thumbnail signatures.
@@ -52,7 +55,63 @@ impl VisionModule {
             backend,
             cfg,
             state: Mutex::new(CaptureState::default()),
+            allowed_apps: Vec::new(),
         }
+    }
+
+    /// The applications a call may name in `app` (`policy.allowed_apps`).
+    /// Composition root only. Naming an application is addressing it, so it
+    /// meets the same list `launch` and `focus_app` do.
+    pub fn with_allowed_apps(mut self, allowed: Vec<String>) -> Self {
+        self.allowed_apps = allowed;
+        self
+    }
+
+    /// A result read from the app that a name resolved to, held to the
+    /// allowlist as that app: a name that contains an allowed one must not
+    /// reach one that is not. The image or text is dropped, not returned.
+    // Envelope is intentionally large (it can carry an image); it is the Err
+    // type here only as a control-flow shortcut.
+    #[allow(clippy::result_large_err)]
+    fn resolved_app_allowed(
+        &self,
+        tool: &str,
+        named: Option<&str>,
+        subject: Option<&crate::backend::WindowSubject>,
+    ) -> Result<(), Envelope> {
+        match (named, subject) {
+            (Some(_), Some(w)) if !mcp_types::apps::app_allowed(&self.allowed_apps, &w.app) => {
+                Err(Envelope::fail(
+                    tool,
+                    ErrorCode::PolicyDenied,
+                    format!("app '{}' is not in policy.allowed_apps", w.app),
+                ))
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// The `app` of a window-taking call, held to the allowlist.
+    // Envelope is intentionally large (it can carry an image); it is the Err
+    // type here only as a control-flow shortcut.
+    #[allow(clippy::result_large_err)]
+    fn app_arg(&self, tool: &str, args: &Value) -> Result<Option<String>, Envelope> {
+        let Some(app) = args
+            .get("app")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|a| !a.is_empty())
+        else {
+            return Ok(None);
+        };
+        if !mcp_types::apps::app_allowed(&self.allowed_apps, app) {
+            return Err(Envelope::fail(
+                tool,
+                ErrorCode::PolicyDenied,
+                format!("app '{app}' is not in policy.allowed_apps"),
+            ));
+        }
+        Ok(Some(app.to_string()))
     }
 
     /// Read `detail` / `max_edge` into capture options.
@@ -213,12 +272,35 @@ impl VisionModule {
             Ok(o) => o,
             Err(e) => return e,
         };
+        let app = match self.app_arg("capture_window", args) {
+            Ok(a) => a,
+            Err(e) => return e,
+        };
         let force = args.get("force").and_then(Value::as_bool).unwrap_or(false);
         let grid = step_from_args(args);
-        let source = format!("window:{window_id}{}", grid_suffix(grid));
-        match self.backend.capture_window(window_id as u32, opts).await {
+        let source = format!(
+            "window:{}:{window_id}{}",
+            app.as_deref().unwrap_or(""),
+            grid_suffix(grid)
+        );
+        match self
+            .backend
+            .capture_window(window_id as u32, app.as_deref(), opts)
+            .await
+        {
             Ok(mut cap) => {
+                if let Err(e) =
+                    self.resolved_app_allowed("capture_window", app.as_deref(), cap.window.as_ref())
+                {
+                    return e;
+                }
                 let mut data = json!({ "window_id": window_id });
+                if let Some(w) = &cap.window {
+                    data["window"] = json!(w);
+                    // The picture dedup compares frames of one window; the
+                    // same index of another application is another source.
+                    data["app"] = json!(w.app);
+                }
                 if let Err(e) = apply_grid("capture_window", grid, &mut cap, &mut data) {
                     return e;
                 }
@@ -306,9 +388,24 @@ impl VisionModule {
             }
         }
         let window_id = args.get("window_id").and_then(Value::as_u64);
+        let app = match self.app_arg(tool, args) {
+            Ok(a) => a,
+            Err(e) => return e,
+        };
+        if app.is_some() && (window_id.is_none() || region.is_some()) {
+            return Envelope::fail(
+                tool,
+                ErrorCode::InvalidArgs,
+                "'app' says which application's window list 'window_id' indexes; it needs \
+                 'window_id' and cannot be combined with 'region'",
+            );
+        }
         let target = match (region, window_id) {
             (Some(r), _) => OcrTarget::Region(r),
-            (None, Some(id)) => OcrTarget::Window(id as u32),
+            (None, Some(id)) => OcrTarget::Window {
+                id: id as u32,
+                app: app.clone(),
+            },
             (None, None) => OcrTarget::Display(
                 args.get("display")
                     .and_then(Value::as_u64)
@@ -354,6 +451,9 @@ impl VisionModule {
             Ok(r) => r,
             Err(e) => return vision_err(tool, e),
         };
+        if let Err(e) = self.resolved_app_allowed(tool, app.as_deref(), res.window.as_ref()) {
+            return e;
+        }
         order_lines(&mut res.lines);
         let (sx, sy) = (res.scale_x(), res.scale_y());
         if let Some(q) = args.get("find").and_then(Value::as_str) {
@@ -362,7 +462,11 @@ impl VisionModule {
             }
             let exact = args.get("exact").and_then(Value::as_bool).unwrap_or(false);
             let found = find_matches(&res.lines, q, exact);
-            return Envelope::ok(tool, find_result(q, exact, &found, &res, (sx, sy)));
+            let mut data = find_result(q, exact, &found, &res, (sx, sy));
+            if let Some(w) = &res.window {
+                data["window"] = json!(w);
+            }
+            return Envelope::ok(tool, data);
         }
         let lines: Vec<Value> = res
             .lines
@@ -385,21 +489,22 @@ impl VisionModule {
             .map(|l| l.text.as_str())
             .collect::<Vec<_>>()
             .join("\n");
-        Envelope::ok(
-            tool,
-            json!({
-                "text": text,
-                "lines": lines,
-                "line_count": lines.len(),
-                // Said explicitly, because the obvious assumption: that these
-                // are image pixels: would put every click in the wrong place.
-                "coordinate_space": "screen",
-                "region": { "x": res.origin.0, "y": res.origin.1,
-                            "w": res.screen_size.0, "h": res.screen_size.1 },
-                "image": { "width": res.width, "height": res.height },
-                "engine": "apple-vision",
-            }),
-        )
+        let mut data = json!({
+            "text": text,
+            "lines": lines,
+            "line_count": lines.len(),
+            // Said explicitly, because the obvious assumption: that these
+            // are image pixels: would put every click in the wrong place.
+            "coordinate_space": "screen",
+            "region": { "x": res.origin.0, "y": res.origin.1,
+                        "w": res.screen_size.0, "h": res.screen_size.1 },
+            "image": { "width": res.width, "height": res.height },
+            "engine": "apple-vision",
+        });
+        if let Some(w) = &res.window {
+            data["window"] = json!(w);
+        }
+        Envelope::ok(tool, data)
     }
 }
 
@@ -546,7 +651,8 @@ impl ToolModule for VisionModule {
                                 "w": { "type": "number" }, "h": { "type": "number" }
                             }
                         },
-                        "window_id": { "type": "integer", "description": "read one window (id from list_windows); results are still in screen coordinates" },
+                        "window_id": { "type": "integer", "description": "read one window (its id in list_windows, for 'app' else the pinned app, else the frontmost one); results are still in screen coordinates" },
+                        "app": { "type": "string", "description": "with window_id: the application whose window list the id is from" },
                         "display": { "type": "integer", "description": "which display, when no region or window is given" },
                         "find": { "type": "string", "description": "return only the lines containing this text (case-insensitive, whitespace-collapsed), best match first, each with x,y (the centre, in screen points, for mouse_action) and bounds, instead of all the text" },
                         "exact": { "type": "boolean", "description": "with find: only a line that is exactly the text, not one that contains it (default false)" },
@@ -574,12 +680,18 @@ impl ToolModule for VisionModule {
                 Tier::Read,
                 "Capture a single window as a PNG image: prefer this over capture_screen when \
                  you only care about one app; fewer pixels means proportionally fewer tokens. \
-                 grid=true labels the image in screen points (the window's own position \
-                 included), what mouse_action takes.",
+                 window_id is the window's id in list_windows for 'app' (else the pinned app, \
+                 else the frontmost one); the result's window names the app it was read \
+                 against. This captures the screen area: on macOS a window that is minimized, \
+                 on another Space or covered by another app's window is refused, not \
+                 returned as that app's pixels; elsewhere a covered window shows what covers \
+                 it. grid=true labels the image in screen points (the \
+                 window's own position included), what mouse_action takes.",
                 json!({
                     "type": "object",
                     "properties": {
                         "window_id": { "type": "integer" },
+                        "app": { "type": "string", "description": "the application whose window list window_id is from (default: the pinned app, else the frontmost)" },
                         "detail": { "type": "string", "enum": ["low", "balanced", "full"] },
                         "max_edge": { "type": "integer" },
                         "force": { "type": "boolean" },
@@ -794,11 +906,13 @@ mod tests {
                 screen_size: (1000.0, 750.0),
                 original: (1000, 750),
                 signature,
+                window: None,
             })
         }
         async fn capture_window(
             &self,
             _w: u32,
+            _a: Option<&str>,
             _o: CaptureOpts,
         ) -> Result<CaptureResult, VisionError> {
             Err(VisionError::NotFound("n/a".into()))
@@ -910,6 +1024,7 @@ mod grid_find_tests {
             screen_size: screen,
             original: (w, h),
             signature: Vec::new(),
+            window: None,
         }
     }
 
@@ -980,6 +1095,7 @@ mod grid_find_tests {
             height: 600,
             origin: (250.0, 100.0),
             screen_size: (400.0, 300.0),
+            window: None,
         }
     }
 
@@ -1013,5 +1129,287 @@ mod grid_find_tests {
         let v = find_result("Delete", false, &found, &res, (0.5, 0.5));
         assert_eq!(v["matches"], json!([]));
         assert!(v["hint"].as_str().unwrap().contains("grid=true"));
+    }
+}
+
+#[cfg(test)]
+mod window_target_tests {
+    use super::*;
+    use crate::backend::{OcrResult, WindowSubject};
+    use std::sync::Mutex;
+
+    /// Answers a window capture as the app it was asked about, and records
+    /// what it was asked, so a test sees which application's list an id was
+    /// read against.
+    #[derive(Default)]
+    struct Windows {
+        asked: Mutex<Vec<(u32, Option<String>)>>,
+    }
+
+    fn subject(app: Option<&str>) -> WindowSubject {
+        WindowSubject {
+            app: app.unwrap_or("Frontmost").to_string(),
+            pid: Some(7),
+            title: Some("Untitled".into()),
+            from: if app.is_some() { "named" } else { "frontmost" }.into(),
+        }
+    }
+
+    #[async_trait]
+    impl VisionBackend for Windows {
+        async fn list_displays(&self) -> Result<Vec<crate::DisplayInfo>, VisionError> {
+            Ok(vec![])
+        }
+        async fn capture_screen(
+            &self,
+            _: Option<u32>,
+            _: Option<(f64, f64, f64, f64)>,
+            _: CaptureOpts,
+        ) -> Result<CaptureResult, VisionError> {
+            Err(VisionError::Unsupported("n/a".into()))
+        }
+        async fn capture_window(
+            &self,
+            id: u32,
+            app: Option<&str>,
+            _: CaptureOpts,
+        ) -> Result<CaptureResult, VisionError> {
+            self.asked
+                .lock()
+                .unwrap()
+                .push((id, app.map(str::to_string)));
+            if id > 1 {
+                return Err(VisionError::NotFound(format!(
+                    "'{}' has 2 windows; there is no window_id {id}",
+                    app.unwrap_or("Frontmost")
+                )));
+            }
+            Ok(CaptureResult {
+                mime_type: "image/png".into(),
+                base64: "AAAA".repeat(64),
+                width: 400,
+                height: 300,
+                origin: (10.0, 20.0),
+                screen_size: (400.0, 300.0),
+                original: (400, 300),
+                signature: vec![id as u8; 64],
+                window: Some(subject(app)),
+            })
+        }
+        async fn ocr(&self, target: OcrTarget, _: &OcrOpts) -> Result<OcrResult, VisionError> {
+            let OcrTarget::Window { id, app } = target else {
+                return Err(VisionError::Unsupported("n/a".into()));
+            };
+            self.asked.lock().unwrap().push((id, app.clone()));
+            Ok(OcrResult {
+                lines: vec![],
+                width: 400,
+                height: 300,
+                origin: (10.0, 20.0),
+                screen_size: (400.0, 300.0),
+                window: Some(subject(app.as_deref())),
+            })
+        }
+        fn platform(&self) -> &'static str {
+            "windows"
+        }
+    }
+
+    fn module(b: &Arc<Windows>, allowed: &[&str]) -> VisionModule {
+        VisionModule::new(b.clone(), VisionConfig::default())
+            .with_allowed_apps(allowed.iter().map(|s| s.to_string()).collect())
+    }
+
+    fn ctx() -> CallCtx {
+        CallCtx::new("t", mcp_types::CancelToken::new())
+    }
+
+    #[tokio::test]
+    async fn the_app_a_window_id_is_read_against_reaches_the_backend_and_comes_back() {
+        let b = Arc::new(Windows::default());
+        let m = module(&b, &["TextEdit"]);
+        let env = m
+            .call(
+                "capture_window",
+                json!({"window_id":1,"app":"TextEdit"}),
+                &ctx(),
+            )
+            .await;
+        assert!(env.ok, "{env:?}");
+        let d = env.data.unwrap();
+        assert_eq!(d["window_id"], 1);
+        assert_eq!(d["app"], "TextEdit");
+        assert_eq!(d["window"]["pid"], 7);
+        assert_eq!(d["window"]["from"], "named");
+        assert_eq!(
+            b.asked.lock().unwrap()[0],
+            (1, Some("TextEdit".to_string()))
+        );
+    }
+
+    /// With no app the id is read against the pinned or frontmost app, and the
+    /// result says so, so a mismatch is visible.
+    #[tokio::test]
+    async fn with_no_app_the_result_still_names_the_app_the_id_was_read_against() {
+        let b = Arc::new(Windows::default());
+        let m = module(&b, &[]);
+        let d = m
+            .call("capture_window", json!({"window_id":0}), &ctx())
+            .await
+            .data
+            .unwrap();
+        assert_eq!(d["window"]["from"], "frontmost");
+        assert_eq!(b.asked.lock().unwrap()[0], (0, None));
+    }
+
+    #[tokio::test]
+    async fn an_id_the_app_does_not_have_is_an_error_not_another_window() {
+        let b = Arc::new(Windows::default());
+        let m = module(&b, &["TextEdit"]);
+        let env = m
+            .call(
+                "capture_window",
+                json!({"window_id":5,"app":"TextEdit"}),
+                &ctx(),
+            )
+            .await;
+        let err = env.error.unwrap();
+        assert_eq!(err.code, ErrorCode::NotFound);
+        assert!(err.message.contains("2 windows"), "{}", err.message);
+    }
+
+    /// Naming an app is addressing it, so it meets `allowed_apps`; a module
+    /// the composition root did not give a list refuses every name.
+    #[tokio::test]
+    async fn a_named_app_outside_allowed_apps_is_refused_before_the_backend() {
+        let b = Arc::new(Windows::default());
+        for m in [module(&b, &["TextEdit"]), module(&b, &[])] {
+            for (tool, args) in [
+                ("capture_window", json!({"window_id":0,"app":"Safari"})),
+                ("ocr_region", json!({"window_id":0,"app":"Safari"})),
+            ] {
+                let env = m.call(tool, args, &ctx()).await;
+                let err = env.error.unwrap();
+                assert_eq!(err.code, ErrorCode::PolicyDenied, "{tool}");
+                assert!(err.message.contains("allowed_apps"), "{tool}");
+            }
+        }
+        assert!(b.asked.lock().unwrap().is_empty());
+    }
+
+    /// A name the list covers that resolves to an app it does not: the picture
+    /// is dropped, not returned.
+    #[tokio::test]
+    async fn a_name_that_resolves_outside_allowed_apps_returns_no_image() {
+        struct Sneaky;
+        #[async_trait]
+        impl VisionBackend for Sneaky {
+            async fn list_displays(&self) -> Result<Vec<crate::DisplayInfo>, VisionError> {
+                Ok(vec![])
+            }
+            async fn capture_screen(
+                &self,
+                _: Option<u32>,
+                _: Option<(f64, f64, f64, f64)>,
+                _: CaptureOpts,
+            ) -> Result<CaptureResult, VisionError> {
+                Err(VisionError::Unsupported("n/a".into()))
+            }
+            async fn capture_window(
+                &self,
+                _: u32,
+                _: Option<&str>,
+                _: CaptureOpts,
+            ) -> Result<CaptureResult, VisionError> {
+                Ok(CaptureResult {
+                    mime_type: "image/png".into(),
+                    base64: "AAAA".into(),
+                    width: 4,
+                    height: 4,
+                    origin: (0.0, 0.0),
+                    screen_size: (4.0, 4.0),
+                    original: (4, 4),
+                    signature: vec![],
+                    window: Some(WindowSubject {
+                        app: "Keychain Access".into(),
+                        pid: Some(1),
+                        title: None,
+                        from: "named".into(),
+                    }),
+                })
+            }
+            fn platform(&self) -> &'static str {
+                "sneaky"
+            }
+        }
+        let m = VisionModule::new(Arc::new(Sneaky), VisionConfig::default())
+            .with_allowed_apps(vec!["Edit".into()]);
+        let env = m
+            .call(
+                "capture_window",
+                json!({"window_id":0,"app":"Edit"}),
+                &ctx(),
+            )
+            .await;
+        assert_eq!(env.error.unwrap().code, ErrorCode::PolicyDenied);
+        assert!(env.data.is_none() && env.image.is_none());
+    }
+
+    #[tokio::test]
+    async fn ocr_reads_a_window_of_the_named_app_and_reports_it() {
+        let b = Arc::new(Windows::default());
+        let m = module(&b, &["TextEdit"]);
+        let d = m
+            .call(
+                "ocr_region",
+                json!({"window_id":1,"app":"TextEdit"}),
+                &ctx(),
+            )
+            .await
+            .data
+            .unwrap();
+        assert_eq!(d["window"]["app"], "TextEdit");
+        assert_eq!(
+            b.asked.lock().unwrap()[0],
+            (1, Some("TextEdit".to_string()))
+        );
+    }
+
+    #[tokio::test]
+    async fn app_without_a_window_id_is_rejected_not_ignored() {
+        let b = Arc::new(Windows::default());
+        let m = module(&b, &["TextEdit"]);
+        for args in [
+            json!({"app":"TextEdit"}),
+            json!({"app":"TextEdit","window_id":0,"region":{"x":0,"y":0,"w":10,"h":10}}),
+        ] {
+            let env = m.call("ocr_region", args, &ctx()).await;
+            assert_eq!(env.error.unwrap().code, ErrorCode::InvalidArgs);
+        }
+        assert!(b.asked.lock().unwrap().is_empty());
+    }
+
+    /// Frames of one index in two applications are different sources: the
+    /// "unchanged" shortcut must not return one as the other.
+    #[tokio::test]
+    async fn the_same_index_in_two_apps_is_not_deduplicated_as_one_window() {
+        let b = Arc::new(Windows::default());
+        let m = module(&b, &["TextEdit", "Finder"]);
+        let a = m
+            .call(
+                "capture_window",
+                json!({"window_id":0,"app":"TextEdit"}),
+                &ctx(),
+            )
+            .await;
+        let f = m
+            .call(
+                "capture_window",
+                json!({"window_id":0,"app":"Finder"}),
+                &ctx(),
+            )
+            .await;
+        assert!(f.data.unwrap().get("unchanged").is_none());
+        assert!(a.ok);
     }
 }

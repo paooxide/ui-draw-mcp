@@ -53,6 +53,12 @@ pub struct WaitSpec {
     pub conditions: Vec<WaitCondition>,
     pub app: Option<String>,
     pub timeout_ms: u64,
+    /// Observe without becoming the target: the polls neither pin `app` nor
+    /// replace the elements the refs of the last `get_ui_tree` point at.
+    /// `wait_for` is passive. An `expect` clause is not: it installs what it
+    /// last saw as the snapshot the next call's refs resolve against, so the
+    /// backend has to have kept the same elements.
+    pub passive: bool,
 }
 
 /// What a wait ended up doing.
@@ -105,6 +111,7 @@ pub fn parse_wait_spec(v: &Value, default_timeout_ms: u64) -> Result<WaitSpec, S
             .and_then(Value::as_u64)
             .unwrap_or(default_timeout_ms)
             .min(MAX_TIMEOUT_MS),
+        passive: false,
     })
 }
 
@@ -268,6 +275,7 @@ impl WaitEvaluator {
             let tree = if needs_tree {
                 let req = SnapshotRequest {
                     app: spec.app.clone(),
+                    passive: spec.passive,
                     ..Default::default()
                 };
                 match self.a11y.snapshot(&req).await {
@@ -528,9 +536,11 @@ mod tests {
         let ws = vec![WindowInfo {
             id: 0,
             app: Some("TextEdit".into()),
+            pid: Some(1),
             title: Some("Untitled 4".into()),
             bounds: None,
             minimized: false,
+            state: crate::backend::WindowState::Onscreen,
         }];
         assert!(window_condition_holds("Untitled", &ws));
         assert!(!window_condition_holds("Report", &ws));

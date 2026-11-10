@@ -20,7 +20,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use mcp_vision::{
     CaptureOpts, CaptureResult, DisplayInfo, OcrOpts, OcrResult, OcrTarget, VisionBackend,
-    VisionError,
+    VisionError, WindowSubject,
 };
 
 use crate::backend::LinuxBackend;
@@ -278,7 +278,49 @@ fn deliver(
         screen_size: screen,
         original,
         signature: img.signature(),
+        window: None,
     })
+}
+
+/// A window's screen rectangle `(x, y, w, h)` and the window it belongs to.
+type WindowArea = ((f64, f64, f64, f64), WindowSubject);
+
+/// The screen rectangle of a window found by `window_by_id`, and who it
+/// belongs to. Where it cannot be read off the screen the message says why.
+fn window_area(
+    found: (
+        crate::a11y::AppInfo,
+        mcp_window::TargetSource,
+        crate::a11y::WindowRef,
+    ),
+) -> Result<WindowArea, VisionError> {
+    let (app, from, win) = found;
+    let subject = WindowSubject {
+        app: app.name.clone(),
+        pid: win.pid,
+        title: Some(win.title.clone()).filter(|t| !t.is_empty()),
+        from: from.as_str().to_string(),
+    };
+    if win.states.contains(atspi::State::Iconified) {
+        return Err(VisionError::Failed(format!(
+            "window {} of '{}' is minimised, so it is not drawn anywhere; capturing its screen \
+             area would photograph whatever else is there. Read it with get_ui_tree",
+            win.index, app.name
+        )));
+    }
+    let b = win.bounds.ok_or_else(|| {
+        VisionError::Unsupported(format!("window '{}' reports no bounds", win.title))
+    })?;
+    // A Wayland-native toolkit reports its window at (0, 0) because the
+    // compositor never tells it where it is. Cropping there would return
+    // the top-left corner of the desktop and call it the window.
+    if b.x == 0.0 && b.y == 0.0 {
+        return Err(VisionError::Unsupported(format!(
+            "'{}' does not report a screen position (Wayland hides window placement from applications), so it cannot be cropped out of the desktop; use capture_screen, or ocr_region on the whole screen",
+            win.title
+        )));
+    }
+    Ok(((b.x, b.y, b.w, b.h), subject))
 }
 
 #[async_trait]
@@ -329,32 +371,18 @@ impl VisionBackend for LinuxBackend {
     async fn capture_window(
         &self,
         window_id: u32,
+        app: Option<&str>,
         opts: CaptureOpts,
     ) -> Result<CaptureResult, VisionError> {
-        let win = self.window_by_id(window_id).await.map_err(|e| match e {
-            mcp_window::WindowError::NotFound(m) => VisionError::NotFound(m),
-            mcp_window::WindowError::PermissionDenied(m) => VisionError::PermissionDenied(m),
-            mcp_window::WindowError::Unsupported(m) => VisionError::Unsupported(m),
-            mcp_window::WindowError::Failed(m) | mcp_window::WindowError::Refused(m) => {
-                VisionError::Failed(m)
-            }
-        })?;
-        let b = win.bounds.ok_or_else(|| {
-            VisionError::Unsupported(format!("window '{}' reports no bounds", win.title))
-        })?;
-        // A Wayland-native toolkit reports its window at (0, 0) because the
-        // compositor never tells it where it is. Cropping there would return
-        // the top-left corner of the desktop and call it the window.
-        if b.x == 0.0 && b.y == 0.0 {
-            return Err(VisionError::Unsupported(format!(
-                "'{}' does not report a screen position (Wayland hides window placement from applications), so it cannot be cropped out of the desktop; use capture_screen, or ocr_region on the whole screen",
-                win.title
-            )));
-        }
-        let (img, origin, screen) = self
-            .capture_region(None, Some((b.x, b.y, b.w, b.h)))
-            .await?;
-        deliver(img, origin, screen, opts.max_edge.unwrap_or(MAX_EDGE))
+        let found = self
+            .window_by_id(window_id, app)
+            .await
+            .map_err(|e| VisionError::Failed(e_str(e)))?;
+        let (region, subject) = window_area(found)?;
+        let (img, origin, screen) = self.capture_region(None, Some(region)).await?;
+        let mut cap = deliver(img, origin, screen, opts.max_edge.unwrap_or(MAX_EDGE))?;
+        cap.window = Some(subject);
+        Ok(cap)
     }
 
     fn platform(&self) -> &'static str {
@@ -362,25 +390,18 @@ impl VisionBackend for LinuxBackend {
     }
 
     async fn ocr(&self, target: OcrTarget, opts: &OcrOpts) -> Result<OcrResult, VisionError> {
+        let mut window = None;
         let (img, origin, screen) = match target {
             OcrTarget::Display(d) => self.capture_region(d, None).await?,
             OcrTarget::Region(r) => self.capture_region(None, Some(r)).await?,
-            OcrTarget::Window(id) => {
-                let win = self
-                    .window_by_id(id)
+            OcrTarget::Window { id, app } => {
+                let found = self
+                    .window_by_id(id, app.as_deref())
                     .await
                     .map_err(|e| VisionError::Failed(e_str(e)))?;
-                let b = win
-                    .bounds
-                    .filter(|b| b.x != 0.0 || b.y != 0.0)
-                    .ok_or_else(|| {
-                        VisionError::Unsupported(format!(
-                            "'{}' reports no screen position; read the whole display instead",
-                            win.title
-                        ))
-                    })?;
-                self.capture_region(None, Some((b.x, b.y, b.w, b.h)))
-                    .await?
+                let (region, subject) = window_area(found)?;
+                window = Some(subject);
+                self.capture_region(None, Some(region)).await?
             }
         };
         let engine = self
@@ -410,6 +431,7 @@ impl VisionBackend for LinuxBackend {
             height: h,
             origin,
             screen_size: screen,
+            window,
         })
     }
 }

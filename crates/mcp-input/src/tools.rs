@@ -424,7 +424,10 @@ impl InputModule {
     fn target_by_ref(&self, tool: &str, reff: &str, need: Need) -> Result<Target, Envelope> {
         let arena = self.arena.lock().unwrap_or_else(|e| e.into_inner());
         match arena.resolve_latest(reff) {
-            Ok(info) => Target::from_info(tool, reff, info, need, None),
+            Ok(info) => Target::from_info(tool, reff, info, need, None).map(|mut t| {
+                t.app = arena.current().and_then(|s| s.app.clone());
+                t
+            }),
             Err(RefError::Stale) => Err(Envelope::fail_with(
                 tool,
                 ErrorCode::StaleRef,
@@ -494,6 +497,10 @@ impl InputModule {
             need,
             Some(tied_with_best(&ranked)),
         )
+        .map(|mut t| {
+            t.app = snap.app.clone();
+            t
+        })
     }
 
     /// Take a fresh snapshot of the target application and install it, for a
@@ -2178,6 +2185,10 @@ struct Target {
     secure: bool,
     /// For a lookup by name: how many elements matched as well as this one.
     matches: Option<usize>,
+    /// The application the snapshot holding this element is of. A ref belongs
+    /// to one application, which need not be the frontmost one, so a result
+    /// says which it acted in.
+    app: Option<String>,
 }
 
 impl Target {
@@ -2207,6 +2218,7 @@ impl Target {
             name: info.name.clone(),
             secure: info.secure,
             matches,
+            app: None,
         })
     }
 
@@ -2216,6 +2228,9 @@ impl Target {
         let mut extra = json!({ "ref": self.reff });
         if let Some(n) = self.matches {
             extra["matches"] = json!(n);
+        }
+        if let Some(app) = &self.app {
+            extra["app"] = json!(app);
         }
         merge(data, extra)
     }
@@ -4064,6 +4079,7 @@ mod tests {
                     window: None,
                     terminal_app: false,
                     partial: false,
+                    target: None,
                 })
             }
             fn platform(&self) -> &'static str {
@@ -5207,6 +5223,28 @@ mod tests {
         .await;
         assert!(env.ok, "{env:?}");
         assert_eq!(env.data.unwrap()["input"], "hid");
+    }
+
+    /// A ref belongs to one application, which need not be the frontmost one,
+    /// so a result says which it acted in.
+    #[tokio::test]
+    async fn an_action_by_ref_says_which_app_the_ref_belongs_to() {
+        let (module, _, _) = test_module();
+        let by_ref = call(
+            &module,
+            "ui_action",
+            json!({ "ref": "@e4", "action": "click" }),
+        )
+        .await;
+        let app = by_ref.data.unwrap()["app"].clone();
+        assert_eq!(app, "Settings");
+        let by_set = call(
+            &module,
+            "set_value",
+            json!({ "ref": "@e4", "text": "hello" }),
+        )
+        .await;
+        assert_eq!(by_set.data.unwrap_or_default()["app"], app);
     }
 
     #[tokio::test]

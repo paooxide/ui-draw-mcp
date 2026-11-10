@@ -7,12 +7,13 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
-use core_foundation::base::TCFType;
 use core_graphics::display::CGDisplay;
-use mcp_vision::{CaptureOpts, CaptureResult, DisplayInfo, VisionBackend, VisionError};
+use mcp_vision::{
+    CaptureOpts, CaptureResult, DisplayInfo, VisionBackend, VisionError, WindowSubject,
+};
 use mcp_window::WindowError;
 
-use crate::imp::{focused_app_element, get_windows, read_bounds, MacosBackend};
+use crate::imp::MacosBackend;
 
 static SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -185,6 +186,7 @@ fn run_screencapture(args: &[String], max_edge: u32) -> Result<CaptureResult, Vi
         screen_size: (delivered.0 as f64, delivered.1 as f64),
         original: (width, height),
         signature,
+        window: None,
     })
 }
 
@@ -226,17 +228,28 @@ impl MacosBackend {
         Ok((args, (chosen.x, chosen.y, chosen.w, chosen.h)))
     }
 
-    /// A window's screen rectangle.
-    async fn window_region(&self, window_id: u32) -> Result<(f64, f64, f64, f64), VisionError> {
+    /// A window's screen rectangle, and who it belongs to. The id is read
+    /// against the application named, else the pinned one, else the frontmost;
+    /// a window that is not drawn, or is covered by another application's, is
+    /// an error rather than that other application's pixels.
+    async fn window_region(
+        &self,
+        window_id: u32,
+        app: Option<&str>,
+    ) -> Result<((f64, f64, f64, f64), WindowSubject), VisionError> {
         unsafe {
-            let app = focused_app_element().map_err(win_to_vision)?;
-            let wins = get_windows(app.as_CFTypeRef());
-            let w = wins
-                .get(window_id as usize)
-                .ok_or_else(|| VisionError::NotFound(format!("window {window_id} not found")))?;
-            read_bounds(w.as_CFTypeRef())
-                .map(|b| (b.x, b.y, b.w, b.h))
-                .ok_or_else(|| VisionError::Failed("window has no bounds".into()))
+            let (target, info, b) = self
+                .window_for_capture(window_id, app)
+                .map_err(win_to_vision)?;
+            Ok((
+                (b.x, b.y, b.w, b.h),
+                WindowSubject {
+                    app: target.name.clone(),
+                    pid: info.pid,
+                    title: info.title,
+                    from: target.from.as_str().to_string(),
+                },
+            ))
         }
     }
 }
@@ -296,11 +309,13 @@ impl VisionBackend for MacosBackend {
     ) -> Result<mcp_vision::OcrResult, VisionError> {
         use mcp_vision::OcrTarget;
         let helper = crate::ocr::ensure_helper(&self.helper_dir)?;
+        let mut window = None;
         let (args, area) = match target {
             OcrTarget::Display(d) => self.capture_args(d, None).await?,
             OcrTarget::Region(r) => self.capture_args(None, Some(r)).await?,
-            OcrTarget::Window(id) => {
-                let r = self.window_region(id).await?;
+            OcrTarget::Window { id, app } => {
+                let (r, subject) = self.window_region(id, app.as_deref()).await?;
+                window = Some(subject);
                 self.capture_args(None, Some(r)).await?
             }
         };
@@ -317,19 +332,22 @@ impl VisionBackend for MacosBackend {
             height: if h > 0 { h } else { height },
             origin: (area.0, area.1),
             screen_size: (area.2, area.3),
+            window,
         })
     }
 
     async fn capture_window(
         &self,
         window_id: u32,
+        app: Option<&str>,
         opts: CaptureOpts,
     ) -> Result<CaptureResult, VisionError> {
-        // Resolve the AX window's bounds and capture that region.
-        let region = self.window_region(window_id).await?;
+        // Resolve the window's bounds and capture that region.
+        let (region, subject) = self.window_region(window_id, app).await?;
         let mut cap = self.capture_screen(None, Some(region), opts).await?;
         cap.origin = (region.0, region.1);
         cap.screen_size = (region.2, region.3);
+        cap.window = Some(subject);
         Ok(cap)
     }
 

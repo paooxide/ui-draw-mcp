@@ -391,7 +391,8 @@ pub fn build_stack(cfg: &PolicyConfig) -> (Vec<Arc<dyn ToolModule>>, Wiring) {
         if engines.demo {
             input = input.with_glide(glide_preset.into());
         }
-        let vision = VisionModule::new(backend.clone(), engines.vision);
+        let vision = VisionModule::new(backend.clone(), engines.vision)
+            .with_allowed_apps(allowed_apps.clone());
         let window = WindowModule::new(window_backend, backend.clone(), allowed_apps)
             .with_judge(judge.clone())
             .with_foreground(cfg.foreground);
@@ -474,7 +475,8 @@ pub fn build_stack(cfg: &PolicyConfig) -> (Vec<Arc<dyn ToolModule>>, Wiring) {
         if engines.demo {
             input = input.with_glide(glide_preset.into());
         }
-        let vision = VisionModule::new(backend.clone(), engines.vision);
+        let vision = VisionModule::new(backend.clone(), engines.vision)
+            .with_allowed_apps(allowed_apps.clone());
         let window = WindowModule::new(window_backend, backend.clone(), allowed_apps)
             .with_judge(judge.clone())
             .with_foreground(cfg.foreground);
