@@ -31,6 +31,13 @@ All notable changes to this project are documented here. The format follows
   ordinary key is a real key-down. On Linux every held key is a real press through the portal. A crash or
   `SIGKILL` cannot run the release, which on Linux can leave a held key down.
 
+### Security
+
+- **tokio 1.54.1**, for RUSTSEC-2026-0386 (`AsyncFd::new` and related constructors violate I/O safety), and
+  async-executor 1.14.1 in place of the yanked 1.14.0. The "unmaintained" notices for `zvariant`,
+  `zvariant_derive` and `zbus_names` (folded into the zbus repository, not vulnerable, Linux only) are ignored
+  by id in `deny.toml` until zbus, ashpd and atspi release against the merged crate.
+
 ## [0.3.0] - 2026-10-10
 
 ### Added
