@@ -12,10 +12,12 @@ use mcp_types::{CallCtx, Category, Envelope, ErrorCode, Tier, ToolDescriptor, To
 use serde_json::{json, Value};
 
 use crate::backend::{
-    ClipFormat, InputBackend, InputError, MouseKind, Reading, ScrollDir, SemanticAction,
+    ClipFormat, InputBackend, InputError, MouseKind, Reading, Route, ScrollDir, Selection,
+    SemanticAction,
 };
 use crate::combo::{parse_combo, parse_hold, Os};
 use crate::hold::{mono_ms, HeldKeys};
+use crate::selection::{clip_echo, judge_selection, resolve, RangeSpec};
 
 /// Per-action policy the input engine enforces (the tier/category gate already
 /// ran in `mcp-core`; these are the input-specific checks).
@@ -156,6 +158,7 @@ const EXPECTING: &[&str] = &[
     "keyboard_type",
     "keyboard_shortcut",
     "mouse_action",
+    "select_text",
 ];
 
 pub struct InputModule {
@@ -638,28 +641,35 @@ impl InputModule {
             Some(o) => o.to_string(),
             None if entry => target.name.clone().unwrap_or_default(),
             None => {
-                self.backend
+                let route = self
+                    .backend
                     .perform(node_id, SemanticAction::Select, None)
                     .await
                     .map_err(|e| input_err(tool, e))?;
-                return Ok(json!({ "ok": true }));
+                return Ok(with_route(json!({ "ok": true }), route));
             }
         };
         match self.backend.choose_option(node_id, &wanted).await {
-            Ok(c) => Ok(json!({
-                "ok": true,
-                "selected": c.selected.clone().unwrap_or_else(|| c.item.clone()),
-                "changed": c.changed,
-                "verified": c.selected.is_some(),
-            })),
+            // Choosing walks the control's own popup through the
+            // accessibility API on every backend; it has no pointer path.
+            Ok(c) => Ok(with_route(
+                json!({
+                    "ok": true,
+                    "selected": c.selected.clone().unwrap_or_else(|| c.item.clone()),
+                    "changed": c.changed,
+                    "verified": c.selected.is_some(),
+                }),
+                Route::Ax,
+            )),
             // A menu item in a menu bar has no popup to resolve to; pressing
             // it is the whole job, as it always was.
             Err(InputError::Unsupported(_)) if entry => {
-                self.backend
+                let route = self
+                    .backend
                     .perform(node_id, SemanticAction::Select, None)
                     .await
                     .map_err(|e| input_err(tool, e))?;
-                Ok(json!({ "ok": true }))
+                Ok(with_route(json!({ "ok": true }), route))
             }
             Err(e) => Err(input_err(tool, e)),
         }
@@ -689,7 +699,8 @@ impl InputModule {
         if action != SemanticAction::Toggle && before.is_some() && before == want {
             return Ok(json!({ "ok": true, "checked": before, "changed": false }));
         }
-        self.backend
+        let route = self
+            .backend
             .perform(node_id, action, None)
             .await
             .map_err(|e| input_err(tool, e))?;
@@ -713,11 +724,51 @@ impl InputModule {
                 ));
             }
         }
-        Ok(json!({
-            "ok": true,
-            "checked": after,
-            "changed": before.zip(after).map(|(b, a)| b != a),
-        }))
+        Ok(with_route(
+            json!({
+                "ok": true,
+                "checked": after,
+                "changed": before.zip(after).map(|(b, a)| b != a),
+            }),
+            route,
+        ))
+    }
+
+    /// One step up or down on a slider, stepper or scroll bar, reading the
+    /// value before and after. A step that leaves the value alone is reported
+    /// as `changed: false` (the control is at its limit, or ignored the
+    /// request), never as a change.
+    #[allow(clippy::result_large_err)] // Err is a ready-to-return Envelope
+    async fn step(
+        &self,
+        tool: &str,
+        node_id: u64,
+        action: SemanticAction,
+    ) -> Result<Value, Envelope> {
+        let before = self
+            .backend
+            .read_element(node_id)
+            .await
+            .ok()
+            .and_then(|r| r.value);
+        let route = self
+            .backend
+            .perform(node_id, action, None)
+            .await
+            .map_err(|e| input_err(tool, e))?;
+        let after = self
+            .settle(node_id, |r| r.value != before)
+            .await
+            .and_then(|r| r.value);
+        let mut data = with_route(json!({ "ok": true }), route);
+        match after {
+            Some(a) => {
+                data["changed"] = json!(before.as_deref() != Some(a.as_str()));
+                data["value_after"] = json!(a);
+            }
+            None => data["verified"] = json!(false),
+        }
+        Ok(data)
     }
 
     /// One semantic action on a resolved element, with the read-backs the
@@ -742,12 +793,16 @@ impl InputModule {
             SemanticAction::Check | SemanticAction::Uncheck | SemanticAction::Toggle => {
                 self.set_checked(tool, node_id, action).await
             }
+            SemanticAction::Increment | SemanticAction::Decrement => {
+                self.step(tool, node_id, action).await
+            }
             _ => {
-                self.backend
+                let route = self
+                    .backend
                     .perform(node_id, action, option)
                     .await
                     .map_err(|e| input_err(tool, e))?;
-                Ok(json!({ "ok": true }))
+                Ok(with_route(json!({ "ok": true }), route))
             }
         }
     }
@@ -786,6 +841,7 @@ impl InputModule {
             text,
             secret || target.secure,
         )
+        .map(|d| with_route(d, Route::Ax))
         .map_err(|m| {
             Envelope::fail_with(
                 tool,
@@ -839,6 +895,98 @@ impl InputModule {
         match self.write_text(tool, &target, node_id, text, secret).await {
             Ok(data) => Envelope::ok(tool, target.annotate(data)),
             Err(e) => e,
+        }
+    }
+
+    /// Select text in an element through the accessibility API and read the
+    /// selection back. The text is read first, so a request made as text or
+    /// as offsets means the same characters on every platform, and the range
+    /// the element reports afterwards must equal the range asked for.
+    async fn select_text(&self, args: &Value) -> Envelope {
+        let tool = "select_text";
+        let spec = match parse_range(args) {
+            Ok(s) => s,
+            Err(m) => return Envelope::fail(tool, ErrorCode::InvalidArgs, m),
+        };
+        let target = match self.resolve(tool, args, Need::Handle).await {
+            Ok(t) => t,
+            Err(e) => return e,
+        };
+        if target.secure {
+            return Envelope::fail(
+                tool,
+                ErrorCode::InvalidArgs,
+                "this is a password field; its text is never read or selected",
+            );
+        }
+        let node_id = target.node_id.unwrap_or_default();
+        let text = match self.backend.read_element(node_id).await {
+            Ok(Reading { value: Some(t), .. }) => t,
+            Ok(_) => {
+                return Envelope::fail_with(
+                    tool,
+                    ErrorCode::ActionFailed,
+                    "the element's text cannot be read, so a range in it cannot be resolved",
+                    "target a text field or text area",
+                )
+            }
+            Err(e) => return input_err(tool, e),
+        };
+        let (start, end) = match resolve(&text, &spec) {
+            Ok(r) => r,
+            Err(m) => return Envelope::fail(tool, ErrorCode::InvalidArgs, m),
+        };
+        let got = match self.backend.select_range(node_id, start, end).await {
+            Ok(g) => g,
+            Err(e) => return input_err(tool, e),
+        };
+        if let Err(m) = judge_selection((start, end), &got) {
+            return Envelope::fail_with(
+                tool,
+                ErrorCode::ActionFailed,
+                m,
+                "the element may snap selections to words or lines, or ignore the request",
+            );
+        }
+        Envelope::ok(tool, target.annotate(selection_data(&got)))
+    }
+
+    /// The text selected in an element, or in the focused one, unchanged.
+    async fn get_selection(&self, args: &Value) -> Envelope {
+        let tool = "get_selection";
+        let aimed = args.get("ref").is_some_and(|v| !v.is_null())
+            || args
+                .get("name")
+                .and_then(Value::as_str)
+                .is_some_and(|n| !n.trim().is_empty());
+        let target = if aimed {
+            match self.resolve(tool, args, Need::Handle).await {
+                Ok(t) => Some(t),
+                Err(e) => return e,
+            }
+        } else {
+            None
+        };
+        if target.as_ref().is_some_and(|t| t.secure) {
+            return Envelope::fail(
+                tool,
+                ErrorCode::InvalidArgs,
+                "this is a password field; its text is never read",
+            );
+        }
+        let node = target.as_ref().map(|t| t.node_id.unwrap_or_default());
+        match self.backend.selection(node).await {
+            Ok(sel) => {
+                let data = selection_data(&sel);
+                Envelope::ok(
+                    tool,
+                    match target {
+                        Some(t) => t.annotate(data),
+                        None => data,
+                    },
+                )
+            }
+            Err(e) => input_err(tool, e),
         }
     }
 
@@ -1058,7 +1206,10 @@ impl InputModule {
         }
         let typed = text.chars().count();
         let Some(t) = target else {
-            return Envelope::ok(tool, json!({ "ok": true, "typed": typed }));
+            return Envelope::ok(
+                tool,
+                with_route(json!({ "ok": true, "typed": typed }), Route::Hid),
+            );
         };
         let hide = secret || t.secure;
         let after = if typed == 0 {
@@ -1068,7 +1219,10 @@ impl InputModule {
                 .await
                 .and_then(|r| r.value)
         };
-        let mut data = json!({ "ok": true, "typed": typed });
+        // The element was focused through the accessibility API, but the
+        // characters are posted as system key events, so the app must be
+        // frontmost: this is the HID route.
+        let mut data = with_route(json!({ "ok": true, "typed": typed }), Route::Hid);
         if let Some(a) = &after {
             let changed = before.as_deref() != Some(a.as_str());
             // Typing that left a text field exactly as it was did not land:
@@ -1120,7 +1274,10 @@ impl InputModule {
             }
         };
         match self.backend.key_combo(&parsed).await {
-            Ok(()) => Envelope::ok(tool, json!({ "ok": true, "pressed": parsed })),
+            Ok(()) => Envelope::ok(
+                tool,
+                with_route(json!({ "ok": true, "pressed": parsed }), Route::Hid),
+            ),
             Err(e) => input_err(tool, e),
         }
     }
@@ -1403,12 +1560,15 @@ impl InputModule {
         };
         match self.backend.mouse(kind, x, y, button, &modifiers).await {
             Ok(()) => {
-                let data = json!({
-                    "ok": true,
-                    "at": { "x": x, "y": y },
-                    "modifiers": modifiers,
-                    "glided": waypoints > 0
-                });
+                let data = with_route(
+                    json!({
+                        "ok": true,
+                        "at": { "x": x, "y": y },
+                        "modifiers": modifiers,
+                        "glided": waypoints > 0
+                    }),
+                    Route::Hid,
+                );
                 Envelope::ok(
                     tool,
                     match target {
@@ -1449,7 +1609,10 @@ impl InputModule {
         }
         match self.backend.scroll_at(x, y, dir, amount, &modifiers).await {
             Ok(()) => {
-                let data = json!({ "ok": true, "at": { "x": x, "y": y }, "modifiers": modifiers });
+                let data = with_route(
+                    json!({ "ok": true, "at": { "x": x, "y": y }, "modifiers": modifiers }),
+                    Route::Hid,
+                );
                 Envelope::ok(
                     tool,
                     match target {
@@ -1489,7 +1652,10 @@ impl InputModule {
         };
         match self.backend.hover(x, y).await {
             Ok(()) => {
-                let data = json!({ "ok": true, "at": { "x": x, "y": y }, "glided": waypoints > 0 });
+                let data = with_route(
+                    json!({ "ok": true, "at": { "x": x, "y": y }, "glided": waypoints > 0 }),
+                    Route::Hid,
+                );
                 Envelope::ok(
                     tool,
                     match target {
@@ -1575,14 +1741,17 @@ impl InputModule {
                     Some(t) => t.annotate(json!({ "x": p.0, "y": p.1 })),
                     None => json!({ "x": p.0, "y": p.1 }),
                 };
-                let mut data = json!({
-                    "ok": true,
-                    "from": at(from, from_target),
-                    "to": at(end, to_target),
-                    "steps": route.len(),
-                    "hold_ms": hold_ms,
-                    "modifiers": modifiers,
-                });
+                let mut data = with_route(
+                    json!({
+                        "ok": true,
+                        "from": at(from, from_target),
+                        "to": at(end, to_target),
+                        "steps": route.len(),
+                        "hold_ms": hold_ms,
+                        "modifiers": modifiers,
+                    }),
+                    Route::Hid,
+                );
                 if !path.is_empty() {
                     data["waypoints"] = json!(path.len());
                 }
@@ -1779,6 +1948,102 @@ fn merge(mut base: Value, extra: Value) -> Value {
     base
 }
 
+/// A selection as a result reports it. The text is echoed up to a limit, so
+/// selecting a whole document does not put the document in the result.
+fn selection_data(sel: &Selection) -> Value {
+    let (text, truncated) = clip_echo(&sel.text);
+    let mut data = with_route(
+        json!({
+            "ok": true,
+            "start": sel.start,
+            "end": sel.end,
+            "length": sel.end.saturating_sub(sel.start),
+            "text": text,
+        }),
+        Route::Ax,
+    );
+    if truncated {
+        data["truncated"] = json!(true);
+    }
+    if let Some(role) = &sel.role {
+        data["role"] = json!(role);
+    }
+    data
+}
+
+/// A non-negative whole number argument, as a number or a numeric string.
+fn index_arg(args: &Value, key: &str) -> Result<Option<usize>, String> {
+    let Some(v) = args.get(key).filter(|v| !v.is_null()) else {
+        return Ok(None);
+    };
+    match as_f64(v) {
+        Some(n) if n >= 0.0 && n.fract() == 0.0 && n <= 1e9 => Ok(Some(n as usize)),
+        _ => Err(format!("'{key}' must be a whole number, 0 or more")),
+    }
+}
+
+/// A non-empty string argument.
+fn str_arg<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
+    args.get(key)
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+}
+
+/// Which text `select_text` was asked for. Exactly one of `all`,
+/// `start`+`end`, `text` (with `occurrence`), or `from_text`+`to_text`: two
+/// ways at once would mean one of them was silently ignored.
+fn parse_range(args: &Value) -> Result<RangeSpec, String> {
+    const HELP: &str = "give one of: all, start and end, text, or from_text and to_text";
+    let all = args.get("all").and_then(Value::as_bool).unwrap_or(false);
+    let start = index_arg(args, "start")?;
+    let end = index_arg(args, "end")?;
+    let text = str_arg(args, "text");
+    let from = str_arg(args, "from_text");
+    let to = str_arg(args, "to_text");
+    let occurrence = index_arg(args, "occurrence")?;
+    let ways = [
+        all,
+        start.is_some() || end.is_some(),
+        text.is_some(),
+        from.is_some() || to.is_some(),
+    ];
+    match ways.iter().filter(|w| **w).count() {
+        0 => return Err(format!("nothing to select: {HELP}")),
+        1 => {}
+        _ => return Err(format!("more than one way to choose the text: {HELP}")),
+    }
+    if occurrence.is_some() && text.is_none() {
+        return Err("'occurrence' goes with 'text'".into());
+    }
+    if all {
+        return Ok(RangeSpec::All);
+    }
+    if start.is_some() || end.is_some() {
+        return match (start, end) {
+            (Some(start), Some(end)) => Ok(RangeSpec::Offsets { start, end }),
+            _ => Err("'start' and 'end' go together".into()),
+        };
+    }
+    if let Some(needle) = text {
+        return Ok(RangeSpec::Text {
+            needle: needle.to_string(),
+            occurrence: occurrence.unwrap_or(1),
+        });
+    }
+    match (from, to) {
+        (Some(f), Some(t)) => Ok(RangeSpec::Between {
+            from: f.to_string(),
+            to: t.to_string(),
+        }),
+        _ => Err("'from_text' and 'to_text' go together".into()),
+    }
+}
+
+/// `data` with the route that acted on the UI, as `input`.
+fn with_route(data: Value, route: Route) -> Value {
+    merge(data, json!({ "input": route.as_str() }))
+}
+
 /// `Double-Click` and `double click` as `double_click`.
 fn snake(s: &str) -> String {
     s.trim().to_lowercase().replace(['-', ' '], "_")
@@ -1959,9 +2224,9 @@ impl ToolModule for InputModule {
                 "ui_action",
                 Category::Input,
                 Tier::Standard,
-                "Perform a semantic action on an element by ref or name (accessibility action, no cursor). select with option chooses a popup or combo box entry by its text.",
+                "Perform a semantic action on an element by ref or name (accessibility action, no cursor, app need not be frontmost). select with option chooses a popup or combo box entry by its text. An action the element does not offer is an error naming the ones it does.",
                 target_schema(json!({
-                    "action":{"type":"string","enum":["click","double_click","right_click","focus","toggle","check","uncheck","expand","collapse","select","scroll_into_view"]},
+                    "action":{"type":"string","enum":["click","double_click","right_click","focus","toggle","check","uncheck","expand","collapse","select","scroll_into_view","show_menu","increment","decrement","pick"]},
                     "option":{"type":"string","description":"entry text for select"},
                     "expect": expect_schema()
                 }), &["action"]),
@@ -1976,7 +2241,20 @@ impl ToolModule for InputModule {
                 `check`, `uncheck` and `toggle` read the state first (checking a checked box changes nothing) and \
                 again afterwards, and report `checked` and `changed`; a press that did not take is an error.\n\n\
                 macOS opens a popup button with the accessibility press and presses its menu item; a combo box takes \
-                the text. Linux invokes the combo box's menu or list item through AT-SPI."),
+                the text. Linux invokes the combo box's menu or list item through AT-SPI.\n\n\
+                `show_menu` opens the element's context menu (AXShowMenu) without a right click, `increment` and \
+                `decrement` take one step on a slider, stepper or scroll bar and report `value_after` and `changed` \
+                (`changed: false` means the control is at its limit or ignored the step), `pick` picks the element \
+                in a list or picker (AXPick), and `scroll_to_visible` is accepted for `scroll_into_view`. On macOS \
+                these four are checked against the element's own action list first, so an element that lacks one \
+                gets an error listing what it does support, never an `ok`. Linux has no context-menu action: \
+                `show_menu` looks for a menu or popup action on the element and otherwise says what it has; \
+                `increment` and `decrement` move an AT-SPI Value by its minimum increment, clamped to its range.\n\n\
+                Every result carries `input`: `ax` when the accessibility API acted (no pointer, the app can stay \
+                in the background) or `hid` when synthetic system input was needed (the real cursor moved). \
+                `right_click` and `double_click` are an accessibility press on macOS, which has no distinct \
+                double or secondary press; on Linux `right_click` clicks at the element's centre, so it is `hid`. \
+                `input` is absent when nothing needed doing (checking a checked box)."),
             ToolDescriptor::new(
                 "set_value",
                 Category::Input,
@@ -1992,6 +2270,46 @@ impl ToolModule for InputModule {
                 than what was written (a number field turning 1000 into 1,000 is fine). A field that keeps its old \
                 value and does not show the new text is an error, not an `ok`. `verified: false` means the platform \
                 could not read the value back."),
+            ToolDescriptor::new(
+                "select_text",
+                Category::Input,
+                Tier::Standard,
+                "Select text in a text field or text area by ref or name, through the accessibility API (no drag, no focus needed), and read the selection back. Give one of: all; start and end (character offsets); text (with occurrence); from_text and to_text.",
+                target_schema(json!({
+                    "all":{"type":"boolean","description":"select everything"},
+                    "start":{"type":"integer","description":"first character offset, from 0"},
+                    "end":{"type":"integer","description":"offset after the last character; equal to start places the caret"},
+                    "text":{"type":"string","description":"select this text"},
+                    "occurrence":{"type":"integer","description":"which match of text, from 1 (default 1)"},
+                    "from_text":{"type":"string","description":"select from the start of this text..."},
+                    "to_text":{"type":"string","description":"...to the end of the next match of this"},
+                    "expect": expect_schema()}), &[]),
+            ).idempotent(true).details(TARGET_DETAILS.to_string() + "\n\n\
+                Offsets count characters (Unicode scalar values) from 0 with `end` exclusive, on every platform: \
+                a combining accent is its own character, and a character outside the Basic Multilingual Plane is \
+                one, not two. `text` matches exactly (case and accents count), non-overlapping, and `occurrence` \
+                picks the Nth. `from_text`/`to_text` select from the start of the first `from_text` through the end \
+                of the first `to_text` that follows it. The element's text is read first and the request is \
+                resolved against it.\n\n\
+                The result carries `start`, `end`, `length` and `text` as the element reports them after the \
+                change (`text` is cut at 2000 characters, with `truncated`), and `input: ax`. If the element \
+                reports a different range than was asked for (some editors snap to words or ignore the request), \
+                the call fails and says what it reports. macOS sets `AXSelectedTextRange`; an element where that \
+                is not settable is an `UNSUPPORTED_OS` error. There is no pointer fallback: dragging to select is \
+                not attempted, so use `drag_drop` or shift-click with `mouse_action` for those. Linux uses the \
+                AT-SPI Text interface (`set_selection`). Password fields are refused. Which apps honour the \
+                selection has not been verified beyond TextEdit."),
+            ToolDescriptor::new(
+                "get_selection",
+                Category::Input,
+                Tier::Standard,
+                "Read the text selected in an element (ref or name), or in the focused element when none is given, without changing it.",
+                target_schema(json!({}), &[]),
+            ).details(TARGET_DETAILS.to_string() + "\n\n\
+                Returns `start`, `end` (character offsets, as in `select_text`), `length`, `text` (cut at 2000 \
+                characters, with `truncated`) and `role`; a caret with nothing selected is `length: 0`. Without a \
+                target it reads the focused element of the app being driven (macOS only; on Linux give a ref). \
+                Password fields are refused."),
             ToolDescriptor::new(
                 "ui_fill_form",
                 Category::Input,
@@ -2216,6 +2534,8 @@ impl ToolModule for InputModule {
         let env = match name {
             "ui_action" => self.ui_action(&args).await,
             "set_value" => self.set_value(&args).await,
+            "select_text" => self.select_text(&args).await,
+            "get_selection" => self.get_selection(&args).await,
             "ui_fill_form" => self.ui_fill_form(&args).await,
             "keyboard_type" => self.keyboard_type(&args).await,
             "keyboard_shortcut" => self.keyboard_shortcut(&args, since).await,
@@ -2424,6 +2744,9 @@ mod tests {
         reads: std::sync::Mutex<std::collections::HashMap<u64, usize>>,
         /// What `choose_option` answers, when it should not just succeed.
         choice: std::sync::Mutex<Option<Result<Choice, InputError>>>,
+        /// The route `perform` reports, when it should not be `Ax`. Scripts
+        /// what the tool layer is told, not what an OS did.
+        route: std::sync::Mutex<Option<Route>>,
     }
 
     impl MockBackend {
@@ -2479,12 +2802,12 @@ mod tests {
             node_id: u64,
             action: SemanticAction,
             option: Option<&str>,
-        ) -> Result<(), InputError> {
+        ) -> Result<Route, InputError> {
             self.actions
                 .lock()
                 .unwrap()
                 .push((node_id, action, option.map(|s| s.to_string())));
-            Ok(())
+            Ok(self.route.lock().unwrap().unwrap_or(Route::Ax))
         }
         async fn set_value(&self, node_id: u64, text: &str) -> Result<(), InputError> {
             self.values
@@ -4448,5 +4771,293 @@ mod tests {
         assert!(drag.input_schema["properties"]["path"]["description"]
             .as_str()
             .is_some_and(|d| d.contains("200")));
+    }
+
+    // ---- input route, new actions, text selection ---------------------------
+
+    /// The route is whatever the backend reports, not something the tool
+    /// layer decides: a backend that fell back to the pointer says so.
+    #[tokio::test]
+    async fn ui_action_reports_the_route_the_backend_took() {
+        let (module, backend, _) = test_module();
+        let env = call(
+            &module,
+            "ui_action",
+            json!({ "ref": "@e4", "action": "click" }),
+        )
+        .await;
+        assert_eq!(env.data.unwrap()["input"], "ax");
+
+        *backend.route.lock().unwrap() = Some(Route::Hid);
+        let env = call(
+            &module,
+            "ui_action",
+            json!({ "ref": "@e4", "action": "right_click" }),
+        )
+        .await;
+        assert!(env.ok, "{env:?}");
+        assert_eq!(env.data.unwrap()["input"], "hid");
+    }
+
+    #[tokio::test]
+    async fn the_new_actions_reach_the_backend_under_their_own_names() {
+        let (module, backend, _) = test_module();
+        for (name, want) in [
+            ("show_menu", SemanticAction::ShowMenu),
+            ("increment", SemanticAction::Increment),
+            ("decrement", SemanticAction::Decrement),
+            ("pick", SemanticAction::Pick),
+            ("scroll_to_visible", SemanticAction::ScrollIntoView),
+            ("Show-Menu", SemanticAction::ShowMenu),
+        ] {
+            let env = call(
+                &module,
+                "ui_action",
+                json!({ "ref": "@e4", "action": name }),
+            )
+            .await;
+            assert!(env.ok, "{name}: {env:?}");
+            assert_eq!(backend.actions.lock().unwrap().last().unwrap().1, want);
+        }
+        let env = call(
+            &module,
+            "ui_action",
+            json!({ "ref": "@e4", "action": "squeeze" }),
+        )
+        .await;
+        assert_eq!(env.error.unwrap().code, ErrorCode::InvalidArgs);
+    }
+
+    #[tokio::test]
+    async fn a_step_reports_the_value_and_whether_it_moved() {
+        let (module, backend, _) = test_module();
+        backend.script(104, vec![shown("3"), shown("4")]);
+        let env = call(
+            &module,
+            "ui_action",
+            json!({ "ref": "@e4", "action": "increment" }),
+        )
+        .await;
+        let d = env.data.unwrap();
+        assert_eq!(
+            (d["value_after"].as_str(), d["changed"].as_bool()),
+            (Some("4"), Some(true))
+        );
+
+        backend.script(104, vec![shown("10")]);
+        let env = call(
+            &module,
+            "ui_action",
+            json!({ "ref": "@e4", "action": "increment" }),
+        )
+        .await;
+        let d = env.data.unwrap();
+        assert_eq!(
+            d["changed"], false,
+            "a step that moved nothing is not a change"
+        );
+        assert_eq!(d["ok"], true);
+
+        // A control that cannot be read back says so rather than claiming a move.
+        backend.script(104, vec![Reading::default()]);
+        let env = call(
+            &module,
+            "ui_action",
+            json!({ "ref": "@e4", "action": "decrement" }),
+        )
+        .await;
+        let d = env.data.unwrap();
+        assert_eq!(d["verified"], false);
+        assert!(d.get("changed").is_none());
+    }
+
+    #[tokio::test]
+    async fn set_value_is_accessibility_and_pointer_tools_are_not() {
+        let (module, backend, _) = test_module();
+        backend.script(101, vec![shown(""), shown("hi")]);
+        let env = call(&module, "set_value", json!({ "ref": "@e1", "text": "hi" })).await;
+        assert_eq!(env.data.unwrap()["input"], "ax");
+
+        for (tool, args) in [
+            ("mouse_action", json!({ "type": "click", "x": 5, "y": 6 })),
+            ("scroll", json!({ "x": 5, "y": 6, "direction": "down" })),
+            ("hover", json!({ "x": 5, "y": 6 })),
+            (
+                "drag_drop",
+                json!({ "from": { "x": 1, "y": 1 }, "to": { "x": 9, "y": 9 } }),
+            ),
+            ("keyboard_shortcut", json!({ "combo": "cmd+s" })),
+            ("keyboard_type", json!({ "text": "x" })),
+        ] {
+            let env = call(&module, tool, args).await;
+            assert!(env.ok, "{tool}: {env:?}");
+            assert_eq!(env.data.unwrap()["input"], "hid", "{tool}");
+        }
+    }
+
+    #[tokio::test]
+    async fn keyboard_type_into_an_element_is_hid_even_though_it_focused_through_ax() {
+        let (module, backend, _) = test_module();
+        backend.script(101, vec![shown(""), shown("x")]);
+        let env = call(
+            &module,
+            "keyboard_type",
+            json!({ "ref": "@e1", "text": "x" }),
+        )
+        .await;
+        assert!(env.ok, "{env:?}");
+        assert_eq!(env.data.unwrap()["input"], "hid");
+    }
+
+    #[test]
+    fn a_range_is_one_of_four_shapes() {
+        let p = |v: Value| parse_range(&v);
+        assert_eq!(p(json!({ "all": true })), Ok(RangeSpec::All));
+        assert_eq!(
+            p(json!({ "start": 2, "end": "5" })),
+            Ok(RangeSpec::Offsets { start: 2, end: 5 })
+        );
+        assert_eq!(
+            p(json!({ "text": "cat" })),
+            Ok(RangeSpec::Text {
+                needle: "cat".into(),
+                occurrence: 1
+            })
+        );
+        assert_eq!(
+            p(json!({ "text": "cat", "occurrence": 3 })),
+            Ok(RangeSpec::Text {
+                needle: "cat".into(),
+                occurrence: 3
+            })
+        );
+        assert_eq!(
+            p(json!({ "from_text": "a", "to_text": "b" })),
+            Ok(RangeSpec::Between {
+                from: "a".into(),
+                to: "b".into()
+            })
+        );
+        // `all: false` is not a choice.
+        assert!(p(json!({ "all": false })).is_err());
+    }
+
+    #[test]
+    fn a_range_that_says_two_things_or_half_of_one_is_refused() {
+        let bad = |v: Value| parse_range(&v).unwrap_err();
+        assert!(bad(json!({})).contains("nothing to select"));
+        assert!(bad(json!({ "all": true, "text": "x" })).contains("more than one"));
+        assert!(bad(json!({ "start": 1, "text": "x" })).contains("more than one"));
+        assert!(bad(json!({ "start": 1 })).contains("go together"));
+        assert!(bad(json!({ "end": 1 })).contains("go together"));
+        assert!(bad(json!({ "from_text": "a" })).contains("go together"));
+        assert!(bad(json!({ "occurrence": 2, "all": true })).contains("goes with 'text'"));
+        assert!(bad(json!({ "start": -1, "end": 2 })).contains("whole number"));
+        assert!(bad(json!({ "start": 1.5, "end": 2 })).contains("whole number"));
+        // An empty string is no string.
+        assert!(bad(json!({ "text": "" })).contains("nothing to select"));
+    }
+
+    #[test]
+    fn a_selection_result_carries_the_range_the_route_and_a_clipped_text() {
+        let d = selection_data(&Selection {
+            start: 2,
+            end: 6,
+            text: "word".into(),
+            role: Some("TextArea".into()),
+        });
+        assert_eq!(
+            d,
+            json!({ "ok": true, "input": "ax", "start": 2, "end": 6, "length": 4,
+                    "text": "word", "role": "TextArea" })
+        );
+        let long = selection_data(&Selection {
+            start: 0,
+            end: 5000,
+            text: "x".repeat(5000),
+            role: None,
+        });
+        assert_eq!(long["truncated"], true);
+        assert_eq!(
+            long["text"].as_str().unwrap().len(),
+            crate::selection::ECHO_LIMIT
+        );
+        assert!(long.get("role").is_none());
+    }
+
+    #[tokio::test]
+    async fn select_text_validates_before_it_touches_anything() {
+        let (module, backend, _) = test_module();
+        let env = call(&module, "select_text", json!({ "ref": "@e1" })).await;
+        assert_eq!(env.error.unwrap().code, ErrorCode::InvalidArgs);
+        let env = call(&module, "select_text", json!({ "all": true })).await;
+        assert_eq!(env.error.unwrap().code, ErrorCode::InvalidArgs);
+        assert!(backend.actions.lock().unwrap().is_empty());
+
+        // A password field is refused whatever the range.
+        let env = call(&module, "select_text", json!({ "ref": "@e2", "all": true })).await;
+        assert!(env.error.unwrap().message.contains("password"));
+        let env = call(&module, "get_selection", json!({ "ref": "@e2" })).await;
+        assert!(env.error.unwrap().message.contains("password"));
+    }
+
+    /// A range that is not in the text is the caller's mistake and is told so
+    /// before the element is asked to select anything.
+    #[tokio::test]
+    async fn select_text_names_a_range_the_text_does_not_have() {
+        let (module, backend, _) = test_module();
+        backend.script(101, vec![shown("hello world")]);
+        let env = call(
+            &module,
+            "select_text",
+            json!({ "ref": "@e1", "text": "mars" }),
+        )
+        .await;
+        let e = env.error.unwrap();
+        assert_eq!(e.code, ErrorCode::InvalidArgs);
+        assert!(e.message.contains("not in the text"), "{}", e.message);
+        let env = call(
+            &module,
+            "select_text",
+            json!({ "ref": "@e1", "start": 0, "end": 99 }),
+        )
+        .await;
+        assert!(env.error.unwrap().message.contains("11 characters"));
+    }
+
+    /// With no selection support in the backend the answer is the platform's
+    /// refusal, never an ok.
+    #[tokio::test]
+    async fn select_text_without_backend_support_is_an_error_not_an_ok() {
+        let (module, backend, _) = test_module();
+        backend.script(101, vec![shown("hello world")]);
+        let env = call(
+            &module,
+            "select_text",
+            json!({ "ref": "@e1", "text": "world" }),
+        )
+        .await;
+        assert!(!env.ok);
+        assert_eq!(env.error.unwrap().code, ErrorCode::UnsupportedOs);
+        let env = call(&module, "get_selection", json!({ "ref": "@e1" })).await;
+        assert_eq!(env.error.unwrap().code, ErrorCode::UnsupportedOs);
+    }
+
+    #[test]
+    fn the_new_tools_are_standard_tier_like_set_value() {
+        let (module, _, _) = test_module();
+        let all = module.descriptors();
+        let tier = |n: &str| all.iter().find(|d| d.name == n).unwrap().tier;
+        assert_eq!(tier("select_text"), tier("set_value"));
+        assert_eq!(tier("get_selection"), tier("set_value"));
+        for n in ["select_text", "get_selection"] {
+            let d = all.iter().find(|d| d.name == n).unwrap();
+            for p in ["ref", "name", "role"] {
+                assert!(
+                    d.input_schema["properties"].get(p).is_some(),
+                    "{n} lacks {p}"
+                );
+            }
+        }
     }
 }

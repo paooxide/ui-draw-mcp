@@ -14,6 +14,13 @@ pub enum SemanticAction {
     Collapse,
     Select,
     ScrollIntoView,
+    /// Open the element's context menu (AXShowMenu) without a right click.
+    ShowMenu,
+    /// One step up / down on a slider, stepper or scroll bar.
+    Increment,
+    Decrement,
+    /// Pick the element in a list or picker (AXPick).
+    Pick,
 }
 
 impl SemanticAction {
@@ -29,9 +36,36 @@ impl SemanticAction {
             "expand" => Self::Expand,
             "collapse" => Self::Collapse,
             "select" => Self::Select,
-            "scroll_into_view" => Self::ScrollIntoView,
+            // The accessibility API's own name for it, accepted beside ours.
+            "scroll_into_view" | "scroll_to_visible" => Self::ScrollIntoView,
+            "show_menu" => Self::ShowMenu,
+            "increment" => Self::Increment,
+            "decrement" => Self::Decrement,
+            "pick" => Self::Pick,
             _ => return None,
         })
+    }
+}
+
+/// How an action reached the UI, so a result can say whether the user's
+/// pointer or foreground was involved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Route {
+    /// The accessibility API acted on the element: no pointer movement, and
+    /// the app need not be frontmost.
+    Ax,
+    /// Synthetic system input: it moves the real cursor or types into the
+    /// frontmost app.
+    Hid,
+}
+
+impl Route {
+    /// The value of a result's `input` field.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ax => "ax",
+            Self::Hid => "hid",
+        }
     }
 }
 
@@ -140,6 +174,21 @@ pub struct Reading {
     pub checked: Option<bool>,
 }
 
+/// A text selection as the element reports it.
+///
+/// Offsets are characters (Unicode scalar values) from the start of the
+/// element's text, `end` exclusive, whatever unit the platform counts in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Selection {
+    pub start: usize,
+    pub end: usize,
+    /// The selected text, as the element reports it.
+    pub text: String,
+    /// The element's role, when the backend knows it. Useful when the element
+    /// was the focused one rather than a named ref.
+    pub role: Option<String>,
+}
+
 /// The outcome of choosing an option from a popup button or combo box.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Choice {
@@ -169,12 +218,15 @@ pub enum InputError {
 /// and clipboard. macOS (AX + CGEvent) lands behind `macos-backend`.
 #[async_trait]
 pub trait InputBackend: Send + Sync {
+    /// Act on an element and say which route did it. A backend returns
+    /// [`Route::Hid`] only when it had to fall back to synthetic input; the
+    /// tool layer reports exactly what it is told and never assumes.
     async fn perform(
         &self,
         node_id: u64,
         action: SemanticAction,
         option: Option<&str>,
-    ) -> Result<(), InputError>;
+    ) -> Result<Route, InputError>;
     /// Choose the entry named `option` from a popup button or combo box, or
     /// from the popup an entry belongs to when `node_id` is itself an entry.
     ///
@@ -192,7 +244,33 @@ pub trait InputBackend: Send + Sync {
     async fn read_element(&self, _node_id: u64) -> Result<Reading, InputError> {
         Ok(Reading::default())
     }
+    /// Write an element's value through the accessibility API. Always
+    /// [`Route::Ax`]: an implementation that would have to type must refuse.
     async fn set_value(&self, node_id: u64, text: &str) -> Result<(), InputError>;
+    /// The current text selection of `node_id`, or of the focused element when
+    /// `None`, without changing it.
+    async fn selection(&self, _node_id: Option<u64>) -> Result<Selection, InputError> {
+        Err(InputError::Unsupported(
+            "reading a text selection is not supported on this platform".into(),
+        ))
+    }
+    /// Select characters `start..end` (see [`Selection`]) of an element's text
+    /// through the accessibility API and return the selection the element then
+    /// reports. Never drags the pointer; an element that will not take the
+    /// range is `Unsupported`, not approximated.
+    async fn select_range(
+        &self,
+        _node_id: u64,
+        _start: usize,
+        _end: usize,
+    ) -> Result<Selection, InputError> {
+        Err(InputError::Unsupported(
+            "selecting text is not supported on this platform".into(),
+        ))
+    }
+    /// Synthetic system input follows: `type_text`, `key_combo`, `mouse`,
+    /// `scroll_at`, `hover` and `drag` all move the real pointer or type into
+    /// the frontmost app, and the tool layer reports them as [`Route::Hid`].
     async fn type_text(&self, text: &str) -> Result<(), InputError>;
     async fn key_combo(&self, combo: &str) -> Result<(), InputError>;
     async fn mouse(
@@ -360,5 +438,33 @@ mod tests {
         assert_eq!(ScrollDir::parse("page_down"), Some(ScrollDir::PageDown));
         assert_eq!(ScrollDir::parse("pagedown"), Some(ScrollDir::PageDown));
         assert_eq!(ScrollDir::parse("sideways"), None);
+    }
+
+    #[test]
+    fn the_new_actions_parse_in_either_spelling() {
+        assert_eq!(
+            SemanticAction::parse("show_menu"),
+            Some(SemanticAction::ShowMenu)
+        );
+        assert_eq!(
+            SemanticAction::parse("increment"),
+            Some(SemanticAction::Increment)
+        );
+        assert_eq!(
+            SemanticAction::parse("decrement"),
+            Some(SemanticAction::Decrement)
+        );
+        assert_eq!(SemanticAction::parse("pick"), Some(SemanticAction::Pick));
+        assert_eq!(
+            SemanticAction::parse("scroll_to_visible"),
+            Some(SemanticAction::ScrollIntoView)
+        );
+        assert_eq!(SemanticAction::parse("showmenu"), None);
+    }
+
+    #[test]
+    fn a_route_is_spelled_the_way_a_result_reports_it() {
+        assert_eq!(Route::Ax.as_str(), "ax");
+        assert_eq!(Route::Hid.as_str(), "hid");
     }
 }

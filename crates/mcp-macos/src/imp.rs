@@ -4,13 +4,13 @@ use std::ptr;
 use std::sync::Mutex;
 
 use async_trait::async_trait;
-use core_foundation::array::CFArray;
+use core_foundation::array::{CFArray, CFArrayRef};
 use core_foundation::base::{CFType, CFTypeRef, TCFType};
 use core_foundation::boolean::CFBoolean;
 use core_foundation::dictionary::CFDictionary;
 use core_foundation::number::{CFNumber, CFNumberRef};
 use core_foundation::string::{CFString, CFStringRef};
-use core_foundation_sys::base::Boolean;
+use core_foundation_sys::base::{Boolean, CFRange};
 use core_graphics::window::{
     copy_window_info, kCGNullWindowID, kCGWindowBounds, kCGWindowIsOnscreen, kCGWindowLayer,
     kCGWindowListExcludeDesktopElements, kCGWindowListOptionOnScreenOnly, kCGWindowName,
@@ -21,8 +21,8 @@ use mcp_a11y::{
     is_interactive_role, A11yBackend, BackendError, Bounds, RawSnapshot, SnapshotRequest, UiNode,
 };
 use mcp_input::{
-    Choice, ClipData, ClipFormat, InputBackend, InputError, MouseKind, Reading, ScrollDir,
-    SemanticAction,
+    char_range_to_utf16, char_slice, utf16_range_to_char, Choice, ClipData, ClipFormat,
+    InputBackend, InputError, MouseKind, Reading, Route, ScrollDir, Selection, SemanticAction,
 };
 use mcp_window::{
     DialogInfo, DialogScope, MenuItemInfo, Rect, WindowAction, WindowBackend, WindowError,
@@ -57,6 +57,13 @@ extern "C" {
     ) -> AXError;
     pub(crate) fn AXUIElementPerformAction(element: AXUIElementRef, action: CFStringRef)
         -> AXError;
+    /// The actions an element advertises (create rule).
+    fn AXUIElementCopyActionNames(element: AXUIElementRef, names: *mut CFArrayRef) -> AXError;
+    fn AXUIElementIsAttributeSettable(
+        element: AXUIElementRef,
+        attribute: CFStringRef,
+        settable: *mut Boolean,
+    ) -> AXError;
     /// Bound how long a request to the target app may take. Opening a popup
     /// can run the app's menu tracking, and without a bound a stuck app would
     /// hold this thread for the system default.
@@ -73,6 +80,7 @@ extern "C" {
 // AXValue wrapped geometry types.
 const KAXVALUE_CGPOINT: u32 = 1;
 const KAXVALUE_CGSIZE: u32 = 2;
+const KAXVALUE_CFRANGE: u32 = 4;
 
 #[repr(C)]
 struct CGPoint {
@@ -210,6 +218,120 @@ pub(crate) fn ax_result(err: AXError, what: &str) -> Result<(), InputError> {
         KAX_ERROR_CANNOT_COMPLETE => Err(InputError::Failed(format!("{what}: cannot complete"))),
         other => Err(InputError::Failed(format!("{what}: AXError {other}"))),
     }
+}
+
+/// The actions an element advertises. `None` when the list cannot be read,
+/// which is not the same as an empty list.
+unsafe fn action_names(elem: CFTypeRef) -> Option<Vec<String>> {
+    let mut raw: CFArrayRef = ptr::null();
+    let err = AXUIElementCopyActionNames(elem, &mut raw);
+    if err != KAX_SUCCESS || raw.is_null() {
+        return None;
+    }
+    // Copy rule: the array is ours to release.
+    let array: CFArray = CFArray::wrap_under_create_rule(raw);
+    Some(
+        array
+            .get_all_values()
+            .into_iter()
+            .filter_map(|p| CFType::wrap_under_get_rule(p).downcast::<CFString>())
+            .map(|s| s.to_string())
+            .collect(),
+    )
+}
+
+/// What to call an element in an error: its title, else its description, else
+/// its role.
+unsafe fn element_label(elem: CFTypeRef) -> String {
+    ["AXTitle", "AXDescription", "AXRole"]
+        .iter()
+        .find_map(|a| copy_attr_string(elem, a).filter(|s| !s.is_empty()))
+        .unwrap_or_default()
+}
+
+/// Perform an AX action on an element.
+///
+/// With `check_list`, the element's own action list is consulted first, so an
+/// element that lacks the action is told apart from one that failed it. Either
+/// way, an element that reports the action unsupported gets an error naming
+/// what it does offer.
+unsafe fn perform_ax_action(elem: CFTypeRef, ax: &str, check_list: bool) -> Result<(), InputError> {
+    if check_list {
+        if let Some(offered) = action_names(elem) {
+            if !offered.iter().any(|a| a == ax) {
+                return Err(InputError::Unsupported(
+                    crate::ax_actions::unsupported_message(&element_label(elem), ax, &offered),
+                ));
+            }
+        }
+    }
+    let act = CFString::new(ax);
+    match AXUIElementPerformAction(elem, act.as_concrete_TypeRef()) {
+        KAX_ERROR_ACTION_UNSUPPORTED => Err(InputError::Unsupported(
+            crate::ax_actions::unsupported_message(
+                &element_label(elem),
+                ax,
+                &action_names(elem).unwrap_or_default(),
+            ),
+        )),
+        err => ax_result(err, ax.trim_start_matches("AX")),
+    }
+}
+
+/// Read an `AXValue`-wrapped `CFRange` attribute as UTF-16 `(location, length)`.
+unsafe fn copy_attr_range(elem: CFTypeRef, name: &str) -> Option<(usize, usize)> {
+    let v = copy_attr(elem, name)?;
+    let mut r = CFRange {
+        location: 0,
+        length: 0,
+    };
+    let ok = AXValueGetValue(
+        v.as_CFTypeRef(),
+        KAXVALUE_CFRANGE,
+        &mut r as *mut CFRange as *mut c_void,
+    );
+    if ok == 0 || r.location < 0 || r.length < 0 {
+        return None;
+    }
+    Some((r.location as usize, r.length as usize))
+}
+
+/// Whether an attribute can be written. A failed query counts as no.
+unsafe fn is_settable(elem: CFTypeRef, name: &str) -> bool {
+    let attr = CFString::new(name);
+    let mut settable: Boolean = 0;
+    AXUIElementIsAttributeSettable(elem, attr.as_concrete_TypeRef(), &mut settable) == KAX_SUCCESS
+        && settable != 0
+}
+
+/// The text selection an element reports, in characters.
+///
+/// A password field is refused before anything is read from it.
+unsafe fn read_selection(elem: CFTypeRef) -> Result<Selection, InputError> {
+    if copy_attr_string(elem, "AXSubrole").as_deref() == Some("AXSecureTextField") {
+        return Err(InputError::InvalidArgs(
+            "this is a password field; its text is never read".into(),
+        ));
+    }
+    let text = copy_attr_string(elem, "AXValue")
+        .ok_or_else(|| InputError::Unsupported("the element has no text".into()))?;
+    let (loc, len) = copy_attr_range(elem, "AXSelectedTextRange").ok_or_else(|| {
+        InputError::Unsupported("the element does not report a selected text range".into())
+    })?;
+    let (start, end) = utf16_range_to_char(&text, loc, len).ok_or_else(|| {
+        InputError::Failed(format!(
+            "the element reports a selection ({loc}, {len} in UTF-16 units) that does not fall \
+             on character boundaries of its text"
+        ))
+    })?;
+    let selected =
+        copy_attr_string(elem, "AXSelectedText").unwrap_or_else(|| char_slice(&text, start, end));
+    Ok(Selection {
+        start,
+        end,
+        text: selected,
+        role: copy_attr_string(elem, "AXRole").map(|r| r.trim_start_matches("AX").to_string()),
+    })
 }
 
 // ---- tree walker ------------------------------------------------------------
@@ -651,12 +773,14 @@ impl InputBackend for MacosBackend {
         node_id: u64,
         action: SemanticAction,
         _option: Option<&str>,
-    ) -> Result<(), InputError> {
+    ) -> Result<Route, InputError> {
         unsafe {
             let elem = self.element_for(node_id)?;
             let eref = elem.as_CFTypeRef();
-            match action {
-                SemanticAction::Focus => {
+            // Every branch below goes through the accessibility API: nothing
+            // here moves the pointer or needs the app frontmost.
+            match crate::ax_actions::ax_action_name(action) {
+                None => {
                     let attr = CFString::new("AXFocused");
                     let val = CFBoolean::from(true);
                     let err = AXUIElementSetAttributeValue(
@@ -664,25 +788,95 @@ impl InputBackend for MacosBackend {
                         attr.as_concrete_TypeRef(),
                         val.as_CFTypeRef(),
                     );
-                    ax_result(err, "focus")
-                }
-                SemanticAction::ScrollIntoView => {
-                    let act = CFString::new("AXScrollToVisible");
-                    ax_result(
-                        AXUIElementPerformAction(eref, act.as_concrete_TypeRef()),
-                        "scroll_into_view",
-                    )
+                    ax_result(err, "focus")?;
                 }
                 // Click / toggle / check / select all map to the AXPress action;
                 // AX has no distinct double/right press.
-                _ => {
-                    let act = CFString::new("AXPress");
-                    ax_result(
-                        AXUIElementPerformAction(eref, act.as_concrete_TypeRef()),
-                        "press",
-                    )
+                Some(ax) => {
+                    perform_ax_action(eref, ax, crate::ax_actions::must_be_listed(action))?;
                 }
             }
+            Ok(Route::Ax)
+        }
+    }
+
+    async fn selection(&self, node_id: Option<u64>) -> Result<Selection, InputError> {
+        unsafe {
+            if let Some(id) = node_id {
+                let elem = self.element_for(id)?;
+                return read_selection(elem.as_CFTypeRef());
+            }
+            if AXIsProcessTrusted() == 0 {
+                return Err(InputError::PermissionDenied(
+                    "accessibility API disabled (grant permission)".into(),
+                ));
+            }
+            let (app, _, name) = self.resolve_target(None).map_err(InputError::NotFound)?;
+            let focused = copy_attr(app.as_CFTypeRef(), "AXFocusedUIElement").ok_or_else(|| {
+                InputError::Failed(format!("nothing has keyboard focus in '{name}'"))
+            })?;
+            read_selection(focused.as_CFTypeRef())
+        }
+    }
+
+    async fn select_range(
+        &self,
+        node_id: u64,
+        start: usize,
+        end: usize,
+    ) -> Result<Selection, InputError> {
+        // No await inside: the AX handles are not `Send`, and the run is short.
+        unsafe {
+            let elem = self.element_for(node_id)?;
+            let e = elem.as_CFTypeRef();
+            // Refuse a password field before reading its text.
+            if copy_attr_string(e, "AXSubrole").as_deref() == Some("AXSecureTextField") {
+                return Err(InputError::InvalidArgs(
+                    "this is a password field; its text is never read or selected".into(),
+                ));
+            }
+            let text = copy_attr_string(e, "AXValue")
+                .ok_or_else(|| InputError::Unsupported("the element has no text".into()))?;
+            let (location, length) = char_range_to_utf16(&text, start, end).ok_or_else(|| {
+                InputError::InvalidArgs(format!(
+                    "range {start}..{end} runs past the text, which is {} characters long",
+                    text.chars().count()
+                ))
+            })?;
+            if !is_settable(e, "AXSelectedTextRange") {
+                return Err(InputError::Unsupported(
+                    "this element does not let its selection be set (AXSelectedTextRange is read-only \
+                     here); select_text does not fall back to dragging the pointer"
+                        .into(),
+                ));
+            }
+            let range = CFRange {
+                location: location as isize,
+                length: length as isize,
+            };
+            let raw = AXValueCreate(KAXVALUE_CFRANGE, &range as *const CFRange as *const c_void);
+            if raw.is_null() {
+                return Err(InputError::Failed(
+                    "could not build the selection range".into(),
+                ));
+            }
+            // Create rule: the wrapper releases it.
+            let value = CFType::wrap_under_create_rule(raw);
+            let attr = CFString::new("AXSelectedTextRange");
+            ax_result(
+                AXUIElementSetAttributeValue(e, attr.as_concrete_TypeRef(), value.as_CFTypeRef()),
+                "select_text",
+            )?;
+            // An app may apply the range on its next run-loop turn.
+            let mut got = read_selection(e)?;
+            for _ in 0..5 {
+                if (got.start, got.end) == (start, end) {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(40));
+                got = read_selection(e)?;
+            }
+            Ok(got)
         }
     }
 

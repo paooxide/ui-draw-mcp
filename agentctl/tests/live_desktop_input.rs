@@ -600,3 +600,201 @@ async fn a_drag_path_selects_a_line_of_text_and_reports_its_waypoints() {
     );
     let _ = c.call("close_app", json!({ "app": APP })).await;
 }
+
+/// A new TextEdit document holding `text`, and the ref of its text area.
+/// `None` (after saying why) if TextEdit did not get there.
+async fn scratch_document(c: &InProcClient, text: &str) -> Option<String> {
+    c.ok("launch", json!({ "app": APP })).await;
+    if !settle_on_textedit(c).await || !guarded_key(c, "cmd+n").await {
+        return None;
+    }
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    let found = c
+        .ok(
+            "find_elements",
+            json!({ "app": APP, "role": "text field", "limit": 5 }),
+        )
+        .await;
+    let Some(area) = found["elements"].as_array().and_then(|e| e.first()) else {
+        eprintln!("skipping: no text area found ({})", found["hint"]);
+        let _ = c.call("close_app", json!({ "app": APP })).await;
+        return None;
+    };
+    let reff = area["ref"].as_str().unwrap().to_string();
+    c.ok("set_value", json!({ "ref": &reff, "text": text }))
+        .await;
+    Some(reff)
+}
+
+/// `select_text` sets the selection through the accessibility API, and what it
+/// reports is what a separate read of the element says, in characters whatever
+/// the platform counts in. The document holds a character outside the Basic
+/// Multilingual Plane (two UTF-16 units) and a combining accent (its own
+/// character) before most of the matches, so a unit mix-up lands on the wrong
+/// text and fails here. The pointer must not move.
+#[tokio::test(flavor = "multi_thread")]
+async fn textedit_select_text_selects_by_text_and_offsets_without_the_pointer() {
+    if !ready() {
+        return;
+    }
+    use mcp_input::InputBackend;
+    let c = client("live-select-text");
+    c.initialize().await;
+    // Characters: "alpha "=0..6 "beta"=6..10 " " 𝄞=11 " " "gamma"=13..18
+    // " " e=19 U+0301=20 "nd"=21..23 " " "beta"=24..28 (28 in all).
+    let text = "alpha beta \u{1D11E} gamma e\u{301}nd beta";
+    let Some(reff) = scratch_document(&c, text).await else {
+        return;
+    };
+    let backend = mcp_macos::MacosBackend::new();
+    let pointer_before = backend.pointer_position().await.ok().flatten();
+
+    let by_text = c
+        .ok("select_text", json!({ "ref": &reff, "text": "gamma" }))
+        .await;
+    assert_eq!(by_text["input"], json!("ax"), "{by_text}");
+    assert_eq!(
+        (by_text["start"].as_u64(), by_text["end"].as_u64()),
+        (Some(13), Some(18)),
+        "{by_text}"
+    );
+    assert_eq!(by_text["text"], json!("gamma"), "{by_text}");
+
+    // A separate call reads the element again: believe it, not the setter.
+    let read = c.ok("get_selection", json!({ "ref": &reff })).await;
+    assert_eq!(read["text"], json!("gamma"), "{read}");
+    assert_eq!(
+        (read["start"].as_u64(), read["end"].as_u64()),
+        (Some(13), Some(18))
+    );
+
+    let second = c
+        .ok(
+            "select_text",
+            json!({ "ref": &reff, "text": "beta", "occurrence": 2 }),
+        )
+        .await;
+    assert_eq!(
+        (second["start"].as_u64(), second["end"].as_u64()),
+        (Some(24), Some(28)),
+        "{second}"
+    );
+
+    let symbol = c
+        .ok(
+            "select_text",
+            json!({ "ref": &reff, "start": 11, "end": 12 }),
+        )
+        .await;
+    assert_eq!(symbol["text"], json!("\u{1D11E}"), "{symbol}");
+    assert_eq!(symbol["length"], json!(1), "one character, not two units");
+
+    let accent = c
+        .ok("select_text", json!({ "ref": &reff, "text": "e\u{301}nd" }))
+        .await;
+    assert_eq!(
+        (accent["start"].as_u64(), accent["end"].as_u64()),
+        (Some(19), Some(23)),
+        "{accent}"
+    );
+
+    let between = c
+        .ok(
+            "select_text",
+            json!({ "ref": &reff, "from_text": "alpha", "to_text": "beta" }),
+        )
+        .await;
+    assert_eq!(between["text"], json!("alpha beta"), "{between}");
+
+    let all = c
+        .ok("select_text", json!({ "ref": &reff, "all": true }))
+        .await;
+    assert_eq!(all["length"], json!(28), "{all}");
+    assert_eq!(all["text"], json!(text), "{all}");
+
+    let caret = c
+        .ok("select_text", json!({ "ref": &reff, "start": 3, "end": 3 }))
+        .await;
+    assert_eq!(caret["length"], json!(0), "{caret}");
+
+    // A range the text does not have is refused, and the selection stays.
+    let past = c
+        .call(
+            "select_text",
+            json!({ "ref": &reff, "start": 0, "end": 99 }),
+        )
+        .await;
+    assert!(!past.ok);
+    assert_eq!(past.error.unwrap().code, ErrorCode::InvalidArgs);
+    let missing = c
+        .call("select_text", json!({ "ref": &reff, "text": "mars" }))
+        .await;
+    assert!(!missing.ok);
+    let still = c.ok("get_selection", json!({ "ref": &reff })).await;
+    assert_eq!(still["length"], json!(0), "{still}");
+
+    // The focused element, with no target, is the same text area.
+    if focused_is_textedit() {
+        c.ok("select_text", json!({ "ref": &reff, "text": "alpha" }))
+            .await;
+        let focused = c.ok("get_selection", json!({})).await;
+        assert_eq!(focused["text"], json!("alpha"), "{focused}");
+    }
+
+    let pointer_after = backend.pointer_position().await.ok().flatten();
+    assert_eq!(
+        pointer_before, pointer_after,
+        "select_text reported the accessibility route but the pointer moved"
+    );
+    let _ = c.call("close_app", json!({ "app": APP })).await;
+}
+
+/// `ui_action` only says ok for what it did. An action the element does not
+/// offer is an error that lists the ones it does; one it does offer reports
+/// the route. TextEdit's text area has no AXIncrement.
+#[tokio::test(flavor = "multi_thread")]
+async fn textedit_ui_action_names_the_actions_an_element_lacks() {
+    if !ready() {
+        return;
+    }
+    let c = client("live-ax-ladder");
+    c.initialize().await;
+    let Some(reff) = scratch_document(&c, "ladder").await else {
+        return;
+    };
+
+    let step = c
+        .call("ui_action", json!({ "ref": &reff, "action": "increment" }))
+        .await;
+    assert!(!step.ok, "a text area cannot be incremented: {step:?}");
+    let err = step.error.unwrap();
+    assert_eq!(err.code, ErrorCode::UnsupportedOs, "{}", err.message);
+    assert!(
+        err.message.contains("does not offer AXIncrement") && err.message.contains("it offers"),
+        "{}",
+        err.message
+    );
+
+    // Whether the text area offers a context menu is the app's to say; either
+    // answer must be honest: an ok carries the route, a refusal names actions.
+    let menu = c
+        .call("ui_action", json!({ "ref": &reff, "action": "show_menu" }))
+        .await;
+    if menu.ok {
+        assert_eq!(menu.data.unwrap()["input"], json!("ax"));
+        // The menu is open and would swallow the next call.
+        if focused_is_textedit() {
+            let _ = c
+                .call("keyboard_shortcut", json!({ "combo": "Escape" }))
+                .await;
+        }
+    } else {
+        assert!(menu.error.unwrap().message.contains("it offers"));
+    }
+
+    let focus = c
+        .ok("ui_action", json!({ "ref": &reff, "action": "focus" }))
+        .await;
+    assert_eq!(focus["input"], json!("ax"), "{focus}");
+    let _ = c.call("close_app", json!({ "app": APP })).await;
+}

@@ -434,8 +434,8 @@ mod tests {
             _: u64,
             _: SemanticAction,
             _: Option<&str>,
-        ) -> Result<(), InputError> {
-            Ok(())
+        ) -> Result<crate::Route, InputError> {
+            Ok(crate::Route::Ax)
         }
         async fn set_value(&self, _: u64, _: &str) -> Result<(), InputError> {
             Ok(())

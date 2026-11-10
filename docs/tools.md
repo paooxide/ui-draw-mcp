@@ -8,7 +8,7 @@ Tiers gate what an agent may call: `read` and `standard` tools are available ins
 enabled category, while a `dangerous` tool additionally has to be named in
 `policy.enable`. Enabling a category never enables its dangerous tools.
 
-**124 tools across 12 categories.**
+**126 tools across 12 categories.**
 
 | Tool | Category | Tier | Summary |
 |---|---|---|---|
@@ -23,14 +23,16 @@ enabled category, while a `dangerous` tool additionally has to be named in
 | [`clipboard_read`](#clipboard-read) | input | standard | Read the clipboard. |
 | [`clipboard_write`](#clipboard-write) | input | standard | Write the clipboard. |
 | [`drag_drop`](#drag-drop) | input | standard | Press-move-release drag from one point/element to another. |
+| [`get_selection`](#get-selection) | input | standard | Read the text selected in an element (ref or name), or in the focused element when none is given, without changing it. |
 | [`hover`](#hover) | input | standard | Move the pointer over an element (ref or name) or point (reveals tooltips/hover menus). |
 | [`input_showcase`](#input-showcase) | input | standard | Glide the real mouse pointer along a smooth Bezier curve to each point instead of jumping there, for demos, screencasts and presentations. |
 | [`keyboard_shortcut`](#keyboard-shortcut) | input | standard | Press a key or chord, e.g. |
 | [`keyboard_type`](#keyboard-type) | input | standard | Type Unicode text into the focused window. |
 | [`mouse_action`](#mouse-action) | input | standard | Coordinate pointer action. |
 | [`scroll`](#scroll) | input | standard | Scroll at an element (ref or name) or a point. |
+| [`select_text`](#select-text) | input | standard | Select text in a text field or text area by ref or name, through the accessibility API (no drag, no focus needed), and read the selection back. |
 | [`set_value`](#set-value) | input | standard | Set the value of a text element by ref or name (accessibility SetValue). |
-| [`ui_action`](#ui-action) | input | standard | Perform a semantic action on an element by ref or name (accessibility action, no cursor). |
+| [`ui_action`](#ui-action) | input | standard | Perform a semantic action on an element by ref or name (accessibility action, no cursor, app need not be frontmost). |
 | [`ui_fill_form`](#ui-fill-form) | input | standard | Fill multiple native UI fields (text fields, checkboxes, switches, popups, radios) in one call, and optionally submit and verify postconditions. |
 | [`close_app`](#close-app) | window | standard | Quit an application by name. |
 | [`control_window`](#control-window) | window | standard | Focus/move/resize/minimize/maximize/restore/close a window. |
@@ -324,6 +326,22 @@ Each end is `from`/`to` as an object (`{ref}`, `{name}` with an optional `role`,
 | `to_x` | number |  |  |
 | `to_y` | number |  |  |
 
+### get-selection
+
+`get_selection` · standard tier
+
+Read the text selected in an element (ref or name), or in the focused element when none is given, without changing it.
+
+Target an element by `ref` (`@e12`; `e12` and `12` also work) or by `name`, with an optional `role` to narrow it. A name is matched against the latest snapshot (a fresh one is taken if there is none), ignoring case and extra whitespace: exact name first, then prefix, then substring; the name and the current value both count; controls come before other elements; ties go to document order. The result reports the `ref` it resolved to and, for a name, `matches`: how many elements matched as well as the one used. A name that matches nothing is NOT_FOUND, with up to five elements that share a word with it.
+
+Returns `start`, `end` (character offsets, as in `select_text`), `length`, `text` (cut at 2000 characters, with `truncated`) and `role`; a caret with nothing selected is `length: 0`. Without a target it reads the focused element of the app being driven (macOS only; on Linux give a ref). Password fields are refused.
+
+| Argument | Type | Required | Description |
+|---|---|---|---|
+| `name` | string |  | element name or label, instead of ref; best match wins |
+| `ref` | string |  | element ref @eN |
+| `role` | string |  | narrow a name by role, e.g. button, popup button, text field |
+
 ### hover
 
 `hover` · standard tier
@@ -462,6 +480,40 @@ With a target, `x` and `y` are offsets from the element's top-left (default its 
 | `x` | number |  | screen x, or offset from the element's left |
 | `y` | number |  | screen y, or offset from the element's top |
 
+### select-text
+
+`select_text` · standard tier
+
+Select text in a text field or text area by ref or name, through the accessibility API (no drag, no focus needed), and read the selection back. Give one of: all; start and end (character offsets); text (with occurrence); from_text and to_text.
+
+Target an element by `ref` (`@e12`; `e12` and `12` also work) or by `name`, with an optional `role` to narrow it. A name is matched against the latest snapshot (a fresh one is taken if there is none), ignoring case and extra whitespace: exact name first, then prefix, then substring; the name and the current value both count; controls come before other elements; ties go to document order. The result reports the `ref` it resolved to and, for a name, `matches`: how many elements matched as well as the one used. A name that matches nothing is NOT_FOUND, with up to five elements that share a word with it.
+
+Offsets count characters (Unicode scalar values) from 0 with `end` exclusive, on every platform: a combining accent is its own character, and a character outside the Basic Multilingual Plane is one, not two. `text` matches exactly (case and accents count), non-overlapping, and `occurrence` picks the Nth. `from_text`/`to_text` select from the start of the first `from_text` through the end of the first `to_text` that follows it. The element's text is read first and the request is resolved against it.
+
+The result carries `start`, `end`, `length` and `text` as the element reports them after the change (`text` is cut at 2000 characters, with `truncated`), and `input: ax`. If the element reports a different range than was asked for (some editors snap to words or ignore the request), the call fails and says what it reports. macOS sets `AXSelectedTextRange`; an element where that is not settable is an `UNSUPPORTED_OS` error. There is no pointer fallback: dragging to select is not attempted, so use `drag_drop` or shift-click with `mouse_action` for those. Linux uses the AT-SPI Text interface (`set_selection`). Password fields are refused. Which apps honour the selection has not been verified beyond TextEdit.
+
+| Argument | Type | Required | Description |
+|---|---|---|---|
+| `all` | boolean |  | select everything |
+| `end` | integer |  | offset after the last character; equal to start places the caret |
+| `expect` | object |  | optional: wait for this to become true after the action, and return what changed |
+| `expect.app` | string |  | which application to observe |
+| `expect.element` | string |  | synonym for text |
+| `expect.focused` | string |  | wait until an element matching this text has focus |
+| `expect.gone` | string |  | wait until this text is no longer present |
+| `expect.judge` | string |  | wait until this plain-language claim about the UI is judged true (needs the judge enabled); the probability is reported |
+| `expect.text` | string |  | wait until this text appears in the UI |
+| `expect.timeout_ms` | integer |  | give up after this long (max 30000) |
+| `expect.window` | string |  | wait until a window with this title exists |
+| `from_text` | string |  | select from the start of this text... |
+| `name` | string |  | element name or label, instead of ref; best match wins |
+| `occurrence` | integer |  | which match of text, from 1 (default 1) |
+| `ref` | string |  | element ref @eN |
+| `role` | string |  | narrow a name by role, e.g. button, popup button, text field |
+| `start` | integer |  | first character offset, from 0 |
+| `text` | string |  | select this text |
+| `to_text` | string |  | ...to the end of the next match of this |
+
 ### set-value
 
 `set_value` · standard tier
@@ -493,7 +545,7 @@ The element is read before and after the write. The result carries `value_after`
 
 `ui_action` · standard tier
 
-Perform a semantic action on an element by ref or name (accessibility action, no cursor). select with option chooses a popup or combo box entry by its text.
+Perform a semantic action on an element by ref or name (accessibility action, no cursor, app need not be frontmost). select with option chooses a popup or combo box entry by its text. An action the element does not offer is an error naming the ones it does.
 
 Target an element by `ref` (`@e12`; `e12` and `12` also work) or by `name`, with an optional `role` to narrow it. A name is matched against the latest snapshot (a fresh one is taken if there is none), ignoring case and extra whitespace: exact name first, then prefix, then substring; the name and the current value both count; controls come before other elements; ties go to document order. The result reports the `ref` it resolved to and, for a name, `matches`: how many elements matched as well as the one used. A name that matches nothing is NOT_FOUND, with up to five elements that share a word with it.
 
@@ -503,9 +555,13 @@ Target an element by `ref` (`@e12`; `e12` and `12` also work) or by `name`, with
 
 macOS opens a popup button with the accessibility press and presses its menu item; a combo box takes the text. Linux invokes the combo box's menu or list item through AT-SPI.
 
+`show_menu` opens the element's context menu (AXShowMenu) without a right click, `increment` and `decrement` take one step on a slider, stepper or scroll bar and report `value_after` and `changed` (`changed: false` means the control is at its limit or ignored the step), `pick` picks the element in a list or picker (AXPick), and `scroll_to_visible` is accepted for `scroll_into_view`. On macOS these four are checked against the element's own action list first, so an element that lacks one gets an error listing what it does support, never an `ok`. Linux has no context-menu action: `show_menu` looks for a menu or popup action on the element and otherwise says what it has; `increment` and `decrement` move an AT-SPI Value by its minimum increment, clamped to its range.
+
+Every result carries `input`: `ax` when the accessibility API acted (no pointer, the app can stay in the background) or `hid` when synthetic system input was needed (the real cursor moved). `right_click` and `double_click` are an accessibility press on macOS, which has no distinct double or secondary press; on Linux `right_click` clicks at the element's centre, so it is `hid`. `input` is absent when nothing needed doing (checking a checked box).
+
 | Argument | Type | Required | Description |
 |---|---|---|---|
-| `action` | one of: click, double_click, right_click, focus, toggle, check, uncheck, expand, collapse, select, scroll_into_view | yes |  |
+| `action` | one of: click, double_click, right_click, focus, toggle, check, uncheck, expand, collapse, select, scroll_into_view, show_menu, increment, decrement, pick | yes |  |
 | `expect` | object |  | optional: wait for this to become true after the action, and return what changed |
 | `expect.app` | string |  | which application to observe |
 | `expect.element` | string |  | synonym for text |

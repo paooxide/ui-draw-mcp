@@ -8,6 +8,44 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- **`ui_action` gains `show_menu`, `increment`, `decrement` and `pick`; `scroll_to_visible` is accepted for
+  `scroll_into_view`.** They act through the accessibility API on the element itself (AXShowMenu, AXIncrement,
+  AXDecrement, AXPick), so they need neither the pointer nor the app in front. On macOS the element's own
+  action list is read first, and one that lacks the action is an `UNSUPPORTED_OS` error naming what it does
+  offer (`'Volume' does not offer AXPick; it offers AXPress (click), AXIncrement (increment)`), never an `ok`.
+  `increment` and `decrement` read the value before and after and report `value_after` and `changed`
+  (`changed: false` is a control at its limit or one that ignored the step; `verified: false` is a control
+  whose value cannot be read). `show_menu` and `pick` have no read-back. On Linux `increment`/`decrement` move
+  an AT-SPI Value by its minimum increment, clamped to its range; `show_menu` and `pick` look for an action of
+  that name on the element (`menu`, `popup`, `pick`...) and otherwise name the actions it has. Before, a
+  context menu needed a right click with the real pointer, and a slider needed a drag. `double_click` and
+  `right_click` remain an accessibility press on macOS, which has no distinct press for either.
+- **Every input result says which route acted: `input` is `ax` or `hid`.** `ax` is the accessibility API, with
+  no pointer movement and the app free to stay in the background; `hid` is synthetic system input that moves
+  the real cursor or types into the frontmost app. It is reported by `ui_action`, `set_value`,
+  `ui_fill_form` (per field), `mouse_action`, `scroll`, `hover`, `drag_drop`, `keyboard_type` and
+  `keyboard_shortcut` (a press), taken from the code path that ran rather than from the request: the backend
+  returns the route of `ui_action`. `keyboard_type` on a ref focuses it through the accessibility API but
+  types with system key events, so it is `hid`. On Linux `right_click` clicks at the element's centre through
+  the portal and is `hid`. The field is absent when nothing needed doing (checking a checked box), and on
+  `keyboard_shortcut` `down` and `up`. Before, a result could not tell an agent whether the user's cursor had
+  just been taken.
+- **`select_text` and `get_selection`.** `select_text` selects text in a text field or text area by `ref` or
+  `name`: `all`, `start` and `end` (character offsets, `end` exclusive; equal places the caret), `text` (the
+  `occurrence`-th match, from 1), or `from_text` and `to_text` (through the end of the first `to_text` after
+  the first `from_text`). The element's text is read first and the request resolved against it. Matching is
+  exact, case and accents included, and non-overlapping. On macOS it sets `AXSelectedTextRange`, converting
+  characters to UTF-16 units (a character outside the Basic Multilingual Plane is two, a combining accent is
+  one of its own), then reads back the range and `AXSelectedText`; an element that reports a different range
+  than was asked for fails the call and says what it reports. An element whose selection is not settable is an
+  `UNSUPPORTED_OS` error, and there is no pointer fallback: it never drags to select. On Linux it uses the AT-SPI
+  Text interface (`set_selection`, `add_selection`; a caret through `set_caret_offset`). `get_selection` reads
+  the selection of a ref or name, or of the focused element of the driven app when none is given (macOS only;
+  on Linux give a ref), without changing it. Both report `start`, `end`, `length`, `text` (cut at 2000
+  characters, with `truncated`), `role` and `input: ax`, refuse password fields, and are standard tier like
+  `set_value`. Before, selecting a span meant a pointer drag or shift-arrow chords with no way to confirm
+  the result. A live test against TextEdit exists (gated behind `AGENTCTL_LIVE_GUI=1`); which other
+  apps honour a set selection is not verified. The Linux code type-checks but has not been run.
 - **`drag_drop` takes `path`.** Up to 200 waypoints `{x, y}` (the argument and limit of `browser_act drag`) that
   the drag passes through in order, releasing at the last, with the moves (`steps`, 2 to 100, default 20) spread
   over the segments by length and at least one landing on every waypoint. Give no `to` with a path. Waypoints

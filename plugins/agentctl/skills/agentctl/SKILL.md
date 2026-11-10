@@ -58,8 +58,10 @@ ones.
    and actions target it rather than whatever happens to be in front.
 2. `find_elements` for the control, or `get_ui_tree` with `skeleton: true` if you need the layout.
 3. Act semantically: `ui_action` (click, check, select with `option`, expand...) on a `ref`, `set_value`
-   for text fields, `ui_fill_form` for several fields at once, `menu_invoke` for menu commands. These
-   work without moving the cursor and, on Linux, on windows that are not focused.
+   for text fields, `select_text` to select text, `ui_fill_form` for several fields at once,
+   `menu_invoke` for menu commands. These work without moving the cursor and, on Linux, on windows that
+   are not focused. Each input result's `input` says which route acted: `ax` (accessibility, background-
+   safe) or `hid` (synthetic input, moved the real cursor or needs the app in front).
 4. Verify in the same call with `expect` (`text`, `gone`, `window`, `focused`) instead of a separate
    observation. Without `expect`, call `wait_for` before observing: input is asynchronous, and observing
    straight after acting reads the previous state.
