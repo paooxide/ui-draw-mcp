@@ -107,6 +107,22 @@ pub(crate) fn capture_obstacle(
     }
 }
 
+/// The cover warning an image earns given how it was made. ScreenCaptureKit
+/// renders the window itself, so what covers it is not in the picture and
+/// there is nothing to warn about; the `screencapture` rectangle grab (and
+/// OCR, which reads the screen) shows the covering windows' pixels.
+pub(crate) fn cover_warning_for(
+    via: &str,
+    app: &str,
+    id: u32,
+    covered_by: &[(String, f64)],
+) -> Option<(Vec<mcp_vision::Covering>, String)> {
+    if via == "screencapturekit" {
+        return None;
+    }
+    cover_warning(app, id, covered_by)
+}
+
 /// The warning for an image of the screen area of a window that other
 /// applications cover: who covers it and how much, and that those pixels are
 /// theirs. `None` below [`MAX_COVERED_SHARE`], which is a shadow or a border.
@@ -265,6 +281,19 @@ mod tests {
             "{m}"
         );
         assert!(m.contains("not this window's"), "{m}");
+    }
+
+    /// The pixels of a ScreenCaptureKit image are the window's own, so a
+    /// warning there would tell the agent to distrust a correct picture; the
+    /// rectangle grab's would be missing the one thing that makes it unsafe.
+    #[test]
+    fn only_a_screen_grab_carries_the_cover_warning() {
+        let by = [("Terminal".to_string(), 0.8)];
+        assert_eq!(cover_warning_for("screencapturekit", "Notes", 0, &by), None);
+        let (owners, _) = cover_warning_for("screencapture", "Notes", 0, &by).unwrap();
+        assert_eq!(owners[0].app, "Terminal");
+        // Nothing covering: no warning on any route.
+        assert_eq!(cover_warning_for("screencapture", "Notes", 0, &[]), None);
     }
 
     #[test]

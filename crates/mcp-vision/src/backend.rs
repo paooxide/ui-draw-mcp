@@ -88,6 +88,12 @@ pub struct CaptureResult {
     pub signature: Vec<u8>,
     /// Set when the image is of one window.
     pub window: Option<WindowSubject>,
+    /// Which mechanism produced the pixels (`"screencapturekit"`,
+    /// `"screencapture"`, `"xdg-desktop-portal"`). Set from the code path that
+    /// actually ran, never from what was attempted: a capture that fell back
+    /// must say so, because the paths differ in what they can see (a covered
+    /// window, another Space).
+    pub via: &'static str,
 }
 
 impl CaptureResult {
@@ -278,6 +284,7 @@ mod tests {
             original: (w, h),
             signature: Vec::new(),
             window: None,
+            via: "test",
         }
     }
 

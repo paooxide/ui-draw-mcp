@@ -129,7 +129,10 @@ cargo binstall --git https://github.com/paooxide/ui-draw-mcp agentctl
 **macOS permissions.** Grant **Accessibility** (and **Screen Recording** if you want captures) to the
 application that *launches* `agentctl` (your terminal, Claude Desktop, Cursor), not to `agentctl` itself.
 macOS attributes a child process's permissions to whoever spawned it. `agentctl doctor` reports what is
-granted; [`docs/clients.md`](docs/clients.md) explains the rest.
+granted; [`docs/clients.md`](docs/clients.md) explains the rest. The macOS binary needs macOS 12.3 or
+later (it links ScreenCaptureKit). `capture_window` reads a window through ScreenCaptureKit on macOS 14 or
+later, so a covered window comes back as itself; on 12.3 to 13, or where ScreenCaptureKit cannot capture a
+window, it falls back to `screencapture`, which shows whatever covers the window and says so in a `warning`.
 
 **Linux.** Nothing to grant up front. Perception reads the AT-SPI accessibility bus, which every graphical
 session has. The first synthetic keystroke or click opens a remote-desktop portal session, and the desktop

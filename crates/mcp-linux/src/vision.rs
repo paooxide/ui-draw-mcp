@@ -279,6 +279,7 @@ fn deliver(
         original,
         signature: img.signature(),
         window: None,
+        via: "xdg-desktop-portal",
     })
 }
 

@@ -1444,6 +1444,8 @@ pub(crate) struct CaptureTarget {
     pub target: Resolved,
     pub info: WindowInfo,
     pub bounds: Rect,
+    /// The window server's id for it (`CGWindowID`).
+    pub number: i64,
     pub covered: Vec<(String, f64)>,
 }
 
@@ -1714,6 +1716,7 @@ impl MacosBackend {
             target,
             info,
             bounds,
+            number,
             covered,
         })
     }

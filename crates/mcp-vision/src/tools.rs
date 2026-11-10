@@ -198,6 +198,7 @@ impl VisionModule {
         data["width"] = json!(cap.width);
         data["height"] = json!(cap.height);
         data["bytes"] = json!(approx_bytes);
+        data["via"] = json!(cap.via);
         // Image pixels are not screen coordinates: the capture is Retina-scaled
         // and may have been downscaled. Publish the mapping so a point read off
         // the image can be converted for mouse_action/scroll instead of being
@@ -689,10 +690,12 @@ impl ToolModule for VisionModule {
                  window_id is the window's id in list_windows for 'app' (else the pinned app, \
                  else the frontmost one); the result's window names the app it was read \
                  against. On macOS a window that is minimized or on another Space is \
-                 refused (nothing is drawn); one covered by another app's window is \
-                 captured with a top-level warning and covered_by [{app, fraction}] \
-                 saying whose pixels are in the image, so do not read those parts as \
-                 this window's; elsewhere a covered window shows what covers \
+                 refused (nothing is drawn). Otherwise it is read through ScreenCaptureKit \
+                 where that works (via: screencapturekit), the window's own pixels even if \
+                 another app's window covers it; if not, the screen area is grabbed (via: \
+                 screencapture) and a window covered by another app comes back with a \
+                 top-level warning and covered_by [{app, fraction}] saying whose pixels are \
+                 in the image, which are not the window's. Elsewhere a covered window shows what covers \
                  it. grid=true labels the image in screen points (the \
                  window's own position included), what mouse_action takes.",
                 json!({
@@ -915,6 +918,7 @@ mod tests {
                 original: (1000, 750),
                 signature,
                 window: None,
+                via: "test",
             })
         }
         async fn capture_window(
@@ -1033,6 +1037,7 @@ mod grid_find_tests {
             original: (w, h),
             signature: Vec::new(),
             window: None,
+            via: "test",
         }
     }
 
@@ -1204,6 +1209,7 @@ mod window_target_tests {
                 original: (400, 300),
                 signature: vec![id as u8; 64],
                 window: Some(subject(app)),
+                via: "test",
             })
         }
         async fn ocr(&self, target: OcrTarget, _: &OcrOpts) -> Result<OcrResult, VisionError> {
@@ -1348,6 +1354,7 @@ mod window_target_tests {
                         covered_by: Vec::new(),
                         warning: None,
                     }),
+                    via: "test",
                 })
             }
             fn platform(&self) -> &'static str {

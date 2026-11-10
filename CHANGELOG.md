@@ -71,6 +71,33 @@ All notable changes to this project are documented here. The format follows
   because they are known to raise it. What `never` does not cover: an app raising itself in answer to an
   accessibility action, a launched app taking focus anyway, a headed browser driven by `browser_*` tools
   (the engine brings tabs forward), and anything run through `exec` or `pty_*`. See `docs/threat-model.md`.
+- **`capture_window` on macOS reads the window itself through ScreenCaptureKit, so a window with other windows
+  on top of it comes back as itself.** It used to run `screencapture -R` on the window's rectangle, which
+  photographs whatever is on screen there, and spawned a process and wrote a temp PNG each time. It now asks
+  ScreenCaptureKit (`SCContentFilter(desktopIndependentWindow:)` + `SCScreenshotManager.captureImage`) for
+  that one window, found by the window server's id (`CGWindowID`) of the window the `app` and `window_id`
+  resolved to (and checked against the owning process), never by frame or by the frontmost app, and encodes
+  the PNG in memory. The result has the same shape and coordinate meaning as before (`width`/`height` are
+  pixels after the `max_edge` downscale, `downscaled_from` is the native pixel size, `coordinate_mapping` is
+  the window's rectangle in points), so `grid`, `ocr_region` coordinates and click mapping are unchanged.
+  Every capture result now carries `via`: `screencapturekit`, `screencapture` or (Linux) `xdg-desktop-portal`,
+  set from the path that ran. The covered-window `warning` and `covered_by` are given only when the image
+  came from the screen (`via: "screencapture"`); a `screencapturekit` image is the window's own pixels and
+  carries none. `ocr_region` always reads the screen, so it always carries them. Limits: the ScreenCaptureKit
+  path needs macOS 14 (`SCScreenshotManager`) and Screen Recording; without the permission it returns
+  `PERM_DENIED` (no fallback, the old path fails the same way). Where ScreenCaptureKit is missing (macOS 12.3
+  to 13), times out (10 s), cannot find the window or cannot start a stream for it (error -3811, seen on
+  some windows that are on screen), it falls back to `screencapture` and says so in `via`. A window that
+  renders no pixels is an error, never a blank image. `capture_screen` and `ocr_region` still use
+  `screencapture`. The binary now links ScreenCaptureKit, so it needs macOS 12.3 or later to start. Verified
+  on the development Mac (macOS 27, display awake): ScreenCaptureKit returned real images at the window's
+  size times the display scale for Finder, Notes, System Settings and Activity Monitor windows that were
+  covered 99 to 100% by other windows, and for some Terminal windows; a Finder capture showed Finder's
+  content with none of what covered it. It could not start a stream (-3811) for other Terminal windows and a
+  Chrome window, which fell back to `screencapture`; why those windows differ is not known. Not verified:
+  ScreenCaptureKit on macOS 14 or earlier, and Screen Recording being refused. Adds `objc2-screen-capture-kit`,
+  `objc2-core-graphics`, `objc2-image-io` and `objc2-io-surface` (each `Zlib OR Apache-2.0 OR MIT`) on macOS
+  only.
 
 - **`browser_act` and `browser_fill_form` say when an action left a dialog or layer in the way.** In a recorded
   MiniWoB++ `login-user-popup` run, focusing the username raised a popup (OK / Cancel) over the form and
