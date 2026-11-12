@@ -12,6 +12,7 @@ mod backend;
 mod config;
 pub mod find;
 pub mod grid;
+pub mod marks;
 #[cfg(feature = "ocr")]
 pub mod ocr;
 mod tools;

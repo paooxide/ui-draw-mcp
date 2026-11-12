@@ -436,6 +436,7 @@ impl VisionBackend for LinuxBackend {
             origin,
             screen_size: screen,
             window,
+            via: "xdg-desktop-portal",
         })
     }
 }

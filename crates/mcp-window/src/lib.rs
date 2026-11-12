@@ -4,6 +4,7 @@
 
 mod backend;
 mod foreground;
+mod observe;
 mod tools;
 mod wait;
 
@@ -13,6 +14,10 @@ pub use backend::{
     WindowInfo, WindowState,
 };
 pub use foreground::{tool_refusal, ForegroundWindow};
+pub use observe::{
+    assess_sparsity, collect as collect_observed, parse_args as parse_observe_args, wants_ocr,
+    ObserveArgs, ObserveModule, OcrMode, SparseItem, SparseReason, Sparsity, SPARSITY_RULE,
+};
 pub use tools::WindowModule;
 pub use wait::{
     default_wait_timeout, parse_wait_spec, poll_until, text_condition_holds, wait_loop,

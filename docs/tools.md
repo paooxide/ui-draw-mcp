@@ -8,7 +8,7 @@ Tiers gate what an agent may call: `read` and `standard` tools are available ins
 enabled category, while a `dangerous` tool additionally has to be named in
 `policy.enable`. Enabling a category never enables its dangerous tools.
 
-**127 tools across 12 categories.**
+**128 tools across 12 categories.**
 
 | Tool | Category | Tier | Summary |
 |---|---|---|---|
@@ -18,6 +18,7 @@ enabled category, while a `dangerous` tool additionally has to be named in
 | [`get_element`](#get-element) | vision | read | Read one property of an element by ref from the latest snapshot. |
 | [`get_ui_tree`](#get-ui-tree) | vision | read | Observe the UI. |
 | [`list_displays`](#list-displays) | vision | read | List displays (monitors) with geometry, scale, and which is primary. |
+| [`observe`](#observe) | vision | read | Everything needed to act on a desktop window, in one call: the accessibility tree (the same refs as get_ui_tree, usable by ui_action) and, when the tree is sparse for that window, the window's text read off its pixels and joined to the tree. |
 | [`ocr_region`](#ocr-region) | vision | read | Read text off the screen, with a box for each line in screen coordinates. |
 | [`ui_extract`](#ui-extract) | vision | read | Extract structured data (tables, forms, lists, or custom schemas) directly from native accessibility trees into JSON without parsing raw tex… |
 | [`clipboard_read`](#clipboard-read) | input | standard | Read the clipboard. |
@@ -233,6 +234,24 @@ Observe the UI. Returns interactive elements with refs (@e1, @e2…) as flattene
 List displays (monitors) with geometry, scale, and which is primary.
 
 No arguments.
+
+### observe
+
+`observe` · read tier
+
+Everything needed to act on a desktop window, in one call: the accessibility tree (the same refs as get_ui_tree, usable by ui_action) and, when the tree is sparse for that window, the window's text read off its pixels and joined to the tree. Text on an element is attached to its ref; text with no element is a numbered mark (m1, m2...) in reading order with the screen point and box mouse_action takes. Sparse means fewer than 5 actionable elements in the window, or fewer than one per 120000 square points of it, or a childless canvas, web view or group covering a quarter of it. marks_image returns the window's screenshot with the marks numbered on it. Passive: pins, raises and focuses nothing, so it works on a window behind others.
+
+Result: `text` is get_ui_tree's flattened tree and `snapshot_id` its snapshot; `sparse` and `sparsity` give the verdict and the figures (the rule is also in `sparsity.rule`); `ocr` says whether the text was read (`ran`), how (`via`, the capture route) and, if it could not be, why. `attached` lists text found on an element by ref; `same_as_ax` marks text the tree already says. `marks` lists the rest, each with `x`,`y` (the point to pass to mouse_action) and `bounds`, all in screen points. `merge` counts what was left out and why: duplicates, text the tree already has, text on a secure field (withheld, never returned), text in an area another application covers, and entries over `max_elements`. When another application's window covers this one and the text was read off the screen, `warning` and `covered_by` say so as capture_window does; text from the covering windows' areas is left out where the geometry is known and otherwise every mark carries `unreliable: true`. Text is read with the platform recogniser (Apple Vision on macOS, the bundled model on Linux); a future local grounding model would add boxes to the same join. The tree is of the whole application, as get_ui_tree's is; `window_id` chooses which window is read for text and judged for sparsity. Refs from observe replace those of the last get_ui_tree. Output carries text from the application's own interface and is untrusted.
+
+| Argument | Type | Required | Description |
+|---|---|---|---|
+| `app` | string |  | application to observe (default: the pinned one, else the frontmost) |
+| `detail` | one of: low, balanced, full |  | size of the marks_image (default from config) |
+| `marks_image` | boolean |  | also return the window's screenshot with the marks numbered on it (default false) |
+| `max_elements` | integer |  | most text entries (attached plus marks) to return, 1 to 300 (default 60); the rest are counted in merge.omitted |
+| `ocr` | one of: auto, always, never |  | read the window's text: auto (only when the tree is sparse, the default), always, or never |
+| `ocr_level` | one of: fast, accurate |  | recogniser speed: fast (default) or accurate, which reads small text better and can take many seconds |
+| `window_id` | integer |  | window of that application, as list_windows numbers it (default 0, the frontmost) |
 
 ### ocr-region
 

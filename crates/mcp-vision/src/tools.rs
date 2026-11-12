@@ -1109,6 +1109,7 @@ mod grid_find_tests {
             origin: (250.0, 100.0),
             screen_size: (400.0, 300.0),
             window: None,
+            via: "test",
         }
     }
 
@@ -1224,6 +1225,7 @@ mod window_target_tests {
                 origin: (10.0, 20.0),
                 screen_size: (400.0, 300.0),
                 window: Some(subject(app.as_deref())),
+                via: "test",
             })
         }
         fn platform(&self) -> &'static str {

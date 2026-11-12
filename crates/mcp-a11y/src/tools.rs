@@ -68,6 +68,7 @@ impl A11yModule {
                 .map(|n| n as usize),
             surface: str_arg(args, "surface"),
             passive: false,
+            without_pin: false,
         };
 
         let raw = match self.backend.snapshot(&req).await {
@@ -193,6 +194,7 @@ impl A11yModule {
             max_depth: None,
             surface: str_arg(args, "surface"),
             passive: false,
+            without_pin: false,
         };
         let raw = match self.backend.snapshot(&req).await {
             Ok(r) => r,
@@ -381,6 +383,7 @@ impl A11yModule {
             max_depth: None,
             surface: str_arg(args, "surface"),
             passive: false,
+            without_pin: false,
         };
 
         let raw = match self.backend.snapshot(&req).await {

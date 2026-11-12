@@ -11,6 +11,8 @@ publish = false
 mcp-types = { path = "../mcp-types" }
 mcp-judge = { path = "../mcp-judge" }
 mcp-a11y = { path = "../mcp-a11y" }
+# `observe` joins an accessibility snapshot with a capture and OCR of the window.
+mcp-vision = { path = "../mcp-vision" }
 serde.workspace = true
 serde_json.workspace = true
 async-trait.workspace = true

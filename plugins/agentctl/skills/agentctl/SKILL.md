@@ -45,6 +45,7 @@ Cheapest first:
 | The shape of a busy app | `get_ui_tree` with `skeleton: true` | then `root: "@eN"` to drill into one container |
 | What changed since last time | `get_ui_tree` with `since: <snapshot_id>` | costs only the delta |
 | A page in the browser | `browser_snapshot` | then `diff: true` on later calls |
+| A desktop window, tree and text in one call | `observe` | the tree with refs, plus, when the tree is sparse, the window's text as attached text or numbered marks (`m1`...) to click with `mouse_action`; passive |
 | A desktop canvas, game or app with no tree | `ocr_region` | returns a clickable box per line of text |
 | Text drawn in a web page (canvas, image UI) | `browser_screenshot` with `find: "text"` | ranked matches with viewport x,y for `browser_act`; `ocr: true` lists every line; no image unless `image: true` |
 | Pixels, as a last resort | `capture_screen` / `browser_screenshot` | image tokens are expensive |

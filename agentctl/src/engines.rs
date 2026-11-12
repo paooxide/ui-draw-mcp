@@ -397,6 +397,18 @@ pub fn build_stack(cfg: &PolicyConfig) -> (Vec<Arc<dyn ToolModule>>, Wiring) {
         }
         let vision = VisionModule::new(backend.clone(), engines.vision)
             .with_allowed_apps(allowed_apps.clone());
+        // One call that reads a window's tree and, when the tree is sparse, its
+        // text: it shares the refs arena with get_ui_tree and holds `app` to the
+        // same allowlist the vision tools do.
+        let observe = mcp_window::ObserveModule::new(
+            backend.clone(),
+            a11y.arena(),
+            window_backend.clone(),
+            backend.clone(),
+            engines.vision,
+            12_000,
+        )
+        .with_allowed_apps(allowed_apps.clone());
         let window = WindowModule::new(window_backend, backend.clone(), allowed_apps)
             .with_judge(judge.clone())
             .with_foreground(cfg.foreground)
@@ -417,6 +429,7 @@ pub fn build_stack(cfg: &PolicyConfig) -> (Vec<Arc<dyn ToolModule>>, Wiring) {
         modules.push(input);
         modules.push(Arc::new(vision));
         modules.push(Arc::new(window));
+        modules.push(Arc::new(observe));
         // `play_audio` is bounded by the same roots as the filesystem engine:
         // an agent able to name any path could use the speakers to read out a
         // file it was never allowed to open.
@@ -496,6 +509,18 @@ pub fn build_stack(cfg: &PolicyConfig) -> (Vec<Arc<dyn ToolModule>>, Wiring) {
         }
         let vision = VisionModule::new(backend.clone(), engines.vision)
             .with_allowed_apps(allowed_apps.clone());
+        // One call that reads a window's tree and, when the tree is sparse, its
+        // text: it shares the refs arena with get_ui_tree and holds `app` to the
+        // same allowlist the vision tools do.
+        let observe = mcp_window::ObserveModule::new(
+            backend.clone(),
+            a11y.arena(),
+            window_backend.clone(),
+            backend.clone(),
+            engines.vision,
+            12_000,
+        )
+        .with_allowed_apps(allowed_apps.clone());
         let window = WindowModule::new(window_backend, backend.clone(), allowed_apps)
             .with_judge(judge.clone())
             .with_foreground(cfg.foreground)
@@ -516,6 +541,7 @@ pub fn build_stack(cfg: &PolicyConfig) -> (Vec<Arc<dyn ToolModule>>, Wiring) {
         modules.push(input);
         modules.push(Arc::new(vision));
         modules.push(Arc::new(window));
+        modules.push(Arc::new(observe));
         let desktop_backend = Arc::new(LinuxDesktop::new());
         modules.push(Arc::new(DesktopModule::new(
             desktop_backend.clone(),

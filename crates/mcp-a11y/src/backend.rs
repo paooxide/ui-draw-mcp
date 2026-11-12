@@ -15,6 +15,13 @@ pub struct SnapshotRequest {
     /// the last `get_ui_tree` point at: a poll of another application would
     /// otherwise leave `@e5` meaning an element of the wrong one.
     pub passive: bool,
+    /// Install the refs of this read so `ui_action` can act on them, but
+    /// leave the session's pinned application alone. A read for acting on
+    /// normally makes the application it reads the one every later call
+    /// follows; `observe` reads a window it was merely asked about and must
+    /// not change which application the session is driving. Ignored when
+    /// `passive` is set, which installs nothing.
+    pub without_pin: bool,
 }
 
 /// A raw accessibility snapshot from a backend: the root node plus labels. The

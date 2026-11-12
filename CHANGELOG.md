@@ -8,6 +8,31 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- **`observe`: a window's tree and, where the tree is thin, its text, in one call.** An agent facing an app it
+  cannot read used to chain `get_ui_tree`, `capture_window` and `ocr_region` and then work out which pixel to
+  click. `observe` returns the accessibility snapshot with `get_ui_tree`'s own refs (they resolve in
+  `ui_action`) and, when the tree is *sparse* for the chosen window, also the window's text read off its pixels
+  and joined to the tree: text that sits on an element is attached to its ref, text that sits on nothing
+  becomes a numbered mark (`m1`, `m2`..., in reading order) with the screen point and box `mouse_action` takes.
+  Sparse is a pure, tested rule stated in the tool description and echoed in every result: fewer than 5
+  actionable elements in the window, or fewer than one per 120000 square points of its area, or a childless
+  canvas, web view, group, scroll area or image covering a quarter of it. `ocr` (`auto`, `always`, `never`)
+  overrides it, `max_elements` caps the entries (the rest are counted), and `marks_image: true` returns the
+  window's screenshot with the numbers drawn on it, sized from the same `[vision]` detail tiers as
+  `capture_window`. It is passive: the app is read without pinning it (a new `without_pin` snapshot mode
+  installs the refs but leaves the session's pinned app alone), nothing is raised, focused or clicked, and it
+  works on a window behind others. The capture's `via` and any covered-window `warning` / `covered_by` are
+  carried through; on macOS the covering windows' rectangles are now kept with the cover report, and text
+  inside them is left out, where a platform only knows that something covers the window every mark is flagged
+  `unreliable`. Text on a secure field is withheld and counted, never returned. A named `app` is held to
+  `allowed_apps` by the name given and by the app it resolves to, and the output is marked untrusted. The
+  join is a source list (`ocr` today), the place a local grounding model would add boxes. Text is read in
+  the recogniser's fast mode unless `ocr_level: "accurate"` is asked for: on the development Mac the accurate
+  mode measured 25 to 52 s wall time per window, mostly waiting on the system, against 0.1 s for fast. Lives
+  in `mcp-window` (the crate that already composes the tree with other reads), the merge and the numbered
+  drawing in `mcp-vision`. Tested live against Finder (nothing pinned, raised or moved), a TextEdit scratch
+  document (the typed word attached to its text area, auto mode reading text exactly when the tree is sparse)
+  and a TextEdit window behind Finder under `foreground = "never"` (reported covered by Finder, 86%).
 - **`wait_for` is woken by the app's own change notifications on macOS.** It registers an `AXObserver` on the
   target app (value, focus, window, title, selection, layout and menu notifications) on a thread of its own and
   re-checks the condition when one arrives, instead of every 150 ms; a 500 ms safety re-check stays because

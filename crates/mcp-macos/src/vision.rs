@@ -253,6 +253,7 @@ impl MacosBackend {
                 bounds: b,
                 number,
                 covered,
+                occluders,
             } = self
                 .window_for_capture(window_id, app)
                 .map_err(win_to_vision)?;
@@ -269,6 +270,7 @@ impl MacosBackend {
                 window_id,
                 number,
                 covered,
+                occluders,
             })
         }
     }
@@ -348,6 +350,7 @@ impl MacosBackend {
             crate::geometry::cover_warning_for(via, &s.app, w.window_id, &w.covered)
         {
             s.covered_by = covered_by;
+            crate::geometry::attach_rects(&mut s.covered_by, &w.occluders);
             s.warning = Some(warning);
         }
         s
@@ -365,6 +368,8 @@ struct ResolvedWindow {
     number: i64,
     /// Other applications on top of it, with the share of it each covers.
     covered: Vec<(String, f64)>,
+    /// Where those applications' windows sit on this one.
+    occluders: Vec<(String, mcp_vision::marks::Rect)>,
 }
 
 #[async_trait]
@@ -448,6 +453,7 @@ impl VisionBackend for MacosBackend {
             origin: (area.0, area.1),
             screen_size: (area.2, area.3),
             window,
+            via: VIA_SCREENCAPTURE,
         })
     }
 

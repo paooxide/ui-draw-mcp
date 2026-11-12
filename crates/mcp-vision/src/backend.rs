@@ -43,6 +43,11 @@ pub struct Covering {
     pub app: String,
     /// Share of the window's area, 0.0 to 1.0, two decimals.
     pub fraction: f64,
+    /// Where that application's windows sit, in screen points, when the
+    /// backend knows (macOS does). What `observe` uses to leave out text that
+    /// belongs to them; not part of the result's JSON.
+    #[serde(skip)]
+    pub rects: Vec<crate::marks::Rect>,
 }
 
 impl WindowSubject {
@@ -248,6 +253,9 @@ pub struct OcrResult {
     pub screen_size: (f64, f64),
     /// Set when the text was read from one window.
     pub window: Option<WindowSubject>,
+    /// Which mechanism produced the pixels the text was read from, as
+    /// [`CaptureResult::via`] says for an image.
+    pub via: &'static str,
 }
 
 impl OcrResult {
@@ -344,6 +352,7 @@ mod tests {
             vec![Covering {
                 app: "Terminal".into(),
                 fraction: 0.8,
+                rects: Vec::new(),
             }],
             Some("covered"),
         );

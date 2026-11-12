@@ -2498,3 +2498,212 @@ async fn sequential_waits_leave_no_observer_threads_behind() {
         "threads grew from {before} to {after} over 60 waits (a leak would add ~60)"
     );
 }
+
+/// `observe` on a real running app changes nothing about the desktop: the
+/// frontmost app, the pointer and the session's pin stay as they were, and what
+/// it returns is a tree with refs. Finder is always running and always has a
+/// desktop of its own, so the test needs no document. The tree itself is
+/// never printed; it holds the owner's file names.
+#[tokio::test(flavor = "multi_thread")]
+async fn observe_reads_a_running_app_without_pinning_raising_or_moving_anything() {
+    if !ready() {
+        return;
+    }
+    use mcp_input::InputBackend;
+    let backend = mcp_macos::MacosBackend::new();
+    let front = frontmost();
+    let pointer = backend.pointer_position().await.ok().flatten();
+
+    let c = client("live-observe-finder");
+    c.initialize().await;
+    let seen = c
+        .ok("observe", json!({ "app": "Finder", "ocr": "never" }))
+        .await;
+    assert!(
+        seen["ref_count"].as_u64().unwrap_or(0) > 0,
+        "Finder's tree has refs"
+    );
+    assert!(seen["text"].as_str().is_some_and(|t| t.contains("@e")));
+    assert_eq!(seen["target"], json!("named"));
+    assert_eq!(seen["ocr"]["ran"], json!(false));
+    assert!(seen["sparsity"]["rule"].as_str().is_some());
+    eprintln!(
+        "Finder observed: {} refs, sparse={}, window {}",
+        seen["ref_count"], seen["sparse"], seen["window_id"]
+    );
+
+    // Nothing was pinned: an unscoped window listing is still of every app.
+    let listing = c.ok("list_windows", json!({})).await;
+    assert_eq!(
+        listing["scope"],
+        json!("all_apps"),
+        "observe pinned Finder: {}",
+        listing["target"]
+    );
+    assert_eq!(frontmost(), front, "observe changed the frontmost app");
+    let after = backend.pointer_position().await.ok().flatten();
+    assert_eq!(after, pointer, "observe moved the pointer");
+
+    // An app outside allowed_apps is refused before it is read.
+    let denied = c.call("observe", json!({ "app": "Safari" })).await;
+    assert_eq!(denied.error.expect("refused").code, ErrorCode::PolicyDenied);
+}
+
+/// In a TextEdit scratch document: the tree has the text area and a ref that
+/// `get_element` resolves; with OCR forced on, a recognised box holding the
+/// typed word is attached to that text area; and in auto mode OCR runs
+/// exactly when the tree is judged sparse.
+#[tokio::test(flavor = "multi_thread")]
+async fn observe_attaches_recognised_text_to_the_text_area_it_sits_on() {
+    if !ready() {
+        return;
+    }
+    let _textedit = Scratch::begin();
+    let c = client("live-observe-textedit");
+    c.initialize().await;
+    // A word the recogniser reads as one token and nothing else on screen is.
+    let word = "Quartzmelon";
+    if scratch_document(&c, word).await.is_none() {
+        return;
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let auto = c.ok("observe", json!({ "app": APP })).await;
+    assert_eq!(
+        auto["ocr"]["ran"], auto["sparse"],
+        "in auto mode OCR runs exactly when the tree is sparse"
+    );
+
+    let seen = c
+        .ok("observe", json!({ "app": APP, "ocr": "always" }))
+        .await;
+    if seen["ocr"]["ran"] != json!(true) {
+        eprintln!(
+            "skipping the OCR half: {} (Screen Recording may not be granted)",
+            seen["ocr"]["reason"]
+        );
+        return;
+    }
+    let attached = seen["attached"].as_array().cloned().unwrap_or_default();
+    let hit = attached.iter().find(|a| {
+        a["text"]
+            .as_str()
+            .is_some_and(|t| t.to_lowercase().contains("quartzmelon"))
+    });
+    let marks = seen["marks"].as_array().cloned().unwrap_or_default();
+    let Some(hit) = hit else {
+        // Recognition is the system's to get right; the join is ours. If the
+        // word was read but landed as a mark, the text area was not matched.
+        panic!(
+            "no recognised box with the typed word was attached to an element \
+             ({} attached, {} marks, merge {})",
+            attached.len(),
+            marks.len(),
+            seen["merge"]
+        );
+    };
+    // Its ref is a text area of the snapshot observe just installed.
+    let role = c
+        .ok(
+            "get_element",
+            json!({ "ref": hit["ref"], "property": "role" }),
+        )
+        .await;
+    let role = role.to_string().to_lowercase();
+    assert!(
+        role.contains("text"),
+        "the word was attached to {} which is {role}",
+        hit["ref"]
+    );
+    let b = &hit["bounds"];
+    assert!(b["w"].as_f64().unwrap_or(0.0) > 0.0 && b["h"].as_f64().unwrap_or(0.0) > 0.0);
+    eprintln!(
+        "TextEdit: word attached to {} ({} attached, {} marks, via {})",
+        hit["ref"],
+        attached.len(),
+        marks.len(),
+        seen["ocr"]["via"]
+    );
+
+    // The numbered screenshot, within the image budget.
+    let with_image = c
+        .call(
+            "observe",
+            json!({ "app": APP, "ocr": "always", "marks_image": true, "detail": "low" }),
+        )
+        .await;
+    assert!(with_image.ok);
+    let data = with_image.data.clone().unwrap();
+    if data["marks_image"]["included"] == json!(true) {
+        let img = with_image.image.expect("an image block");
+        assert_eq!(img.mime_type, "image/png");
+        assert!(
+            data["marks_image"]["width"].as_u64().unwrap_or(0) <= 768
+                && data["marks_image"]["height"].as_u64().unwrap_or(0) <= 768,
+            "low detail stays within the configured edge: {}",
+            data["marks_image"]
+        );
+        assert!(data["marks_image"]["via"].as_str().is_some());
+    } else {
+        eprintln!("image skipped: {}", data["marks_image"]["reason"]);
+    }
+}
+
+/// A window behind another app is observed in place: TextEdit stays behind
+/// Finder under `foreground = "never"`, the text is read, and nothing is raised.
+#[tokio::test(flavor = "multi_thread")]
+async fn observe_works_on_a_background_window_under_never() {
+    if !ready() {
+        return;
+    }
+    let _textedit = Scratch::begin();
+    use mcp_input::InputBackend;
+    let setup = client("live-observe-bg-setup");
+    setup.initialize().await;
+    if scratch_document(&setup, "Pineapplequartz").await.is_none() {
+        return;
+    }
+    let _ = setup.call("focus_app", json!({ "app": "Finder" })).await;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !frontmost().is_some_and(|f| f.contains("Finder")) {
+        if Instant::now() > deadline {
+            eprintln!("skipping: Finder never became frontmost");
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+    let before = frontmost();
+    let backend = mcp_macos::MacosBackend::new();
+    let pointer = backend.pointer_position().await.ok().flatten();
+
+    let c = client_with("live-observe-bg", mcp_types::Foreground::Never);
+    c.initialize().await;
+    let seen = c
+        .call(
+            "observe",
+            json!({ "app": APP, "ocr": "always", "marks_image": true, "detail": "low" }),
+        )
+        .await;
+    assert!(seen.ok, "{:?}", seen.error.map(|e| e.message));
+    let data = seen.data.unwrap();
+    assert_eq!(frontmost(), before, "observe raised an app");
+    assert_eq!(
+        backend.pointer_position().await.ok().flatten(),
+        pointer,
+        "observe moved the pointer"
+    );
+    assert!(data["ref_count"].as_u64().unwrap_or(0) > 0);
+    // Either the cover is reported or nothing covers the window; a cover with
+    // no geometry flags the marks. Never silent.
+    if data.get("covered_by").is_some() {
+        assert!(data["covered_by"].as_array().is_some_and(|c| !c.is_empty()));
+        assert!(data["warning"].as_str().is_some());
+    }
+    if data["ocr"]["ran"] != json!(true) {
+        eprintln!("the text was not read: {}", data["ocr"]["reason"]);
+    }
+    eprintln!(
+        "background TextEdit: ocr.ran={}, marks_image via {}, warning {}",
+        data["ocr"]["ran"], data["marks_image"]["via"], data["warning"]
+    );
+}

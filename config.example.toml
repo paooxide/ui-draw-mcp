@@ -246,6 +246,7 @@ allow_private = false
 detail_low_px = 768         # layout/state checks: "did the dialog appear?"
 detail_balanced_px = 1024   # most interactions
 detail_full_px = 1568       # small text stays legible
+# `observe` with `marks_image: true` sizes its numbered screenshot from these same tiers.
 
 # The tier used when a call names neither `detail` nor `max_edge`. Lower this to
 # make every capture cheaper without touching a single call site.

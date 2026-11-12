@@ -57,12 +57,12 @@ heuristic.
 
 ## What it does
 
-127 tools across 12 categories. The full reference, generated from the server's own descriptors, is
+128 tools across 12 categories. The full reference, generated from the server's own descriptors, is
 [`docs/tools.md`](docs/tools.md).
 
 | Category | Tools | Names | Dangerous |
 |---|---|---|---|
-| vision | 8 | `capture_screen`, `capture_window`, `find_elements`, `get_element`, `get_ui_tree`, `list_displays`, `ocr_region`, `ui_extract` | 0 |
+| vision | 9 | `capture_screen`, `capture_window`, `find_elements`, `get_element`, `get_ui_tree`, `list_displays`, `observe`, `ocr_region`, `ui_extract` | 0 |
 | input | 14 | `clipboard_read`, `clipboard_write`, `drag_drop`, `get_selection`, `hover`, `input_showcase`, `keyboard_shortcut`, `keyboard_type`, `mouse_action`, `scroll`, `select_text`, `set_value`, `ui_action`, `ui_fill_form` | 0 |
 | window | 11 | `close_app`, `control_window`, `focus_app`, `handle_dialogs`, `launch`, `list_apps`, `list_windows`, `menu_invoke`, `menu_list`, `menu_open`, `wait_for` | 0 |
 | desktop | 8 | `idle_status`, `lock_screen`, `media_control`, `notify_user`, `play_audio`, `power_control`, `speak`, `system_settings` | 1 |

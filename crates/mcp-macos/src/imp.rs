@@ -808,7 +808,7 @@ impl A11yBackend for MacosBackend {
             // only fall back to the frontmost one if there is no target yet.
             // A passive read (a wait, a check) names the app it reads without
             // becoming it.
-            let (app, resolved) = if req.passive {
+            let (app, resolved) = if req.passive || req.without_pin {
                 let r = self
                     .peek_target(req.app.as_deref())
                     .map_err(BackendError::NotFound)?;
@@ -1580,6 +1580,8 @@ pub(crate) struct CaptureTarget {
     /// The window server's id for it (`CGWindowID`).
     pub number: i64,
     pub covered: Vec<(String, f64)>,
+    /// The same windows as rectangles, clipped to the target's area.
+    pub occluders: Vec<(String, mcp_vision::marks::Rect)>,
 }
 
 /// A window as the window server lists it, with what is needed to capture it.
@@ -1848,13 +1850,16 @@ impl MacosBackend {
             return Err(WindowError::Failed(why));
         }
         let number = rows[window_id as usize].number;
-        let covered = crate::geometry::coverage(&bounds, target.pid, &self.windows_above(number));
+        let above = self.windows_above(number);
+        let covered = crate::geometry::coverage(&bounds, target.pid, &above);
+        let occluders = crate::geometry::occluders(&bounds, target.pid, &above);
         Ok(CaptureTarget {
             target,
             info,
             bounds,
             number,
             covered,
+            occluders,
         })
     }
 }

@@ -81,6 +81,44 @@ pub(crate) fn coverage(target: &Rect, target_pid: i32, above: &[Above]) -> Vec<(
     by_owner
 }
 
+/// Where the windows covering `target` are, grouped by owner, clipped to the
+/// target: the parts of its screen area whose pixels are another application's.
+/// Windows of the target's own process are not occluders, as in [`coverage`].
+pub(crate) fn occluders(
+    target: &Rect,
+    target_pid: i32,
+    above: &[Above],
+) -> Vec<(String, mcp_vision::marks::Rect)> {
+    above
+        .iter()
+        .filter(|w| w.pid != target_pid && overlap(target, &w.bounds) > 0.0)
+        .map(|w| {
+            let x = target.x.max(w.bounds.x);
+            let y = target.y.max(w.bounds.y);
+            let right = (target.x + target.w).min(w.bounds.x + w.bounds.w);
+            let bottom = (target.y + target.h).min(w.bounds.y + w.bounds.h);
+            (
+                w.owner.clone(),
+                mcp_vision::marks::Rect::new(x, y, right - x, bottom - y),
+            )
+        })
+        .collect()
+}
+
+/// Give each covering application the rectangles of its windows.
+pub(crate) fn attach_rects(
+    owners: &mut [mcp_vision::Covering],
+    rects: &[(String, mcp_vision::marks::Rect)],
+) {
+    for o in owners {
+        o.rects = rects
+            .iter()
+            .filter(|(app, _)| *app == o.app)
+            .map(|(_, r)| *r)
+            .collect();
+    }
+}
+
 /// Why a window has no pixels to read off the screen, or `None` when it is
 /// drawn. A minimised or off-screen window is refused: its screen area holds
 /// whatever else is there, and nothing of the window. Another application
@@ -141,6 +179,7 @@ pub(crate) fn cover_warning(
         .map(|(o, s)| mcp_vision::Covering {
             app: o.clone(),
             fraction: (s.min(1.0) * 100.0).round() / 100.0,
+            rects: Vec::new(),
         })
         .collect();
     owners.sort_by(|a, b| b.fraction.total_cmp(&a.fraction));
@@ -266,11 +305,13 @@ mod tests {
             vec![
                 mcp_vision::Covering {
                     app: "Terminal".into(),
-                    fraction: 0.8
+                    fraction: 0.8,
+                    rects: Vec::new(),
                 },
                 mcp_vision::Covering {
                     app: "Mail".into(),
-                    fraction: 0.1
+                    fraction: 0.1,
+                    rects: Vec::new(),
                 },
             ],
             "largest first"
@@ -286,6 +327,62 @@ mod tests {
     /// The pixels of a ScreenCaptureKit image are the window's own, so a
     /// warning there would tell the agent to distrust a correct picture; the
     /// rectangle grab's would be missing the one thing that makes it unsafe.
+    #[test]
+    fn covering_windows_are_clipped_to_the_target_and_given_to_their_owner() {
+        let target = Rect {
+            x: 100.0,
+            y: 100.0,
+            w: 400.0,
+            h: 300.0,
+        };
+        let above = [
+            Above {
+                pid: 7,
+                owner: "Terminal".into(),
+                bounds: Rect {
+                    x: 300.0,
+                    y: 50.0,
+                    w: 600.0,
+                    h: 200.0,
+                },
+            },
+            Above {
+                pid: 9,
+                owner: "Mail".into(),
+                bounds: Rect {
+                    x: 900.0,
+                    y: 900.0,
+                    w: 10.0,
+                    h: 10.0,
+                },
+            },
+            // The target's own sheet is not an occluder.
+            Above {
+                pid: 1,
+                owner: "Notes".into(),
+                bounds: Rect {
+                    x: 120.0,
+                    y: 120.0,
+                    w: 50.0,
+                    h: 50.0,
+                },
+            },
+        ];
+        let rects = occluders(&target, 1, &above);
+        assert_eq!(
+            rects,
+            vec![(
+                "Terminal".to_string(),
+                mcp_vision::marks::Rect::new(300.0, 100.0, 200.0, 150.0)
+            )]
+        );
+        let by = coverage(&target, 1, &above);
+        let (mut owners, _) = cover_warning("Notes", 0, &[("Terminal".into(), 0.5)]).unwrap();
+        attach_rects(&mut owners, &rects);
+        assert_eq!(owners[0].rects.len(), 1);
+        assert_eq!(by.len(), 1);
+    }
+
     #[test]
     fn only_a_screen_grab_carries_the_cover_warning() {
         let by = [("Terminal".to_string(), 0.8)];

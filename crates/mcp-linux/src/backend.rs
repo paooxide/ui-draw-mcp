@@ -206,7 +206,7 @@ impl A11yBackend for LinuxBackend {
         let conn = self.conn().await.map_err(BackendError::PermissionDenied)?;
         // A passive read (a wait, a check) names the app it reads without
         // becoming it, and keeps the refs of the last walk.
-        let (app, from) = if req.passive {
+        let (app, from) = if req.passive || req.without_pin {
             self.peek_target(req.app.as_deref()).await
         } else {
             self.resolve_target(req.app.as_deref()).await
