@@ -230,17 +230,28 @@ impl MacosBackend {
 
     /// A window's screen rectangle, and who it belongs to. The id is read
     /// against the application named, else the pinned one, else the frontmost;
-    /// a window that is not drawn, or is covered by another application's, is
-    /// an error rather than that other application's pixels.
+    /// a window that is not drawn is an error. One that another application's
+    /// window covers is returned with who covers it, as a warning on the
+    /// subject, because the screen holds their pixels there.
     async fn window_region(
         &self,
         window_id: u32,
         app: Option<&str>,
     ) -> Result<((f64, f64, f64, f64), WindowSubject), VisionError> {
         unsafe {
-            let (target, info, b) = self
+            let crate::imp::CaptureTarget {
+                target,
+                info,
+                bounds: b,
+                covered,
+            } = self
                 .window_for_capture(window_id, app)
                 .map_err(win_to_vision)?;
+            let (covered_by, warning) =
+                match crate::geometry::cover_warning(&target.name, window_id, &covered) {
+                    Some((c, w)) => (c, Some(w)),
+                    None => (Vec::new(), None),
+                };
             Ok((
                 (b.x, b.y, b.w, b.h),
                 WindowSubject {
@@ -248,6 +259,8 @@ impl MacosBackend {
                     pid: info.pid,
                     title: info.title,
                     from: target.from.as_str().to_string(),
+                    covered_by,
+                    warning,
                 },
             ))
         }

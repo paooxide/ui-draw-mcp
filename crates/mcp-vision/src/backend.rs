@@ -18,7 +18,7 @@ pub struct DisplayInfo {
 /// read against. A `window_id` is an index into one application's window list,
 /// so the result names that application: a caller that mixed up two lists sees
 /// it here rather than in a picture of the wrong window.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct WindowSubject {
     pub app: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -26,6 +26,35 @@ pub struct WindowSubject {
     pub title: Option<String>,
     /// `named`, `pinned` or `frontmost`: how the application was chosen.
     pub from: String,
+    /// Other applications whose windows sit on top of this one and whose
+    /// pixels are therefore in the image in place of the window's own. Empty
+    /// when nothing covers it, when the pixels were read from the window
+    /// itself, and on a platform that cannot tell.
+    #[serde(skip)]
+    pub covered_by: Vec<Covering>,
+    /// What to make of `covered_by`, in words; set exactly when it is not empty.
+    #[serde(skip)]
+    pub warning: Option<String>,
+}
+
+/// One application covering part of a captured window.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Covering {
+    pub app: String,
+    /// Share of the window's area, 0.0 to 1.0, two decimals.
+    pub fraction: f64,
+}
+
+impl WindowSubject {
+    /// Put the cover warning on a tool result as top-level `warning` and
+    /// `covered_by`, where a caller reads the answer, not buried in `window`.
+    /// Writes nothing when the window is not covered.
+    pub fn add_cover_to(&self, data: &mut serde_json::Value) {
+        if let Some(w) = &self.warning {
+            data["warning"] = serde_json::json!(w);
+            data["covered_by"] = serde_json::json!(self.covered_by);
+        }
+    }
 }
 
 /// A captured image (PNG, base64), plus everything an agent needs to map a
@@ -142,8 +171,9 @@ pub trait VisionBackend: Send + Sync {
     /// application: an id the application does not have is `NotFound`.
     ///
     /// A backend that captures by screen region must refuse a window that is
-    /// not on screen or is covered by another application's, rather than
-    /// return that application's pixels as this window's.
+    /// not on screen, and must say in `WindowSubject::covered_by` and `warning`
+    /// when another application's window is on top of it, so that application's
+    /// pixels are not taken for this window's.
     async fn capture_window(
         &self,
         window_id: u32,
@@ -288,5 +318,44 @@ mod tests {
         let c = cap(0, 0, (0.0, 0.0), (100.0, 100.0));
         assert_eq!(c.scale_x(), 1.0);
         assert_eq!(c.scale_y(), 1.0);
+    }
+
+    fn subject(covered_by: Vec<Covering>, warning: Option<&str>) -> WindowSubject {
+        WindowSubject {
+            app: "Notes".into(),
+            pid: Some(1),
+            title: None,
+            from: "named".into(),
+            covered_by,
+            warning: warning.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn a_cover_warning_is_a_top_level_field_with_the_covering_apps() {
+        let s = subject(
+            vec![Covering {
+                app: "Terminal".into(),
+                fraction: 0.8,
+            }],
+            Some("covered"),
+        );
+        let mut data = serde_json::json!({});
+        s.add_cover_to(&mut data);
+        assert_eq!(data["warning"], "covered");
+        assert_eq!(
+            data["covered_by"],
+            serde_json::json!([{ "app": "Terminal", "fraction": 0.8 }])
+        );
+        // Not repeated inside the window object.
+        let w = serde_json::to_value(&s).unwrap();
+        assert!(w.get("warning").is_none() && w.get("covered_by").is_none());
+    }
+
+    #[test]
+    fn an_uncovered_window_adds_no_warning_fields() {
+        let mut data = serde_json::json!({});
+        subject(Vec::new(), None).add_cover_to(&mut data);
+        assert!(data.get("warning").is_none() && data.get("covered_by").is_none());
     }
 }

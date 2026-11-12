@@ -166,7 +166,7 @@ Capture a display (or a region) as a PNG image. Large captures are downscaled fo
 
 `capture_window` · read tier
 
-Capture a single window as a PNG image: prefer this over capture_screen when you only care about one app; fewer pixels means proportionally fewer tokens. window_id is the window's id in list_windows for 'app' (else the pinned app, else the frontmost one); the result's window names the app it was read against. This captures the screen area: on macOS a window that is minimized, on another Space or covered by another app's window is refused, not returned as that app's pixels; elsewhere a covered window shows what covers it. grid=true labels the image in screen points (the window's own position included), what mouse_action takes.
+Capture a single window as a PNG image: prefer this over capture_screen when you only care about one app; fewer pixels means proportionally fewer tokens. window_id is the window's id in list_windows for 'app' (else the pinned app, else the frontmost one); the result's window names the app it was read against. On macOS a window that is minimized or on another Space is refused (nothing is drawn); one covered by another app's window is captured with a top-level warning and covered_by [{app, fraction}] saying whose pixels are in the image, so do not read those parts as this window's; elsewhere a covered window shows what covers it. grid=true labels the image in screen points (the window's own position included), what mouse_action takes.
 
 | Argument | Type | Required | Description |
 |---|---|---|---|
@@ -238,7 +238,7 @@ No arguments.
 
 `ocr_region` · read tier
 
-Read text off the screen, with a box for each line in screen coordinates. The fallback when get_ui_tree comes back sparse: a canvas, a game, a custom-drawn or Electron UI: where the text is visible but not in the accessibility tree. Cheaper than a screenshot for reading, and unlike a screenshot it hands back coordinates you can click. Pass find to get only the lines containing some text, ranked, each with the x,y to click: two small calls (ocr_region find, then mouse_action) instead of a screenshot.
+Read text off the screen, with a box for each line in screen coordinates. The fallback when get_ui_tree comes back sparse: a canvas, a game, a custom-drawn or Electron UI: where the text is visible but not in the accessibility tree. Cheaper than a screenshot for reading, and unlike a screenshot it hands back coordinates you can click. Pass find to get only the lines containing some text, ranked, each with the x,y to click: two small calls (ocr_region find, then mouse_action) instead of a screenshot. With window_id on macOS, a window another app's window covers is read anyway and the result carries warning and covered_by [{app, fraction}]: text in the covered part is that app's, not the window's.
 
 | Argument | Type | Required | Description |
 |---|---|---|---|

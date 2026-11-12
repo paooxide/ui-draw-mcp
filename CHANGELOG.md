@@ -161,10 +161,13 @@ All notable changes to this project are documented here. The format follows
   `ui_action`, `set_value`, `select_text` and `get_selection` by ref say the `app` the ref belongs to. A
   `list_windows` with no app and nothing pinned says `scope: "all_apps"`. An app name that matches no running
   application, and a `window_id` the app does not have, are errors that name the app (and, for the id, how
-  many windows it has); none falls back to another app. `capture_window` and `ocr_region` on macOS capture
-  the screen area, so a window that is minimised, off screen, or covered by 5% or more of its area by other
-  applications' windows (read from the window server) is now an error that says which, instead of an image
-  of whatever is on screen there; on Linux a covered window cannot be told and shows what covers it.
+  many windows it has); none falls back to another app. `capture_window` and `ocr_region` on macOS read
+  the screen area, so a window that is minimised or off screen is an error (nothing of it is drawn), and one
+  that other applications' windows cover by 5% or more of its area (read from the window server) is still
+  captured, with a top-level `warning` and `covered_by: [{app, fraction}]` (largest first, fractions of the
+  window's area, capped at 1) saying whose pixels are in the image in place of the window's own. An agent
+  that sees `warning` should not read those parts as the window's content; on Linux a covered window
+  cannot be told and shows what covers it.
   Unverified: the live test (`a_background_app_is_pinned_listed_and_read_by_window_id_without_taking_the_foreground`)
   is written and has not been run; nothing here has run on Linux, which type-checks only; no capture was
   taken, so the `screencapture` half of a window read, and a window on another Space (none was open when
@@ -206,7 +209,7 @@ All notable changes to this project are documented here. The format follows
   the app the id came from.** With TextEdit pinned behind Terminal, `window_id: 0` was Terminal's first
   window, and the capture was of Terminal. They also photographed whatever was on screen at the window's
   coordinates, so a window covered by another app's came back as that app's pixels. See Added for the id and
-  the refusal. Seen on the development Mac: Finder's only window listed as `onscreen` and covered 100% by
+  the covered-window warning. Seen on the development Mac: Finder's only window listed as `onscreen` and covered 100% by
   Terminal, which a capture would have returned as Finder's.
 - **`wait_for` with `app` pinned that app and replaced the elements `@eN` refs pointed at.** Its polls took
   ordinary snapshots, so `wait_for { app: "Finder", ... }` between `get_ui_tree` of TextEdit and `ui_action

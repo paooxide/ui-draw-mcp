@@ -43,7 +43,7 @@ pub(crate) struct Above {
     pub bounds: Rect,
 }
 
-/// A covered share below this is not worth refusing a capture for: a drop
+/// A covered share below this is not worth warning about: a drop
 /// shadow or a one-pixel border of a neighbouring window.
 pub(crate) const MAX_COVERED_SHARE: f64 = 0.05;
 
@@ -59,7 +59,7 @@ fn overlap(a: &Rect, b: &Rect) -> f64 {
 
 /// The other applications whose windows cover part of `target`, with the share
 /// of it each covers (summed, so overlapping windows of one application can add
-/// to more than the true union; the figure is a reason to refuse, not a
+/// to more than the true union; the figure is a reason to warn, not a
 /// measurement). Windows of the target's own process are not occluders: a
 /// palette or sheet of the same application is that application's pixels.
 pub(crate) fn coverage(target: &Rect, target_pid: i32, above: &[Above]) -> Vec<(String, f64)> {
@@ -81,51 +81,65 @@ pub(crate) fn coverage(target: &Rect, target_pid: i32, above: &[Above]) -> Vec<(
     by_owner
 }
 
-/// Why a window cannot be captured by reading the screen, or `None` when it
-/// can: its state, or the other applications on top of it. The message says
-/// what a capture would have returned instead.
+/// Why a window has no pixels to read off the screen, or `None` when it is
+/// drawn. A minimised or off-screen window is refused: its screen area holds
+/// whatever else is there, and nothing of the window. Another application
+/// covering it is not a refusal; see [`cover_warning`].
 pub(crate) fn capture_obstacle(
     app: &str,
     id: u32,
     state: mcp_window::WindowState,
-    covered_by: &[(String, f64)],
 ) -> Option<String> {
     use mcp_window::WindowState;
     match state {
-        WindowState::Minimized => {
-            return Some(format!(
-                "window {id} of '{app}' is minimised, so it is not drawn anywhere; capturing its \
-                 screen area would photograph whatever else is there. Read it with get_ui_tree, \
-                 or un-minimise it yourself"
-            ))
-        }
-        WindowState::Offscreen => {
-            return Some(format!(
-                "window {id} of '{app}' is not on screen (another Space, or the app is hidden), \
-                 so it is not drawn anywhere; capturing its screen area would photograph \
-                 whatever else is there. Read it with get_ui_tree, or bring it to this Space \
-                 yourself"
-            ))
-        }
-        WindowState::Onscreen => {}
+        WindowState::Minimized => Some(format!(
+            "window {id} of '{app}' is minimised, so it is not drawn anywhere; capturing its \
+             screen area would photograph whatever else is there. Read it with get_ui_tree, \
+             or un-minimise it yourself"
+        )),
+        WindowState::Offscreen => Some(format!(
+            "window {id} of '{app}' is not on screen (another Space, or the app is hidden), \
+             so it is not drawn anywhere; capturing its screen area would photograph \
+             whatever else is there. Read it with get_ui_tree, or bring it to this Space \
+             yourself"
+        )),
+        WindowState::Onscreen => None,
     }
+}
+
+/// The warning for an image of the screen area of a window that other
+/// applications cover: who covers it and how much, and that those pixels are
+/// theirs. `None` below [`MAX_COVERED_SHARE`], which is a shadow or a border.
+/// Largest share first; fractions are capped at 1 and rounded to two places.
+pub(crate) fn cover_warning(
+    app: &str,
+    id: u32,
+    covered_by: &[(String, f64)],
+) -> Option<(Vec<mcp_vision::Covering>, String)> {
     let total: f64 = covered_by.iter().map(|(_, s)| s).sum();
     if total < MAX_COVERED_SHARE {
         return None;
     }
-    let mut owners: Vec<&(String, f64)> = covered_by.iter().collect();
-    owners.sort_by(|a, b| b.1.total_cmp(&a.1));
+    let mut owners: Vec<mcp_vision::Covering> = covered_by
+        .iter()
+        .map(|(o, s)| mcp_vision::Covering {
+            app: o.clone(),
+            fraction: (s.min(1.0) * 100.0).round() / 100.0,
+        })
+        .collect();
+    owners.sort_by(|a, b| b.fraction.total_cmp(&a.fraction));
     let list: Vec<String> = owners
         .iter()
         .take(3)
-        .map(|(o, s)| format!("{o} ({:.0}%)", (s * 100.0).min(100.0)))
+        .map(|c| format!("{} ({:.0}%)", c.app, c.fraction * 100.0))
         .collect();
-    Some(format!(
-        "window {id} of '{app}' is covered by {}; the screen holds their pixels there, not this \
-         window's, so capturing it would return another application's content. Read it with \
-         get_ui_tree, or uncover it yourself",
+    let msg = format!(
+        "window {id} of '{app}' is covered by {}; in those parts the image shows their pixels, \
+         not this window's, so do not read them as '{app}' content. Read the window with \
+         get_ui_tree, or uncover it yourself and capture again",
         list.join(", ")
-    ))
+    );
+    Some((owners, msg))
 }
 
 #[cfg(test)]
@@ -217,39 +231,55 @@ mod tests {
     }
 
     #[test]
-    fn a_visible_uncovered_window_can_be_captured() {
-        assert_eq!(
-            capture_obstacle("Notes", 0, WindowState::Onscreen, &[]),
-            None
-        );
-        // A sliver is not a reason to refuse.
+    fn a_drawn_window_has_no_obstacle_and_a_sliver_no_warning() {
+        assert_eq!(capture_obstacle("Notes", 0, WindowState::Onscreen), None);
+        assert_eq!(cover_warning("Notes", 0, &[]), None);
+        // A shadow or a border is not worth a warning.
         let sliver = [("Dock".to_string(), 0.01)];
-        assert_eq!(
-            capture_obstacle("Notes", 0, WindowState::Onscreen, &sliver),
-            None
-        );
+        assert_eq!(cover_warning("Notes", 0, &sliver), None);
     }
 
-    /// The refusal is the point of the check: an agent that is told "covered
-    /// by Terminal" stops trusting the picture, one that gets Terminal's
-    /// pixels as Notes' window acts on them.
+    /// A covered window is captured, and the warning is what stops an agent
+    /// acting on Terminal's pixels as if they were Notes'.
     #[test]
-    fn a_covered_window_is_refused_and_says_by_whom() {
-        let by = [("Terminal".to_string(), 0.8), ("Mail".to_string(), 0.1)];
-        let m = capture_obstacle("Notes", 2, WindowState::Onscreen, &by).unwrap();
+    fn a_covered_window_warns_and_says_by_whom() {
+        let by = [("Mail".to_string(), 0.1), ("Terminal".to_string(), 0.8)];
+        let (owners, m) = cover_warning("Notes", 2, &by).unwrap();
+        assert_eq!(
+            owners,
+            vec![
+                mcp_vision::Covering {
+                    app: "Terminal".into(),
+                    fraction: 0.8
+                },
+                mcp_vision::Covering {
+                    app: "Mail".into(),
+                    fraction: 0.1
+                },
+            ],
+            "largest first"
+        );
         assert!(m.contains("window 2 of 'Notes'"), "{m}");
         assert!(
             m.contains("Terminal (80%)") && m.contains("Mail (10%)"),
             "{m}"
         );
-        assert!(m.contains("another application's content"), "{m}");
+        assert!(m.contains("not this window's"), "{m}");
     }
 
     #[test]
-    fn a_window_that_is_not_drawn_is_refused_whatever_covers_it() {
-        let m = capture_obstacle("Notes", 0, WindowState::Minimized, &[]).unwrap();
+    fn overlapping_covers_cannot_report_more_than_all_of_the_window() {
+        let by = [("Terminal".to_string(), 1.4)];
+        let (owners, m) = cover_warning("Notes", 0, &by).unwrap();
+        assert_eq!(owners[0].fraction, 1.0);
+        assert!(m.contains("Terminal (100%)"), "{m}");
+    }
+
+    #[test]
+    fn a_window_that_is_not_drawn_is_refused() {
+        let m = capture_obstacle("Notes", 0, WindowState::Minimized).unwrap();
         assert!(m.contains("minimised") && m.contains("'Notes'"), "{m}");
-        let m = capture_obstacle("Notes", 1, WindowState::Offscreen, &[]).unwrap();
+        let m = capture_obstacle("Notes", 1, WindowState::Offscreen).unwrap();
         assert!(m.contains("not on screen"), "{m}");
     }
 }

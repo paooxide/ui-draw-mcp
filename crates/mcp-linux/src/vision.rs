@@ -300,6 +300,9 @@ fn window_area(
         pid: win.pid,
         title: Some(win.title.clone()).filter(|t| !t.is_empty()),
         from: from.as_str().to_string(),
+        // A covered window cannot be told apart on Linux.
+        covered_by: Vec::new(),
+        warning: None,
     };
     if win.states.contains(atspi::State::Iconified) {
         return Err(VisionError::Failed(format!(

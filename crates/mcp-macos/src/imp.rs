@@ -1438,6 +1438,15 @@ unsafe fn frontmost_identity() -> Option<(c_int, String)> {
     Some((pid, name))
 }
 
+/// A window resolved for capture: whose it is, where, and the other
+/// applications on top of it (name and share of its area).
+pub(crate) struct CaptureTarget {
+    pub target: Resolved,
+    pub info: WindowInfo,
+    pub bounds: Rect,
+    pub covered: Vec<(String, f64)>,
+}
+
 /// A window as the window server lists it, with what is needed to capture it.
 pub(crate) struct WindowRow {
     pub info: WindowInfo,
@@ -1670,15 +1679,15 @@ impl MacosBackend {
     }
 
     /// One window of an application, by its id in that application's list,
-    /// with the reason it could not be captured from the screen if there is
-    /// one. The application is the one `app` names, else the pinned one, else
+    /// and the other applications whose windows cover it. A window that is not
+    /// drawn is an error; a covered one is not, the caller says so in the result. The application is the one `app` names, else the pinned one, else
     /// the frontmost; nothing is pinned. An id the application does not have
     /// is an error saying which application and how many windows it has.
     pub(crate) unsafe fn window_for_capture(
         &self,
         window_id: u32,
         app: Option<&str>,
-    ) -> Result<(Resolved, WindowInfo, Rect), WindowError> {
+    ) -> Result<CaptureTarget, WindowError> {
         let target = self.peek_target(app).map_err(WindowError::NotFound)?;
         let rows: Vec<WindowRow> = self
             .window_rows()?
@@ -1696,18 +1705,17 @@ impl MacosBackend {
                 target.name
             ))
         })?;
-        let number = rows[window_id as usize].number;
-        let covered = if info.state == WindowState::Onscreen {
-            crate::geometry::coverage(&bounds, target.pid, &self.windows_above(number))
-        } else {
-            Vec::new()
-        };
-        if let Some(why) =
-            crate::geometry::capture_obstacle(&target.name, window_id, info.state, &covered)
-        {
+        if let Some(why) = crate::geometry::capture_obstacle(&target.name, window_id, info.state) {
             return Err(WindowError::Failed(why));
         }
-        Ok((target, info, bounds))
+        let number = rows[window_id as usize].number;
+        let covered = crate::geometry::coverage(&bounds, target.pid, &self.windows_above(number));
+        Ok(CaptureTarget {
+            target,
+            info,
+            bounds,
+            covered,
+        })
     }
 }
 
@@ -3074,22 +3082,34 @@ mod background_app_tests {
             }
             other => panic!("expected NotFound, got {other:?}"),
         }
-        // Each id it does have is either capturable and Finder's, or refused
-        // with the reason; it is never somebody else's window.
+        // Each id it does have is Finder's and capturable, with whatever
+        // covers it listed, or refused because nothing of it is drawn; it is
+        // never somebody else's window.
         for w in &ws {
             match unsafe { b.window_for_capture(w.id, None) } {
-                Ok((target, info, _)) => {
+                Ok(CaptureTarget {
+                    target,
+                    info,
+                    covered,
+                    ..
+                }) => {
                     assert_eq!(info.pid, want);
                     assert_eq!(target.from, TargetSource::Pinned);
-                    eprintln!("Finder window {} would capture", w.id);
+                    assert_eq!(w.state, WindowState::Onscreen);
+                    assert!(
+                        covered.iter().all(|(owner, _)| owner != "Finder"),
+                        "Finder's own windows are not covering it: {covered:?}"
+                    );
+                    eprintln!(
+                        "Finder window {} would capture, covered by {covered:?}",
+                        w.id
+                    );
                 }
                 Err(WindowError::Failed(m)) => {
                     eprintln!("Finder window {} refused: {m}", w.id);
                     assert!(
-                        m.contains("covered by")
-                            || m.contains("minimised")
-                            || m.contains("not on screen"),
-                        "{m}"
+                        m.contains("minimised") || m.contains("not on screen"),
+                        "a window is refused only when it is not drawn: {m}"
                     );
                 }
                 Err(e) => panic!("unexpected: {e:?}"),
