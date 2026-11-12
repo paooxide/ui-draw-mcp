@@ -278,6 +278,63 @@ fn by_args(backend: &dyn InputBackend, tool: &str, args: &Value) -> Option<Refus
     }
 }
 
+/// Whether `tool` called with `args` takes the user's pointer, keyboard or
+/// foreground, which is what `foreground = "polite"` borrows the desktop for.
+///
+/// It is the question `never` asks, answered the other way: a call `never`
+/// would refuse is a call that needs the desktop, so the two settings cannot
+/// disagree about what counts. `input_showcase` is the one exception: it only
+/// shapes later pointer moves and needs the desktop for nothing.
+pub(crate) fn takes_foreground(backend: &dyn InputBackend, tool: &str, args: &Value) -> bool {
+    tool != "input_showcase"
+        && TOOLS.iter().any(|(n, _)| *n == tool)
+        && tool_refusal(backend, tool, args).is_some()
+}
+
+/// What `foreground = "polite"` cannot do at all, said plainly, or `None`.
+///
+/// A key held with `keyboard_shortcut` `down` outlives the call, so the desktop
+/// it borrowed cannot be given back at the end of that call, and it would
+/// carry into whatever the person does next. A batch is judged step by step,
+/// before the first one runs.
+pub(crate) fn polite_refusal(tool: &str, args: &Value) -> Option<String> {
+    let holds = |a: &Value| {
+        a.get("action")
+            .and_then(Value::as_str)
+            .is_some_and(|x| x.eq_ignore_ascii_case("down"))
+    };
+    let (what, hit) = match tool {
+        "keyboard_shortcut" => ("keyboard_shortcut down".to_string(), holds(args)),
+        "input_steps" => {
+            let at = args
+                .get("steps")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .position(|st| {
+                    st.get("tool").and_then(Value::as_str) == Some("keyboard_shortcut")
+                        && st.get("args").is_some_and(holds)
+                });
+            (
+                format!(
+                    "input_steps step {} (keyboard_shortcut down)",
+                    at.unwrap_or(0)
+                ),
+                at.is_some(),
+            )
+        }
+        _ => return None,
+    };
+    hit.then(|| {
+        format!(
+            "{what} was refused and nothing was done: this server runs with foreground = \
+             \"polite\", which borrows the keyboard for one call and gives it back, and a key \
+             held down across calls cannot be given back at the end of one. Use \
+             keyboard_shortcut without action (a press), or set foreground = \"allow\""
+        )
+    })
+}
+
 /// What `ui_fill_form` will do with one field, as far as the foreground is
 /// concerned: mirrors how the tool reads `action`, `value` and `option`.
 fn field_refusal(backend: &dyn InputBackend, field: &Value) -> Option<Refusal> {
@@ -521,6 +578,7 @@ impl InputBackend for ForegroundInput {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn focus_is_let_through_only_where_it_was_measured() {
@@ -528,6 +586,23 @@ mod tests {
         for other in ["linux", "windows", "mock", ""] {
             assert!(!focus_is_quiet_on(other), "{other:?}");
         }
+    }
+
+    #[test]
+    fn a_held_key_is_refused_under_polite_alone_and_inside_a_batch() {
+        let down = json!({ "combo": "shift", "action": "down" });
+        let msg = polite_refusal("keyboard_shortcut", &down).expect("refused");
+        assert!(msg.contains("polite") && msg.contains("nothing was done"));
+        assert!(polite_refusal("keyboard_shortcut", &json!({ "combo": "a" })).is_none());
+        assert!(polite_refusal("keyboard_shortcut", &json!({ "action": "up" })).is_none());
+        let batch = json!({ "steps": [
+            { "tool": "keyboard_type", "args": { "text": "x" } },
+            { "tool": "keyboard_shortcut", "args": down },
+        ]});
+        let msg = polite_refusal("input_steps", &batch).expect("refused");
+        assert!(msg.contains("step 1"), "{msg}");
+        assert!(polite_refusal("input_steps", &json!({ "steps": [] })).is_none());
+        assert!(polite_refusal("mouse_action", &json!({ "action": "down" })).is_none());
     }
 
     #[test]

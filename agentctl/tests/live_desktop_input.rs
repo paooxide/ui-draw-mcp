@@ -54,6 +54,8 @@ fn client_with(name: &str, foreground: mcp_types::Foreground) -> InProcClient {
     ]);
     cfg.allowed_apps = vec![APP.to_string(), "Finder".to_string()];
     cfg.foreground = foreground;
+    cfg.polite_idle_ms = 300;
+    cfg.polite_max_wait_ms = 12_000;
     let server = agentctl::build_server(cfg, AuditSink::memory(), Arc::new(NoConsent), name)
         .expect("server builds");
     InProcClient::new(server)
@@ -1989,4 +1991,202 @@ async fn a_destructive_command_sent_by_pid_meets_the_gate_for_the_target_app() {
     let fine = c.call("keyboard_type", json!({ "text": "ok" })).await;
     assert!(fine.ok, "{:?}", fine.error);
     assert_eq!(fine.data.as_ref().unwrap()["input"], "pid_event");
+}
+
+/// Input this process posts itself must not count as the person acting.
+///
+/// Measured: a synthetic pointer move resets the system idle clock exactly as
+/// a real one does (the raw clock read about 600 ms after one, from over three
+/// minutes), so `foreground = "polite"` would wait out its own click before
+/// every call. The backend records what it posts and reads the clock against
+/// that; this checks the number it reports does not drop when it moves the
+/// pointer itself.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_idle_reading_does_not_count_the_servers_own_input_as_the_person() {
+    if !ready() {
+        return;
+    }
+    use mcp_input::InputBackend;
+    let b = mcp_macos::MacosBackend::new();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        if b.user_idle_ms().await.is_some_and(|i| i >= 3_000) {
+            break;
+        }
+        if Instant::now() > deadline {
+            eprintln!("skipping: somebody is using the machine, so idleness cannot be measured");
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    let before = b.user_idle_ms().await.unwrap();
+    // The same clock `idle_status` reports, to the second it counts in.
+    use mcp_desktop::DesktopBackend;
+    let reported = mcp_desktop::MacosDesktop::new()
+        .idle_status()
+        .await
+        .expect("idle_status")
+        .idle_seconds;
+    assert!(
+        (before / 1_000).abs_diff(reported) <= 2,
+        "idle_status says {reported} s and the input backend {before} ms"
+    );
+    let here = b.pointer_position().await.unwrap().expect("pointer");
+    b.hover(here.0 + 2.0, here.1).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let after = b.user_idle_ms().await.unwrap();
+    b.hover(here.0, here.1).await.unwrap();
+    eprintln!("MEASURED idle before={before}ms after a synthetic pointer move={after}ms");
+    assert!(
+        after >= before,
+        "the server's own pointer move was counted as the person: {before} ms, then {after} ms"
+    );
+}
+
+/// Under `foreground = "polite"` a batch that clicks into a TextEdit document
+/// and types takes the real pointer and keyboard, and hands them back.
+///
+/// Finder is in front and the pointer is parked at a known spot. One
+/// `input_steps` call clicks TextEdit's text area (which brings TextEdit
+/// forward, so the typing that follows lands there) and types. What is
+/// asserted is read from outside the tools: the document's own text, the
+/// topmost window's owner and the active application afterwards, and the
+/// pointer's position, which must be back within a few points of the spot.
+#[tokio::test(flavor = "multi_thread")]
+async fn under_polite_a_batch_uses_the_real_input_and_hands_the_desk_back() {
+    if !ready() {
+        return;
+    }
+    let _textedit = Scratch::begin();
+    use mcp_input::InputBackend;
+    let setup = client("live-polite-setup");
+    setup.initialize().await;
+    let Some(area) = scratch_document(&setup, "").await else {
+        return;
+    };
+    if !finder_in_front(&setup).await {
+        eprintln!("skipping: Finder never came to the front");
+        return;
+    }
+    let backend = mcp_macos::MacosBackend::new();
+    let spot = (240.0, 180.0);
+    backend
+        .hover(spot.0, spot.1)
+        .await
+        .expect("park the pointer");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let before = (frontmost(), active_app());
+    assert!(
+        before.0.as_deref().is_some_and(|f| f.contains("Finder")),
+        "the starting point is Finder in front: {before:?}"
+    );
+
+    let mut cfg = test_policy(&[
+        Category::Vision,
+        Category::Input,
+        Category::Window,
+        Category::System,
+    ]);
+    cfg.allowed_apps = vec![APP.to_string(), "Finder".to_string()];
+    cfg.foreground = mcp_types::Foreground::Polite;
+    cfg.polite_idle_ms = 300;
+    cfg.polite_max_wait_ms = 12_000;
+    let server =
+        agentctl::build_server(cfg, AuditSink::memory(), Arc::new(NoConsent), "live-polite")
+            .expect("server builds");
+    let c = InProcClient::new(server);
+    c.initialize().await;
+    let found = c
+        .ok(
+            "find_elements",
+            json!({ "app": APP, "role": "text field", "limit": 5 }),
+        )
+        .await;
+    let mine = found["elements"][0]["ref"]
+        .as_str()
+        .expect("the scratch document's text area")
+        .to_string();
+
+    let env = c
+        .call(
+            "input_steps",
+            json!({ "steps": [
+                { "tool": "mouse_action", "args": { "type": "click", "ref": &mine } },
+                { "tool": "keyboard_type", "args": { "text": "polite" } },
+            ]}),
+        )
+        .await;
+    if let Some(e) = &env.error {
+        if e.message.contains("user is active") {
+            eprintln!("skipping: somebody is using the machine, so politeness waited it out");
+            return;
+        }
+    }
+    let shown = env
+        .data
+        .as_ref()
+        .map(|d| d["polite"].to_string())
+        .unwrap_or_default();
+    eprintln!("MEASURED polite batch ok={} polite={shown}", env.ok);
+    assert!(env.ok, "{:?}", env.error);
+    let (landed, text) = document_shows(&setup, Some(&area), |t| t == "polite").await;
+    assert!(
+        landed,
+        "the typed text did not reach the document: {text:?}"
+    );
+
+    // Give the app switch back a moment to settle, then look from outside.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let after = (frontmost(), active_app());
+    let pointer = backend.pointer_position().await.unwrap().expect("pointer");
+    let off = ((pointer.0 - spot.0).powi(2) + (pointer.1 - spot.1).powi(2)).sqrt();
+    eprintln!("MEASURED polite after: front={after:?} pointer off by {off:.1} pt");
+    assert_eq!(after, before, "the frontmost app was not given back");
+    assert!(
+        off <= 3.0,
+        "the pointer is {off:.1} points from where it was"
+    );
+    let p = &env.data.as_ref().unwrap()["polite"];
+    assert_eq!(p["returned"]["app"], json!(true), "{p}");
+    assert_eq!(p["returned"]["pointer"], json!(true), "{p}");
+}
+
+/// Under `polite`, `focus_app` raises the app only for the length of the call:
+/// afterwards Finder is in front again, TextEdit is still the pinned target,
+/// and the result says the frontmost app was given back.
+#[tokio::test(flavor = "multi_thread")]
+async fn under_polite_raising_an_app_returns_the_front_to_the_user() {
+    if !ready() {
+        return;
+    }
+    let _textedit = Scratch::begin();
+    let setup = client("live-polite-focus-setup");
+    setup.initialize().await;
+    if scratch_document(&setup, "x").await.is_none() {
+        return;
+    }
+    if !finder_in_front(&setup).await {
+        eprintln!("skipping: Finder never came to the front");
+        return;
+    }
+    let before = (frontmost(), active_app());
+    let c = client_with("live-polite-focus", mcp_types::Foreground::Polite);
+    c.initialize().await;
+    let env = c.call("focus_app", json!({ "app": APP })).await;
+    if let Some(e) = &env.error {
+        if e.message.contains("user is active") {
+            eprintln!("skipping: somebody is using the machine");
+            return;
+        }
+    }
+    assert!(env.ok, "{:?}", env.error);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let after = (frontmost(), active_app());
+    eprintln!("MEASURED polite focus_app: {before:?} -> {after:?}");
+    assert_eq!(after, before, "Finder was not given the front back");
+    let p = &env.data.as_ref().unwrap()["polite"];
+    assert_eq!(p["returned"]["app"], json!(true), "{p}");
+    // The pin outlives the borrow: later calls act on TextEdit.
+    let windows = c.ok("list_windows", json!({})).await;
+    assert_eq!(windows["target"]["from"], json!("pinned"), "{windows}");
 }

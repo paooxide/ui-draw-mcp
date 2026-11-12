@@ -239,6 +239,7 @@ async fn serve(force_http: bool) -> std::io::Result<()> {
         grace_ms: cfg.human_override_grace_ms,
         ..mcp_input::OverrideConfig::default()
     };
+    let polite = cfg.foreground.is_polite();
     let (server, policy, wiring) =
         agentctl::build_server_with(cfg, audit, consent_provider(), session_id.clone())
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
@@ -253,6 +254,7 @@ async fn serve(force_http: bool) -> std::io::Result<()> {
             policy.clone(),
             wiring.desktop.clone(),
             session_id.clone(),
+            polite,
         );
     }
 
@@ -1475,6 +1477,12 @@ fn foreground_summary(cfg: &mcp_policy::PolicyConfig) -> String {
         mcp_types::Foreground::Allow => {
             "allow (tools may move the pointer, type and bring apps forward)".to_string()
         }
+        mcp_types::Foreground::Polite => format!(
+            "polite (an action that needs the pointer, keyboard or foreground waits for {} ms \
+             of user idle time, up to {} ms, then gives the pointer and frontmost app back; \
+             the human-override watcher abandons the action instead of tripping the kill switch)",
+            cfg.polite_idle_ms, cfg.polite_max_wait_ms
+        ),
         mcp_types::Foreground::Never => {
             let mut s = String::from(
                 "never (no synthetic pointer, key or scroll input; no app or window brought \
@@ -1766,6 +1774,17 @@ mod test_cmd_tests {
         cfg.foreground = mcp_types::Foreground::Never;
         let never = foreground_summary(&cfg);
         assert!(never.starts_with("never") && !never.contains("demo"));
+        cfg.foreground = mcp_types::Foreground::Polite;
+        cfg.polite_idle_ms = 900;
+        cfg.polite_max_wait_ms = 7_000;
+        let polite = foreground_summary(&cfg);
+        assert!(polite.starts_with("polite"), "{polite}");
+        assert!(
+            polite.contains("900 ms") && polite.contains("7000 ms"),
+            "{polite}"
+        );
+        assert!(polite.contains("kill switch"), "{polite}");
+        cfg.foreground = mcp_types::Foreground::Never;
         cfg.demo = true;
         assert!(foreground_summary(&cfg).contains("demo has no effect"));
     }

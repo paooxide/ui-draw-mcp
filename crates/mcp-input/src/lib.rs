@@ -14,14 +14,15 @@ pub mod glide;
 mod hold;
 mod human_override;
 mod pid_route;
+pub mod polite;
 mod postcondition;
 mod selection;
 mod steps;
 mod tools;
 
 pub use backend::{
-    valid_modifier, BackgroundTarget, Choice, ClipData, ClipFormat, FocusedText, InputBackend,
-    InputError, MouseKind, Reading, Route, ScrollDir, Selection, SemanticAction,
+    valid_modifier, AppRef, BackgroundTarget, Choice, ClipData, ClipFormat, DeskState, FocusedText,
+    InputBackend, InputError, MouseKind, Reading, Route, ScrollDir, Selection, SemanticAction,
 };
 pub use choose::{list_options, missing_message, pick_option, same_option, OptionItem, Pick};
 pub use combo::{parse_combo, parse_hold, Combo, Os, KEY_NAMES};
@@ -30,6 +31,7 @@ pub use foreground::{tool_refusal, ForegroundInput};
 pub use glide::{bezier_interpolate, execute_glide, GlideConfig, GlidePreset};
 pub use hold::{HeldKeys, HOLD_MAX_MS, MAX_HELD_KEYS};
 pub use human_override::{Activity, ActivityGuard, Detector, OverrideConfig, SetPoint, Verdict};
+pub use polite::{InputDesk, PoliteConfig};
 pub use postcondition::Verifier;
 pub use selection::{char_range_to_utf16, char_slice, utf16_range_to_char};
 pub use steps::{parse_steps, Step, StepDispatch, StepRelay, BATCHABLE, MAX_BATCH_MS, MAX_STEPS};

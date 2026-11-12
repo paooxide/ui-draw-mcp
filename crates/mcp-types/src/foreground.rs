@@ -7,11 +7,21 @@
 use crate::{Envelope, ErrorCode};
 
 /// Whether tools may take the user's pointer, keyboard or foreground.
+///
+/// Ordered by strictness: `Allow` < `Polite` < `Never`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Foreground {
     /// Today's behaviour: every tool may use synthetic input and raise apps.
     #[default]
     Allow,
+    /// An action that needs the real pointer or keyboard, or to raise an app,
+    /// waits until the person has been idle for a while, borrows the desktop,
+    /// and gives it back: the frontmost app and the pointer are put where they
+    /// were, and if the person reaches for the mouse mid-action the action
+    /// stops and the call fails with a retryable error. A courtesy, not a
+    /// containment: nothing stops the app that was raised from doing what it
+    /// likes while it is in front. See `docs/threat-model.md`.
+    Polite,
     /// No tool moves the real pointer, posts synthetic key or scroll events,
     /// or brings an app or window to the front. Set in the operator's config
     /// or environment only; no tool, role or argument can change it.
@@ -23,6 +33,7 @@ impl Foreground {
     pub fn as_str(self) -> &'static str {
         match self {
             Foreground::Allow => "allow",
+            Foreground::Polite => "polite",
             Foreground::Never => "never",
         }
     }
@@ -31,6 +42,7 @@ impl Foreground {
     pub fn parse(s: &str) -> Option<Foreground> {
         match s {
             "allow" => Some(Foreground::Allow),
+            "polite" => Some(Foreground::Polite),
             "never" => Some(Foreground::Never),
             _ => None,
         }
@@ -38,6 +50,30 @@ impl Foreground {
 
     pub fn is_never(self) -> bool {
         self == Foreground::Never
+    }
+
+    pub fn is_polite(self) -> bool {
+        self == Foreground::Polite
+    }
+
+    fn strictness(self) -> u8 {
+        match self {
+            Foreground::Allow => 0,
+            Foreground::Polite => 1,
+            Foreground::Never => 2,
+        }
+    }
+
+    /// The stricter of two settings. How the environment's
+    /// `AGENTCTL_FOREGROUND` meets the config file's value: it can add
+    /// restriction and never remove it, so `never` beats `polite` beats
+    /// `allow` whichever side it came from.
+    pub fn tighten(self, other: Foreground) -> Foreground {
+        if other.strictness() > self.strictness() {
+            other
+        } else {
+            self
+        }
     }
 }
 
@@ -106,10 +142,38 @@ mod tests {
     fn only_the_exact_spellings_parse() {
         assert_eq!(Foreground::parse("allow"), Some(Foreground::Allow));
         assert_eq!(Foreground::parse("never"), Some(Foreground::Never));
-        for bad in ["", "Never", "NEVER", "deny", "polite", "false", " never"] {
+        assert_eq!(Foreground::parse("polite"), Some(Foreground::Polite));
+        for bad in [
+            "", "Never", "NEVER", "deny", "Polite", "POLITE", "false", " never", "polite ",
+        ] {
             assert_eq!(Foreground::parse(bad), None, "{bad:?}");
         }
         assert_eq!(Foreground::default(), Foreground::Allow);
+        for f in [Foreground::Allow, Foreground::Polite, Foreground::Never] {
+            assert_eq!(Foreground::parse(f.as_str()), Some(f));
+        }
+    }
+
+    /// The whole lattice, every pair: the stricter one wins from either side,
+    /// so no combination of file and environment can loosen a setting.
+    #[test]
+    fn tightening_takes_the_stricter_of_any_two() {
+        use Foreground::{Allow, Never, Polite};
+        let cases = [
+            (Allow, Allow, Allow),
+            (Allow, Polite, Polite),
+            (Allow, Never, Never),
+            (Polite, Allow, Polite),
+            (Polite, Polite, Polite),
+            (Polite, Never, Never),
+            (Never, Allow, Never),
+            (Never, Polite, Never),
+            (Never, Never, Never),
+        ];
+        for (file, env, want) in cases {
+            assert_eq!(file.tighten(env), want, "file {file:?} env {env:?}");
+            assert_eq!(env.tighten(file), want, "commutes: {env:?} {file:?}");
+        }
     }
 
     #[test]

@@ -9,6 +9,7 @@ pub mod apps;
 pub mod args;
 mod context;
 mod descriptor;
+mod desk;
 pub mod drag;
 mod envelope;
 mod foreground;
@@ -16,6 +17,7 @@ mod module;
 
 pub use context::{CallCtx, CancelToken, Notifier, Progress};
 pub use descriptor::{Category, Tier, ToolDescriptor};
+pub use desk::{Desk, Loan};
 pub use envelope::{Envelope, ErrorCode, ImageContent, ToolError};
 pub use foreground::{Foreground, Refusal};
 pub use module::ToolModule;

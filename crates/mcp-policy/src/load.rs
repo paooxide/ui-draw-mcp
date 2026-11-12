@@ -121,6 +121,8 @@ const KNOWN_KEYS: &[&str] = &[
     "input.human_override",
     "input.human_override_grace_ms",
     "input.human_override_px",
+    "input.polite_idle_ms",
+    "input.polite_max_wait_ms",
     "input.terminal_apps",
     "invariants.denied_domains",
     "invariants.protected_paths",
@@ -184,25 +186,24 @@ fn boolean(key: &str, s: &str) -> Result<bool, String> {
     }
 }
 
-/// `allow` or `never`. Anything else is an error: this setting restricts, so
-/// a misspelling read as `allow` would drop the restriction without a word.
+/// `allow`, `polite` or `never`. Anything else is an error: this setting
+/// restricts, so a misspelling read as `allow` would drop the restriction
+/// without a word.
 fn parse_foreground(source: &str, value: &str) -> Result<mcp_types::Foreground, String> {
-    mcp_types::Foreground::parse(value)
-        .ok_or_else(|| format!("unknown {source} '{value}' (expected \"allow\" or \"never\")"))
+    mcp_types::Foreground::parse(value).ok_or_else(|| {
+        format!("unknown {source} '{value}' (expected \"allow\", \"polite\" or \"never\")")
+    })
 }
 
-/// The file's setting after the environment's `AGENTCTL_FOREGROUND`: `never`
-/// from either source wins, and an invalid value is an error from either.
+/// The file's setting after the environment's `AGENTCTL_FOREGROUND`: the
+/// stricter of the two wins (`never` over `polite` over `allow`), and an
+/// invalid value is an error from either.
 fn tighten_foreground(
     from_file: mcp_types::Foreground,
     env: &str,
 ) -> Result<mcp_types::Foreground, String> {
     let from_env = parse_foreground("AGENTCTL_FOREGROUND", env)?;
-    Ok(if from_env.is_never() || from_file.is_never() {
-        mcp_types::Foreground::Never
-    } else {
-        mcp_types::Foreground::Allow
-    })
+    Ok(from_file.tighten(from_env))
 }
 
 fn parse_value(s: &str) -> Result<Val, String> {
@@ -403,6 +404,10 @@ impl PolicyConfig {
                 ("memory.max_recipes", Val::Int(i)) if *i >= 0 => cfg.max_recipes = *i as usize,
                 ("input.foreground", Val::Str(s)) => {
                     cfg.foreground = parse_foreground(key, s)?;
+                }
+                ("input.polite_idle_ms", Val::Int(i)) if *i >= 0 => cfg.polite_idle_ms = *i as u64,
+                ("input.polite_max_wait_ms", Val::Int(i)) if *i > 0 => {
+                    cfg.polite_max_wait_ms = *i as u64
                 }
                 ("input.human_override", Val::Str(s)) => cfg.human_override = boolean(key, s)?,
                 ("input.human_override_px", Val::Int(i)) if *i > 0 => {
@@ -986,11 +991,14 @@ mod tests {
 
     #[test]
     fn an_unknown_foreground_value_is_a_config_error_not_allow() {
-        for bad in ["Never", "NEVER", "deny", "polite", "", "yes", "true"] {
+        for bad in ["Never", "NEVER", "deny", "Polite", "", "yes", "true"] {
             let err = PolicyConfig::from_toml_str(&format!("[input]\nforeground = \"{bad}\"\n"))
                 .unwrap_err();
             assert!(
-                err.contains("input.foreground") && err.contains("allow") && err.contains("never"),
+                err.contains("input.foreground")
+                    && err.contains("allow")
+                    && err.contains("polite")
+                    && err.contains("never"),
                 "{bad:?}: {err}"
             );
         }
@@ -1004,12 +1012,57 @@ mod tests {
     }
 
     #[test]
-    fn the_environment_can_add_never_but_not_remove_it() {
-        use mcp_types::Foreground::{Allow, Never};
-        assert_eq!(tighten_foreground(Allow, "never").unwrap(), Never);
-        assert_eq!(tighten_foreground(Never, "never").unwrap(), Never);
-        assert_eq!(tighten_foreground(Never, "allow").unwrap(), Never);
-        assert_eq!(tighten_foreground(Allow, "allow").unwrap(), Allow);
+    fn polite_is_read_from_the_input_table_with_its_two_timings() {
+        let cfg = PolicyConfig::from_toml_str("[input]\nforeground = \"polite\"\n").unwrap();
+        assert_eq!(cfg.foreground, mcp_types::Foreground::Polite);
+        // Defaults when the keys are absent.
+        assert_eq!(
+            (cfg.polite_idle_ms, cfg.polite_max_wait_ms),
+            (1_500, 15_000)
+        );
+        let cfg = PolicyConfig::from_toml_str(
+            "[input]\nforeground = \"polite\"\npolite_idle_ms = 800\npolite_max_wait_ms = 4000\n",
+        )
+        .unwrap();
+        assert_eq!((cfg.polite_idle_ms, cfg.polite_max_wait_ms), (800, 4_000));
+        // Zero idle is allowed (borrow at once); a zero wait would refuse
+        // every call, and a negative number is not a duration.
+        assert!(PolicyConfig::from_toml_str("[input]\npolite_idle_ms = 0\n").is_ok());
+        for bad in [
+            "polite_max_wait_ms = 0",
+            "polite_idle_ms = -1",
+            "polite_idle_ms = \"slow\"",
+        ] {
+            assert!(
+                PolicyConfig::from_toml_str(&format!("[input]\n{bad}\n")).is_err(),
+                "{bad}"
+            );
+        }
+    }
+
+    /// The environment can only tighten, over every pair of file and
+    /// environment values: `polite` over a file's `allow` applies, and
+    /// neither `allow` nor `polite` loosens a stricter file.
+    #[test]
+    fn the_environment_can_add_restriction_but_not_remove_it() {
+        use mcp_types::Foreground::{Allow, Never, Polite};
+        for (file, env, want) in [
+            (Allow, "allow", Allow),
+            (Allow, "polite", Polite),
+            (Allow, "never", Never),
+            (Polite, "allow", Polite),
+            (Polite, "polite", Polite),
+            (Polite, "never", Never),
+            (Never, "allow", Never),
+            (Never, "polite", Never),
+            (Never, "never", Never),
+        ] {
+            assert_eq!(
+                tighten_foreground(file, env).unwrap(),
+                want,
+                "file {file:?} env {env}"
+            );
+        }
         let err = tighten_foreground(Allow, "nevr").unwrap_err();
         assert!(
             err.contains("AGENTCTL_FOREGROUND") && err.contains("nevr"),

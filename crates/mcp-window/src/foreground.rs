@@ -465,6 +465,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn under_polite_with_no_desk_to_borrow_what_raises_an_app_is_refused_and_the_rest_runs() {
+        for (tool, args, want) in cases() {
+            let rec = Arc::new(Recorder::default());
+            let m = module(&rec, Foreground::Polite);
+            let env = call(&m, tool, args.clone()).await;
+            let unwired = env.error.as_ref().is_some_and(|e| {
+                e.code == ErrorCode::UnsupportedOs && e.message.contains("\"polite\"")
+            });
+            match want {
+                Want::Refused => {
+                    assert!(unwired, "{tool} {args}: {env:?}");
+                    assert!(
+                        env.error.unwrap().message.contains("nothing was done"),
+                        "{tool}"
+                    );
+                    assert!(rec.calls().is_empty(), "{tool} {args} reached the backend");
+                }
+                Want::Runs => assert!(!unwired, "{tool} {args}: {env:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn the_default_refuses_nothing_and_launches_as_it_always_did() {
         for (tool, args, _) in cases() {
             let rec = Arc::new(Recorder::default());

@@ -1112,6 +1112,34 @@ impl InputBackend for MacosBackend {
             })
         }
     }
+    async fn user_idle_ms(&self) -> Option<u64> {
+        crate::event::hid_idle_ms()
+    }
+    async fn desk_state(&self) -> mcp_input::DeskState {
+        mcp_input::DeskState {
+            app: unsafe { frontmost_app_ref() },
+            pointer: crate::event::pointer_position().ok().flatten(),
+        }
+    }
+    fn restore_desk(&self, saved: &mcp_input::DeskState, pointer: bool) {
+        if pointer {
+            if let (Some((x, y)), Ok(Some(now))) = (saved.pointer, crate::event::pointer_position())
+            {
+                if ((now.0 - x).powi(2) + (now.1 - y).powi(2)).sqrt() > 1.0 {
+                    let _ = crate::event::mouse(&self.held, MouseKind::Move, x, y, None, &[]);
+                }
+            }
+        }
+        if let Some(app) = &saved.app {
+            unsafe {
+                if frontmost_pid() != Some(app.pid) && pid_alive(app.pid) {
+                    if let Some(el) = app_element(app.pid) {
+                        let _ = set_bool_attr(el.as_CFTypeRef(), "AXFrontmost", true);
+                    }
+                }
+            }
+        }
+    }
     async fn key_combo(&self, combo: &str) -> Result<(), InputError> {
         unsafe { self.ensure_target_frontmost()? };
         crate::event::key_combo(combo, self.keys.flags())
@@ -1474,6 +1502,17 @@ unsafe fn frontmost_pid() -> Option<c_int> {
         }
     }
     None
+}
+
+/// The app whose window is topmost, as a pid and a name, for putting it back.
+unsafe fn frontmost_app_ref() -> Option<mcp_input::AppRef> {
+    let pid = frontmost_pid()?;
+    let name = window_owners_all()
+        .into_iter()
+        .find(|(p, _)| *p == pid)
+        .map(|(_, n)| n)
+        .unwrap_or_default();
+    Some(mcp_input::AppRef { pid, name })
 }
 
 /// The frontmost application's AX element.

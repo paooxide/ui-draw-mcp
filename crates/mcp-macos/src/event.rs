@@ -108,6 +108,166 @@ fn display_rects() -> Vec<(f64, f64, f64, f64)> {
         .collect()
 }
 
+extern "C" {
+    fn CGEventSourceSecondsSinceLastEventType(state: i32, event_type: u32) -> f64;
+}
+
+/// `kCGAnyInputEventType`: whichever input event came last.
+const ANY_INPUT_EVENT: u32 = !0;
+/// `kCGEventSourceStateHIDSystemState`: the hardware's own clock, the one
+/// `ioreg`'s `HIDIdleTime` (what `idle_status` reports) reads.
+const HID_SYSTEM_STATE: i32 = 1;
+
+/// Milliseconds since the last input event of any kind, from the person's
+/// devices or from anything that posted synthetic input, this process
+/// included. `None` if the OS gives no answer.
+fn system_idle_ms() -> Option<u64> {
+    let secs = unsafe { CGEventSourceSecondsSinceLastEventType(HID_SYSTEM_STATE, ANY_INPUT_EVENT) };
+    (secs.is_finite() && secs >= 0.0).then_some((secs * 1000.0) as u64)
+}
+
+/// How a person's idleness is told apart from this process's own input.
+///
+/// Measured on macOS: a synthetic pointer move resets the system idle clock
+/// exactly as a real one does. Read raw, the clock would say "the person just
+/// acted" after every call the server itself made, and a polite server would
+/// wait out its own click. So every event posted to the system stream is
+/// recorded here, and the clock is read against it.
+#[derive(Debug, Clone, Copy, Default)]
+struct PostLedger {
+    /// When this process last posted a system-stream event (epoch ms).
+    last_post: Option<u64>,
+    /// When the last event that was not this process's happened (epoch ms),
+    /// as far as it is known. `None` until a post has looked at the clock.
+    person_last: Option<u64>,
+}
+
+/// A person's event must land this much after our own to count as theirs:
+/// the clock has a timestamp per event, and ours is stamped a moment after
+/// the instant recorded around the post.
+const OWN_EVENT_SLACK_MS: u64 = 100;
+
+static POSTS: Mutex<PostLedger> = Mutex::new(PostLedger {
+    last_post: None,
+    person_last: None,
+});
+
+/// Note that this process is about to post to the system stream, keeping
+/// what the clock says about the person up to date first.
+fn note_post(ledger: &mut PostLedger, now: u64, system_idle: Option<u64>) {
+    if let Some(idle) = system_idle {
+        let last_event = now.saturating_sub(idle);
+        let was_ours = ledger
+            .last_post
+            .is_some_and(|p| last_event <= p + OWN_EVENT_SLACK_MS);
+        if !was_ours {
+            ledger.person_last = Some(last_event);
+        }
+    }
+    ledger.last_post = Some(now);
+}
+
+/// Milliseconds since the person last touched the keyboard or pointer.
+///
+/// If the last event on the clock is the server's own, the person's idle time
+/// is counted from their last known event; if nothing is known about them
+/// before the server's first post, from that post (the server has acted only
+/// after waiting for them to be idle). Pure in its inputs, for testing.
+fn person_idle(ledger: &PostLedger, now: u64, system_idle: u64) -> u64 {
+    let last_event = now.saturating_sub(system_idle);
+    match ledger.last_post {
+        Some(p) if last_event <= p + OWN_EVENT_SLACK_MS => {
+            let since = ledger.person_last.unwrap_or(p);
+            now.saturating_sub(since)
+        }
+        _ => system_idle,
+    }
+}
+
+/// Milliseconds since the person last used the keyboard or pointer, not
+/// counting what this process posted. `None` if the OS gives no answer.
+pub fn hid_idle_ms() -> Option<u64> {
+    let sys = system_idle_ms()?;
+    let ledger = *POSTS.lock().unwrap_or_else(|e| e.into_inner());
+    Some(person_idle(&ledger, now_ms(), sys))
+}
+
+/// Post to the system event stream, which the frontmost app reads, and record
+/// that it was us. Every system-stream post goes through here.
+fn post_hid(ev: &CGEvent) {
+    {
+        let idle = system_idle_ms();
+        let mut g = POSTS.lock().unwrap_or_else(|e| e.into_inner());
+        note_post(&mut g, now_ms(), idle);
+    }
+    ev.post(CGEventTapLocation::HID);
+    // Stamped after the post as well: the event's own timestamp falls after
+    // the instant noted before it.
+    POSTS.lock().unwrap_or_else(|e| e.into_inner()).last_post = Some(now_ms());
+}
+
+#[cfg(test)]
+mod idle_tests {
+    use super::*;
+
+    fn ledger(last_post: Option<u64>, person_last: Option<u64>) -> PostLedger {
+        PostLedger {
+            last_post,
+            person_last,
+        }
+    }
+
+    #[test]
+    fn with_no_post_of_ours_the_clock_is_the_person() {
+        assert_eq!(person_idle(&PostLedger::default(), 10_000, 4_000), 4_000);
+    }
+
+    #[test]
+    fn our_own_last_event_is_not_counted_as_the_person() {
+        // The person last acted at t=1000; we posted at t=9000; the clock now
+        // (t=9500) says 500ms. They have been idle since 1000, not for 500.
+        let l = ledger(Some(9_000), Some(1_000));
+        assert_eq!(person_idle(&l, 9_500, 500), 8_500);
+    }
+
+    #[test]
+    fn a_person_acting_after_our_post_resets_their_idle_time() {
+        // We posted at 9000; the clock says the last event was at 9400, well
+        // after, so that was theirs.
+        let l = ledger(Some(9_000), Some(1_000));
+        assert_eq!(person_idle(&l, 9_500, 100), 100);
+    }
+
+    #[test]
+    fn nothing_known_before_our_first_post_counts_from_that_post() {
+        let l = ledger(Some(9_000), None);
+        assert_eq!(person_idle(&l, 9_500, 400), 500);
+    }
+
+    #[test]
+    fn noting_a_post_learns_when_the_person_last_acted() {
+        let mut l = PostLedger::default();
+        // First post at 5000; the clock says the last event was 3000ms ago.
+        note_post(&mut l, 5_000, Some(3_000));
+        assert_eq!(l.person_last, Some(2_000));
+        assert_eq!(l.last_post, Some(5_000));
+        // Second post at 5200: the last event (200ms ago, at 5000) was ours.
+        note_post(&mut l, 5_200, Some(200));
+        assert_eq!(l.person_last, Some(2_000), "our own event must not move it");
+        // A third at 9000 when the clock says 300ms (at 8700): theirs.
+        note_post(&mut l, 9_000, Some(300));
+        assert_eq!(l.person_last, Some(8_700));
+    }
+
+    #[test]
+    fn an_unreadable_clock_leaves_what_is_known_alone() {
+        let mut l = ledger(Some(1_000), Some(500));
+        note_post(&mut l, 2_000, None);
+        assert_eq!(l.person_last, Some(500));
+        assert_eq!(l.last_post, Some(2_000));
+    }
+}
+
 fn source() -> Result<CGEventSource, InputError> {
     CGEventSource::new(CGEventSourceStateID::HIDSystemState)
         .map_err(|_| InputError::Failed("could not create CGEventSource".into()))
@@ -134,7 +294,7 @@ pub enum Dest {
 impl Dest {
     fn post(self, ev: &CGEvent) {
         match self {
-            Dest::Hid => ev.post(CGEventTapLocation::HID),
+            Dest::Hid => post_hid(ev),
             Dest::Pid(pid) => ev.post_to_pid(pid),
         }
     }
@@ -312,7 +472,7 @@ pub fn key_down(held: &HeldKeys, key: &str) -> Result<(), InputError> {
     let down =
         CGEvent::new_keyboard_event(source()?, keycode, true).map_err(|_| fail("key down"))?;
     down.set_flags(flags);
-    down.post(CGEventTapLocation::HID);
+    post_hid(&down);
     held.add(key);
     Ok(())
 }
@@ -336,7 +496,7 @@ pub fn key_up(held: &HeldKeys, key: &str) -> Result<(), InputError> {
     }
     let up = CGEvent::new_keyboard_event(source()?, keycode, false).map_err(|_| fail("key up"))?;
     up.set_flags(flags);
-    up.post(CGEventTapLocation::HID);
+    post_hid(&up);
     Ok(())
 }
 
@@ -528,7 +688,7 @@ fn post_mouse_ex(
     // Record before posting: this is the only place the pointer is written, so
     // it is the only place the override watcher can learn what was ours.
     record_set(pt);
-    ev.post(CGEventTapLocation::HID);
+    post_hid(&ev);
     Ok(())
 }
 
@@ -667,7 +827,7 @@ pub fn scroll(
     let flags = modifier_flags(modifiers);
     // Position the cursor so the scroll targets that location.
     post_motion(held, CGPoint::new(x, y), flags)?;
-    build_scroll_event(dir, amount, flags)?.post(CGEventTapLocation::HID);
+    post_hid(&build_scroll_event(dir, amount, flags)?);
     Ok(())
 }
 

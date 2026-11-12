@@ -352,6 +352,10 @@ pub fn build_stack(cfg: &PolicyConfig) -> (Vec<Arc<dyn ToolModule>>, Wiring) {
             terminal_apps,
             judge: Some(judge.clone()),
             foreground: cfg.foreground,
+            polite: mcp_input::PoliteConfig {
+                idle_ms: cfg.polite_idle_ms,
+                max_wait_ms: cfg.polite_max_wait_ms,
+            },
             ..InputPolicy::default()
         };
         // Everything that can post input or raise a window is handed the
@@ -395,7 +399,18 @@ pub fn build_stack(cfg: &PolicyConfig) -> (Vec<Arc<dyn ToolModule>>, Wiring) {
             .with_allowed_apps(allowed_apps.clone());
         let window = WindowModule::new(window_backend, backend.clone(), allowed_apps)
             .with_judge(judge.clone())
-            .with_foreground(cfg.foreground);
+            .with_foreground(cfg.foreground)
+            // Under `polite`, raising an app borrows the desktop the way an
+            // input call does: wait for the person to be idle, then give the
+            // frontmost app and the pointer back.
+            .with_desk(Arc::new(mcp_input::InputDesk::new(
+                input_backend.clone(),
+                mcp_input::PoliteConfig {
+                    idle_ms: cfg.polite_idle_ms,
+                    max_wait_ms: cfg.polite_max_wait_ms,
+                },
+                Some(stop_file_probe(&cfg.kill_switch_file)),
+            )));
         modules.push(Arc::new(a11y));
         let input = Arc::new(input);
         wiring.steps = Some((input.clone(), steps));
@@ -439,6 +454,10 @@ pub fn build_stack(cfg: &PolicyConfig) -> (Vec<Arc<dyn ToolModule>>, Wiring) {
             terminal_apps,
             judge: Some(judge.clone()),
             foreground: cfg.foreground,
+            polite: mcp_input::PoliteConfig {
+                idle_ms: cfg.polite_idle_ms,
+                max_wait_ms: cfg.polite_max_wait_ms,
+            },
             ..InputPolicy::default()
         };
         // Everything that can post input or raise a window is handed the
@@ -479,7 +498,18 @@ pub fn build_stack(cfg: &PolicyConfig) -> (Vec<Arc<dyn ToolModule>>, Wiring) {
             .with_allowed_apps(allowed_apps.clone());
         let window = WindowModule::new(window_backend, backend.clone(), allowed_apps)
             .with_judge(judge.clone())
-            .with_foreground(cfg.foreground);
+            .with_foreground(cfg.foreground)
+            // Under `polite`, raising an app borrows the desktop the way an
+            // input call does: wait for the person to be idle, then give the
+            // frontmost app and the pointer back.
+            .with_desk(Arc::new(mcp_input::InputDesk::new(
+                input_backend.clone(),
+                mcp_input::PoliteConfig {
+                    idle_ms: cfg.polite_idle_ms,
+                    max_wait_ms: cfg.polite_max_wait_ms,
+                },
+                Some(stop_file_probe(&cfg.kill_switch_file)),
+            )));
         modules.push(Arc::new(a11y));
         let input = Arc::new(input);
         wiring.steps = Some((input.clone(), steps));

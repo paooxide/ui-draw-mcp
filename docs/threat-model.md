@@ -87,7 +87,7 @@ gate would have refused.
 | argv execution | `mcp-proc` | Shell metacharacter injection. No shell unless `allow_shell` is on. |
 | Redaction | `mcp-policy::Redactor` | Secrets in results *and* in the audit log. |
 | No plaintext secret read | `mcp-sec` | Exfiltration of keychain values. The capability does not exist. |
-| Foreground refusal (`input.foreground = "never"`) | Tool layer: `mcp-input::tool_refusal`, `mcp-window::tool_refusal`; backend boundary: `mcp-input::ForegroundInput`, `mcp-window::ForegroundWindow`, wired in `agentctl::engines` | Agentctl itself taking the user's pointer, keyboard or foreground while they work. See the note below the table. Config or `AGENTCTL_FOREGROUND` only; roles, `access` profiles and tool arguments cannot change it, and the environment can add `never` but not remove it. |
+| Foreground refusal (`input.foreground = "never"`; `"polite"` borrows and returns the desktop) | Tool layer: `mcp-input::tool_refusal`, `mcp-window::tool_refusal`; backend boundary: `mcp-input::ForegroundInput`, `mcp-window::ForegroundWindow`, wired in `agentctl::engines` | Agentctl itself taking the user's pointer, keyboard or foreground while they work. See the note below the table. Config or `AGENTCTL_FOREGROUND` only; roles, `access` profiles and tool arguments cannot change it, and the environment can add `never` but not remove it. |
 | Pinned-target raise-or-refuse | `mcp-macos::ensure_target_frontmost` | Keystrokes landing in the wrong window. Refuses to type if it cannot raise the intended app. |
 | Frame cap | `mcp-core::DEFAULT_MAX_FRAME_BYTES` | Memory exhaustion before any policy runs. |
 | HTTP: loopback bind, bearer token, `Origin` refusal | `mcp-core::http` | Network reachability, unauthenticated access, and drive-by requests from the operator's own browser. |
@@ -129,6 +129,41 @@ promise:
 
 The refusal appears in the audit log as an ordinary `POLICY_DENIED` result for the tool; the log records the
 code, not the message.
+
+**Keys sent to a background app by process.** With the app pinned (`focus_app`, `activate: false`) and not
+frontmost, `keyboard_type` and `keyboard_shortcut` post their key events to that process alone
+(`input: "pid_event"`), so under `never` they are allowed: measured on macOS, they arrived in TextEdit
+behind Finder while the topmost window, the active application, Finder's focused element and the pointer
+stayed put. Keys that would go to the frontmost app are still refused. Per-process delivery is a courtesy
+of the OS, not a gate: the destructive-command screen applies to the pinned app by name, exactly as it does
+to the frontmost one, but nothing stops the receiving app from doing whatever the keys ask.
+
+**What `foreground = "polite"` does, and what it does not.** `polite` sits between `allow` and `never`
+(`never` is stricter, `allow` looser; `AGENTCTL_FOREGROUND` can only move a setting toward `never`, so
+`polite` from the environment applies over `allow` in the file and never loosens a file's `polite` or
+`never`). An action that needs the real pointer or keyboard, or to raise an app, waits until the
+person has been idle for `input.polite_idle_ms` (1500 by default; the OS idle clock, with agentctl's own
+input not counted as the person), up to `input.polite_max_wait_ms` (15000), then fails with a retryable
+`TIMEOUT` ("the user is active") having done nothing. Otherwise it records the frontmost app and the
+pointer, acts, and puts both back, on error paths too; a batch (`input_steps`) borrows once for all its
+steps. If the person moves the pointer part way, the action is abandoned (buttons and keys are released) and
+the call fails with the same retryable error; the app is put back but the pointer is left in their hand.
+In this mode the human-override watcher abandons the action instead of tripping the kill switch
+(`agentctl/src/override_watch.rs`); under `allow` it still trips it, and the STOP file stops every call in every mode.
+
+This is courtesy, not containment:
+
+- It protects a person who is idle from being surprised, and a person who is moving the mouse from being
+  fought. It does not limit what the borrowed app does while it is in front, or what keys the agent sends it.
+- Keyboard use is only noticed when a call starts (the idle clock covers it), not mid-action: detecting
+  typing while the agent acts would take a global key tap, which agentctl does not install.
+- Restoring is best effort and reported: the result's `polite.returned` says whether the app and the pointer
+  were back, and an app that was closed meanwhile cannot be. A call costs about half a second more, spent
+  watching for an app that is slow to come forward.
+- A key held with `keyboard_shortcut` `down` is refused: it outlives the call, so it cannot be given back.
+- `focus_app` and `control_window focus` raise the app only for the length of the call (`focus_app` still pins
+  it). Where the platform cannot tell when the person is idle (Linux), a call that needs the desktop is
+  refused rather than guessed. The same gaps as `never` apply: `exec`, a headed browser, an app raising itself.
 
 Full mapping to OWASP categories is in [`architecture.md`](architecture.md) §8.
 

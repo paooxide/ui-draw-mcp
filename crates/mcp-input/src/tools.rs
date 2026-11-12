@@ -39,6 +39,8 @@ pub struct InputPolicy {
     /// synthetic keys or scroll events, or bring an app forward. See
     /// [`crate::foreground`].
     pub foreground: mcp_types::Foreground,
+    /// How long `foreground = "polite"` waits for the person to be idle.
+    pub polite: crate::polite::PoliteConfig,
 }
 
 /// Apps whose keystrokes may be shell input.
@@ -148,6 +150,7 @@ impl Default for InputPolicy {
             destructive_patterns: mcp_policy::default_destructive_patterns(),
             judge: None,
             foreground: mcp_types::Foreground::Allow,
+            polite: crate::polite::PoliteConfig::default(),
         }
     }
 }
@@ -247,6 +250,9 @@ pub struct InputModule {
     relay: Option<Arc<crate::steps::StepRelay>>,
     /// Wall time a batch may spend; [`crate::steps::MAX_BATCH_MS`] outside tests.
     batch_ms: u64,
+    /// Set while an `input_steps` batch holds a polite loan, so its steps run
+    /// inside that one borrow instead of waiting and restoring each.
+    batch_loan: std::sync::atomic::AtomicBool,
 }
 
 /// What the module holds down.
@@ -308,6 +314,7 @@ impl InputModule {
             probe: None,
             relay: None,
             batch_ms: crate::steps::MAX_BATCH_MS,
+            batch_loan: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -2713,6 +2720,160 @@ fn expect_schema() -> serde_json::Value {
     )
 }
 
+/// Marks a batch as holding the loan for as long as it lives.
+struct BatchLoan<'a>(&'a std::sync::atomic::AtomicBool);
+
+impl<'a> BatchLoan<'a> {
+    fn begin(flag: &'a std::sync::atomic::AtomicBool) -> Self {
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        BatchLoan(flag)
+    }
+}
+
+impl Drop for BatchLoan<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl InputModule {
+    /// `foreground = "polite"`: a call that needs the pointer, keyboard or
+    /// foreground waits for the person to be idle, borrows the desk, and gives
+    /// it back on every path out, including an error and a cancelled call
+    /// (the loan's `Drop`). A batch borrows once for all its steps and gives
+    /// back once at the end; a person who takes the pointer part way ends the
+    /// action with a retryable error, and the pointer is left with them.
+    async fn call_politely(&self, name: &str, args: Value, ctx: &CallCtx) -> Envelope {
+        use crate::polite::Loan;
+        if let Some(why) = crate::foreground::polite_refusal(name, &args) {
+            return Envelope::fail_with(
+                name,
+                ErrorCode::PolicyDenied,
+                why,
+                "press the key instead, or hold it with the foreground setting at allow",
+            );
+        }
+        // A step of a batch that has already borrowed: the batch settles up.
+        if name != "input_steps" && self.batch_loan.load(std::sync::atomic::Ordering::SeqCst) {
+            return self.run_call(name, args, ctx).await;
+        }
+        if !crate::foreground::takes_foreground(&*self.backend, name, &args) {
+            return self.run_call(name, args, ctx).await;
+        }
+        let halt = self.halt.clone();
+        let cancel = ctx.cancel.clone();
+        let loan = match Loan::borrow(self.backend.clone(), self.policy.polite, move || {
+            if halt.as_ref().is_some_and(|h| h()) {
+                Some("the kill switch is engaged")
+            } else if cancel.is_cancelled() {
+                Some("the call was cancelled")
+            } else {
+                None
+            }
+        })
+        .await
+        {
+            Ok(l) => l,
+            Err(e) => return e.envelope(name),
+        };
+        let _batch = (name == "input_steps").then(|| BatchLoan::begin(&self.batch_loan));
+        let since = self.backend.takeover_generation();
+        let env = self.run_call(name, args, ctx).await;
+        crate::polite::settle(loan, &*self.backend, since, env).await
+    }
+
+    /// The call itself, once the foreground setting has had its say.
+    async fn run_call(&self, name: &str, args: Value, ctx: &CallCtx) -> Envelope {
+        // Read before anything can await: a takeover from here on is this
+        // call's to honour, whenever its first pointer move happens to be.
+        let since = self.backend.takeover_generation();
+
+        // Held for the whole call, including any `expect` wait: the pointer is
+        // ours for that entire window, so a divergence during it is somebody
+        // else's hand.
+        let _driving = self.activity.as_ref().map(crate::Activity::begin);
+
+        // An `expect` clause is parsed *before* the action: discovering the
+        // expectation was malformed after clicking is too late to be useful.
+        let spec = if EXPECTING.contains(&name) {
+            match crate::postcondition::Verifier::parse(name, &args) {
+                Ok(s) => s,
+                Err(e) => return *e,
+            }
+        } else {
+            None
+        };
+        if spec.is_some() && self.verifier.is_none() {
+            return Envelope::fail_with(
+                name,
+                ErrorCode::UnsupportedOs,
+                "postconditions need a UI to observe, and none is wired on this platform",
+                "drop 'expect' and confirm separately with wait_for",
+            );
+        }
+        // The comparison point has to be captured before the action, not after.
+        let before = match (&spec, self.verifier.as_ref()) {
+            (Some(_), Some(v)) => v.before(),
+            _ => None,
+        };
+        // `effects` is validated with the rest of the arguments, so a typo is
+        // refused before the action instead of discovered after it. An `expect`
+        // brings its own delta, which makes the second report redundant.
+        let reporting = if EFFECTING.contains(&name) {
+            match crate::effects::wanted(&args) {
+                Ok(on) => on && spec.is_none() && effects_apply(name, &args),
+                Err(m) => return Envelope::fail(name, ErrorCode::InvalidArgs, m),
+            }
+        } else {
+            false
+        };
+        let seen_before = match (&self.probe, reporting) {
+            (Some(_), true) => Some(self.facts_before(name, &args).await),
+            _ => None,
+        };
+
+        let mut env = match name {
+            "ui_action" => self.ui_action(&args).await,
+            "set_value" => self.set_value(&args).await,
+            "select_text" => self.select_text(&args).await,
+            "get_selection" => self.get_selection(&args).await,
+            "ui_fill_form" => self.ui_fill_form(&args).await,
+            "keyboard_type" => self.keyboard_type(&args).await,
+            "keyboard_shortcut" => self.keyboard_shortcut(&args, since).await,
+            "mouse_action" => self.mouse_action(&args, &ctx.cancel, since).await,
+            "scroll" => self.scroll(&args).await,
+            "hover" => self.hover(&args, &ctx.cancel, since).await,
+            "drag_drop" => self.drag_drop(&args, since).await,
+            "clipboard_read" => self.clipboard_read(&args).await,
+            "clipboard_write" => self.clipboard_write(&args).await,
+            "input_showcase" => self.input_showcase(&args).await,
+            "input_steps" => self.input_steps(&args, ctx).await,
+            other => Envelope::fail(other, ErrorCode::InvalidArgs, "unknown tool"),
+        };
+        if let (Some(before), true) = (seen_before, env.ok) {
+            self.attach_effects(&mut env, before).await;
+        }
+
+        let mut env = match (spec, self.verifier.as_ref()) {
+            (Some(spec), Some(v)) => {
+                let verified = v.verify(&spec, before, ctx).await;
+                crate::postcondition::attach(env, name, verified)
+            }
+            _ => env,
+        };
+        // `down` and `up` settle their own holds, and so does each step of a
+        // batch: one that reached the module and failed has released them, and
+        // one the gate refused never touched them, as when called alone.
+        let manages_holds = name == "input_steps"
+            || (name == "keyboard_shortcut"
+                && !matches!(shortcut_action(&args), Ok(HoldAction::Press) | Err(_)));
+        if !env.ok && !manages_holds {
+            self.release_after_failure(&mut env).await;
+        }
+        env
+    }
+}
+
 #[async_trait]
 impl ToolModule for InputModule {
     fn descriptors(&self) -> Vec<ToolDescriptor> {
@@ -3059,93 +3220,10 @@ impl ToolModule for InputModule {
                 return refusal.envelope(name);
             }
         }
-        // Read before anything can await: a takeover from here on is this
-        // call's to honour, whenever its first pointer move happens to be.
-        let since = self.backend.takeover_generation();
-
-        // Held for the whole call, including any `expect` wait: the pointer is
-        // ours for that entire window, so a divergence during it is somebody
-        // else's hand.
-        let _driving = self.activity.as_ref().map(crate::Activity::begin);
-
-        // An `expect` clause is parsed *before* the action: discovering the
-        // expectation was malformed after clicking is too late to be useful.
-        let spec = if EXPECTING.contains(&name) {
-            match crate::postcondition::Verifier::parse(name, &args) {
-                Ok(s) => s,
-                Err(e) => return *e,
-            }
-        } else {
-            None
-        };
-        if spec.is_some() && self.verifier.is_none() {
-            return Envelope::fail_with(
-                name,
-                ErrorCode::UnsupportedOs,
-                "postconditions need a UI to observe, and none is wired on this platform",
-                "drop 'expect' and confirm separately with wait_for",
-            );
+        if self.policy.foreground.is_polite() {
+            return self.call_politely(name, args, ctx).await;
         }
-        // The comparison point has to be captured before the action, not after.
-        let before = match (&spec, self.verifier.as_ref()) {
-            (Some(_), Some(v)) => v.before(),
-            _ => None,
-        };
-        // `effects` is validated with the rest of the arguments, so a typo is
-        // refused before the action instead of discovered after it. An `expect`
-        // brings its own delta, which makes the second report redundant.
-        let reporting = if EFFECTING.contains(&name) {
-            match crate::effects::wanted(&args) {
-                Ok(on) => on && spec.is_none() && effects_apply(name, &args),
-                Err(m) => return Envelope::fail(name, ErrorCode::InvalidArgs, m),
-            }
-        } else {
-            false
-        };
-        let seen_before = match (&self.probe, reporting) {
-            (Some(_), true) => Some(self.facts_before(name, &args).await),
-            _ => None,
-        };
-
-        let mut env = match name {
-            "ui_action" => self.ui_action(&args).await,
-            "set_value" => self.set_value(&args).await,
-            "select_text" => self.select_text(&args).await,
-            "get_selection" => self.get_selection(&args).await,
-            "ui_fill_form" => self.ui_fill_form(&args).await,
-            "keyboard_type" => self.keyboard_type(&args).await,
-            "keyboard_shortcut" => self.keyboard_shortcut(&args, since).await,
-            "mouse_action" => self.mouse_action(&args, &ctx.cancel, since).await,
-            "scroll" => self.scroll(&args).await,
-            "hover" => self.hover(&args, &ctx.cancel, since).await,
-            "drag_drop" => self.drag_drop(&args, since).await,
-            "clipboard_read" => self.clipboard_read(&args).await,
-            "clipboard_write" => self.clipboard_write(&args).await,
-            "input_showcase" => self.input_showcase(&args).await,
-            "input_steps" => self.input_steps(&args, ctx).await,
-            other => Envelope::fail(other, ErrorCode::InvalidArgs, "unknown tool"),
-        };
-        if let (Some(before), true) = (seen_before, env.ok) {
-            self.attach_effects(&mut env, before).await;
-        }
-
-        let mut env = match (spec, self.verifier.as_ref()) {
-            (Some(spec), Some(v)) => {
-                let verified = v.verify(&spec, before, ctx).await;
-                crate::postcondition::attach(env, name, verified)
-            }
-            _ => env,
-        };
-        // `down` and `up` settle their own holds, and so does each step of a
-        // batch: one that reached the module and failed has released them, and
-        // one the gate refused never touched them, as when called alone.
-        let manages_holds = name == "input_steps"
-            || (name == "keyboard_shortcut"
-                && !matches!(shortcut_action(&args), Ok(HoldAction::Press) | Err(_)));
-        if !env.ok && !manages_holds {
-            self.release_after_failure(&mut env).await;
-        }
-        env
+        self.run_call(name, args, ctx).await
     }
 
     /// Server stop: nothing may stay down once the process that pressed it is

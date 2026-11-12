@@ -176,6 +176,12 @@ pub struct PolicyConfig {
     /// here or by `AGENTCTL_FOREGROUND` only: no tool, argument or role can
     /// change it, and `access = "bypass"` does not loosen it.
     pub foreground: mcp_types::Foreground,
+    /// With `foreground = "polite"`: how long the person must have been idle
+    /// before a call borrows the pointer or keyboard, in milliseconds.
+    pub polite_idle_ms: u64,
+    /// With `foreground = "polite"`: the longest a call waits for that idle
+    /// time before giving up with a retryable error, in milliseconds.
+    pub polite_max_wait_ms: u64,
     /// Shells `pty_spawn` may start, by absolute path.
     pub allowed_shells: Vec<String>,
     pub max_pty_sessions: usize,
@@ -284,6 +290,8 @@ impl Default for PolicyConfig {
             human_override_px: 12,
             human_override_grace_ms: 1_500,
             foreground: mcp_types::Foreground::Allow,
+            polite_idle_ms: 1_500,
+            polite_max_wait_ms: 15_000,
             allowed_shells: ["/bin/zsh", "/bin/bash", "/bin/sh"]
                 .iter()
                 .map(|s| s.to_string())
@@ -393,6 +401,8 @@ impl PolicyConfig {
                 "human_override_px": self.human_override_px,
                 "human_override_grace_ms": self.human_override_grace_ms,
                 "foreground": self.foreground.as_str(),
+                "polite_idle_ms": self.polite_idle_ms,
+                "polite_max_wait_ms": self.polite_max_wait_ms,
             },
             "fs": { "roots": paths(&self.fs_roots) },
             "terminal": {

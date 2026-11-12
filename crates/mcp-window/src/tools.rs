@@ -17,6 +17,7 @@ pub struct WindowModule {
     allowed_apps: Vec<String>,
     judge: Option<Arc<mcp_judge::Judge>>,
     foreground: mcp_types::Foreground,
+    desk: Option<Arc<dyn mcp_types::Desk>>,
 }
 
 impl WindowModule {
@@ -31,6 +32,7 @@ impl WindowModule {
             allowed_apps,
             judge: None,
             foreground: mcp_types::Foreground::Allow,
+            desk: None,
         }
     }
 
@@ -39,6 +41,14 @@ impl WindowModule {
     /// before they reach the backend, and `launch` asks not to activate.
     pub fn with_foreground(mut self, foreground: mcp_types::Foreground) -> Self {
         self.foreground = foreground;
+        self
+    }
+
+    /// Where a call borrows the desktop from under `foreground = "polite"`
+    /// (composition root only). Without one, polite refuses the calls that
+    /// would need it rather than raise an app unannounced.
+    pub fn with_desk(mut self, desk: Arc<dyn mcp_types::Desk>) -> Self {
+        self.desk = Some(desk);
         self
     }
 
@@ -131,7 +141,10 @@ impl WindowModule {
                 format!("app '{app}' is not in policy.allowed_apps"),
             );
         }
-        let started = if self.foreground.is_never() {
+        // `polite` also starts it without activating: a new app that took the
+        // front would be one more thing to give back, and the person never
+        // asked for it.
+        let started = if self.foreground.is_never() || self.foreground.is_polite() {
             self.backend.launch_in_background(&app).await
         } else {
             self.backend.launch(&app).await
@@ -606,6 +619,42 @@ impl ToolModule for WindowModule {
                 return refusal.envelope(name);
             }
         }
+        if self.foreground.is_polite()
+            && crate::foreground::tool_refusal(&*self.backend, name, &args).is_some()
+        {
+            return self.call_politely(name, args, ctx).await;
+        }
+        self.dispatch(name, args, ctx).await
+    }
+}
+
+impl WindowModule {
+    /// A call that raises an app or window, under `foreground = "polite"`:
+    /// it waits for the person to be idle, runs, and puts the frontmost app
+    /// and the pointer back. `focus_app` and `control_window focus` therefore
+    /// raise the app only for the length of the call; `focus_app` still pins
+    /// it, which is what later calls act on.
+    async fn call_politely(&self, name: &str, args: Value, ctx: &CallCtx) -> Envelope {
+        let Some(desk) = &self.desk else {
+            return Envelope::fail_with(
+                name,
+                ErrorCode::UnsupportedOs,
+                format!(
+                    "{name} would bring an app forward and this server runs with foreground = \
+                     \"polite\" but has no way to borrow the desktop, so nothing was done"
+                ),
+                "use foreground = \"allow\" or \"never\"",
+            );
+        };
+        let loan = match desk.borrow(name, &ctx.cancel).await {
+            Ok(l) => l,
+            Err(e) => return e,
+        };
+        let env = self.dispatch(name, args, ctx).await;
+        loan.settle(env).await
+    }
+
+    async fn dispatch(&self, name: &str, args: Value, ctx: &CallCtx) -> Envelope {
         match name {
             "list_windows" => self.list_windows(&args).await,
             "list_apps" => self.list_apps().await,

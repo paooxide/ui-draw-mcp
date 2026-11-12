@@ -8,6 +8,32 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- **`foreground = "polite"`: borrow the pointer and keyboard when you are idle, and give them back.** A third
+  setting between `allow` and `never`, for actions that genuinely need the real pointer, keyboard or a raised
+  app (`mouse_action`, `scroll`, `hover`, `drag_drop`, `keyboard_type` and `keyboard_shortcut` when no pinned
+  background app takes them by process, `ui_action show_menu`, `menu_open`, `menu_invoke`, `control_window
+  restore`, `focus_app` and `control_window focus`). Such a call first waits until you have been idle for
+  `input.polite_idle_ms` (default 1500; the OS idle clock, with agentctl's own input not counted as you:
+  a synthetic pointer move was measured to reset it exactly as a real one does) for at most
+  `input.polite_max_wait_ms` (default 15000), then fails with a retryable `TIMEOUT` ("the user is active")
+  having done nothing. Otherwise it records the frontmost app and the pointer, acts, and puts both back, on
+  error paths and a dropped call too; the result's `polite` says what was returned (`returned.app`,
+  `returned.pointer`) and `waited_ms`. An `input_steps` batch borrows once and restores once. If you move
+  the pointer mid-action, the action is abandoned with buttons and keys released and fails with the same
+  retryable error; the app is put back but the pointer is left in your hand. The human-override watcher does
+  not trip the kill switch in this mode (it abandons the action instead); under `allow` it does as before,
+  and the STOP file stops everything in every mode. `AGENTCTL_FOREGROUND` can only tighten (`never` over
+  `polite` over `allow`): `polite` from the environment applies over a file's `allow`, and neither `allow`
+  nor `polite` loosens a stricter file. Not supported, and refused with the reason: `keyboard_shortcut`
+  `action: "down"` (a held key outlives the call, so it cannot be given back), and any call that needs the
+  desktop on a platform with no idle clock (Linux). A polite call costs about half a second more, spent
+  watching for an app that is slow to come forward. `focus_app` and `control_window focus` raise the app only
+  for the length of the call (`focus_app` still pins it), and `launch` starts apps without activating them.
+  `agentctl doctor` reports the mode and its timings. Courtesy, not containment: see `docs/threat-model.md`.
+  Measured on macOS with Finder in front, the pointer parked at a known spot and a TextEdit scratch document:
+  a click-and-type batch landed its text and afterwards Finder was frontmost and the pointer 0.0 points from
+  where it was; `focus_app` raised TextEdit and handed the front back.
+
 - **Keys reach a pinned background app by process, without raising it (`input: "pid_event"`).** When the app
   pinned with `focus_app` is not frontmost, `keyboard_type` and `keyboard_shortcut` (press) post their key
   events to that process (`CGEventPostToPid`) instead of bringing it forward and typing into the foreground;

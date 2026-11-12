@@ -133,6 +133,13 @@ human_override_px = 12
 human_override_grace_ms = 1500
 # Whether tools may take your pointer, keyboard or foreground.
 #   "allow"  (default) every tool may move the pointer, type and bring apps forward.
+#   "polite" an action that needs the real pointer, keyboard or foreground waits
+#            until you have been idle for polite_idle_ms (up to polite_max_wait_ms,
+#            then it fails with a retryable error and does nothing), borrows
+#            them, and puts the frontmost app and the pointer back. If you
+#            move the mouse mid-action it stops and gives the pointer to you
+#            instead of tripping the kill switch. Courtesy, not containment:
+#            see docs/threat-model.md. Stricter than "allow", looser than "never".
 #   "never"  no tool moves the real pointer, posts synthetic key or scroll events,
 #            holds a key, or brings an app or window to the front. Each one is
 #            refused before it runs, with the background-safe alternative if
@@ -146,9 +153,14 @@ human_override_grace_ms = 1500
 # not limit what `exec` can run. See docs/threat-model.md.
 #
 # Only this file or AGENTCTL_FOREGROUND can set it: no tool, role or access
-# profile can. The environment can add "never" but cannot remove it. Any other
-# value is a startup error. `agentctl doctor` shows the mode in effect.
+# profile can. The environment can only make it stricter (allow -> polite ->
+# never), never looser. Any other value is a startup error. `agentctl doctor`
+# shows the mode in effect.
 foreground = "allow"
+# With "polite": how long you must have been idle, and the longest a call waits
+# for that, in milliseconds.
+# polite_idle_ms = 1500
+# polite_max_wait_ms = 15000
 # Apps whose typed input is screened for destructive shell commands.
 # Editors are included by default because their *integrated terminals* run the
 # same shell: the accessibility API cannot tell an editor pane from a terminal

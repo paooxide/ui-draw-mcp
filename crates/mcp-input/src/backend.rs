@@ -97,6 +97,23 @@ pub struct FocusedText {
     pub secure: bool,
 }
 
+/// The application in front, as much as putting it back needs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppRef {
+    pub pid: i32,
+    pub name: String,
+}
+
+/// What a person would notice moving: which app is in front and where the
+/// pointer is. Read before a borrow under `foreground = "polite"` and put
+/// back after it. Either half is `None` when the platform cannot say, and a
+/// half that is unknown is never restored.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DeskState {
+    pub app: Option<AppRef>,
+    pub pointer: Option<(f64, f64)>,
+}
+
 /// A coordinate pointer action.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MouseKind {
@@ -334,6 +351,26 @@ pub trait InputBackend: Send + Sync {
             "reading the focused element of another app is not supported on this platform".into(),
         ))
     }
+    /// How long the person has gone without touching the keyboard or pointer,
+    /// in milliseconds, or `None` when this platform cannot say. Input this
+    /// server posted itself is not counted as the person (see the macOS
+    /// implementation for how). Without it `foreground = "polite"` cannot
+    /// know when the desktop is free, and refuses to act rather than guess.
+    async fn user_idle_ms(&self) -> Option<u64> {
+        None
+    }
+    /// The frontmost app and the pointer position now.
+    async fn desk_state(&self) -> DeskState {
+        DeskState::default()
+    }
+    /// Put the desk back as `saved` found it: the pointer to where it was
+    /// (when `pointer` is true) and the saved app to the front. Synchronous
+    /// and quick, because it also runs from a `Drop` on an error path; it asks
+    /// for the app to come forward and does not wait for it to. The caller
+    /// reads [`InputBackend::desk_state`] to see whether it did. The pointer
+    /// move is posted the way every other pointer move is, so the
+    /// human-override watcher knows it was the server's.
+    fn restore_desk(&self, _saved: &DeskState, _pointer: bool) {}
     /// Synthetic system input follows: `type_text`, `key_combo`, `mouse`,
     /// `scroll_at`, `hover` and `drag` all move the real pointer or type into
     /// the frontmost app, and the tool layer reports them as [`Route::Hid`].
