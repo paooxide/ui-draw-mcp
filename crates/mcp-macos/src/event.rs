@@ -13,6 +13,7 @@ use core_graphics::geometry::CGPoint;
 use std::collections::VecDeque;
 use std::sync::Mutex;
 
+use mcp_input::trackpad::{Phase, PixelScroll};
 use mcp_input::{InputError, MouseKind, ScrollDir, SetPoint};
 
 fn fail(what: &str) -> InputError {
@@ -831,6 +832,56 @@ pub fn scroll(
     Ok(())
 }
 
+/// `kCGScrollWheelEventScrollPhase` and `kCGScrollWheelEventMomentumPhase`, the
+/// public CGEventField numbers from CGEventTypes.h. The crate wrapper does not
+/// name them.
+const SCROLL_PHASE_FIELD: u32 = 99;
+const MOMENTUM_PHASE_FIELD: u32 = 123;
+
+/// The (scroll, momentum) field values for a phase: `CGScrollPhase` while the
+/// fingers are down, `CGMomentumScrollPhase` while coasting, the other zero.
+pub fn phase_fields(phase: Phase) -> (i64, i64) {
+    match phase {
+        Phase::Began => (1, 0),
+        Phase::Changed => (2, 0),
+        Phase::Ended => (4, 0),
+        Phase::MomentumBegan => (0, 1),
+        Phase::MomentumContinue => (0, 2),
+        Phase::MomentumEnded => (0, 3),
+    }
+}
+
+/// Build one pixel-unit scroll event with its gesture phase, without posting.
+/// CoreGraphics counts positive as up and left, so the planner's down / right
+/// deltas are negated.
+fn build_pixel_scroll(ev: &PixelScroll, flags: CGEventFlags) -> Result<CGEvent, InputError> {
+    let out = CGEvent::new_scroll_event(source()?, ScrollEventUnit::PIXEL, 2, -ev.dy, -ev.dx, 0)
+        .map_err(|_| fail("scroll event"))?;
+    let (scroll, momentum) = phase_fields(ev.phase);
+    out.set_integer_value_field(EventField::SCROLL_WHEEL_EVENT_IS_CONTINUOUS, 1);
+    out.set_integer_value_field(SCROLL_PHASE_FIELD, scroll);
+    out.set_integer_value_field(MOMENTUM_PHASE_FIELD, momentum);
+    out.set_flags(flags);
+    Ok(out)
+}
+
+/// Post one event of a trackpad-style scroll. The pointer goes to `(x, y)` with
+/// the first event, since a wheel event is delivered to whatever is under it.
+pub fn scroll_pixels(
+    held: &Held,
+    x: f64,
+    y: f64,
+    ev: &PixelScroll,
+    modifiers: &[String],
+) -> Result<(), InputError> {
+    let flags = modifier_flags(modifiers);
+    if ev.phase == Phase::Began {
+        post_motion(held, CGPoint::new(x, y), flags)?;
+    }
+    post_hid(&build_pixel_scroll(ev, flags)?);
+    Ok(())
+}
+
 pub fn hover(held: &Held, x: f64, y: f64, modifiers: &[String]) -> Result<(), InputError> {
     post_motion(held, CGPoint::new(x, y), modifier_flags(modifiers))
 }
@@ -1346,6 +1397,47 @@ mod drag_tests {
 #[cfg(test)]
 mod scroll_tests {
     use super::*;
+
+    /// The phases ride on the public CGEvent fields and read back from the
+    /// event, so a wrong field number or a lost unit shows here and not as an
+    /// app that quietly ignores the gesture.
+    #[test]
+    fn pixel_scroll_events_carry_phase_momentum_and_pixel_deltas() {
+        let mk = |phase, dx, dy| {
+            build_pixel_scroll(
+                &PixelScroll {
+                    phase,
+                    dx,
+                    dy,
+                    at_ms: 0,
+                },
+                CGEventFlags::empty(),
+            )
+            .unwrap()
+        };
+        let began = mk(Phase::Began, 0, 40);
+        assert!(matches!(began.get_type(), CGEventType::ScrollWheel));
+        assert_eq!(began.get_integer_value_field(SCROLL_PHASE_FIELD), 1);
+        assert_eq!(began.get_integer_value_field(MOMENTUM_PHASE_FIELD), 0);
+        assert_eq!(
+            began.get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_IS_CONTINUOUS),
+            1
+        );
+        // Down is negative to CoreGraphics; the pixel field carries it.
+        assert_eq!(
+            began.get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_1),
+            -40
+        );
+        let coast = mk(Phase::MomentumContinue, 12, 0);
+        assert_eq!(coast.get_integer_value_field(SCROLL_PHASE_FIELD), 0);
+        assert_eq!(coast.get_integer_value_field(MOMENTUM_PHASE_FIELD), 2);
+        assert_eq!(
+            coast.get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_2),
+            -12
+        );
+        assert_eq!(phase_fields(Phase::Ended), (4, 0));
+        assert_eq!(phase_fields(Phase::MomentumEnded), (0, 3));
+    }
 
     #[test]
     fn scroll_deltas_follow_direction_and_a_page_is_ten_lines() {

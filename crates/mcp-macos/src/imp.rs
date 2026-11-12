@@ -1179,6 +1179,19 @@ impl InputBackend for MacosBackend {
         let modifiers = self.keys.with_modifiers(modifiers);
         crate::event::scroll(&self.held, x, y, d, a, &modifiers)
     }
+    async fn scroll_pixels(
+        &self,
+        x: f64,
+        y: f64,
+        ev: &mcp_input::trackpad::PixelScroll,
+        modifiers: &[String],
+    ) -> Result<(), InputError> {
+        let modifiers = self.keys.with_modifiers(modifiers);
+        crate::event::scroll_pixels(&self.held, x, y, ev, &modifiers)
+    }
+    fn pixel_momentum(&self) -> bool {
+        true
+    }
     async fn pointer_position(&self) -> Result<Option<(f64, f64)>, InputError> {
         crate::event::pointer_position()
     }

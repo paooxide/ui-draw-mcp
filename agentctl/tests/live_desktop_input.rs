@@ -2190,3 +2190,140 @@ async fn under_polite_raising_an_app_returns_the_front_to_the_user() {
     let windows = c.ok("list_windows", json!({})).await;
     assert_eq!(windows["target"]["from"], json!("pinned"), "{windows}");
 }
+
+/// How far down the front TextEdit window's text is scrolled, 0 (top) to 1,
+/// read from its vertical scroll bar through System Events rather than from
+/// anything this server reports.
+fn scroll_position() -> Option<f64> {
+    osascript(
+        "tell application \"System Events\" to tell process \"TextEdit\" to \
+         get value of (first scroll bar of scroll area 1 of window 1 \
+         whose orientation is \"AXVerticalOrientation\")",
+    )?
+    .trim()
+    .replace(',', ".")
+    .parse()
+    .ok()
+}
+
+/// A pixel scroll with gesture phases moves the document the way a trackpad
+/// drag does: down for positive `dy`, up for negative, by an amount in
+/// proportion to the request, and a flick with momentum goes further than the
+/// same drag without. The positions come from the scroll bar, so a gesture the
+/// app ignored fails here even though the tool reported its events as sent.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pixel_scroll_moves_a_textedit_document_and_momentum_goes_further() {
+    if !ready() {
+        return;
+    }
+    let _textedit = Scratch::begin();
+    let c = client("live-trackpad");
+    c.initialize().await;
+    let text: String = (1..=400).map(|n| format!("line {n}\n")).collect();
+    let Some(area) = scratch_document(&c, &text).await else {
+        return;
+    };
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let Some(top) = scroll_position() else {
+        eprintln!("skipping: the scroll bar of the scratch document cannot be read");
+        return;
+    };
+    // The caret is at the end after set_value, which scrolls to the bottom
+    // on some versions; go to the top by gesture and measure from there.
+    for _ in 0..4 {
+        let r = c
+            .ok(
+                "scroll",
+                json!({ "ref": &area, "dy": -10000, "duration_ms": 200 }),
+            )
+            .await;
+        assert_eq!(r["ok"], true, "{r}");
+    }
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let start = scroll_position().unwrap_or(top);
+    assert!(start < 0.05, "expected to be at the top, at {start}");
+
+    let plain = c
+        .ok(
+            "scroll",
+            json!({ "ref": &area, "dy": 600, "duration_ms": 300 }),
+        )
+        .await;
+    assert_eq!(plain["dy"], 600, "{plain}");
+    assert_eq!(plain["input"], "hid", "{plain}");
+    assert_eq!(plain["momentum"], false, "{plain}");
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let after_plain = scroll_position().unwrap();
+    let moved_plain = after_plain - start;
+    assert!(
+        moved_plain > 0.002,
+        "a downward pixel scroll must move the document down: {start} -> {after_plain}"
+    );
+
+    // Back to the top, then the same drag with the flick.
+    for _ in 0..4 {
+        let r = c
+            .ok(
+                "scroll",
+                json!({ "ref": &area, "dy": -10000, "duration_ms": 200 }),
+            )
+            .await;
+        assert_eq!(r["ok"], true, "{r}");
+    }
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let reset = scroll_position().unwrap();
+    let flick = c
+        .ok(
+            "scroll",
+            json!({ "ref": &area, "dy": 600, "duration_ms": 300, "momentum": true }),
+        )
+        .await;
+    assert_eq!(flick["momentum"], true, "{flick}");
+    assert!(flick["momentum_dy"].as_i64().unwrap() > 0, "{flick}");
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let after_flick = scroll_position().unwrap();
+    let moved_flick = after_flick - reset;
+    eprintln!(
+        "pixel scroll: plain moved {moved_plain:.4}, flick moved {moved_flick:.4} of the document"
+    );
+    assert!(
+        moved_flick > moved_plain,
+        "momentum must scroll further: plain {moved_plain}, flick {moved_flick}"
+    );
+
+    // And up again: negative dy goes the other way.
+    c.ok(
+        "scroll",
+        json!({ "ref": &area, "dy": -300, "duration_ms": 200 }),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert!(scroll_position().unwrap() < after_flick, "upward scroll");
+
+    // A pinch is refused with the working route, and moves nothing.
+    let pinch = c.call("scroll", json!({ "gesture": "pinch" })).await;
+    let err = pinch.error.unwrap();
+    assert_eq!(err.code, ErrorCode::UnsupportedOs);
+    assert!(err.message.contains("cmd+plus"), "{}", err.message);
+}
+
+/// Under `never` a pixel scroll is refused whole, naming the accessibility
+/// route, and no event is posted.
+#[tokio::test(flavor = "multi_thread")]
+async fn under_never_a_pixel_scroll_is_refused_and_names_the_ax_route() {
+    if !ready() {
+        return;
+    }
+    let c = client_with("live-trackpad-never", mcp_types::Foreground::Never);
+    c.initialize().await;
+    let r = c.call("scroll", json!({ "x": 5, "y": 5, "dy": 300 })).await;
+    let err = r.error.unwrap();
+    assert_eq!(err.code, ErrorCode::PolicyDenied);
+    assert!(
+        err.suggestion
+            .as_deref()
+            .unwrap_or("")
+            .contains("scroll_into_view"),
+        "{err:?}"
+    );
+}

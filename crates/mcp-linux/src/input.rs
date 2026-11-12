@@ -732,6 +732,37 @@ impl InputBackend for LinuxBackend {
         turned.and(released)
     }
 
+    async fn scroll_pixels(
+        &self,
+        x: f64,
+        y: f64,
+        ev: &mcp_input::trackpad::PixelScroll,
+        modifiers: &[String],
+    ) -> Result<(), InputError> {
+        use mcp_input::trackpad::Phase;
+        // The compositor makes its own coast when it sees `finish`, so the
+        // planner is never asked for momentum here (`pixel_momentum`); a stray
+        // one is dropped rather than doubled.
+        if ev.phase.is_momentum() {
+            return Ok(());
+        }
+        let mods = keys::pointer_modifiers(modifiers).map_err(InputError::Failed)?;
+        if ev.phase == Phase::Began {
+            self.portal.pointer_abs(x, y).await?;
+            self.note_pointer(x, y);
+            sleep(Duration::from_millis(10)).await;
+        }
+        // Modifiers are real key presses on this path, as for `scroll_at`, so
+        // they are held only for the event and released even if it fails.
+        self.press_modifiers(&mods, true).await?;
+        let sent = self
+            .portal
+            .axis_smooth(ev.dx as f64, ev.dy as f64, ev.phase == Phase::Ended)
+            .await;
+        let released = self.press_modifiers(&mods, false).await;
+        sent.and(released)
+    }
+
     async fn hover(&self, x: f64, y: f64) -> Result<(), InputError> {
         self.portal.pointer_abs(x, y).await?;
         self.note_pointer(x, y);

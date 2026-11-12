@@ -2070,8 +2070,19 @@ impl InputModule {
         }
     }
 
-    async fn scroll(&self, args: &Value) -> Envelope {
+    async fn scroll(&self, args: &Value, cancel: &mcp_types::CancelToken, since: u64) -> Envelope {
         let tool = "scroll";
+        let present = |k: &str| args.get(k).is_some_and(|v| !v.is_null());
+        if let Some(g) = args.get("gesture").filter(|v| !v.is_null()) {
+            let name = g.as_str().map(snake).unwrap_or_default();
+            return match crate::trackpad::gesture_unsupported(&name) {
+                Ok(m) => Envelope::fail(tool, ErrorCode::UnsupportedOs, m),
+                Err(m) => Envelope::fail(tool, ErrorCode::InvalidArgs, m),
+            };
+        }
+        if present("dx") || present("dy") {
+            return self.scroll_pixels(args, cancel, since).await;
+        }
         let Some(dir) = args
             .get("direction")
             .and_then(Value::as_str)
@@ -2112,6 +2123,142 @@ impl InputModule {
             }
             Err(e) => input_err(tool, e),
         }
+    }
+
+    /// `scroll` with `dx` / `dy`: a trackpad-style gesture of pixel events with
+    /// phases and optional momentum. The schedule is planned first (pure, and
+    /// refused if over the caps) and the events are then posted one by one at
+    /// their times. A gesture left open, with no `ended`, would leave the app
+    /// waiting for a finger that never lifts, so every way out of the loop
+    /// after the first event, a cancel or a person taking the pointer
+    /// included, posts the closing phase before it returns.
+    async fn scroll_pixels(
+        &self,
+        args: &Value,
+        cancel: &mcp_types::CancelToken,
+        since: u64,
+    ) -> Envelope {
+        use crate::trackpad::{plan, Phase};
+        let tool = "scroll";
+        if args.get("direction").is_some_and(|v| !v.is_null())
+            || args.get("amount").is_some_and(|v| !v.is_null())
+        {
+            return Envelope::fail(
+                tool,
+                ErrorCode::InvalidArgs,
+                "give either direction (with amount, in wheel lines) or dx / dy (in pixels), not both",
+            );
+        }
+        let axis = |k: &str| -> Result<i32, String> {
+            match args.get(k).filter(|v| !v.is_null()) {
+                None => Ok(0),
+                Some(_) => i64_arg(args, k)
+                    .and_then(|v| i32::try_from(v).ok())
+                    .ok_or_else(|| format!("'{k}' must be a whole number of pixels")),
+            }
+        };
+        let (dx, dy) = match (axis("dx"), axis("dy")) {
+            (Ok(dx), Ok(dy)) => (dx, dy),
+            (Err(m), _) | (_, Err(m)) => return Envelope::fail(tool, ErrorCode::InvalidArgs, m),
+        };
+        let duration = match args.get("duration_ms").filter(|v| !v.is_null()) {
+            None => None,
+            Some(_) => match u64_arg(args, "duration_ms") {
+                Some(d) => Some(d),
+                None => {
+                    return Envelope::fail(
+                        tool,
+                        ErrorCode::InvalidArgs,
+                        "'duration_ms' must be a whole number of milliseconds",
+                    )
+                }
+            },
+        };
+        let asked_momentum = args
+            .get("momentum")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let momentum = asked_momentum && self.backend.pixel_momentum();
+        let plan = match plan(dx, dy, duration, momentum) {
+            Ok(p) => p,
+            Err(m) => return Envelope::fail(tool, ErrorCode::InvalidArgs, m),
+        };
+        let modifiers = match parse_modifiers(tool, args) {
+            Ok(m) => m,
+            Err(e) => return e,
+        };
+        let ((x, y), target) = match self.parse_point(tool, args).await {
+            Ok(p) => p,
+            Err(e) => return e,
+        };
+        if let Some(deny) = self.clamp_check(tool, x, y) {
+            return deny;
+        }
+        let start = tokio::time::Instant::now();
+        let mut last: Option<Phase> = None;
+        let mut failure: Option<InputError> = None;
+        for ev in &plan.events {
+            tokio::time::sleep_until(start + std::time::Duration::from_millis(ev.at_ms)).await;
+            if last.is_some() {
+                if cancel.is_cancelled() {
+                    failure = Some(InputError::Failed(
+                        "scroll aborted: the call was cancelled".into(),
+                    ));
+                } else if self.backend.takeover_generation() != since {
+                    failure = Some(InputError::Failed(
+                        "scroll aborted: a human took over the pointer".into(),
+                    ));
+                }
+                if failure.is_some() {
+                    break;
+                }
+            }
+            if let Err(e) = self.backend.scroll_pixels(x, y, ev, &modifiers).await {
+                failure = Some(e);
+                break;
+            }
+            last = Some(ev.phase);
+        }
+        if let (Some(phase), Some(_)) = (last, &failure) {
+            if !matches!(phase, Phase::Ended | Phase::MomentumEnded) {
+                let close = crate::trackpad::PixelScroll {
+                    phase: phase.closing(),
+                    dx: 0,
+                    dy: 0,
+                    at_ms: 0,
+                };
+                // Best effort: the error being reported is the first one.
+                let _ = self.backend.scroll_pixels(x, y, &close, &modifiers).await;
+            }
+        }
+        if let Some(e) = failure {
+            return input_err(tool, e);
+        }
+        let mut data = json!({
+            "ok": true,
+            "at": { "x": x, "y": y },
+            "modifiers": modifiers,
+            "dx": plan.body_dx,
+            "dy": plan.body_dy,
+            "events": plan.events.len(),
+            "duration_ms": plan.events.last().map_or(0, |e| e.at_ms),
+            "momentum": momentum,
+            "momentum_dx": plan.momentum_dx,
+            "momentum_dy": plan.momentum_dy,
+        });
+        if asked_momentum && !momentum {
+            data["note"] = json!(
+                "momentum was not sent: on this platform the toolkit coasts a finished gesture itself"
+            );
+        }
+        let data = with_route(data, Route::Hid);
+        Envelope::ok(
+            tool,
+            match target {
+                Some(t) => t.annotate(data),
+                None => data,
+            },
+        )
     }
 
     async fn hover(&self, args: &Value, cancel: &mcp_types::CancelToken, since: u64) -> Envelope {
@@ -2841,7 +2988,7 @@ impl InputModule {
             "keyboard_type" => self.keyboard_type(&args).await,
             "keyboard_shortcut" => self.keyboard_shortcut(&args, since).await,
             "mouse_action" => self.mouse_action(&args, &ctx.cancel, since).await,
-            "scroll" => self.scroll(&args).await,
+            "scroll" => self.scroll(&args, &ctx.cancel, since).await,
             "hover" => self.hover(&args, &ctx.cancel, since).await,
             "drag_drop" => self.drag_drop(&args, since).await,
             "clipboard_read" => self.clipboard_read(&args).await,
@@ -3087,19 +3234,35 @@ impl ToolModule for InputModule {
                 "scroll",
                 Category::Input,
                 Tier::Standard,
-                "Scroll at an element (ref or name) or a point. 'modifiers' holds keys down for the wheel, e.g. [\"cmd\"] or [\"ctrl\"] to zoom.",
+                "Scroll at an element (ref or name) or a point: wheel lines by 'direction', or smooth trackpad-style pixels by 'dx'/'dy' with optional momentum. 'modifiers' holds keys down for the wheel, e.g. [\"cmd\"] or [\"ctrl\"] to zoom.",
                 target_schema(json!({
                     "x":{"type":"number","description":"screen x, or offset from the element's left"},
                     "y":{"type":"number","description":"screen y, or offset from the element's top"},
                     "direction":{"type":"string","enum":["up","down","left","right","page_up","page_down"]},
                     "amount":{"type":"integer","description":"wheel lines (default 3); a page is ten lines"},
-                    "modifiers":{"type":"array","items":{"type":"string","enum":["cmd","shift","opt","alt","ctrl","fn"]}}}), &["direction"]),
+                    "dx":{"type":"integer","description":"smooth scroll right by this many pixels (negative: left); with dy, used instead of direction and amount"},
+                    "dy":{"type":"integer","description":"smooth scroll down by this many pixels (negative: up)"},
+                    "duration_ms":{"type":"integer","description":"how long the fingers-down part takes with dx/dy (default 250, at most 3000)"},
+                    "momentum":{"type":"boolean","description":"with dx/dy, keep coasting after release as a flick does (macOS)"},
+                    "gesture":{"type":"string","enum":["pinch","rotate","swipe"],"description":"always UNSUPPORTED_OS; the error names the working equivalent"},
+                    "modifiers":{"type":"array","items":{"type":"string","enum":["cmd","shift","opt","alt","ctrl","fn"]}}}), &[]),
             ).details(TARGET_DETAILS.to_string() + "\n\n\
                 With a target, `x` and `y` are offsets from the element's top-left (default its centre); without \
                 one they are absolute screen coordinates. `modifiers` takes the same names as `mouse_action` and \
                 `drag_drop` and is held for the whole gesture: `[\"cmd\"]` (macOS) or `[\"ctrl\"]` zooms in most \
                 documents, maps and canvases, `[\"shift\"]` scrolls sideways where an app binds it. The result's \
-                `modifiers` is what was held."),
+                `modifiers` is what was held.\n\n\
+                Give `direction` (with `amount`) for wheel lines, or `dx` and/or `dy` for a smooth trackpad scroll in \
+                pixels (positive is right and down). That sends a stream of pixel events with gesture phases \
+                (began, changed, ended) over `duration_ms`, and with `momentum: true` the coast of a flick after \
+                release. Caps: 10000 px per axis, 3000 ms, momentum at most 3000 px and 60 events; over them is \
+                INVALID_ARGS. The deltas sum exactly to the request; the result's `dx`, `dy`, `events` and \
+                `momentum_dx` / `momentum_dy` say what was sent. Either form moves the real pointer to the target, so \
+                `foreground = \"never\"` refuses it (use `ui_action scroll_into_view`, or increment / decrement on a \
+                scroll bar) and `polite` waits for the person to be idle. Pinch, rotate and swipe have no public \
+                system API to synthesise and are not attempted: `gesture` returns UNSUPPORTED_OS naming the app's own \
+                command (zoom: `cmd+plus` / `cmd+minus` or ctrl-scroll; rotate: its menu item; swipe: back / forward \
+                shortcut, or `ctrl+left` / `ctrl+right` between spaces)."),
             ToolDescriptor::new(
                 "hover",
                 Category::Input,
@@ -3452,6 +3615,12 @@ mod tests {
         scrolls: std::sync::Mutex<Vec<(f64, f64, i32)>>,
         /// The modifiers handed to each scroll, in the same order as `scrolls`.
         scroll_modifiers: std::sync::Mutex<Vec<Vec<String>>>,
+        /// Every pixel-scroll event handed to the backend, as sent.
+        pixel_events: std::sync::Mutex<Vec<crate::trackpad::PixelScroll>>,
+        /// Whether this backend says it understands momentum phases.
+        momentum_ok: std::sync::atomic::AtomicBool,
+        /// Cancels the token once this many pixel events have been posted.
+        cancel_after_pixels: std::sync::Mutex<Option<(usize, mcp_types::CancelToken)>>,
         typed: std::sync::Mutex<Vec<String>>,
         /// What `read_element` returns per node, one entry per read; the last
         /// one repeats. Scripts the *tool layer's* judging of a read-back, not
@@ -3601,6 +3770,25 @@ mod tests {
                 .unwrap()
                 .push(modifiers.to_vec());
             Ok(())
+        }
+        async fn scroll_pixels(
+            &self,
+            _x: f64,
+            _y: f64,
+            event: &crate::trackpad::PixelScroll,
+            _modifiers: &[String],
+        ) -> Result<(), InputError> {
+            let mut events = self.pixel_events.lock().unwrap();
+            events.push(*event);
+            if let Some((n, token)) = &*self.cancel_after_pixels.lock().unwrap() {
+                if events.len() == *n {
+                    token.cancel();
+                }
+            }
+            Ok(())
+        }
+        fn pixel_momentum(&self) -> bool {
+            self.momentum_ok.load(std::sync::atomic::Ordering::SeqCst)
         }
         async fn hover(&self, _x: f64, _y: f64) -> Result<(), InputError> {
             Ok(())
@@ -4589,6 +4777,118 @@ mod tests {
         assert!(env.ok, "{env:?}");
         assert_eq!(backend.scrolls.lock().unwrap()[0], (130.0, 210.0, 4));
         assert_eq!(env.data.unwrap()["ref"], "@e1");
+    }
+
+    #[tokio::test]
+    async fn pixel_scroll_posts_the_planned_phases_and_reports_what_was_sent() {
+        use crate::trackpad::Phase;
+        let (module, backend, _arena) = test_module();
+        backend
+            .momentum_ok
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let env = call(
+            &module,
+            "scroll",
+            json!({ "x": 10, "y": 20, "dy": 300, "dx": -40, "duration_ms": 64, "momentum": true }),
+        )
+        .await;
+        assert!(env.ok, "{env:?}");
+        let sent = backend.pixel_events.lock().unwrap().clone();
+        assert_eq!(sent.first().unwrap().phase, Phase::Began);
+        assert_eq!(sent.last().unwrap().phase, Phase::MomentumEnded);
+        assert!(sent.iter().any(|e| e.phase == Phase::Ended));
+        let body: i32 = sent
+            .iter()
+            .filter(|e| !e.phase.is_momentum())
+            .map(|e| e.dy)
+            .sum();
+        assert_eq!(body, 300);
+        let data = env.data.unwrap();
+        assert_eq!(data["dy"], 300);
+        assert_eq!(data["dx"], -40);
+        assert_eq!(data["events"], sent.len());
+        assert_eq!(data["momentum"], true);
+        assert!(data["momentum_dy"].as_i64().unwrap() > 0);
+        assert_eq!(data["input"], "hid");
+        // Plain wheel lines were not used.
+        assert!(backend.scrolls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn momentum_a_backend_cannot_do_is_left_out_and_said_so() {
+        let (module, backend, _arena) = test_module();
+        let env = call(
+            &module,
+            "scroll",
+            json!({ "x": 1, "y": 1, "dy": 200, "duration_ms": 32, "momentum": true }),
+        )
+        .await;
+        assert!(env.ok, "{env:?}");
+        assert!(backend
+            .pixel_events
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|e| !e.phase.is_momentum()));
+        let data = env.data.unwrap();
+        assert_eq!(data["momentum"], false);
+        assert!(data["note"].as_str().unwrap().contains("momentum"));
+    }
+
+    #[tokio::test]
+    async fn pixel_scroll_refuses_bad_requests_before_touching_anything() {
+        let (module, backend, _arena) = test_module();
+        for args in [
+            json!({ "x": 1, "y": 1, "dy": 20000 }),
+            json!({ "x": 1, "y": 1, "dy": 10, "duration_ms": 99999 }),
+            json!({ "x": 1, "y": 1, "dy": 0, "dx": 0 }),
+            json!({ "x": 1, "y": 1, "dy": 10, "direction": "down" }),
+            json!({ "x": 1, "y": 1, "dy": "lots" }),
+        ] {
+            let env = call(&module, "scroll", args.clone()).await;
+            assert_eq!(env.error.unwrap().code, ErrorCode::InvalidArgs, "{args}");
+        }
+        assert!(backend.pixel_events.lock().unwrap().is_empty());
+    }
+
+    /// A cancelled gesture must not leave the app with fingers still down.
+    #[tokio::test]
+    async fn a_cancelled_pixel_scroll_still_ends_the_gesture() {
+        use crate::trackpad::Phase;
+        let (module, backend, _arena) = test_module();
+        let token = mcp_types::CancelToken::new();
+        *backend.cancel_after_pixels.lock().unwrap() = Some((2, token.clone()));
+        let ctx = CallCtx::new("t", token);
+        let env = module
+            .call(
+                "scroll",
+                json!({ "x": 1, "y": 1, "dy": 500, "duration_ms": 320 }),
+                &ctx,
+            )
+            .await;
+        assert!(!env.ok);
+        let sent = backend.pixel_events.lock().unwrap().clone();
+        assert_eq!(sent.len(), 3, "two events, then the closing one: {sent:?}");
+        assert_eq!(sent.last().unwrap().phase, Phase::Ended);
+        assert_eq!(sent.last().unwrap().dy, 0);
+    }
+
+    #[tokio::test]
+    async fn pinch_rotate_and_swipe_are_unsupported_and_name_the_equivalent() {
+        let (module, backend, _arena) = test_module();
+        for (g, hint) in [
+            ("pinch", "cmd+plus"),
+            ("rotate", "rotate command"),
+            ("swipe", "ctrl+left"),
+        ] {
+            let env = call(&module, "scroll", json!({ "gesture": g, "x": 1, "y": 1 })).await;
+            let e = env.error.unwrap();
+            assert_eq!(e.code, ErrorCode::UnsupportedOs);
+            assert!(e.message.contains(hint), "{g}: {}", e.message);
+        }
+        let env = call(&module, "scroll", json!({ "gesture": "shake" })).await;
+        assert_eq!(env.error.unwrap().code, ErrorCode::InvalidArgs);
+        assert!(backend.pixel_events.lock().unwrap().is_empty());
     }
 
     /// Cmd+wheel is zoom in most apps, and `scroll` had no way to ask for it.
@@ -6040,6 +6340,7 @@ mod tests {
             && b.drags.lock().unwrap().is_empty()
             && b.key_events.lock().unwrap().is_empty()
             && b.scrolls.lock().unwrap().is_empty()
+            && b.pixel_events.lock().unwrap().is_empty()
             && b.typed.lock().unwrap().is_empty()
     }
 
@@ -6180,6 +6481,11 @@ mod tests {
                 Refused,
             ),
             ("scroll", json!({"direction":"down","x":5,"y":5}), Refused),
+            (
+                "scroll",
+                json!({"dy":300,"x":5,"y":5,"momentum":true}),
+                Refused,
+            ),
             ("scroll", with("@e1", json!({"direction":"up"})), Refused),
             ("hover", json!({"x":5,"y":5}), Refused),
             ("hover", with("@e4", json!({"glide":true})), Refused),
@@ -6450,6 +6756,7 @@ mod tests {
         );
         assert!(said("keyboard_type", json!({"text":"x","ref":"@e1"})).contains("set_value"));
         assert!(said("scroll", json!({"direction":"down"})).contains("scroll_into_view"));
+        assert!(said("scroll", json!({"dy":300})).contains("scroll_into_view"));
         assert!(said("ui_action", json!({"ref":"@e1","action":"focus"})).contains("select_text"));
         for none in [
             (

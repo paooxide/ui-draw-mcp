@@ -396,6 +396,30 @@ pub trait InputBackend: Send + Sync {
         amount: i32,
         modifiers: &[String],
     ) -> Result<(), InputError>;
+    /// Post one event of a trackpad-style scroll (see [`crate::trackpad`]).
+    /// The tool layer paces the events and calls this once per event, so a
+    /// backend holds no gesture state; it moves the pointer to `(x, y)` on the
+    /// [`Phase::Began`](crate::trackpad::Phase::Began) event, because scroll
+    /// events go to whatever is under the pointer. Smooth scrolling is a
+    /// capability, not a given: the default says so.
+    async fn scroll_pixels(
+        &self,
+        _x: f64,
+        _y: f64,
+        _event: &crate::trackpad::PixelScroll,
+        _modifiers: &[String],
+    ) -> Result<(), InputError> {
+        Err(InputError::Unsupported(
+            "pixel scrolling is not available on this platform; scroll with direction and amount"
+                .into(),
+        ))
+    }
+    /// Whether [`InputBackend::scroll_pixels`] understands the momentum
+    /// phases. Where the toolkit makes its own coast from a finished gesture
+    /// (Linux), momentum events would double it, so they are not sent.
+    fn pixel_momentum(&self) -> bool {
+        false
+    }
     async fn hover(&self, x: f64, y: f64) -> Result<(), InputError>;
     /// Press at `from`, move to each point of `route` in order, release on the
     /// last one.

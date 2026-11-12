@@ -19,6 +19,7 @@ mod postcondition;
 mod selection;
 mod steps;
 mod tools;
+pub mod trackpad;
 
 pub use backend::{
     valid_modifier, AppRef, BackgroundTarget, Choice, ClipData, ClipFormat, DeskState, FocusedText,

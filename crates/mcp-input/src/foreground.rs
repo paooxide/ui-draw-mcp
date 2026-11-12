@@ -523,6 +523,18 @@ impl InputBackend for ForegroundInput {
             Some("ui_action scroll_into_view"),
         ))
     }
+    async fn scroll_pixels(
+        &self,
+        _x: f64,
+        _y: f64,
+        _event: &crate::trackpad::PixelScroll,
+        _modifiers: &[String],
+    ) -> Result<(), InputError> {
+        Err(method_refusal(
+            "scroll_at",
+            Some("ui_action scroll_into_view"),
+        ))
+    }
     async fn hover(&self, _x: f64, _y: f64) -> Result<(), InputError> {
         Err(method_refusal("hover", None))
     }

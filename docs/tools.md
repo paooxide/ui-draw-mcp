@@ -30,7 +30,7 @@ enabled category, while a `dangerous` tool additionally has to be named in
 | [`keyboard_shortcut`](#keyboard-shortcut) | input | standard | Press a key or chord, e.g. |
 | [`keyboard_type`](#keyboard-type) | input | standard | Type Unicode text into the focused window. |
 | [`mouse_action`](#mouse-action) | input | standard | Coordinate pointer action. |
-| [`scroll`](#scroll) | input | standard | Scroll at an element (ref or name) or a point. |
+| [`scroll`](#scroll) | input | standard | Scroll at an element (ref or name) or a point: wheel lines by 'direction', or smooth trackpad-style pixels by 'dx'/'dy' with optional momentum. |
 | [`select_text`](#select-text) | input | standard | Select text in a text field or text area by ref or name, through the accessibility API (no drag, no focus needed), and read the selection back. |
 | [`set_value`](#set-value) | input | standard | Set the value of a text element by ref or name (accessibility SetValue). |
 | [`ui_action`](#ui-action) | input | standard | Perform a semantic action on an element by ref or name (accessibility action, no cursor, app need not be frontmost). |
@@ -495,17 +495,24 @@ The result carries `effects` when the action changed something that was seen (a 
 
 `scroll` · standard tier
 
-Scroll at an element (ref or name) or a point. 'modifiers' holds keys down for the wheel, e.g. ["cmd"] or ["ctrl"] to zoom.
+Scroll at an element (ref or name) or a point: wheel lines by 'direction', or smooth trackpad-style pixels by 'dx'/'dy' with optional momentum. 'modifiers' holds keys down for the wheel, e.g. ["cmd"] or ["ctrl"] to zoom.
 
 Target an element by `ref` (`@e12`; `e12` and `12` also work) or by `name`, with an optional `role` to narrow it. A name is matched against the latest snapshot (a fresh one is taken if there is none), ignoring case and extra whitespace: exact name first, then prefix, then substring; the name and the current value both count; controls come before other elements; ties go to document order. The result reports the `ref` it resolved to and, for a name, `matches`: how many elements matched as well as the one used. A name that matches nothing is NOT_FOUND, with up to five elements that share a word with it.
 
 With a target, `x` and `y` are offsets from the element's top-left (default its centre); without one they are absolute screen coordinates. `modifiers` takes the same names as `mouse_action` and `drag_drop` and is held for the whole gesture: `["cmd"]` (macOS) or `["ctrl"]` zooms in most documents, maps and canvases, `["shift"]` scrolls sideways where an app binds it. The result's `modifiers` is what was held.
 
+Give `direction` (with `amount`) for wheel lines, or `dx` and/or `dy` for a smooth trackpad scroll in pixels (positive is right and down). That sends a stream of pixel events with gesture phases (began, changed, ended) over `duration_ms`, and with `momentum: true` the coast of a flick after release. Caps: 10000 px per axis, 3000 ms, momentum at most 3000 px and 60 events; over them is INVALID_ARGS. The deltas sum exactly to the request; the result's `dx`, `dy`, `events` and `momentum_dx` / `momentum_dy` say what was sent. Either form moves the real pointer to the target, so `foreground = "never"` refuses it (use `ui_action scroll_into_view`, or increment / decrement on a scroll bar) and `polite` waits for the person to be idle. Pinch, rotate and swipe have no public system API to synthesise and are not attempted: `gesture` returns UNSUPPORTED_OS naming the app's own command (zoom: `cmd+plus` / `cmd+minus` or ctrl-scroll; rotate: its menu item; swipe: back / forward shortcut, or `ctrl+left` / `ctrl+right` between spaces).
+
 | Argument | Type | Required | Description |
 |---|---|---|---|
 | `amount` | integer |  | wheel lines (default 3); a page is ten lines |
-| `direction` | one of: up, down, left, right, page_up, page_down | yes |  |
+| `direction` | one of: up, down, left, right, page_up, page_down |  |  |
+| `duration_ms` | integer |  | how long the fingers-down part takes with dx/dy (default 250, at most 3000) |
+| `dx` | integer |  | smooth scroll right by this many pixels (negative: left); with dy, used instead of direction and amount |
+| `dy` | integer |  | smooth scroll down by this many pixels (negative: up) |
+| `gesture` | one of: pinch, rotate, swipe |  | always UNSUPPORTED_OS; the error names the working equivalent |
 | `modifiers` | array&lt;one of: cmd, shift, opt, alt, ctrl, fn&gt; |  |  |
+| `momentum` | boolean |  | with dx/dy, keep coasting after release as a flick does (macOS) |
 | `name` | string |  | element name or label, instead of ref; best match wins |
 | `ref` | string |  | element ref @eN |
 | `role` | string |  | narrow a name by role, e.g. button, popup button, text field |

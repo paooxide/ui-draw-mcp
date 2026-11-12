@@ -8,6 +8,19 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- **`scroll` with `dx` / `dy`: trackpad-style smooth scrolling with gesture phases and momentum.** Pixel deltas
+  (positive is right and down) sent as a stream of events over `duration_ms` (default 250), began, changed,
+  ended, as a trackpad produces them, which apps that smooth or hand off a scroll key off; the deltas sum
+  exactly to the request. `momentum: true` adds the coast of a flick after release (macOS, using the public
+  `kCGScrollWheelEventScrollPhase` and `kCGScrollWheelEventMomentumPhase` fields; Linux sends the portal's
+  smooth axis with its `finish` flag and lets the compositor coast, and the result says momentum was not
+  sent). Capped at 10000 px per axis, 3000 ms, and momentum at 3000 px and 60 events; a cancelled or
+  interrupted gesture still posts its closing phase. It uses the real pointer like any `scroll`, so
+  `never` refuses it and `polite` borrows it. Measured in TextEdit: a 600 px drag moved the document 17.4%,
+  the same drag with momentum 20.0%. Pinch, rotate and swipe are not attempted (`scroll` `gesture`
+  returns `UNSUPPORTED_OS`): macOS has no public API to synthesise them, and the error names the working
+  route (cmd+plus / cmd+minus or ctrl-scroll, the app's rotate command, back / forward shortcuts, ctrl+arrow
+  between spaces).
 - **`foreground = "polite"`: borrow the pointer and keyboard when you are idle, and give them back.** A third
   setting between `allow` and `never`, for actions that genuinely need the real pointer, keyboard or a raised
   app (`mouse_action`, `scroll`, `hover`, `drag_drop`, `keyboard_type` and `keyboard_shortcut` when no pinned
