@@ -773,7 +773,7 @@ Open a menu-bar menu by title path, e.g. ["File"].
 
 `wait_for` · read tier
 
-Block until the UI settles: text appears, a window appears, text is gone, or an element takes focus. Synthetic input is asynchronous, so observing straight after acting reads the previous state: wait first. Several conditions must all hold at once. 'app' watches that application without pinning it.
+Block until the UI settles: text appears, a window appears, text is gone, or an element takes focus. Synthetic input is asynchronous, so observing straight after acting reads the previous state: wait first. Several conditions must all hold at once. 'app' watches that application without pinning it. Where the platform announces UI changes (macOS) it re-checks when the app reports one, with a 500 ms safety re-check; the result's 'woke_by' is 'immediate' (already true), 'event' or 'poll' (found by the timer, which is also what happens when the app cannot be observed), with 'waited_ms'.
 
 | Argument | Type | Required | Description |
 |---|---|---|---|

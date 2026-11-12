@@ -302,7 +302,36 @@ pub trait WindowBackend: Send + Sync {
     async fn describe_target(&self, app: Option<&str>) -> Result<TargetInfo, WindowError>;
     /// The pinned application, if one is set and still running.
     async fn pinned(&self) -> Option<TargetInfo>;
+    /// Start listening for changes in `app`'s UI (the frontmost app when
+    /// `None`), so a wait can re-check when something happens instead of on a
+    /// timer. `None` means this platform or this app gives no events and the
+    /// wait polls. It must be passive: it neither pins nor raises the app.
+    /// Everything it started is torn down when the [`ChangeWatch`] drops.
+    async fn watch_changes(&self, _app: Option<&str>) -> Option<ChangeWatch> {
+        None
+    }
     fn platform(&self) -> &'static str;
+}
+
+/// A live subscription to "something changed in this app's UI".
+///
+/// `changed` has a permit stored whenever a notification arrived since it was
+/// last awaited, so a change during an observation is never missed, and many
+/// notifications in a burst are one wake-up. Dropping the watch drops `guard`,
+/// which is where a backend puts the teardown of whatever it started (an
+/// observer, its run-loop source and thread).
+pub struct ChangeWatch {
+    pub changed: std::sync::Arc<tokio::sync::Notify>,
+    _guard: Box<dyn Send>,
+}
+
+impl ChangeWatch {
+    pub fn new(changed: std::sync::Arc<tokio::sync::Notify>, guard: impl Send + 'static) -> Self {
+        ChangeWatch {
+            changed,
+            _guard: Box::new(guard),
+        }
+    }
 }
 
 #[cfg(test)]

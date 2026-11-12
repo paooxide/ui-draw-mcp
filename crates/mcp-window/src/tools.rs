@@ -418,6 +418,11 @@ impl WindowModule {
         }
         let outcome = self.evaluator.wait(&spec, ctx).await;
         let mut data = json!({ "ok": outcome.met, "waited_ms": outcome.waited_ms });
+        if outcome.met {
+            // What noticed the condition, so a caller (and a test) can tell an
+            // app that announces its changes from one that is only polled.
+            data["woke_by"] = json!(outcome.woke_by.as_str());
+        }
         if let Some(p) = outcome.judge_probability {
             data["judge_probability"] = json!((p * 1000.0).round() / 1000.0);
         }
@@ -607,7 +612,11 @@ impl ToolModule for WindowModule {
                  or an element takes focus. Synthetic input is asynchronous, so observing \
                  straight after acting reads the previous state: wait first. Several \
                  conditions must all hold at once. 'app' watches that application without \
-                 pinning it.",
+                 pinning it. Where the platform announces UI changes (macOS) it re-checks \
+                 when the app reports one, with a 500 ms safety re-check; the result's \
+                 'woke_by' is 'immediate' (already true), 'event' or 'poll' (found by the \
+                 timer, which is also what happens when the app cannot be observed), with \
+                 'waited_ms'.",
                 wait_schema("what to wait for; all given conditions must hold together"),
             ),
         ]

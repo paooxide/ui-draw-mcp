@@ -45,7 +45,7 @@ pub(crate) const KAX_ERROR_CANNOT_COMPLETE: AXError = -25204;
 #[link(name = "ApplicationServices", kind = "framework")]
 extern "C" {
     fn AXUIElementCreateSystemWide() -> AXUIElementRef;
-    fn AXUIElementCreateApplication(pid: c_int) -> AXUIElementRef;
+    pub(crate) fn AXUIElementCreateApplication(pid: c_int) -> AXUIElementRef;
     fn AXUIElementCopyAttributeValue(
         element: AXUIElementRef,
         attribute: CFStringRef,
@@ -2544,6 +2544,13 @@ impl WindowBackend for MacosBackend {
                 .map(|r| r.info())
                 .map_err(WindowError::NotFound)
         }
+    }
+
+    async fn watch_changes(&self, app: Option<&str>) -> Option<mcp_window::ChangeWatch> {
+        // Resolved without pinning, like every read of an app that is not the
+        // one being driven: waiting is not choosing a target.
+        let pid = unsafe { self.peek_target(app) }.ok()?.pid;
+        crate::observe::watch_pid(pid).await
     }
 
     async fn pinned(&self) -> Option<TargetInfo> {

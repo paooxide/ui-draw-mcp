@@ -8,6 +8,18 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- **`wait_for` is woken by the app's own change notifications on macOS.** It registers an `AXObserver` on the
+  target app (value, focus, window, title, selection, layout and menu notifications) on a thread of its own and
+  re-checks the condition when one arrives, instead of every 150 ms; a 500 ms safety re-check stays because
+  many apps post some changes unreliably or not at all. The result says what noticed: `woke_by` is `immediate`
+  (true at the first look), `event`, or `poll` (found by the timer, which is also what an app that refuses
+  observation, or any platform without events such as Linux, gets, at the old 150 ms). `waited_ms` is
+  unchanged and a timeout has the same shape as before. The observer, its run-loop source, its callback
+  context and its thread are torn down when the wait ends by success, timeout, cancellation or the call being
+  dropped, and waiting still does not pin or raise the app. Measured against TextEdit (text written through
+  accessibility 300 ms into a wait, median of 7): the wait returned 187 ms after the 300 ms mark by event,
+  against 382 ms with a 150 ms timer re-reading the tree; the figure includes the time `set_value` itself
+  takes to land the write, which is the same in both. `expect` clauses on input tools use the same wait.
 - **`scroll` with `dx` / `dy`: trackpad-style smooth scrolling with gesture phases and momentum.** Pixel deltas
   (positive is right and down) sent as a stream of events over `duration_ms` (default 250), began, changed,
   ended, as a trackpad produces them, which apps that smooth or hand off a scroll key off; the deltas sum

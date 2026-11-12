@@ -75,6 +75,31 @@ pub(crate) fn unsupported_message(label: &str, wanted: &str, offered: &[String])
     format!("'{label}' does not offer {wanted}; it offers {list}")
 }
 
+/// `kAXErrorNotificationAlreadyRegistered`: the observer already has it, which
+/// is what was asked for.
+const AX_ALREADY_REGISTERED: i32 = -25209;
+
+/// Whether an app can be observed, from what registering each notification
+/// returned. Apps differ widely in which they accept (`kAXErrorCannotComplete`
+/// from one that is busy or not accessible, `NotificationUnsupported` from one
+/// that does not post it), so one refusal is not the app refusing: observation
+/// stands if any notification registered. If none did the answer is the
+/// reason, and the caller polls instead.
+pub(crate) fn registration_outcome(results: &[(&str, i32)]) -> Result<usize, String> {
+    let ok = results
+        .iter()
+        .filter(|(_, e)| *e == 0 || *e == AX_ALREADY_REGISTERED)
+        .count();
+    if ok > 0 {
+        return Ok(ok);
+    }
+    let codes: Vec<String> = results.iter().map(|(n, e)| format!("{n}={e}")).collect();
+    Err(format!(
+        "the app accepted none of the notifications ({})",
+        codes.join(", ")
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -139,5 +164,24 @@ mod tests {
     fn an_element_with_no_actions_says_so() {
         let m = unsupported_message("Label", "AXShowMenu", &[]);
         assert!(m.ends_with("it offers no actions"), "{m}");
+    }
+
+    #[test]
+    fn one_accepted_notification_is_enough_to_observe() {
+        let r = [
+            ("AXValueChanged", -25204),
+            ("AXTitleChanged", 0),
+            ("AXLayoutChanged", -25207),
+            ("AXWindowCreated", -25209),
+        ];
+        assert_eq!(registration_outcome(&r), Ok(2));
+    }
+
+    #[test]
+    fn an_app_that_refuses_every_notification_is_polled_with_the_reason() {
+        let r = [("AXValueChanged", -25204), ("AXTitleChanged", -25207)];
+        let e = registration_outcome(&r).unwrap_err();
+        assert!(e.contains("AXValueChanged=-25204") && e.contains("AXTitleChanged=-25207"));
+        assert!(registration_outcome(&[]).is_err());
     }
 }

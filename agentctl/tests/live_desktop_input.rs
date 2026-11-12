@@ -2327,3 +2327,174 @@ async fn under_never_a_pixel_scroll_is_refused_and_names_the_ax_route() {
         "{err:?}"
     );
 }
+
+/// Threads in this test process, from `ps`: one row each after the header.
+fn process_threads() -> usize {
+    let out = std::process::Command::new("ps")
+        .args(["-M", "-p", &std::process::id().to_string()])
+        .output()
+        .expect("ps runs");
+    String::from_utf8_lossy(&out.stdout).lines().count() - 1
+}
+
+/// `wait_for` hears about a change from the app instead of timing it: the text
+/// is set through accessibility 300 ms into a wait, and the wait returns
+/// because of that notification, long before its 500 ms safety re-check. Also
+/// the other ends of the contract: a condition already true is `immediate`, a
+/// timeout is a timeout and not late, and none of it raises or pins the app.
+#[tokio::test(flavor = "multi_thread")]
+async fn wait_for_is_woken_by_the_apps_own_change_notification() {
+    if !ready() {
+        return;
+    }
+    let _textedit = Scratch::begin();
+    let c = client("live-wait-events");
+    c.initialize().await;
+    let Some(area) = scratch_document(&c, "start").await else {
+        return;
+    };
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let front_before = active_app();
+
+    // Already true: no waiting, and it says so.
+    let now = c
+        .ok(
+            "wait_for",
+            json!({ "app": APP, "text": "start", "timeout_ms": 3000 }),
+        )
+        .await;
+    assert_eq!(now["woke_by"], "immediate", "{now}");
+
+    // Not there yet; set from the same process 300 ms in. The lag is the
+    // return time minus those 300 ms, so it includes the part of `set_value`
+    // before the write lands, the same in both runs.
+    let mut event_lag = Vec::new();
+    for round in 0..7 {
+        let word = format!("quartz{round}");
+        let (wait, _) = tokio::join!(
+            c.ok(
+                "wait_for",
+                json!({ "app": APP, "text": &word, "timeout_ms": 4000 }),
+            ),
+            async {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                c.ok("set_value", json!({ "ref": &area, "text": &word }))
+                    .await;
+            }
+        );
+        let waited = wait["waited_ms"].as_u64().unwrap();
+        assert_eq!(
+            wait["woke_by"], "event",
+            "round {round}: the change must be heard, not polled for: {wait}"
+        );
+        assert!(
+            (290..700).contains(&waited),
+            "round {round}: woke after {waited} ms"
+        );
+        event_lag.push(waited as i64 - 300);
+    }
+
+    // The same change found by a plain 150 ms timer, as every wait did before.
+    // Each look is a full tree read, as in the wait itself.
+    let mut poll_lag = Vec::new();
+    for round in 0..7 {
+        let word = format!("basalt{round}");
+        let cancel = mcp_types::CancelToken::new();
+        let (found, _) = tokio::join!(
+            mcp_window::wait_loop(4000, 150, &cancel, None, || async {
+                let tree = c.ok("get_ui_tree", json!({ "app": APP })).await;
+                tree.to_string().contains(&word)
+            }),
+            async {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                c.ok("set_value", json!({ "ref": &area, "text": &word }))
+                    .await;
+            }
+        );
+        assert!(found.0, "polling never saw {word}");
+        poll_lag.push(found.1 as i64 - 300);
+    }
+    let med = |v: &[i64]| {
+        let mut v = v.to_vec();
+        v.sort_unstable();
+        v[v.len() / 2]
+    };
+    eprintln!(
+        "wait latency after the 300 ms mark: event median {} ms ({event_lag:?}), 150 ms timer median {} ms ({poll_lag:?})",
+        med(&event_lag),
+        med(&poll_lag),
+    );
+
+    // A timeout is still a timeout, on time, in the same shape.
+    let started = Instant::now();
+    let late = c
+        .call(
+            "wait_for",
+            json!({ "app": APP, "text": "never-appears-anywhere", "timeout_ms": 700 }),
+        )
+        .await;
+    assert_eq!(late.error.as_ref().unwrap().code, ErrorCode::Timeout);
+    assert!(
+        started.elapsed() < Duration::from_millis(1400),
+        "a 700 ms wait took {:?}",
+        started.elapsed()
+    );
+
+    assert_eq!(
+        front_before,
+        active_app(),
+        "waiting must not raise or change the frontmost app"
+    );
+}
+
+/// Teardown on every way out: success, timeout, and a wait dropped mid-flight
+/// (what the server's per-call cancellation does to the future). Twenty of each
+/// in a row must not add threads.
+#[tokio::test(flavor = "multi_thread")]
+async fn sequential_waits_leave_no_observer_threads_behind() {
+    if !ready() {
+        return;
+    }
+    let _textedit = Scratch::begin();
+    let c = client("live-wait-threads");
+    c.initialize().await;
+    let Some(_area) = scratch_document(&c, "present").await else {
+        return;
+    };
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    // One of each first, so lazily started runtime threads are counted in.
+    c.ok(
+        "wait_for",
+        json!({ "app": APP, "text": "present", "timeout_ms": 2000 }),
+    )
+    .await;
+    let before = process_threads();
+    for _ in 0..20 {
+        c.ok(
+            "wait_for",
+            json!({ "app": APP, "text": "present", "timeout_ms": 2000 }),
+        )
+        .await;
+        let r = c
+            .call(
+                "wait_for",
+                json!({ "app": APP, "text": "absent-text", "timeout_ms": 60 }),
+            )
+            .await;
+        assert_eq!(r.error.unwrap().code, ErrorCode::Timeout);
+        let dropped = tokio::time::timeout(
+            Duration::from_millis(120),
+            c.call(
+                "wait_for",
+                json!({ "app": APP, "text": "absent-text", "timeout_ms": 20000 }),
+            ),
+        )
+        .await;
+        assert!(dropped.is_err(), "the long wait should still be waiting");
+    }
+    let after = process_threads();
+    assert!(
+        after <= before + 2,
+        "threads grew from {before} to {after} over 60 waits (a leak would add ~60)"
+    );
+}

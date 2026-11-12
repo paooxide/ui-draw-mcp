@@ -202,6 +202,10 @@ impl WindowBackend for ForegroundWindow {
     async fn pinned(&self) -> Option<TargetInfo> {
         self.inner.pinned().await
     }
+    // Observing an app is passive, so it is as background-safe as reading it.
+    async fn watch_changes(&self, app: Option<&str>) -> Option<crate::ChangeWatch> {
+        self.inner.watch_changes(app).await
+    }
     fn platform(&self) -> &'static str {
         self.inner.platform()
     }

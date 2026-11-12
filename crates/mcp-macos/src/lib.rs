@@ -25,6 +25,8 @@ mod geometry;
 #[cfg(target_os = "macos")]
 mod imp;
 #[cfg(target_os = "macos")]
+mod observe;
+#[cfg(target_os = "macos")]
 mod ocr;
 #[cfg(target_os = "macos")]
 mod popup;

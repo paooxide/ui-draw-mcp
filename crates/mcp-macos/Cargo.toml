@@ -17,7 +17,7 @@ async-trait.workspace = true
 tracing.workspace = true
 # `time` only: drags need real gaps between motion events, and blocking the
 # runtime with `thread::sleep` would stall every other in-flight call.
-tokio = { workspace = true, features = ["time", "process"] }
+tokio = { workspace = true, features = ["time", "process", "sync"] }
 serde_json.workspace = true
 
 # Native frameworks — only on macOS. On other targets this crate is empty.
