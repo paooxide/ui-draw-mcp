@@ -104,10 +104,14 @@ backend boundary, so a tool added later still posts nothing. `launch` asks the O
 (`open -g` on macOS) and is refused where the platform has no such request (Linux). The accessibility tools
 (`set_value`, `select_text`, the other `ui_action` actions, `get_ui_tree`, the window and menu reads)
 keep working and never raise anything themselves; so does `focus_app` with `activate: false`, which pins an app
-as the target of later calls and writes nothing to it. Actions that open a menu or popup, set keyboard focus, or
-un-minimise a window (`ui_action` `focus`, `show_menu`, `select` with an option; `menu_open`,
-`menu_invoke`; `control_window` `focus` and `restore`) are refused because it is **not verified** that an
-app does not bring itself forward in response; this is a precaution, not a measured fact. It does not
+as the target of later calls and writes nothing to it. Setting keyboard focus on an element (`ui_action`
+`focus`) is allowed on macOS, where it was measured: against TextEdit with Finder frontmost, three runs left
+the topmost window and the active application on Finder. It stays refused on other platforms, where it was
+not measured. The rest are refused, and for them it is now a measured fact and not only a precaution, on
+macOS: `ui_action` `show_menu` and `select` with an option bring TextEdit forward, `menu_open` and
+`menu_invoke` leave a menu on screen above the user's app, and `control_window` `restore` puts the
+restored window above Finder's (`control_window` `focus` raises by definition). Each was observed once
+against TextEdit; an operation that raises an app in one run is refused whatever it does in another. It does not
 promise:
 
 - That an application stays behind. An app may raise itself in answer to an accessibility action it

@@ -268,13 +268,16 @@ unsafe fn perform_ax_action(elem: CFTypeRef, ax: &str, check_list: bool) -> Resu
     }
     let act = CFString::new(ax);
     match AXUIElementPerformAction(elem, act.as_concrete_TypeRef()) {
-        KAX_ERROR_ACTION_UNSUPPORTED => Err(InputError::Unsupported(
-            crate::ax_actions::unsupported_message(
+        // Apps answer an action they do not have with either code (TextEdit's
+        // text area answers AXScrollToVisible with the attribute one), and
+        // both should name what the element does offer.
+        KAX_ERROR_ACTION_UNSUPPORTED | KAX_ERROR_ATTRIBUTE_UNSUPPORTED => Err(
+            InputError::Unsupported(crate::ax_actions::unsupported_message(
                 &element_label(elem),
                 ax,
                 &action_names(elem).unwrap_or_default(),
-            ),
-        )),
+            )),
+        ),
         err => ax_result(err, ax.trim_start_matches("AX")),
     }
 }
@@ -1536,7 +1539,11 @@ impl MacosBackend {
                 number,
                 title: dict_string(&dict, kCGWindowName).filter(|t| !t.is_empty()),
                 bounds,
-                onscreen: dict_bool(&dict, kCGWindowIsOnscreen).unwrap_or(true),
+                // The window server writes this key only for a window that is
+                // drawn. A minimised window, or one on another Space, has no
+                // such entry, and reading its absence as "on screen" reported
+                // a minimised window as visible.
+                onscreen: dict_bool(&dict, kCGWindowIsOnscreen).unwrap_or(false),
             });
         }
 
@@ -2192,6 +2199,47 @@ fn run(cmd: &str, args: &[&str]) -> Result<std::process::Output, WindowError> {
         .map_err(|e| WindowError::Failed(format!("{cmd}: {e}")))
 }
 
+/// How long `launch` keeps retrying an app that is still shutting down.
+const LAUNCH_RETRY_WINDOW: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// Whether `open`'s complaint means "try again in a moment".
+///
+/// An app that was quit a heartbeat ago is still known to LaunchServices for a
+/// short while, and `open -a` answers with error -600 (`procNotFound`) instead
+/// of starting a fresh copy. The same call a second later works, so a caller
+/// that closed an app and reopens it must not be told it cannot be launched.
+/// Every other failure (no such application, a damaged bundle) is permanent
+/// and is returned at once.
+fn launch_failure_is_transient(stderr: &str) -> bool {
+    stderr.contains("error -600") || stderr.contains("procNotFound")
+}
+
+/// `open -a`, retried while the previous instance of the app finishes quitting.
+async fn open_app(app: &str, background: bool) -> Result<(), WindowError> {
+    let args: Vec<&str> = if background {
+        vec!["-g", "-a", app]
+    } else {
+        vec!["-a", app]
+    };
+    let deadline = std::time::Instant::now() + LAUNCH_RETRY_WINDOW;
+    loop {
+        let out = run("open", &args)?;
+        if out.status.success() {
+            return Ok(());
+        }
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if !launch_failure_is_transient(&stderr) || std::time::Instant::now() >= deadline {
+            let why = stderr.trim();
+            return Err(WindowError::NotFound(if why.is_empty() {
+                format!("could not launch '{app}'; check the name with list_apps")
+            } else {
+                format!("could not launch '{app}': {why}")
+            }));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+}
+
 #[async_trait]
 impl WindowBackend for MacosBackend {
     async fn list_windows(&self, app_name: Option<&str>) -> Result<Vec<WindowInfo>, WindowError> {
@@ -2241,23 +2289,13 @@ impl WindowBackend for MacosBackend {
     }
 
     async fn launch(&self, app: &str) -> Result<(), WindowError> {
-        let out = run("open", &["-a", app])?;
-        if out.status.success() {
-            Ok(())
-        } else {
-            Err(WindowError::NotFound(format!("could not launch '{app}'")))
-        }
+        open_app(app, false).await
     }
 
     /// `open -g`: launch without bringing the app to the foreground. The app
     /// can still activate itself once it is running.
     async fn launch_in_background(&self, app: &str) -> Result<(), WindowError> {
-        let out = run("open", &["-g", "-a", app])?;
-        if out.status.success() {
-            Ok(())
-        } else {
-            Err(WindowError::NotFound(format!("could not launch '{app}'")))
-        }
+        open_app(app, true).await
     }
 
     async fn close_app(&self, target: &str) -> Result<(), WindowError> {
@@ -2283,7 +2321,20 @@ impl WindowBackend for MacosBackend {
             // read the frontmost app whatever `app` said, so closing a window
             // of one application closed a window of another.
             let (app, who) = self.peek_app(app)?;
-            let win = pick_window(app.as_CFTypeRef(), &who.name, title)?;
+            // Restoring with no title means the window that is minimised. The
+            // main window is the one in view, so un-minimising "it" does
+            // nothing while the window the caller meant stays in the Dock.
+            let minimized = (action == WindowAction::Restore && title.is_none())
+                .then(|| {
+                    get_windows(app.as_CFTypeRef())
+                        .into_iter()
+                        .find(|w| copy_attr_bool(w.as_CFTypeRef(), "AXMinimized") == Some(true))
+                })
+                .flatten();
+            let win = match minimized {
+                Some(w) => w,
+                None => pick_window(app.as_CFTypeRef(), &who.name, title)?,
+            };
             let wref = win.as_CFTypeRef();
             match action {
                 WindowAction::Focus => {
@@ -2581,6 +2632,17 @@ mod tests {
     use mcp_types::{CallCtx, CancelToken, ErrorCode, ToolModule};
     use serde_json::json;
     use std::sync::Arc;
+
+    #[test]
+    fn only_a_still_quitting_app_is_worth_retrying() {
+        // The exact text `open -a` printed when run straight after a quit.
+        let quitting = "_LSOpenURLsWithCompletionHandler() failed for the application \
+            /System/Applications/TextEdit.app with error -600.";
+        assert!(launch_failure_is_transient(quitting));
+        let missing = "Unable to find application named 'NoSuchApp'";
+        assert!(!launch_failure_is_transient(missing));
+        assert!(!launch_failure_is_transient(""));
+    }
 
     /// Real backend through the real module. Without the TCC Accessibility grant
     /// this returns PERM_DENIED (or NotFound if no focused app); with it, an ok

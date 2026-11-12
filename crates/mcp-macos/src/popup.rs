@@ -191,7 +191,11 @@ pub(crate) unsafe fn choose(elem: &CFType, option: &str) -> Result<Choice, Input
     // a stuck app cannot hold the thread for the system default.
     let _ = AXUIElementSetMessagingTimeout(p, 2.0);
     if copy_attr_bool(p, "AXEnabled") == Some(false) {
-        return Err(InputError::Failed("the control is disabled".into()));
+        return Err(InputError::Failed(
+            "the control is disabled; the app enables it once something else in its window is \
+             filled in or chosen, so look at the window for what it is waiting on"
+                .into(),
+        ));
     }
     if role_of(p) == "AXComboBox" {
         return choose_in_combo(p, option);

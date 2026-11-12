@@ -32,7 +32,7 @@ async fn the_configured_value_reaches_both_engines_and_the_refusal_is_audited() 
     let (c, policy) = client(Foreground::Never, "fg-never");
 
     let env = c
-        .call("ui_action", json!({"ref":"@e999","action":"focus"}))
+        .call("ui_action", json!({"ref":"@e999","action":"show_menu"}))
         .await;
     let err = env.error.expect("refused");
     assert_eq!(err.code, ErrorCode::PolicyDenied);

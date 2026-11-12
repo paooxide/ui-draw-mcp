@@ -66,9 +66,11 @@ All notable changes to this project are documented here. The format follows
   taken a snapshot or raised a consent dialog; and in a wrapper around the platform backend, so a tool added
   later still posts nothing. Only the config file or the environment sets it; the environment can add `never`
   but not remove it, an unknown value is a startup error, and no role, access profile or tool argument
-  changes it. `agentctl doctor` reports the mode. The three `ui_action` actions, `menu_open`, `menu_invoke`
-  and `control_window restore` are refused because it is not verified that they leave the app behind, not
-  because they are known to raise it. What `never` does not cover: an app raising itself in answer to an
+  changes it. `agentctl doctor` reports the mode. `ui_action` `show_menu` and `select` with an option, `menu_open`, `menu_invoke`
+  and `control_window restore` are refused; each was measured against TextEdit with Finder in front and
+  brought the app forward, left a menu on screen, or put the restored window above Finder's.
+  `ui_action focus` is allowed on macOS, where three runs left the frontmost app alone (it stays refused on
+  Linux, which was not measured). What `never` does not cover: an app raising itself in answer to an
   accessibility action, a launched app taking focus anyway, a headed browser driven by `browser_*` tools
   (the engine brings tabs forward), and anything run through `exec` or `pty_*`. See `docs/threat-model.md`.
 - **`capture_window` on macOS reads the window itself through ScreenCaptureKit, so a window with other windows
@@ -226,6 +228,20 @@ All notable changes to this project are documented here. The format follows
   `docs/threat-model.md`.
 
 ### Fixed
+
+- **macOS: `launch` right after `close_app` failed with "could not launch".** The closed app was still known to
+  LaunchServices for a moment and `open -a` answered error -600, so an agent that closed TextEdit and opened it
+  again was told it could not be started. `launch` (and the background launch used under
+  `foreground = "never"`) now retries that one error for up to 8 seconds, and any other failure carries
+  `open`'s own message instead of a bare "could not launch".
+- **macOS: a minimised window was listed as `onscreen`.** The window server leaves out the on-screen key for a
+  window that is not drawn, and its absence was read as "on screen", so `minimized` was always false.
+  `control_window restore` with no `title` now un-minimises a minimised window; it used to act on the main
+  window, which is the one in view, and did nothing.
+- **macOS: `ui_action` on an element that lacks the action said only "unsupported on this element".** Some
+  apps answer a missing action with the attribute-unsupported code instead of the action one, and that path
+  skipped the message that names what the element does offer. Both now say, for example, that TextEdit's text
+  area does not offer AXScrollToVisible and offers only AXShowMenu. A disabled popup says what to do next.
 
 - **`control_window`, `menu_open` and `menu_invoke` acted on the frontmost app whatever `app` said.** The
   argument was accepted and discarded (`_app`), so `control_window { app: "TextEdit", action: "close" }` closed

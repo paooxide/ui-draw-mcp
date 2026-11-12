@@ -65,6 +65,137 @@ fn focused_is_textedit() -> bool {
     matches!(backend.input_target(), Some(t) if t.contains(APP))
 }
 
+/// Run an AppleScript through System Events and return what it printed.
+///
+/// System Events and not TextEdit itself: scripting TextEdit asks for a
+/// separate Automation permission, and without it the call waits for a dialog
+/// nobody answers. Bounded, so a wedged app cannot hang the suite.
+fn osascript(script: &str) -> Option<String> {
+    let mut child = std::process::Command::new("osascript")
+        .args(["-e", script])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+    let mut out = String::new();
+    std::io::Read::read_to_string(&mut child.stdout.take()?, &mut out).ok()?;
+    Some(out.trim().to_string())
+}
+
+fn textedit_running() -> bool {
+    std::process::Command::new("pgrep")
+        .args(["-x", APP])
+        .output()
+        .is_ok_and(|o| o.status.success())
+}
+
+/// Titles of TextEdit's windows, one per line.
+fn textedit_windows() -> Vec<String> {
+    if !textedit_running() {
+        return Vec::new();
+    }
+    osascript(
+        "tell application \"System Events\" to tell process \"TextEdit\" \
+         to get name of every window",
+    )
+    .map(|names| names.split(", ").map(str::to_string).collect())
+    .unwrap_or_default()
+}
+
+/// Leaves TextEdit as the test found it, whether the test passes, skips or
+/// panics: every window the test opened is closed without saving, and if
+/// TextEdit was not running at all it is quit again.
+///
+/// Windows are told apart by title. A new scratch document is always called
+/// "Untitled N" with a number nothing else holds, so the titles present
+/// before the test are exactly the ones to leave alone.
+struct Scratch {
+    was_running: bool,
+    before: Vec<String>,
+}
+
+impl Scratch {
+    fn begin() -> Scratch {
+        Scratch {
+            was_running: textedit_running(),
+            before: textedit_windows(),
+        }
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        for title in textedit_windows() {
+            if self.before.contains(&title) {
+                continue;
+            }
+            let title = title.replace('\\', "\\\\").replace('"', "\\\"");
+            // A Save sheet is cancelled with Escape. Closing a document that
+            // holds text raises a sheet of its own, whose Delete button
+            // lives in a view System Events cannot see into; its shortcut,
+            // Command-Delete, is the way to answer it. Keys go to the front
+            // app, so TextEdit is brought forward first and the keys are sent
+            // only while it is there.
+            let _ = osascript(&format!(
+                "tell application \"System Events\" to tell process \"TextEdit\"\n\
+                 set frontmost to true\n\
+                 repeat 3 times\n\
+                   if (count of (windows whose name is \"{title}\")) is 0 then exit repeat\n\
+                   set w to first window whose name is \"{title}\"\n\
+                   perform action \"AXRaise\" of w\n\
+                   if frontmost and (count of sheets of w) > 0 then\n\
+                     key code 53\n\
+                     delay 0.5\n\
+                   end if\n\
+                   click (first button of w whose subrole is \"AXCloseButton\")\n\
+                   delay 0.6\n\
+                   if (count of (windows whose name is \"{title}\")) > 0 then\n\
+                     set w to first window whose name is \"{title}\"\n\
+                     if frontmost and (count of sheets of w) > 0 then\n\
+                       key code 51 using command down\n\
+                       delay 0.6\n\
+                     end if\n\
+                   end if\n\
+                 end repeat\n\
+                 end tell"
+            ));
+        }
+        if !self.was_running && textedit_running() {
+            // Nothing of ours is left open, so there is nothing to lose.
+            // Asking it to quit politely keeps it from restoring a window the
+            // next time it starts; the signal is the fallback.
+            let _ = osascript(
+                "tell application \"System Events\" to tell process \"TextEdit\" \
+                 to click menu item \"Quit TextEdit\" of menu 1 of menu bar item \"TextEdit\" \
+                 of menu bar 1",
+            );
+            let deadline = Instant::now() + Duration::from_secs(4);
+            while textedit_running() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            if textedit_running() {
+                let _ = std::process::Command::new("pkill")
+                    .args(["-x", APP])
+                    .status();
+            }
+        }
+    }
+}
+
 async fn settle_on_textedit(c: &InProcClient) -> bool {
     let _ = c.call("focus_app", json!({ "app": APP })).await;
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -129,6 +260,8 @@ async fn open_save_sheet(c: &InProcClient) -> Option<()> {
     Some(())
 }
 
+/// Take the Save sheet away. The scratch document behind it is the guard's to
+/// close.
 async fn cancel_and_close(c: &InProcClient) {
     // Escape cancels the sheet. It is sent only while TextEdit is frontmost.
     if focused_is_textedit() {
@@ -136,7 +269,6 @@ async fn cancel_and_close(c: &InProcClient) {
             .call("keyboard_shortcut", json!({ "combo": "Escape" }))
             .await;
     }
-    let _ = c.call("close_app", json!({ "app": APP })).await;
 }
 
 /// Choose an entry of a real popup button by its text, and check the answer
@@ -151,6 +283,7 @@ async fn a_popup_button_in_the_save_sheet_takes_a_choice_by_its_text() {
     if !ready() {
         return;
     }
+    let _textedit = Scratch::begin();
     let c = client("live-popup");
     c.initialize().await;
     if open_save_sheet(&c).await.is_none() {
@@ -164,33 +297,51 @@ async fn a_popup_button_in_the_save_sheet_takes_a_choice_by_its_text() {
         )
         .await;
     let popups = found["elements"].as_array().cloned().unwrap_or_default();
-    let Some(popup) = popups.first() else {
+    if popups.is_empty() {
         eprintln!(
             "skipping: the save sheet exposes no popup button ({})",
             found["hint"]
         );
         cancel_and_close(&c).await;
         return;
-    };
-    let reff = popup["ref"].as_str().unwrap().to_string();
+    }
 
     // A choice that does not exist is refused, with the real ones listed, and
-    // nothing is left open behind it.
-    let wrong = c
-        .call(
-            "ui_action",
-            json!({ "ref": &reff, "action": "select", "option": "agentctl-no-such-option" }),
-        )
-        .await;
-    assert!(!wrong.ok, "a missing option must not report ok");
-    let err = wrong.error.unwrap();
-    assert_eq!(err.code, ErrorCode::InvalidArgs, "{}", err.message);
-    let options = listed_options(&err.message);
-    assert!(
-        !options.is_empty(),
-        "the error must list the options: {}",
-        err.message
-    );
+    // nothing is left open behind it. The sheet may hold popups that are
+    // disabled (which depends on the macOS version and the save location), and
+    // find_elements does not say which; trying each is how they are told
+    // apart. A disabled control is a valid request the app cannot carry out,
+    // so it is ACTION_FAILED and says the control is disabled; INVALID_ARGS is
+    // for a request that is wrong, like an option the popup does not have.
+    let mut chosen = None;
+    for (index, popup) in popups.iter().enumerate() {
+        let wrong = c
+            .call(
+                "ui_action",
+                json!({ "ref": popup["ref"], "action": "select", "option": "agentctl-no-such-option" }),
+            )
+            .await;
+        assert!(!wrong.ok, "a missing option must not report ok");
+        let err = wrong.error.unwrap();
+        if err.message.contains("is disabled") {
+            assert_eq!(err.code, ErrorCode::ActionFailed, "{}", err.message);
+            continue;
+        }
+        assert_eq!(err.code, ErrorCode::InvalidArgs, "{}", err.message);
+        let options = listed_options(&err.message);
+        assert!(
+            !options.is_empty(),
+            "the error must list the options: {}",
+            err.message
+        );
+        chosen = Some((index, options));
+        break;
+    }
+    let Some((index, options)) = chosen else {
+        eprintln!("skipping: every popup in the save sheet is disabled");
+        cancel_and_close(&c).await;
+        return;
+    };
 
     // Still operable: a menu left open would swallow or misroute the next call.
     let again = c
@@ -204,9 +355,9 @@ async fn a_popup_button_in_the_save_sheet_takes_a_choice_by_its_text() {
         "the popup must still be there after a refused choice"
     );
 
-    let current = again["elements"][0]["value"]
+    let current = again["elements"][index]["value"]
         .as_str()
-        .or_else(|| again["elements"][0]["name"].as_str())
+        .or_else(|| again["elements"][index]["name"].as_str())
         .unwrap_or_default()
         .to_string();
     let Some(target) = options
@@ -219,7 +370,10 @@ async fn a_popup_button_in_the_save_sheet_takes_a_choice_by_its_text() {
     };
 
     // Case and spacing are forgiven; the answer is the control's own text.
-    let reff = again["elements"][0]["ref"].as_str().unwrap().to_string();
+    let reff = again["elements"][index]["ref"]
+        .as_str()
+        .unwrap()
+        .to_string();
     let chose = c
         .ok(
             "ui_action",
@@ -236,9 +390,9 @@ async fn a_popup_button_in_the_save_sheet_takes_a_choice_by_its_text() {
             json!({ "app": APP, "surface": "sheet", "role": "popup button" }),
         )
         .await;
-    let shown = after["elements"][0]["value"]
+    let shown = after["elements"][index]["value"]
         .as_str()
-        .or_else(|| after["elements"][0]["name"].as_str())
+        .or_else(|| after["elements"][index]["name"].as_str())
         .unwrap_or_default();
     assert_eq!(shown, target, "the control must show what was chosen");
 
@@ -272,6 +426,7 @@ async fn a_checkbox_in_the_save_sheet_is_checked_idempotently_and_verified() {
     if !ready() {
         return;
     }
+    let _textedit = Scratch::begin();
     let c = client("live-checkbox");
     c.initialize().await;
     if open_save_sheet(&c).await.is_none() {
@@ -333,6 +488,7 @@ async fn textedit_set_value_and_typing_report_what_the_document_shows() {
     if !ready() {
         return;
     }
+    let _textedit = Scratch::begin();
     let c = client("live-readback");
     c.initialize().await;
     c.ok("launch", json!({ "app": APP })).await;
@@ -354,7 +510,6 @@ async fn textedit_set_value_and_typing_report_what_the_document_shows() {
         .await;
     let Some(area) = found["elements"].as_array().and_then(|e| e.first()) else {
         eprintln!("skipping: no text area found ({})", found["hint"]);
-        let _ = c.call("close_app", json!({ "app": APP })).await;
         return;
     };
     let reff = area["ref"].as_str().unwrap().to_string();
@@ -367,10 +522,10 @@ async fn textedit_set_value_and_typing_report_what_the_document_shows() {
     assert_eq!(set["changed"], json!(true), "{set}");
 
     // Believe the tree, not the tool.
-    let tree = c.ok("get_ui_tree", json!({ "app": APP })).await;
+    let (shown, text) = document_shows(&c, Some(&reff), |t| t == nonce).await;
     assert!(
-        tree["text"].as_str().unwrap_or_default().contains(&nonce),
-        "set_value reported success but the document does not show the text"
+        shown,
+        "set_value reported success but the document shows {text:?}"
     );
 
     // The same text again is not a change, and is still ok.
@@ -383,7 +538,6 @@ async fn textedit_set_value_and_typing_report_what_the_document_shows() {
     // receive the keystrokes.
     if !focused_is_textedit() {
         eprintln!("skipping typing: focus moved off {APP}");
-        let _ = c.call("close_app", json!({ "app": APP })).await;
         return;
     }
     let typed = c
@@ -404,8 +558,6 @@ async fn textedit_set_value_and_typing_report_what_the_document_shows() {
         )
         .await;
     assert!(secret.get("value_after").is_none(), "{secret}");
-
-    let _ = c.call("close_app", json!({ "app": APP })).await;
 }
 
 /// The chord spellings a model reaches for are accepted, and a chord of two
@@ -415,6 +567,7 @@ async fn shortcut_spellings_work_in_textedit_and_two_keys_are_refused() {
     if !ready() {
         return;
     }
+    let _textedit = Scratch::begin();
     let c = client("live-chords");
     c.initialize().await;
     c.ok("launch", json!({ "app": APP })).await;
@@ -439,22 +592,55 @@ async fn shortcut_spellings_work_in_textedit_and_two_keys_are_refused() {
         count >= 2,
         "two new documents expected, saw {count}: {windows}"
     );
-    let _ = c.call("close_app", json!({ "app": APP })).await;
 }
 
-/// The document's text as the accessibility tree shows it, polled for a
-/// moment because an app applies keystrokes on its own run loop.
-async fn document_shows(c: &InProcClient, want: impl Fn(&str) -> bool) -> (bool, String) {
+/// The value of a TextEdit text area, shortened for a failure message.
+///
+/// The whole accessibility tree names every other window the machine has
+/// open, so a failed check prints this one value and nothing else.
+fn shortened(text: &str) -> String {
+    const MAX: usize = 200;
+    match text.char_indices().nth(MAX) {
+        Some((end, _)) => format!("{}... ({} chars)", &text[..end], text.chars().count()),
+        None => text.to_string(),
+    }
+}
+
+/// What a TextEdit document holds, as the accessibility tree shows it, polled
+/// for a moment because an app applies keystrokes on its own run loop.
+///
+/// `reff` names the text area to read. Without it the first text area is read,
+/// which is the one in the frontmost window. Either way only that one value is
+/// looked at: a check over the whole tree is fooled by every other document
+/// that happens to be open.
+async fn document_shows(
+    c: &InProcClient,
+    reff: Option<&str>,
+    want: impl Fn(&str) -> bool,
+) -> (bool, String) {
     let mut text = String::new();
     for _ in 0..20 {
-        let tree = c.ok("get_ui_tree", json!({ "app": APP })).await;
-        text = tree["text"].as_str().unwrap_or_default().to_string();
+        let found = c
+            .ok(
+                "find_elements",
+                json!({ "app": APP, "role": "text field", "limit": 20 }),
+            )
+            .await;
+        let areas = found["elements"].as_array().cloned().unwrap_or_default();
+        let area = match reff {
+            Some(r) => areas.iter().find(|a| a["ref"].as_str() == Some(r)),
+            None => areas.first(),
+        };
+        text = area
+            .and_then(|a| a["value"].as_str())
+            .unwrap_or_default()
+            .to_string();
         if want(&text) {
-            return (true, text);
+            return (true, shortened(&text));
         }
         tokio::time::sleep(Duration::from_millis(150)).await;
     }
-    (false, text)
+    (false, shortened(&text))
 }
 
 /// A held Shift turns later arrow chords into a selection, and releasing it
@@ -468,6 +654,7 @@ async fn a_held_shift_selects_across_chords_and_up_lets_go() {
     if !ready() {
         return;
     }
+    let _textedit = Scratch::begin();
     let c = client("live-hold");
     c.initialize().await;
     c.ok("launch", json!({ "app": APP })).await;
@@ -508,11 +695,11 @@ async fn a_held_shift_selects_across_chords_and_up_lets_go() {
     assert_eq!(up["held"], json!([]), "{up}");
     if !ok || !focused_is_textedit() {
         eprintln!("skipping the rest: focus moved off {APP}");
-        let _ = c.call("close_app", json!({ "app": APP })).await;
         return;
     }
     c.ok("keyboard_type", json!({ "text": "X" })).await;
-    let (selected, text) = document_shows(&c, |t| t.contains("aX") && !t.contains("abX")).await;
+    let (selected, text) =
+        document_shows(&c, None, |t| t.contains("aX") && !t.contains("abX")).await;
     assert!(
         selected,
         "two shifted Lefts must select \"bc\": document shows {text:?}"
@@ -520,13 +707,12 @@ async fn a_held_shift_selects_across_chords_and_up_lets_go() {
 
     if guarded_key(&c, "Left").await {
         c.ok("keyboard_type", json!({ "text": "Z" })).await;
-        let (released, text) = document_shows(&c, |t| t.contains("aZX")).await;
+        let (released, text) = document_shows(&c, None, |t| t.contains("aZX")).await;
         assert!(
             released,
             "Shift must be up after `up`: document shows {text:?}"
         );
     }
-    let _ = c.call("close_app", json!({ "app": APP })).await;
 }
 
 /// A drag with a `path` presses at the start, passes through the waypoints
@@ -537,6 +723,7 @@ async fn a_drag_path_selects_a_line_of_text_and_reports_its_waypoints() {
     if !ready() {
         return;
     }
+    let _textedit = Scratch::begin();
     let c = client("live-drag-path");
     c.initialize().await;
     c.ok("launch", json!({ "app": APP })).await;
@@ -559,7 +746,6 @@ async fn a_drag_path_selects_a_line_of_text_and_reports_its_waypoints() {
         .await;
     let Some(area) = found["elements"].as_array().and_then(|e| e.first()) else {
         eprintln!("skipping: no text area found ({})", found["hint"]);
-        let _ = c.call("close_app", json!({ "app": APP })).await;
         return;
     };
     let reff = area["ref"].as_str().unwrap().to_string();
@@ -594,16 +780,15 @@ async fn a_drag_path_selects_a_line_of_text_and_reports_its_waypoints() {
 
     if !focused_is_textedit() {
         eprintln!("skipping typing: focus moved off {APP}");
-        let _ = c.call("close_app", json!({ "app": APP })).await;
         return;
     }
     c.ok("keyboard_type", json!({ "text": "Q" })).await;
-    let (replaced, text) = document_shows(&c, |t| t.contains('Q') && !t.contains("wordword")).await;
+    let (replaced, text) =
+        document_shows(&c, None, |t| t.contains('Q') && !t.contains("wordword")).await;
     assert!(
         replaced,
         "the dragged line must have been selected and replaced: document shows {text:?}"
     );
-    let _ = c.call("close_app", json!({ "app": APP })).await;
 }
 
 /// A new TextEdit document holding `text`, and the ref of its text area.
@@ -622,7 +807,6 @@ async fn scratch_document(c: &InProcClient, text: &str) -> Option<String> {
         .await;
     let Some(area) = found["elements"].as_array().and_then(|e| e.first()) else {
         eprintln!("skipping: no text area found ({})", found["hint"]);
-        let _ = c.call("close_app", json!({ "app": APP })).await;
         return None;
     };
     let reff = area["ref"].as_str().unwrap().to_string();
@@ -642,6 +826,7 @@ async fn textedit_select_text_selects_by_text_and_offsets_without_the_pointer() 
     if !ready() {
         return;
     }
+    let _textedit = Scratch::begin();
     use mcp_input::InputBackend;
     let c = client("live-select-text");
     c.initialize().await;
@@ -751,7 +936,6 @@ async fn textedit_select_text_selects_by_text_and_offsets_without_the_pointer() 
         pointer_before, pointer_after,
         "select_text reported the accessibility route but the pointer moved"
     );
-    let _ = c.call("close_app", json!({ "app": APP })).await;
 }
 
 /// `ui_action` only says ok for what it did. An action the element does not
@@ -762,6 +946,7 @@ async fn textedit_ui_action_names_the_actions_an_element_lacks() {
     if !ready() {
         return;
     }
+    let _textedit = Scratch::begin();
     let c = client("live-ax-ladder");
     c.initialize().await;
     let Some(reff) = scratch_document(&c, "ladder").await else {
@@ -801,7 +986,6 @@ async fn textedit_ui_action_names_the_actions_an_element_lacks() {
         .ok("ui_action", json!({ "ref": &reff, "action": "focus" }))
         .await;
     assert_eq!(focus["input"], json!("ax"), "{focus}");
-    let _ = c.call("close_app", json!({ "app": APP })).await;
 }
 
 /// The app that owns the frontmost window right now, read by a backend that
@@ -824,6 +1008,7 @@ async fn under_never_the_accessibility_tools_work_without_taking_the_foreground(
     if !ready() {
         return;
     }
+    let _textedit = Scratch::begin();
     use mcp_input::InputBackend;
     let setup = client("live-never-setup");
     setup.initialize().await;
@@ -837,7 +1022,6 @@ async fn under_never_the_accessibility_tools_work_without_taking_the_foreground(
     while !frontmost().is_some_and(|f| f.contains("Finder")) {
         if Instant::now() > deadline {
             eprintln!("skipping: Finder never became frontmost; cannot show TextEdit stays behind");
-            let _ = setup.call("close_app", json!({ "app": APP })).await;
             return;
         }
         tokio::time::sleep(Duration::from_millis(150)).await;
@@ -885,14 +1069,35 @@ async fn under_never_the_accessibility_tools_work_without_taking_the_foreground(
     assert_eq!(selected["text"], json!("gamma"), "{selected}");
     still_behind("select_text");
 
+    // TextEdit's text area does not offer AXScrollToVisible (it offers only
+    // AXShowMenu), so the honest answer is an error that says what it does
+    // offer. What matters here is that the call ran, rather than being refused
+    // for the foreground, and left the front alone.
     let acted = c
-        .ok(
+        .call(
             "ui_action",
             json!({ "ref": &reff, "action": "scroll_into_view" }),
         )
         .await;
-    assert_eq!(acted["input"], json!("ax"), "{acted}");
+    assert!(!acted.ok, "a text area has no scroll-to-visible: {acted:?}");
+    let err = acted.error.unwrap();
+    assert_eq!(err.code, ErrorCode::UnsupportedOs, "{}", err.message);
+    assert!(
+        err.message.contains("does not offer AXScrollToVisible")
+            && err.message.contains("it offers"),
+        "{}",
+        err.message
+    );
     still_behind("ui_action");
+
+    // Setting keyboard focus was measured not to bring TextEdit forward (see
+    // `measured_which_refused_operations_would_have_raised_the_app`), so it is
+    // allowed here, and must leave the front where it was.
+    let focused = c
+        .ok("ui_action", json!({ "ref": &reff, "action": "focus" }))
+        .await;
+    assert_eq!(focused["input"], json!("ax"), "{focused}");
+    still_behind("ui_action focus");
 
     // What the document shows is what was written, read back separately.
     let shown = c.ok("get_selection", json!({ "ref": &reff })).await;
@@ -908,7 +1113,17 @@ async fn under_never_the_accessibility_tools_work_without_taking_the_foreground(
         ("mouse_action", json!({ "type": "click", "ref": &reff })),
         ("keyboard_type", json!({ "text": "x", "ref": &reff })),
         ("keyboard_shortcut", json!({ "combo": "cmd+a" })),
-        ("ui_action", json!({ "ref": &reff, "action": "focus" })),
+        ("ui_action", json!({ "ref": &reff, "action": "show_menu" })),
+        (
+            "ui_action",
+            json!({ "ref": &reff, "action": "select", "option": "x" }),
+        ),
+        ("menu_open", json!({ "app": APP, "path": ["Edit"] })),
+        (
+            "menu_invoke",
+            json!({ "app": APP, "path": ["Edit", "Select All"] }),
+        ),
+        ("control_window", json!({ "app": APP, "action": "restore" })),
         ("focus_app", json!({ "app": APP })),
         ("control_window", json!({ "action": "focus" })),
     ] {
@@ -927,7 +1142,6 @@ async fn under_never_the_accessibility_tools_work_without_taking_the_foreground(
         pointer_before, pointer_after,
         "the pointer moved under foreground = never"
     );
-    let _ = setup.call("close_app", json!({ "app": APP })).await;
 }
 
 /// Several actions in one call, against a real document: the steps run in
@@ -939,6 +1153,7 @@ async fn textedit_input_steps_edit_a_scratch_document_in_one_call() {
     if !ready() {
         return;
     }
+    let _textedit = Scratch::begin();
     let c = client("live-input-steps");
     c.initialize().await;
     let Some(reff) = scratch_document(&c, "").await else {
@@ -948,7 +1163,6 @@ async fn textedit_input_steps_edit_a_scratch_document_in_one_call() {
     // now, as every guarded chord in this file does.
     if !focused_is_textedit() {
         eprintln!("skipping: focus moved off {APP}");
-        let _ = c.call("close_app", json!({ "app": APP })).await;
         return;
     }
     let env = c
@@ -971,7 +1185,7 @@ async fn textedit_input_steps_edit_a_scratch_document_in_one_call() {
         .map(|s| s["tool"].as_str().unwrap_or_default().to_string())
         .collect();
     assert_eq!(tools, ["set_value", "select_text", "keyboard_type"]);
-    let (done, text) = document_shows(&c, |t| t == "hello world").await;
+    let (done, text) = document_shows(&c, Some(&reff), |t| t == "hello world").await;
     assert!(
         done,
         "the batch must have left the document as hello world: {text:?}"
@@ -992,9 +1206,8 @@ async fn textedit_input_steps_edit_a_scratch_document_in_one_call() {
     assert!(!env.ok);
     let data = env.data.unwrap();
     assert_eq!(data["failed_at"], json!(1), "{data}");
-    let (stopped, text) = document_shows(&c, |t| t == "first").await;
+    let (stopped, text) = document_shows(&c, Some(&reff), |t| t == "first").await;
     assert!(stopped, "step 2 must not have run: {text:?}");
-    let _ = c.call("close_app", json!({ "app": APP })).await;
 }
 
 /// `effects` has to say what the app really did. Cmd+S on a new document
@@ -1005,6 +1218,7 @@ async fn effects_report_the_save_sheet_a_shortcut_opens_and_closes() {
     if !ready() {
         return;
     }
+    let _textedit = Scratch::begin();
     let c = client("live-effects-sheet");
     c.initialize().await;
     c.ok("launch", json!({ "app": APP })).await;
@@ -1046,7 +1260,6 @@ async fn effects_report_the_save_sheet_a_shortcut_opens_and_closes() {
     // carries no effects.
     let quiet = c.ok("keyboard_shortcut", json!({ "combo": "Right" })).await;
     assert!(quiet.get("effects").is_none(), "{quiet}");
-    let _ = c.call("close_app", json!({ "app": APP })).await;
 }
 
 /// A TextEdit document in the background is found, addressed and read while
@@ -1070,6 +1283,7 @@ async fn a_background_app_is_pinned_listed_and_read_by_window_id_without_taking_
     if !ready() {
         return;
     }
+    let _textedit = Scratch::begin();
     use mcp_input::InputBackend;
     let setup = client("live-bg-setup");
     setup.initialize().await;
@@ -1081,7 +1295,6 @@ async fn a_background_app_is_pinned_listed_and_read_by_window_id_without_taking_
     while !frontmost().is_some_and(|f| f.contains("Finder")) {
         if Instant::now() > deadline {
             eprintln!("skipping: Finder never became frontmost; cannot show TextEdit stays behind");
-            let _ = setup.call("close_app", json!({ "app": APP })).await;
             return;
         }
         tokio::time::sleep(Duration::from_millis(150)).await;
@@ -1191,5 +1404,368 @@ async fn a_background_app_is_pinned_listed_and_read_by_window_id_without_taking_
         backend.pointer_position().await.ok().flatten(),
         "the pointer moved"
     );
-    let _ = setup.call("close_app", json!({ "app": APP })).await;
+}
+
+// ---------------------------------------------------------------------------
+// What the operations refused under `foreground = "never"` really do.
+//
+// They were refused only because nobody had watched them: an accessibility
+// action on a background app may be answered by that app coming to the front,
+// or by a menu opening in front of the user. This measures each one against
+// TextEdit while Finder is frontmost, and the table at the end of the file's
+// test is the evidence for the classification in the `foreground.rs` tables.
+// ---------------------------------------------------------------------------
+
+/// How many windows of `owner` are on screen above the normal window layer:
+/// an open menu or popup is one. A document window is not.
+fn overlay_windows(owner: &str) -> usize {
+    use core_foundation::base::{CFType, TCFType};
+    use core_foundation::dictionary::CFDictionary;
+    use core_foundation::number::CFNumber;
+    use core_foundation::string::CFString;
+    use core_graphics::window::{
+        copy_window_info, kCGNullWindowID, kCGWindowLayer, kCGWindowListOptionOnScreenOnly,
+        kCGWindowOwnerName,
+    };
+
+    let Some(all) = copy_window_info(kCGWindowListOptionOnScreenOnly, kCGNullWindowID) else {
+        return 0;
+    };
+    all.get_all_values()
+        .into_iter()
+        .filter(|raw| !raw.is_null())
+        .filter(|raw| {
+            // SAFETY: the pointers are the entries of the array the window
+            // server just returned, each a CFDictionary, alive while `all` is.
+            let dict: CFDictionary<CFString, CFType> =
+                unsafe { CFDictionary::wrap_under_get_rule(*raw as _) };
+            // SAFETY: the window server's own key constants.
+            let owner_key = unsafe { CFString::wrap_under_get_rule(kCGWindowOwnerName) };
+            let layer_key = unsafe { CFString::wrap_under_get_rule(kCGWindowLayer) };
+            let owned = dict
+                .find(&owner_key)
+                .and_then(|v| v.downcast::<CFString>())
+                .is_some_and(|name| name == owner);
+            let layer = dict
+                .find(&layer_key)
+                .and_then(|v| v.downcast::<CFNumber>())
+                .and_then(|n| n.to_i64());
+            owned && layer.is_some_and(|l| l != 0)
+        })
+        .count()
+}
+
+/// What was seen while one operation ran and for a moment after.
+struct Watch {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    thread: std::thread::JoinHandle<(Vec<Option<String>>, usize)>,
+}
+
+impl Watch {
+    /// Sample the frontmost app and TextEdit's overlay windows every 20 ms.
+    /// Sampling runs beside the operation, not after it: a popup that opens
+    /// and closes inside one call is over by the time the call returns.
+    fn start() -> Watch {
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = stop.clone();
+        let thread = std::thread::spawn(move || {
+            let mut fronts: Vec<Option<String>> = Vec::new();
+            let mut most = 0;
+            while !flag.load(std::sync::atomic::Ordering::Relaxed) {
+                let now = frontmost();
+                if fronts.last() != Some(&now) {
+                    fronts.push(now);
+                }
+                most = most.max(overlay_windows(APP));
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            (fronts, most)
+        });
+        Watch { stop, thread }
+    }
+
+    /// Stop after a settling moment, since an app may come forward a beat
+    /// after the call that asked it to.
+    async fn finish(self) -> (Vec<Option<String>>, usize) {
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.thread.join().expect("sampler thread")
+    }
+}
+
+/// The application macOS itself calls active, which can differ from the owner
+/// of the topmost window: both are read, since either one changing is the user
+/// losing their place.
+fn active_app() -> Option<String> {
+    osascript(
+        "tell application \"System Events\" to get name of first application process \
+         whose frontmost is true",
+    )
+}
+
+/// One measured operation.
+struct Measured {
+    label: &'static str,
+    ok: bool,
+    detail: String,
+    /// Every distinct topmost-window owner seen, in order, starting with the
+    /// one before the call.
+    fronts: Vec<Option<String>>,
+    /// The active application before and after.
+    active: (Option<String>, Option<String>),
+    /// The most TextEdit overlay windows (menus, popups) seen at once.
+    overlays: usize,
+}
+
+impl Measured {
+    /// Left the frontmost app alone and put nothing in front of the user.
+    fn quiet(&self) -> bool {
+        self.fronts.len() == 1 && self.active.0 == self.active.1 && self.overlays == 0
+    }
+}
+
+async fn finder_in_front(c: &InProcClient) -> bool {
+    let _ = c.call("focus_app", json!({ "app": "Finder" })).await;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if frontmost().is_some_and(|f| f.contains("Finder"))
+            && active_app().is_some_and(|a| a == "Finder")
+        {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    false
+}
+
+/// Back to the starting position between measurements: nothing of TextEdit's
+/// open above its windows, and Finder in front.
+async fn reset_scene(c: &InProcClient) -> bool {
+    if overlay_windows(APP) > 0 && settle_on_textedit(c).await {
+        let _ = c
+            .call("keyboard_shortcut", json!({ "combo": "Escape" }))
+            .await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    finder_in_front(c).await && overlay_windows(APP) == 0
+}
+
+async fn measure(
+    c: &InProcClient,
+    label: &'static str,
+    tool: &str,
+    args: Value,
+) -> Option<Measured> {
+    if !reset_scene(c).await {
+        eprintln!("skipping {label}: could not get back to Finder in front with no menu open");
+        return None;
+    }
+    let before = frontmost();
+    let active_before = active_app();
+    let watch = Watch::start();
+    let env = c.call(tool, args).await;
+    let (mut fronts, overlays) = watch.finish().await;
+    let active_after = active_app();
+    if fronts.first() != Some(&before) {
+        fronts.insert(0, before);
+    }
+    let detail = match (&env.error, &env.data) {
+        (Some(e), _) => e.message.chars().take(90).collect(),
+        (None, Some(d)) => d.to_string().chars().take(90).collect(),
+        _ => String::new(),
+    };
+    let m = Measured {
+        label,
+        ok: env.ok,
+        detail,
+        fronts,
+        active: (active_before, active_after),
+        overlays,
+    };
+    eprintln!(
+        "MEASURED {:<26} ok={:<5} quiet={:<5} topmost={:?} active={:?} overlays={} | {}",
+        m.label,
+        m.ok,
+        m.quiet(),
+        m.fronts,
+        m.active,
+        m.overlays,
+        m.detail
+    );
+    Some(m)
+}
+
+/// How many times an operation that looks quiet is repeated before it is
+/// believed. A single quiet run proves nothing about an app that answers a
+/// beat late.
+const REPEATS: usize = 3;
+
+/// Which of the operations `foreground = "never"` once refused for want of a
+/// measurement really leave the frontmost app alone, measured on TextEdit with
+/// Finder in front, once as the topmost window's owner and once as the
+/// application macOS calls active.
+///
+/// What is asserted is what was observed on this machine. The tables in the
+/// `foreground.rs` files follow it: an operation that came forward or opened a
+/// menu on screen stays refused, and so does any whose measurement here could
+/// not be taken.
+///
+///   ui_action focus          quiet: the text area takes focus, TextEdit stays behind
+///   control_window restore   the restored window appears above Finder's
+///   ui_action show_menu      raises TextEdit and opens a context menu
+///   menu_open                leaves the menu open on screen above Finder
+///   menu_invoke              puts the menu on screen above Finder while it runs
+///   ui_action select+option  raises TextEdit to open the popup
+#[tokio::test(flavor = "multi_thread")]
+async fn measured_which_refused_operations_would_have_raised_the_app() {
+    if !ready() {
+        return;
+    }
+    let _textedit = Scratch::begin();
+    let c = client("live-measure");
+    c.initialize().await;
+    let Some(area) = scratch_document(&c, "measure me").await else {
+        return;
+    };
+    let mut seen: Vec<Measured> = Vec::new();
+
+    for _ in 0..REPEATS {
+        seen.extend(
+            measure(
+                &c,
+                "ui_action focus",
+                "ui_action",
+                json!({ "ref": &area, "action": "focus" }),
+            )
+            .await,
+        );
+    }
+    seen.extend(
+        measure(
+            &c,
+            "ui_action show_menu",
+            "ui_action",
+            json!({ "ref": &area, "action": "show_menu" }),
+        )
+        .await,
+    );
+    seen.extend(
+        measure(
+            &c,
+            "menu_open",
+            "menu_open",
+            json!({ "app": APP, "path": ["Edit"] }),
+        )
+        .await,
+    );
+    seen.extend(
+        measure(
+            &c,
+            "menu_invoke",
+            "menu_invoke",
+            json!({ "app": APP, "path": ["Edit", "Select All"] }),
+        )
+        .await,
+    );
+
+    // A minimised window, restored; checked to be really minimised before (one
+    // of TextEdit's windows) and really back after, or a quiet restore would be
+    // a restore that did nothing.
+    {
+        let down = c
+            .call(
+                "control_window",
+                json!({ "app": APP, "action": "minimize" }),
+            )
+            .await;
+        let minimised = |windows: &Value| {
+            windows["windows"]
+                .as_array()
+                .is_some_and(|w| w.iter().any(|w| w["minimized"] == json!(true)))
+        };
+        // The window takes a moment to finish its trip into the Dock.
+        let mut listed = c.ok("list_windows", json!({ "app": APP })).await;
+        for _ in 0..20 {
+            if minimised(&listed) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            listed = c.ok("list_windows", json!({ "app": APP })).await;
+        }
+        if !down.ok || !minimised(&listed) {
+            eprintln!("skipping restore: the window did not minimise ({listed})");
+            return;
+        }
+        let m = measure(
+            &c,
+            "control_window restore",
+            "control_window",
+            json!({ "app": APP, "action": "restore" }),
+        )
+        .await;
+        let mut listed = c.ok("list_windows", json!({ "app": APP })).await;
+        for _ in 0..20 {
+            if minimised(&listed) {
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                listed = c.ok("list_windows", json!({ "app": APP })).await;
+            }
+        }
+        assert!(
+            listed["windows"]
+                .as_array()
+                .is_some_and(|w| !w.is_empty() && w.iter().all(|w| w["minimized"] == json!(false))),
+            "restore reported {:?} but the window is still minimised",
+            m.as_ref().map(|m| m.ok)
+        );
+        seen.extend(m);
+    }
+
+    // A popup button in a Save sheet. The sheet needs TextEdit forward to open;
+    // the measurement starts from Finder in front again.
+    if settle_on_textedit(&c).await && guarded_key(&c, "cmd+s").await {
+        tokio::time::sleep(Duration::from_millis(900)).await;
+        let popups = c
+            .ok(
+                "find_elements",
+                json!({ "app": APP, "surface": "sheet", "role": "popup button" }),
+            )
+            .await;
+        // Some popups are disabled, which says nothing about the foreground;
+        // the first enabled one is the measurement.
+        for popup in popups["elements"].as_array().cloned().unwrap_or_default() {
+            let m = measure(
+                &c,
+                "ui_action select+option",
+                "ui_action",
+                json!({ "ref": popup["ref"], "action": "select", "option": "agentctl-no-such-option" }),
+            )
+            .await;
+            if m.as_ref()
+                .is_some_and(|m| !m.detail.contains("is disabled"))
+            {
+                seen.extend(m);
+                break;
+            }
+        }
+    }
+
+    let expected_quiet = |label: &str| label == "ui_action focus";
+    for m in &seen {
+        assert_eq!(
+            m.quiet(),
+            expected_quiet(m.label),
+            "{} was observed with topmost {:?}, active {:?}, {} menu window(s)",
+            m.label,
+            m.fronts,
+            m.active,
+            m.overlays
+        );
+    }
+    // One counterexample is enough to keep an operation refused; a quiet one
+    // has to have been seen every time.
+    assert_eq!(
+        seen.iter().filter(|m| m.label == "ui_action focus").count(),
+        REPEATS,
+        "focus was not measured {REPEATS} times; the scene could not be set up"
+    );
 }

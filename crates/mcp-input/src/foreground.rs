@@ -14,7 +14,8 @@
 //!   only known after it ran, and by then the pointer has moved.
 //!
 //! When unsure whether an accessibility action brings an app forward, it is
-//! refused here and the doubt is said in the refusal.
+//! refused here and the doubt is said in the refusal. An action is let through
+//! only where it has been measured not to (see [`focus_is_quiet_on`]).
 
 use std::sync::Arc;
 
@@ -66,8 +67,22 @@ const POINTER: &str = "move the real pointer";
 const KEYS: &str = "post synthetic key events to whichever app is frontmost, after first bringing \
                     the target app to the front";
 const UNVERIFIED_FOCUS: &str = "ask an app to take keyboard focus, which an app may answer by \
-                                coming to the front (not verified to be background-safe, so it \
-                                is refused)";
+                                coming to the front (not verified to be background-safe on this \
+                                platform, so it is refused)";
+
+/// Whether `ui_action focus` has been watched not to bring an app forward on
+/// `platform`.
+///
+/// Measured on macOS by `measured_which_refused_operations_would_have_raised_the_app`
+/// in `agentctl/tests/live_desktop_input.rs`: with Finder frontmost, setting
+/// `AXFocused` on TextEdit's text area was run three times and each time left
+/// both the topmost window's owner and the active application on Finder, with
+/// no menu on screen. Nothing was measured on Linux, where the same action is
+/// AT-SPI `grab_focus` and a compositor may answer it by raising the window, so
+/// it stays refused there.
+fn focus_is_quiet_on(platform: &str) -> bool {
+    platform == "macos"
+}
 const UNVERIFIED_MENU: &str = "open a menu or popup in another app, which may bring that app \
                                forward (not verified to be background-safe, so it is refused)";
 
@@ -254,7 +269,7 @@ fn action_refusal(
 ) -> Option<Refusal> {
     let what = format!("{tool} {name}");
     match action {
-        SemanticAction::Focus => Some(Refusal::new(
+        SemanticAction::Focus if !focus_is_quiet_on(backend.platform()) => Some(Refusal::new(
             what,
             UNVERIFIED_FOCUS,
             Some(
@@ -435,5 +450,18 @@ impl InputBackend for ForegroundInput {
     }
     fn takeover_generation(&self) -> u64 {
         self.inner.takeover_generation()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn focus_is_let_through_only_where_it_was_measured() {
+        assert!(focus_is_quiet_on("macos"));
+        for other in ["linux", "windows", "mock", ""] {
+            assert!(!focus_is_quiet_on(other), "{other:?}");
+        }
     }
 }
