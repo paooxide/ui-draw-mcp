@@ -24,7 +24,7 @@ serde_json.workspace = true
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = "0.10"
 core-foundation-sys = "0.8"
-core-graphics = { version = "0.25", features = ["highsierra"] }
+core-graphics = { version = "0.25", features = ["highsierra", "elcapitan"] }
 # ScreenCaptureKit window capture (see src/sck.rs). Feature lists are the
 # minimum the code names; the bindings' defaults would pull in the whole of
 # AVFoundation and the content-sharing picker.

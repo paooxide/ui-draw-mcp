@@ -13,14 +13,15 @@ mod foreground;
 pub mod glide;
 mod hold;
 mod human_override;
+mod pid_route;
 mod postcondition;
 mod selection;
 mod steps;
 mod tools;
 
 pub use backend::{
-    valid_modifier, Choice, ClipData, ClipFormat, InputBackend, InputError, MouseKind, Reading,
-    Route, ScrollDir, Selection, SemanticAction,
+    valid_modifier, BackgroundTarget, Choice, ClipData, ClipFormat, FocusedText, InputBackend,
+    InputError, MouseKind, Reading, Route, ScrollDir, Selection, SemanticAction,
 };
 pub use choose::{list_options, missing_message, pick_option, same_option, OptionItem, Pick};
 pub use combo::{parse_combo, parse_hold, Combo, Os, KEY_NAMES};

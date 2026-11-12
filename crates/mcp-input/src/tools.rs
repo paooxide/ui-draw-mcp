@@ -12,8 +12,8 @@ use mcp_types::{CallCtx, Category, Envelope, ErrorCode, Tier, ToolDescriptor, To
 use serde_json::{json, Value};
 
 use crate::backend::{
-    ClipFormat, InputBackend, InputError, MouseKind, Reading, Route, ScrollDir, Selection,
-    SemanticAction,
+    BackgroundTarget, ClipFormat, FocusedText, InputBackend, InputError, MouseKind, Reading, Route,
+    ScrollDir, Selection, SemanticAction,
 };
 use crate::combo::{parse_combo, parse_hold, Os};
 use crate::hold::{mono_ms, HeldKeys};
@@ -609,7 +609,16 @@ impl InputModule {
         if self.policy.bypass {
             return None;
         }
-        let target = self.backend.input_target().or_else(|| self.current_app());
+        // On the per-process route the text goes to the pinned app whether or
+        // not it is in front, so that app is the one screened. It is asked
+        // for by name here rather than left to `input_target`, so the gate
+        // does not depend on a backend answering both questions the same way.
+        let target = self
+            .backend
+            .background_key_target()
+            .map(|b| b.name)
+            .or_else(|| self.backend.input_target())
+            .or_else(|| self.current_app());
         let is_term = screens_as_terminal(target.as_deref(), &self.policy.terminal_apps);
         if !is_term {
             return None;
@@ -1468,6 +1477,9 @@ impl InputModule {
                 .get("name")
                 .and_then(Value::as_str)
                 .is_some_and(|n| !n.trim().is_empty());
+        if let Some(bg) = self.backend.background_key_target() {
+            return self.type_to_background(args, text, secret, aimed, bg).await;
+        }
         let mut target = None;
         let mut before = None;
         if aimed {
@@ -1563,6 +1575,9 @@ impl InputModule {
                 )
             }
         };
+        if let Some(bg) = self.backend.background_key_target() {
+            return self.press_in_background(&parsed, bg).await;
+        }
         match self.backend.key_combo(&parsed).await {
             Ok(()) => Envelope::ok(
                 tool,
@@ -1570,6 +1585,183 @@ impl InputModule {
             ),
             Err(e) => input_err(tool, e),
         }
+    }
+
+    /// The error for a key route that cannot be used while keys are held.
+    /// Held modifiers are applied to the events agentctl posts to the system;
+    /// a per-process event carries none of them, and a route that silently
+    /// dropped Shift would type the wrong thing.
+    fn held_blocks_pid(&self, tool: &str, bg: &BackgroundTarget) -> Option<Envelope> {
+        let held = lock_ledger(&self.ledger).keys.names();
+        if held.is_empty() {
+            return None;
+        }
+        Some(Envelope::fail_with(
+            tool,
+            ErrorCode::ActionFailed,
+            format!(
+                "keys are held down ({}) and '{}' is in the background: held keys are applied \
+                 only to events sent to the frontmost app, so sending to '{}' directly would \
+                 drop them",
+                held.join(", "),
+                bg.name,
+                bg.name
+            ),
+            "release them with keyboard_shortcut action up, or bring the app forward with \
+             focus_app (activate true)",
+        ))
+    }
+
+    /// Wait for the focused element of `pid` to read differently from
+    /// `before`, up to the settle window, and return the last read.
+    async fn focused_after(&self, pid: i32, before: &FocusedText) -> Option<FocusedText> {
+        let mut last = None;
+        for attempt in 0..SETTLE_READS {
+            let Ok(now) = self.backend.read_focused_text(pid).await else {
+                break;
+            };
+            let moved = crate::pid_route::changed(before, &now) != Some(false);
+            last = Some(now);
+            if moved {
+                break;
+            }
+            if attempt + 1 < SETTLE_READS {
+                tokio::time::sleep(SETTLE_GAP).await;
+            }
+        }
+        last
+    }
+
+    /// `keyboard_type` while the pinned app is in the background: per-process
+    /// events, read back, and an error rather than a guess when the read-back
+    /// cannot show the text arrived. Never raises the app, and never falls
+    /// back to the system event stream, which would type into whatever the
+    /// person is using.
+    async fn type_to_background(
+        &self,
+        args: &Value,
+        text: &str,
+        secret: bool,
+        aimed: bool,
+        bg: BackgroundTarget,
+    ) -> Envelope {
+        let tool = "keyboard_type";
+        if let Some(e) = self.held_blocks_pid(tool, &bg) {
+            return e;
+        }
+        let typed = text.chars().count();
+        let mut target = None;
+        if aimed {
+            let t = match self.resolve(tool, args, Need::Handle).await {
+                Ok(t) => t,
+                Err(e) => return e,
+            };
+            // Focus through accessibility, which does not bring the app up;
+            // the keys then land in the element and not wherever the app last
+            // had its caret.
+            if let Err(e) = self
+                .backend
+                .perform(t.node_id.unwrap_or_default(), SemanticAction::Focus, None)
+                .await
+            {
+                return input_err(tool, e);
+            }
+            target = Some(t);
+        }
+        let hide = secret || target.as_ref().is_some_and(|t| t.secure);
+        let before = self
+            .backend
+            .read_focused_text(bg.pid)
+            .await
+            .unwrap_or_default();
+        if typed > 0 {
+            if let Err(e) = self.backend.type_text_to_pid(bg.pid, text).await {
+                return input_err(tool, e);
+            }
+        }
+        let after = if typed == 0 {
+            before.clone()
+        } else {
+            self.focused_after(bg.pid, &before)
+                .await
+                .unwrap_or_default()
+        };
+        match crate::pid_route::judge_typed(&before, &after, text) {
+            crate::pid_route::Delivery::Landed => {
+                let mut data = with_route(
+                    json!({ "ok": true, "typed": typed, "verified": true,
+                            "background_app": bg.name }),
+                    Route::PidEvent,
+                );
+                if !hide {
+                    if let Some(v) = &after.value {
+                        data["value_after"] = json!(v);
+                    }
+                }
+                match target {
+                    Some(t) => Envelope::ok(tool, t.annotate(data)),
+                    None => Envelope::ok(tool, data),
+                }
+            }
+            crate::pid_route::Delivery::NotLanded => Envelope::fail_with(
+                tool,
+                ErrorCode::ActionFailed,
+                format!(
+                    "sent {typed} characters to '{}' without bringing it forward, but its focused \
+                     element did not change: the app dropped them or the field refused them",
+                    bg.name
+                ),
+                BACKGROUND_ALTERNATIVES,
+            ),
+            crate::pid_route::Delivery::Unverifiable => Envelope::fail_with(
+                tool,
+                ErrorCode::ActionFailed,
+                format!(
+                    "sent {typed} characters to '{}' without bringing it forward, but its focused \
+                     element cannot be read back (a password field, or an app with no readable \
+                     text), so it is not known whether they arrived. They may have: check the \
+                     app before typing again",
+                    bg.name
+                ),
+                BACKGROUND_ALTERNATIVES,
+            ),
+        }
+    }
+
+    /// `keyboard_shortcut` press while the pinned app is in the background.
+    /// There is usually no read-back for a chord, so the result says
+    /// `verified: false` unless the focused element visibly changed.
+    async fn press_in_background(&self, combo: &str, bg: BackgroundTarget) -> Envelope {
+        let tool = "keyboard_shortcut";
+        if let Some(e) = self.held_blocks_pid(tool, &bg) {
+            return e;
+        }
+        let before = self.backend.read_focused_text(bg.pid).await.ok();
+        if let Err(e) = self.backend.key_combo_to_pid(bg.pid, combo).await {
+            return input_err(tool, e);
+        }
+        let changed = match &before {
+            Some(b) => self
+                .focused_after(bg.pid, b)
+                .await
+                .and_then(|a| crate::pid_route::changed(b, &a)),
+            None => None,
+        };
+        let verified = changed == Some(true);
+        let mut data = with_route(
+            json!({ "ok": true, "pressed": combo, "verified": verified,
+                    "background_app": bg.name }),
+            Route::PidEvent,
+        );
+        if !verified {
+            data["note"] = json!(format!(
+                "sent to '{}' without bringing it forward; the focused element did not change, \
+                 and a chord has no other read-back, so it is not known that the app acted on \
+                 it. Check its state before relying on it",
+                bg.name
+            ));
+        }
+        Envelope::ok(tool, data)
     }
 
     /// `action: "down"`: press the keys and leave them down.
@@ -2132,6 +2324,13 @@ impl InputModule {
     }
 }
 
+/// What to offer when keys sent to a background app cannot be shown to have
+/// arrived. Not the system event stream: that is the route that takes over
+/// the person's keyboard, and an automatic fallback to it would do so unasked.
+const BACKGROUND_ALTERNATIVES: &str = "set_value writes the field through accessibility and works \
+    in the background; or bring the app forward with focus_app (activate true) and type again, \
+    which is refused under foreground = \"never\"";
+
 /// How many candidates a failed name lookup offers.
 const MAX_CANDIDATES: usize = 5;
 /// Reads while waiting for an app to apply a change, and the gap between
@@ -2549,7 +2748,8 @@ impl ToolModule for InputModule {
                 `show_menu` looks for a menu or popup action on the element and otherwise says what it has; \
                 `increment` and `decrement` move an AT-SPI Value by its minimum increment, clamped to its range.\n\n\
                 Every result carries `input`: `ax` when the accessibility API acted (no pointer, the app can stay \
-                in the background) or `hid` when synthetic system input was needed (the real cursor moved). \
+                in the background) `pid_event` for keys sent to one background process (`keyboard_type`, `keyboard_shortcut`), or `hid` when \
+                synthetic system input was needed (the real cursor moved). \
                 `right_click` and `double_click` are an accessibility press on macOS, which has no distinct \
                 double or secondary press; on Linux `right_click` clicks at the element's centre, so it is `hid`. \
                 `input` is absent when nothing needed doing (checking a checked box)."),
@@ -2648,7 +2848,7 @@ impl ToolModule for InputModule {
                 "keyboard_type",
                 Category::Input,
                 Tier::Standard,
-                "Type Unicode text into the focused window. If a target (ref or name) is given, focus it first and read its value back. Does not press return. Set 'secret' when typing a password so it is kept out of the audit log and never sent to the judge.",
+                "Type Unicode text into the focused window. If a target (ref or name) is given, focus it first and read its value back. Does not press return. When the app pinned with focus_app is not frontmost, the text is sent to that app directly (input \"pid_event\") without raising it. Set 'secret' when typing a password so it is kept out of the audit log and never sent to the judge.",
                 target_schema(json!({
                     "text":{"type":"string"},
                     "secret":{"type":"boolean","description":"the text is a password or other secret: keep it out of the audit log and never send it to the judge"},
@@ -2657,7 +2857,16 @@ impl ToolModule for InputModule {
                 With a target, the element's value is read before and after. The result carries `value_after` \
                 (never for a `secret` or a password field) and `changed`; typing into a text field that then shows \
                 the same value is an error. Without a target, the keystrokes go wherever focus is and nothing is \
-                read back."),
+                read back.\n\n\
+                When the app pinned with `focus_app` is not the frontmost one (pin it with `activate: false`), \
+                the text is sent to that process with per-process key events, so it does not bring the app \
+                forward and the frontmost app receives nothing. The result's `input` is `pid_event` and \
+                `verified: true` means the app's focused element changed as typed. Some apps drop these events \
+                while they are in the background; then the call is an error that says so (or that delivery \
+                could not be read back, for a password field or an app with no readable text) and does not \
+                retry through the foreground. Use `set_value` for those, or `focus_app` with `activate: true` \
+                and type again. Not available on Linux, where keys always go to the focused window. It is \
+                refused while keys are held with `keyboard_shortcut` `down`."),
             ToolDescriptor::new(
                 "keyboard_shortcut",
                 Category::Input,
@@ -2685,7 +2894,14 @@ impl ToolModule for InputModule {
                 trips or a human takes the mouse, and when the server stops. `keyboard_type` ignores held \
                 modifiers: the text carries its own case. On macOS a held modifier is applied to the events \
                 agentctl posts and is not a physical key press, so it cannot stay latched in the system; \
-                other software that polls the keyboard state does not see it. On Linux it is a real key press."),
+                other software that polls the keyboard state does not see it. On Linux it is a real key press.\n\n\
+                A chord pressed while the app pinned with `focus_app` is in the background is sent to that \
+                process (`input` is `pid_event`) and does not bring it forward. Text-editing chords such as \
+                `shift+left` arrive; menu key equivalents such as `cmd+a` and `cmd+s` were not delivered to \
+                TextEdit this way. A chord has no read-back, so the result's `verified` is `true` only when \
+                the focused element visibly changed and `false` otherwise, with a `note`: `false` means \
+                not known, not that it failed. `action: \"down\"` and `up` always use the frontmost app \
+                (and `down` brings a pinned app forward); a pid press is refused while keys are held."),
             ToolDescriptor::new(
                 "mouse_action",
                 Category::Input,
@@ -3169,6 +3385,15 @@ mod tests {
         /// The route `perform` reports, when it should not be `Ax`. Scripts
         /// what the tool layer is told, not what an OS did.
         route: std::sync::Mutex<Option<Route>>,
+        /// The pinned background app, when the tool layer should take the
+        /// per-process route. Scripts what the backend reports, not what an
+        /// OS does with the keys: that is measured in the live tests.
+        background: std::sync::Mutex<Option<BackgroundTarget>>,
+        /// What `read_focused_text` returns, one per read; the last repeats.
+        focused: std::sync::Mutex<Vec<FocusedText>>,
+        focused_reads: std::sync::atomic::AtomicUsize,
+        pid_typed: std::sync::Mutex<Vec<(i32, String)>>,
+        pid_keys: std::sync::Mutex<Vec<(i32, String)>>,
     }
 
     impl MockBackend {
@@ -3248,6 +3473,27 @@ mod tests {
         async fn key_combo(&self, combo: &str) -> Result<(), InputError> {
             self.keys.lock().unwrap().push(combo.to_string());
             Ok(())
+        }
+        fn background_key_target(&self) -> Option<BackgroundTarget> {
+            self.background.lock().unwrap().clone()
+        }
+        async fn type_text_to_pid(&self, pid: i32, text: &str) -> Result<(), InputError> {
+            self.pid_typed.lock().unwrap().push((pid, text.to_string()));
+            Ok(())
+        }
+        async fn key_combo_to_pid(&self, pid: i32, combo: &str) -> Result<(), InputError> {
+            self.pid_keys.lock().unwrap().push((pid, combo.to_string()));
+            Ok(())
+        }
+        async fn read_focused_text(&self, _pid: i32) -> Result<FocusedText, InputError> {
+            let script = self.focused.lock().unwrap();
+            let n = self
+                .focused_reads
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            script
+                .get(n.min(script.len().saturating_sub(1)))
+                .cloned()
+                .ok_or_else(|| InputError::Unsupported("no scripted read".into()))
         }
         async fn mouse(
             &self,
@@ -4486,6 +4732,188 @@ mod tests {
         let env = call(&module, "keyboard_type", json!({ "text": "x" })).await;
         assert!(env.ok);
         assert!(env.data.unwrap().get("value_after").is_none());
+    }
+
+    // ---- per-process key delivery (route pid_event) -------------------------
+
+    fn field(value: &str, caret: usize) -> FocusedText {
+        FocusedText {
+            value: Some(value.into()),
+            selection: Some((caret, caret)),
+            secure: false,
+        }
+    }
+
+    /// A module over a mock whose pinned app is `app`, in the background, with
+    /// the default (screening) policy: the destructive gate is on.
+    fn background_module(app: &str, reads: Vec<FocusedText>) -> (InputModule, Arc<MockBackend>) {
+        let backend = Arc::new(MockBackend::default());
+        *backend.background.lock().unwrap() = Some(BackgroundTarget {
+            pid: 4242,
+            name: app.into(),
+        });
+        *backend.focused.lock().unwrap() = reads;
+        let arena = Arc::new(Mutex::new(SnapshotArena::new()));
+        let module = InputModule::new(backend.clone(), arena, InputPolicy::default());
+        (module, backend)
+    }
+
+    #[tokio::test]
+    async fn typing_at_a_background_app_goes_by_pid_and_is_read_back() {
+        let (module, backend) = background_module(
+            "Notes",
+            vec![field("ab", 2), field("ab", 2), field("abcd", 4)],
+        );
+        let env = call(&module, "keyboard_type", json!({ "text": "cd" })).await;
+        assert!(env.ok, "{env:?}");
+        let d = env.data.unwrap();
+        assert_eq!(d["input"], "pid_event");
+        assert_eq!(d["verified"], true);
+        assert_eq!(d["value_after"], "abcd");
+        assert_eq!(d["background_app"], "Notes");
+        assert_eq!(
+            *backend.pid_typed.lock().unwrap(),
+            vec![(4242, "cd".to_string())]
+        );
+        assert!(
+            backend.typed.lock().unwrap().is_empty(),
+            "nothing may go to the frontmost app"
+        );
+    }
+
+    #[tokio::test]
+    async fn typing_that_changed_nothing_is_an_error_and_never_falls_back_to_hid() {
+        let (module, backend) = background_module("Notes", vec![field("ab", 2)]);
+        let env = call(&module, "keyboard_type", json!({ "text": "cd" })).await;
+        let err = env.error.expect("an error, not ok");
+        assert_eq!(err.code, ErrorCode::ActionFailed);
+        assert!(err.message.contains("did not change"), "{}", err.message);
+        let hint = err.suggestion.unwrap_or_default();
+        assert!(
+            hint.contains("set_value") && hint.contains("focus_app"),
+            "{hint}"
+        );
+        assert!(
+            backend.typed.lock().unwrap().is_empty()
+                && backend.key_events.lock().unwrap().is_empty(),
+            "a failed delivery must not retype through the system event stream"
+        );
+    }
+
+    #[tokio::test]
+    async fn typing_into_something_unreadable_is_not_reported_as_delivered() {
+        let (module, _) = background_module("Notes", vec![FocusedText::default()]);
+        let env = call(&module, "keyboard_type", json!({ "text": "cd" })).await;
+        let err = env.error.expect("unverified delivery is an error");
+        assert!(err.message.contains("not known whether"), "{}", err.message);
+        assert!(err.message.contains("may have"), "{}", err.message);
+
+        let secure = FocusedText {
+            secure: true,
+            ..Default::default()
+        };
+        let (module, _) = background_module("Notes", vec![secure]);
+        let env = call(
+            &module,
+            "keyboard_type",
+            json!({ "text": "hunter2", "secret": true }),
+        )
+        .await;
+        let err = env.error.expect("a password field cannot be read back");
+        assert!(!err.message.contains("hunter2"));
+    }
+
+    #[tokio::test]
+    async fn a_shortcut_at_a_background_app_says_when_it_could_not_be_verified() {
+        let (module, backend) = background_module("Notes", vec![field("abc", 0)]);
+        let env = call(&module, "keyboard_shortcut", json!({ "combo": "cmd+a" })).await;
+        assert!(env.ok, "{env:?}");
+        let d = env.data.unwrap();
+        assert_eq!(d["input"], "pid_event");
+        assert_eq!(d["verified"], false);
+        assert!(d["note"].as_str().unwrap().contains("not known"));
+        assert_eq!(
+            *backend.pid_keys.lock().unwrap(),
+            vec![(4242, "cmd+a".to_string())]
+        );
+        assert!(backend.keys.lock().unwrap().is_empty());
+
+        let (module, _) = background_module("Notes", vec![field("abc", 0), field("abc", 3)]);
+        let env = call(&module, "keyboard_shortcut", json!({ "combo": "End" })).await;
+        let d = env.data.unwrap();
+        assert_eq!(
+            (d["verified"].clone(), d.get("note").is_none()),
+            (json!(true), true)
+        );
+    }
+
+    #[tokio::test]
+    async fn keys_held_down_block_the_background_route_rather_than_being_dropped() {
+        let (module, backend) = background_module("Notes", vec![field("ab", 2)]);
+        for (tool, args) in [
+            ("keyboard_type", json!({ "text": "x" })),
+            ("keyboard_shortcut", json!({ "combo": "left" })),
+        ] {
+            // A failed input call releases whatever is held (that is the
+            // contract for held keys), so shift is held afresh each time.
+            let env = call(
+                &module,
+                "keyboard_shortcut",
+                json!({ "combo": "shift", "action": "down" }),
+            )
+            .await;
+            assert!(env.ok, "{env:?}");
+            let env = call(&module, tool, args).await;
+            let err = env.error.expect("refused while shift is held");
+            assert!(err.message.contains("shift"), "{}", err.message);
+        }
+        assert!(backend.pid_typed.lock().unwrap().is_empty());
+        assert!(backend.pid_keys.lock().unwrap().is_empty());
+    }
+
+    /// The destructive screen follows the app the keys are sent to. The mock's
+    /// frontmost app is a harmless one; the pinned background app is Terminal.
+    #[tokio::test]
+    async fn a_destructive_command_at_a_background_terminal_meets_the_same_gate() {
+        let (module, backend) = background_module("Terminal", vec![field("$ ", 2)]);
+        let env = call(&module, "keyboard_type", json!({ "text": "rm -rf /" })).await;
+        let err = env.error.expect("the gate must stop it");
+        assert_eq!(err.code, ErrorCode::ConsentRequired, "{}", err.message);
+        assert!(backend.pid_typed.lock().unwrap().is_empty());
+
+        // Autonomous: a denial, as on the foreground route.
+        let backend = Arc::new(MockBackend::default());
+        *backend.background.lock().unwrap() = Some(BackgroundTarget {
+            pid: 1,
+            name: "iTerm2".into(),
+        });
+        let arena = Arc::new(Mutex::new(SnapshotArena::new()));
+        let policy = InputPolicy {
+            autonomous: true,
+            ..InputPolicy::default()
+        };
+        let module = InputModule::new(backend.clone(), arena, policy);
+        let env = call(&module, "keyboard_type", json!({ "text": "rm -rf /" })).await;
+        assert_eq!(env.error.unwrap().code, ErrorCode::PolicyDenied);
+        assert!(backend.pid_typed.lock().unwrap().is_empty());
+
+        // The same text at a background app that is not a terminal is let
+        // through (it is only text there).
+        let (module, backend) =
+            background_module("Notes", vec![field("", 0), field("rm -rf /", 8)]);
+        let env = call(&module, "keyboard_type", json!({ "text": "rm -rf /" })).await;
+        assert!(env.ok, "{env:?}");
+        assert_eq!(backend.pid_typed.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn with_nothing_in_the_background_keys_still_take_the_ordinary_route() {
+        let (module, backend, _) = test_module();
+        let env = call(&module, "keyboard_type", json!({ "text": "x" })).await;
+        assert_eq!(env.data.unwrap()["input"], "hid");
+        assert_eq!(backend.typed.lock().unwrap().len(), 1);
+        let env = call(&module, "keyboard_shortcut", json!({ "combo": "a" })).await;
+        assert_eq!(env.data.unwrap()["input"], "hid");
     }
 
     #[tokio::test]
@@ -5900,6 +6328,17 @@ mod tests {
                 Err(InputError::Refused(_))
             ));
         }
+        // Per-process keys are let through only where they were measured (see
+        // `pid_route_is_quiet_on`), and this platform is not one of them.
+        *backend.background.lock().unwrap() = Some(BackgroundTarget {
+            pid: 7,
+            name: "Notes".into(),
+        });
+        assert!(g.background_key_target().is_none());
+        assert!(refused(g.type_text_to_pid(7, "x").await));
+        assert!(refused(g.key_combo_to_pid(7, "cmd+s").await));
+        assert!(backend.pid_typed.lock().unwrap().is_empty());
+        assert!(backend.pid_keys.lock().unwrap().is_empty());
         assert!(untouched(&backend));
         // What is background-safe goes through.
         assert_eq!(

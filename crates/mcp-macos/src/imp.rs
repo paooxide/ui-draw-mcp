@@ -663,6 +663,18 @@ impl MacosBackend {
         )))
     }
 
+    /// A per-process event to a pid that is gone goes nowhere and says
+    /// nothing, so the pid is checked first.
+    fn require_live_pid(&self, pid: i32) -> Result<(), InputError> {
+        if pid_alive(pid) {
+            Ok(())
+        } else {
+            Err(InputError::NotFound(format!(
+                "process {pid} is no longer running"
+            )))
+        }
+    }
+
     fn set_target(&self, pid: c_int, name: &str) {
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
         st.target = Some(AppTarget {
@@ -1033,6 +1045,72 @@ impl InputBackend for MacosBackend {
             sleep(Duration::from_millis(3)).await;
         }
         Ok(())
+    }
+    fn background_key_target(&self) -> Option<mcp_input::BackgroundTarget> {
+        let t = self.live_pin()?;
+        // Compared at the moment of asking: an app that was raised a moment
+        // ago is in front, and its keys go through the ordinary route.
+        if unsafe { frontmost_pid() } == Some(t.pid) {
+            return None;
+        }
+        Some(mcp_input::BackgroundTarget {
+            pid: t.pid,
+            name: t.name,
+        })
+    }
+    async fn type_text_to_pid(&self, pid: i32, text: &str) -> Result<(), InputError> {
+        use tokio::time::{sleep, Duration};
+        self.require_live_pid(pid)?;
+        let since = self.takeover_generation();
+        let total = text.chars().count();
+        let mut typed = 0;
+        for chunk in crate::chunk::chunks(text) {
+            if self.takeover_generation() != since {
+                return Err(InputError::Failed(format!(
+                    "typing aborted after {typed} of {total} characters: a human took over"
+                )));
+            }
+            crate::event::type_chunk_to(crate::event::Dest::Pid(pid), chunk)?;
+            typed += chunk.chars().count();
+            sleep(Duration::from_millis(3)).await;
+        }
+        Ok(())
+    }
+    async fn key_combo_to_pid(&self, pid: i32, combo: &str) -> Result<(), InputError> {
+        self.require_live_pid(pid)?;
+        // No held flags: the tool layer refuses this route while keys are held.
+        crate::event::key_combo_to(
+            crate::event::Dest::Pid(pid),
+            combo,
+            core_graphics::event::CGEventFlags::empty(),
+        )
+    }
+    async fn read_focused_text(&self, pid: i32) -> Result<mcp_input::FocusedText, InputError> {
+        unsafe {
+            let app = app_element(pid)
+                .ok_or_else(|| InputError::NotFound("cannot open the application".into()))?;
+            let Some(focused) = copy_attr(app.as_CFTypeRef(), "AXFocusedUIElement") else {
+                return Ok(mcp_input::FocusedText::default());
+            };
+            let e = focused.as_CFTypeRef();
+            if copy_attr_string(e, "AXSubrole").as_deref() == Some("AXSecureTextField") {
+                return Ok(mcp_input::FocusedText {
+                    value: None,
+                    selection: None,
+                    secure: true,
+                });
+            }
+            let value = copy_attr_string(e, "AXValue");
+            let selection = value.as_deref().and_then(|v| {
+                let (loc, len) = copy_attr_range(e, "AXSelectedTextRange")?;
+                utf16_range_to_char(v, loc, len)
+            });
+            Ok(mcp_input::FocusedText {
+                value,
+                selection,
+                secure: false,
+            })
+        }
     }
     async fn key_combo(&self, combo: &str) -> Result<(), InputError> {
         unsafe { self.ensure_target_frontmost()? };

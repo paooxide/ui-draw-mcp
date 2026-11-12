@@ -57,6 +57,12 @@ pub enum Route {
     /// Synthetic system input: it moves the real cursor or types into the
     /// frontmost app.
     Hid,
+    /// Key events addressed to one process (`CGEventPostToPid`): the app
+    /// receives them without being brought forward, and the frontmost app and
+    /// the pointer are not involved. Keys only; a pointer has no per-process
+    /// delivery. Some apps drop such events while they are not the active
+    /// app, which is why every use is read back.
+    PidEvent,
 }
 
 impl Route {
@@ -65,8 +71,30 @@ impl Route {
         match self {
             Self::Ax => "ax",
             Self::Hid => "hid",
+            Self::PidEvent => "pid_event",
         }
     }
+}
+
+/// An app that key events can be addressed to without bringing it forward:
+/// the session's pinned app, when it is not the frontmost one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackgroundTarget {
+    pub pid: i32,
+    pub name: String,
+}
+
+/// What a text element shows right now, read to tell whether keys sent to a
+/// background app arrived. Offsets are characters, as in [`Selection`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FocusedText {
+    /// The element's text. `None` when it cannot be read, and always `None`
+    /// for a password field, whose text is never read.
+    pub value: Option<String>,
+    /// The caret or selection, `start..end`.
+    pub selection: Option<(usize, usize)>,
+    /// A password field: nothing typed into it can be read back.
+    pub secure: bool,
 }
 
 /// A coordinate pointer action.
@@ -279,6 +307,33 @@ pub trait InputBackend: Send + Sync {
             "selecting text is not supported on this platform".into(),
         ))
     }
+    /// The pinned app when key events can be addressed to it directly: it is
+    /// pinned, still running, and not the frontmost app. `None` means keys go
+    /// to the frontmost app as always (nothing pinned, the pinned app is in
+    /// front, or the platform has no per-process delivery, as on Linux).
+    fn background_key_target(&self) -> Option<BackgroundTarget> {
+        None
+    }
+    /// Type `text` into process `pid` with per-process events
+    /// ([`Route::PidEvent`]). Never raises the app and never posts to the
+    /// frontmost one. Delivery is not confirmed here; the caller reads back.
+    async fn type_text_to_pid(&self, _pid: i32, _text: &str) -> Result<(), InputError> {
+        Err(InputError::Unsupported(
+            "per-process key delivery is not available on this platform".into(),
+        ))
+    }
+    /// Press a canonical chord in process `pid`; see [`Self::type_text_to_pid`].
+    async fn key_combo_to_pid(&self, _pid: i32, _combo: &str) -> Result<(), InputError> {
+        Err(InputError::Unsupported(
+            "per-process key delivery is not available on this platform".into(),
+        ))
+    }
+    /// The focused text element of process `pid`, as it is now.
+    async fn read_focused_text(&self, _pid: i32) -> Result<FocusedText, InputError> {
+        Err(InputError::Unsupported(
+            "reading the focused element of another app is not supported on this platform".into(),
+        ))
+    }
     /// Synthetic system input follows: `type_text`, `key_combo`, `mouse`,
     /// `scroll_at`, `hover` and `drag` all move the real pointer or type into
     /// the frontmost app, and the tool layer reports them as [`Route::Hid`].
@@ -477,5 +532,6 @@ mod tests {
     fn a_route_is_spelled_the_way_a_result_reports_it() {
         assert_eq!(Route::Ax.as_str(), "ax");
         assert_eq!(Route::Hid.as_str(), "hid");
+        assert_eq!(Route::PidEvent.as_str(), "pid_event");
     }
 }

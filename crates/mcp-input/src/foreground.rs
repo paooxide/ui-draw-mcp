@@ -48,7 +48,7 @@ pub(crate) const TOOLS: &[(&str, Stance)] = &[
     ("select_text", Stance::Background),
     ("get_selection", Stance::Background),
     ("ui_fill_form", Stance::ByArgs),
-    ("keyboard_type", Stance::Refused),
+    ("keyboard_type", Stance::ByArgs),
     ("keyboard_shortcut", Stance::ByArgs),
     ("mouse_action", Stance::Refused),
     ("scroll", Stance::Refused),
@@ -83,6 +83,27 @@ const UNVERIFIED_FOCUS: &str = "ask an app to take keyboard focus, which an app 
 fn focus_is_quiet_on(platform: &str) -> bool {
     platform == "macos"
 }
+
+/// Whether per-process key delivery has been watched leave the frontmost app,
+/// the pointer and the windows alone on `platform`.
+///
+/// Measured on macOS by `pid_event_types_into_a_background_app_without_raising_it`
+/// in `agentctl/tests/live_desktop_input.rs`: with Finder frontmost and a
+/// TextEdit document behind it, keys sent to TextEdit's process arrived (text
+/// and text-system chords; a menu key equivalent such as Command-A did not, and
+/// the tool says so) while the topmost window's owner, the active application,
+/// Finder's focused element and the pointer were all unchanged. Linux has no
+/// per-process delivery at all, so the route does not exist there.
+fn pid_route_is_quiet_on(platform: &str) -> bool {
+    platform == "macos"
+}
+
+/// Whether keys would go to the pinned app by process rather than to the
+/// frontmost one, which is what makes them safe under `never`.
+fn keys_go_to_background(backend: &dyn InputBackend) -> bool {
+    pid_route_is_quiet_on(backend.platform()) && backend.background_key_target().is_some()
+}
+
 const UNVERIFIED_MENU: &str = "open a menu or popup in another app, which may bring that app \
                                forward (not verified to be background-safe, so it is refused)";
 
@@ -127,9 +148,13 @@ fn always_refused(backend: &dyn InputBackend, tool: &str, args: &Value) -> Refus
             KEYS,
             Some(if aimed(args) {
                 "set_value writes the field's value through accessibility; the field need not \
-                 be focused or frontmost, and the text replaces what it holds"
+                 be focused or frontmost, and the text replaces what it holds. Or pin the app \
+                 with focus_app (activate false) while it is in the background: keys are then \
+                 sent to that process without raising it"
             } else {
-                "find the field with get_ui_tree, then set_value on its ref"
+                "find the field with get_ui_tree, then set_value on its ref; or pin the app \
+                 with focus_app (activate false) while it is in the background: keys are then \
+                 sent to that process without raising it"
             }),
         ),
         "mouse_action" => {
@@ -215,6 +240,11 @@ fn by_args(backend: &dyn InputBackend, tool: &str, args: &Value) -> Option<Refus
                 .chain(args.get("submit"))
                 .find_map(|f| field_refusal(backend, f))
         }
+        // Keys sent to a pinned background app by process touch neither the
+        // frontmost app nor the pointer, so they are let through; with the app
+        // in front, or nothing pinned, they would go to the foreground.
+        "keyboard_type" if keys_go_to_background(backend) => None,
+        "keyboard_type" => Some(always_refused(backend, tool, args)),
         "keyboard_shortcut" => {
             let hold = match args.get("action").and_then(Value::as_str) {
                 Some(a) if a.eq_ignore_ascii_case("down") => true,
@@ -222,6 +252,9 @@ fn by_args(backend: &dyn InputBackend, tool: &str, args: &Value) -> Option<Refus
                 Some(a) if !a.eq_ignore_ascii_case("press") => return None,
                 _ => false,
             };
+            if !hold && keys_go_to_background(backend) {
+                return None;
+            }
             Some(if hold {
                 Refusal::new(
                     "keyboard_shortcut down",
@@ -234,7 +267,9 @@ fn by_args(backend: &dyn InputBackend, tool: &str, args: &Value) -> Option<Refus
                     KEYS,
                     Some(
                         "ui_action on the control the shortcut would trigger; menu_list names a \
-                         menu item and its shortcut without opening anything",
+                         menu item and its shortcut without opening anything; or pin the app \
+                         with focus_app (activate false) while it is in the background and the \
+                         chord is sent to that process without raising it",
                     ),
                 )
             })
@@ -330,6 +365,18 @@ impl ForegroundInput {
     pub fn new(inner: Arc<dyn InputBackend>) -> Self {
         ForegroundInput { inner }
     }
+
+    /// The per-process key route, where it has been measured to leave the
+    /// foreground alone and only to a pinned app that is not frontmost: the
+    /// check that keeps a tool added later from sending keys by process to
+    /// the app the person is using.
+    fn require_pid_route(&self) -> Result<(), InputError> {
+        if keys_go_to_background(&*self.inner) {
+            Ok(())
+        } else {
+            Err(method_refusal("type_text_to_pid", Some("set_value")))
+        }
+    }
 }
 
 #[async_trait]
@@ -374,6 +421,24 @@ impl InputBackend for ForegroundInput {
     }
     async fn type_text(&self, _text: &str) -> Result<(), InputError> {
         Err(method_refusal("type_text", Some("set_value")))
+    }
+    fn background_key_target(&self) -> Option<crate::BackgroundTarget> {
+        if pid_route_is_quiet_on(self.inner.platform()) {
+            self.inner.background_key_target()
+        } else {
+            None
+        }
+    }
+    async fn type_text_to_pid(&self, pid: i32, text: &str) -> Result<(), InputError> {
+        self.require_pid_route()?;
+        self.inner.type_text_to_pid(pid, text).await
+    }
+    async fn key_combo_to_pid(&self, pid: i32, combo: &str) -> Result<(), InputError> {
+        self.require_pid_route()?;
+        self.inner.key_combo_to_pid(pid, combo).await
+    }
+    async fn read_focused_text(&self, pid: i32) -> Result<crate::FocusedText, InputError> {
+        self.inner.read_focused_text(pid).await
     }
     async fn key_combo(&self, _combo: &str) -> Result<(), InputError> {
         Err(method_refusal("key_combo", Some("ui_action")))
@@ -462,6 +527,14 @@ mod tests {
         assert!(focus_is_quiet_on("macos"));
         for other in ["linux", "windows", "mock", ""] {
             assert!(!focus_is_quiet_on(other), "{other:?}");
+        }
+    }
+
+    #[test]
+    fn per_process_keys_are_let_through_only_where_they_were_measured() {
+        assert!(pid_route_is_quiet_on("macos"));
+        for other in ["linux", "windows", "mock", ""] {
+            assert!(!pid_route_is_quiet_on(other), "{other:?}");
         }
     }
 }

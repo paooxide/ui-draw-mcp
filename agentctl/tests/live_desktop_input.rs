@@ -1111,8 +1111,10 @@ async fn under_never_the_accessibility_tools_work_without_taking_the_foreground(
             json!({ "type": "click", "x": 100, "y": 100 }),
         ),
         ("mouse_action", json!({ "type": "click", "ref": &reff })),
-        ("keyboard_type", json!({ "text": "x", "ref": &reff })),
-        ("keyboard_shortcut", json!({ "combo": "cmd+a" })),
+        // Keys are not in this list: TextEdit is pinned and in the background
+        // here, so they are sent to its process (see
+        // `under_never_pid_event_still_leaves_the_foreground_alone`), and are
+        // refused only when they would go to the app in front.
         ("ui_action", json!({ "ref": &reff, "action": "show_menu" })),
         (
             "ui_action",
@@ -1768,4 +1770,223 @@ async fn measured_which_refused_operations_would_have_raised_the_app() {
         REPEATS,
         "focus was not measured {REPEATS} times; the scene could not be set up"
     );
+}
+
+/// Key events addressed to one process (`input: "pid_event"`) reach a pinned
+/// app that is not frontmost, without raising it and without touching the app
+/// that is.
+///
+/// Finder is in front and a TextEdit scratch document is behind it. TextEdit
+/// is pinned with `activate: false`, then typed into, given a chord and typed
+/// into by ref through the tool layer. What is asserted is read from outside
+/// the tools: the document's own text, the topmost window's owner sampled
+/// every 20 ms while the calls ran, the application macOS calls active, and
+/// Finder's focused element, which would hold the text if any of it had gone
+/// to the system event stream.
+async fn pid_event_in_the_background(foreground: mcp_types::Foreground) {
+    let _textedit = Scratch::begin();
+    use mcp_input::InputBackend;
+    let setup = client("live-pid-setup");
+    setup.initialize().await;
+    let Some(area) = scratch_document(&setup, "seed ").await else {
+        return;
+    };
+    if !finder_in_front(&setup).await {
+        eprintln!("skipping: Finder never came to the front; nothing to show stays in front");
+        return;
+    }
+    let backend = mcp_macos::MacosBackend::new();
+    let finder_pid =
+        osascript("tell application \"System Events\" to get unix id of process \"Finder\"")
+            .and_then(|p| p.parse::<i32>().ok())
+            .expect("Finder's pid");
+    let finder_text_before = backend.read_focused_text(finder_pid).await.ok();
+    let topmost_before = frontmost();
+    let active_before = active_app();
+    let pointer_before = backend.pointer_position().await.ok().flatten();
+
+    let c = client_with("live-pid", foreground);
+    c.initialize().await;
+    if foreground == mcp_types::Foreground::Never {
+        // Nothing pinned: the keys would go to Finder, which is in front, so
+        // they are refused before anything is posted.
+        for (tool, args) in [
+            ("keyboard_type", json!({ "text": "zqxv" })),
+            ("keyboard_shortcut", json!({ "combo": "shift+Left" })),
+        ] {
+            let env = c.call(tool, args).await;
+            assert_eq!(
+                env.error.expect("refused with nothing pinned").code,
+                ErrorCode::PolicyDenied,
+                "{tool}"
+            );
+        }
+    }
+    let pinned = c
+        .ok("focus_app", json!({ "app": APP, "activate": false }))
+        .await;
+    assert_eq!(pinned["activated"], json!(false), "{pinned}");
+
+    let found = c
+        .ok(
+            "find_elements",
+            json!({ "app": APP, "role": "text field", "limit": 5 }),
+        )
+        .await;
+    let mine = found["elements"]
+        .as_array()
+        .and_then(|e| e.iter().find(|a| a["value"].as_str() == Some("seed ")))
+        .and_then(|a| a["ref"].as_str())
+        .expect("the scratch document's text area")
+        .to_string();
+    let show = |env: &mcp_types::Envelope| {
+        format!(
+            "ok={} err={:?} data={}",
+            env.ok,
+            env.error
+                .as_ref()
+                .map(|e| e.message.chars().take(160).collect::<String>()),
+            env.data
+                .as_ref()
+                .map(|d| d.to_string().chars().take(200).collect::<String>())
+                .unwrap_or_default()
+        )
+    };
+
+    let watch = Watch::start();
+    let typed = c.call("keyboard_type", json!({ "text": "by pid" })).await;
+    eprintln!("MEASURED pid keyboard_type {}", show(&typed));
+    // A chord the text system binds itself, with no menu involved.
+    let selected = c
+        .call("keyboard_shortcut", json!({ "combo": "shift+Left" }))
+        .await;
+    eprintln!("MEASURED pid shift+Left {}", show(&selected));
+    // A menu key equivalent: measured and reported, not assumed.
+    let menu = c
+        .call("keyboard_shortcut", json!({ "combo": "cmd+a" }))
+        .await;
+    eprintln!("MEASURED pid cmd+a {}", show(&menu));
+    let replaced = c
+        .call("keyboard_type", json!({ "ref": &mine, "text": "Z" }))
+        .await;
+    eprintln!("MEASURED pid keyboard_type by ref {}", show(&replaced));
+    let (fronts, _) = watch.finish().await;
+    let active_after = active_app();
+    let (landed, shows) = document_shows(&setup, Some(&area), |t| t.starts_with("seed by p")).await;
+    eprintln!(
+        "MEASURED pid fronts={fronts:?} active={active_before:?}->{active_after:?} doc={shows:?}"
+    );
+
+    assert!(typed.ok, "{:?}", typed.error);
+    assert_eq!(typed.data.as_ref().unwrap()["input"], "pid_event");
+    assert_eq!(typed.data.as_ref().unwrap()["verified"], true);
+    assert!(selected.ok, "{:?}", selected.error);
+    assert_eq!(selected.data.as_ref().unwrap()["input"], "pid_event");
+    assert_eq!(selected.data.as_ref().unwrap()["verified"], true);
+    assert_eq!(menu.data.as_ref().unwrap()["input"], "pid_event");
+    assert!(replaced.ok, "{:?}", replaced.error);
+    assert!(
+        landed,
+        "type, extend the selection, replace it: the document shows {shows:?}"
+    );
+    // Whether the menu chord landed is reported by `verified`, and that
+    // report must be true to what the document then holds: select all
+    // followed by one character leaves one character.
+    let menu_landed = shows.chars().count() <= 2;
+    assert_eq!(
+        menu.data.as_ref().unwrap()["verified"].as_bool(),
+        Some(menu_landed),
+        "cmd+a reported verified={:?} but the document shows {shows:?}",
+        menu.data.as_ref().unwrap()["verified"]
+    );
+    assert_eq!(
+        fronts,
+        vec![topmost_before.clone()],
+        "the topmost window's owner changed while keys were sent by pid"
+    );
+    assert_eq!(active_after, active_before, "the active app changed");
+    assert_eq!(
+        backend.read_focused_text(finder_pid).await.ok(),
+        finder_text_before,
+        "Finder's focused element changed: keys reached the foreground app"
+    );
+    assert_eq!(
+        backend.pointer_position().await.ok().flatten(),
+        pointer_before,
+        "the pointer moved"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pid_event_types_into_a_background_app_without_raising_it() {
+    if !ready() {
+        return;
+    }
+    pid_event_in_the_background(mcp_types::Foreground::Allow).await;
+}
+
+/// The same measurement under `foreground = "never"`, where per-process keys
+/// are allowed because they were measured not to raise anything: the keyboard
+/// tools work on a pinned background app, and are still refused when the app
+/// they would reach is the frontmost one.
+#[tokio::test(flavor = "multi_thread")]
+async fn under_never_pid_event_still_leaves_the_foreground_alone() {
+    if !ready() {
+        return;
+    }
+    pid_event_in_the_background(mcp_types::Foreground::Never).await;
+}
+
+/// The destructive-command screen follows the app the keys are sent to, not
+/// the one in front. TextEdit stands in for a terminal (it is added to
+/// `terminal_apps`; a real terminal is not started or typed into), sits behind
+/// Finder, and is pinned quietly. `rm -rf /` sent to it by process must meet
+/// the gate and put nothing in the document; harmless text in the same place
+/// goes through.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_destructive_command_sent_by_pid_meets_the_gate_for_the_target_app() {
+    if !ready() {
+        return;
+    }
+    let _textedit = Scratch::begin();
+    let setup = client("live-pid-gate-setup");
+    setup.initialize().await;
+    let Some(area) = scratch_document(&setup, "gate ").await else {
+        return;
+    };
+    if !finder_in_front(&setup).await {
+        eprintln!("skipping: Finder never came to the front");
+        return;
+    }
+    let mut cfg = test_policy(&[Category::Input, Category::Window, Category::System]);
+    cfg.allowed_apps = vec![APP.to_string(), "Finder".to_string()];
+    cfg.terminal_apps = vec![APP.to_string()];
+    let server = agentctl::build_server(cfg, AuditSink::memory(), Arc::new(NoConsent), "live-gate")
+        .expect("server builds");
+    let c = InProcClient::new(server);
+    c.initialize().await;
+    c.ok("focus_app", json!({ "app": APP, "activate": false }))
+        .await;
+    assert!(
+        frontmost().is_some_and(|f| f.contains("Finder")),
+        "pinning raised something"
+    );
+
+    let blocked = c.call("keyboard_type", json!({ "text": "rm -rf /" })).await;
+    let err = blocked.error.expect("the destructive screen must stop it");
+    assert!(
+        matches!(
+            err.code,
+            ErrorCode::ConsentRequired | ErrorCode::PolicyDenied
+        ),
+        "{:?}: {}",
+        err.code,
+        err.message
+    );
+    let (unchanged, shows) = document_shows(&setup, Some(&area), |t| t == "gate ").await;
+    assert!(unchanged, "text reached the target anyway: {shows:?}");
+
+    let fine = c.call("keyboard_type", json!({ "text": "ok" })).await;
+    assert!(fine.ok, "{:?}", fine.error);
+    assert_eq!(fine.data.as_ref().unwrap()["input"], "pid_event");
 }

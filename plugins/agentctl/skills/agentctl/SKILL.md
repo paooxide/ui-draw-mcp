@@ -67,7 +67,8 @@ ones.
    for text fields, `select_text` to select text, `ui_fill_form` for several fields at once,
    `menu_invoke` for menu commands. These work without moving the cursor and, on Linux, on windows that
    are not focused. Each input result's `input` says which route acted: `ax` (accessibility, background-
-   safe) or `hid` (synthetic input, moved the real cursor or needs the app in front).
+   safe), `pid_event` (keys sent to a pinned background app without raising it; check `verified`) or `hid`
+   (synthetic input, moved the real cursor or needs the app in front).
 4. Verify in the same call with `expect` (`text`, `gone`, `window`, `focused`) instead of a separate
    observation. Without `expect`, call `wait_for` before observing: input is asynchronous, and observing
    straight after acting reads the previous state. An action's result also carries `effects` when it

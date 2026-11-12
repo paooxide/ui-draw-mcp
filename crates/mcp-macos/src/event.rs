@@ -120,6 +120,28 @@ fn source() -> Result<CGEventSource, InputError> {
 /// anything longer is cut silently. [`crate::chunk::chunks`] produces the
 /// pieces; the caller posts them in order.
 pub fn type_chunk(chunk: &str) -> Result<(), InputError> {
+    type_chunk_to(Dest::Hid, chunk)
+}
+
+/// Where a keyboard event goes: the system event stream, which the frontmost
+/// app reads, or one process's own queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dest {
+    Hid,
+    Pid(i32),
+}
+
+impl Dest {
+    fn post(self, ev: &CGEvent) {
+        match self {
+            Dest::Hid => ev.post(CGEventTapLocation::HID),
+            Dest::Pid(pid) => ev.post_to_pid(pid),
+        }
+    }
+}
+
+/// [`type_chunk`] to a chosen destination.
+pub fn type_chunk_to(dest: Dest, chunk: &str) -> Result<(), InputError> {
     let src = source()?;
     let down = CGEvent::new_keyboard_event(src.clone(), 0, true).map_err(|_| fail("key down"))?;
     down.set_string(chunk);
@@ -130,11 +152,11 @@ pub fn type_chunk(chunk: &str) -> Result<(), InputError> {
     // every character silently becomes a menu shortcut. The call still reports
     // the full character count, so the agent is told it typed and sees nothing.
     down.set_flags(CGEventFlags::empty());
-    down.post(CGEventTapLocation::HID);
+    dest.post(&down);
     let up = CGEvent::new_keyboard_event(src, 0, false).map_err(|_| fail("key up"))?;
     up.set_string(chunk);
     up.set_flags(CGEventFlags::empty());
-    up.post(CGEventTapLocation::HID);
+    dest.post(&up);
     Ok(())
 }
 
@@ -142,6 +164,11 @@ pub fn type_chunk(chunk: &str) -> Result<(), InputError> {
 /// modifiers, then one key, joined by `+`. `held` are the modifiers already
 /// held down by `key_down`, which the chord carries too.
 pub fn key_combo(combo: &str, held: CGEventFlags) -> Result<(), InputError> {
+    key_combo_to(Dest::Hid, combo, held)
+}
+
+/// [`key_combo`] to a chosen destination.
+pub fn key_combo_to(dest: Dest, combo: &str, held: CGEventFlags) -> Result<(), InputError> {
     let mut flags = held;
     let mut key: Option<(CGKeyCode, bool)> = None;
     for seg in combo.split('+') {
@@ -175,10 +202,10 @@ pub fn key_combo(combo: &str, held: CGEventFlags) -> Result<(), InputError> {
     let down =
         CGEvent::new_keyboard_event(src.clone(), keycode, true).map_err(|_| fail("key down"))?;
     down.set_flags(flags);
-    down.post(CGEventTapLocation::HID);
+    dest.post(&down);
     let up = CGEvent::new_keyboard_event(src, keycode, false).map_err(|_| fail("key up"))?;
     up.set_flags(flags);
-    up.post(CGEventTapLocation::HID);
+    dest.post(&up);
     Ok(())
 }
 

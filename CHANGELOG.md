@@ -8,6 +8,25 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- **Keys reach a pinned background app by process, without raising it (`input: "pid_event"`).** When the app
+  pinned with `focus_app` is not frontmost, `keyboard_type` and `keyboard_shortcut` (press) post their key
+  events to that process (`CGEventPostToPid`) instead of bringing it forward and typing into the foreground;
+  with the pinned app in front, or nothing pinned, they are `hid` as before. Per-process delivery is
+  unreliable in some apps, so it is never taken on trust: typed text is read back from the app's focused
+  element (or the element a `ref` named) and the call is an error when it did not change, or cannot be read
+  (a password field, an app with no readable text), naming `set_value` and `focus_app activate: true` as the
+  ways forward; it does not fall back to `hid`, which would take the foreground. A chord has no read-back,
+  so its result says `verified: true` only when the focused element visibly changed and `verified: false`
+  with a note otherwise. Measured on TextEdit behind Finder: typed text and text-system chords
+  (`shift+left`) arrived and the topmost window, the active app, Finder's focused element and the pointer
+  were unchanged; the menu key equivalent `cmd+a` was not delivered and the result said so. The
+  destructive-command screen applies to the pinned target, as it does to the frontmost app on `hid`. Held
+  keys (`action: "down"`) stay on the frontmost app, and a pid press is refused, saying why, while keys are
+  held. `foreground = "never"` allows the route, since the measurement showed it neither moves the pointer
+  nor changes the frontmost app, and still refuses keys that would go to the frontmost app. Not available
+  on Linux: the RemoteDesktop portal has no per-process delivery, so keys there go to the focused window as
+  before.
+
 - **`input_steps` runs up to 20 desktop input actions in one call.** An agent filling a dialog spent a model
   turn on every click and keystroke; `browser_act` `steps` removed that for the browser and the desktop had
   nothing like it. A step is `{tool, args}`, the tool being `ui_action`, `set_value`, `select_text`,
