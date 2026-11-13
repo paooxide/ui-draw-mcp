@@ -449,6 +449,8 @@ fn resolve_key(name: &str, bits: u32) -> Option<Key> {
     })
 }
 
+pub(crate) use mcp_types::drag::{drag_path, drag_route, parse_drag_path};
+
 /// A coordinate argument: a number, or a numeric string (models quote them).
 pub(crate) fn coord(v: &serde_json::Value) -> Option<f64> {
     match v {
@@ -551,28 +553,13 @@ pub(crate) fn visible_center(r: Rect, vw: f64, vh: f64) -> Option<(f64, f64)> {
     (rt > l && b > t).then(|| ((l + rt) / 2.0, (t + b) / 2.0))
 }
 
-/// The points of a drag from `from` to `to`: `steps` evenly spaced moves, the
-/// last of them exactly on `to`.
-pub(crate) fn drag_path(from: (f64, f64), to: (f64, f64), steps: usize) -> Vec<(f64, f64)> {
-    let n = steps.max(1);
-    (1..=n)
-        .map(|i| {
-            if i == n {
-                return to;
-            }
-            let t = i as f64 / n as f64;
-            (from.0 + (to.0 - from.0) * t, from.1 + (to.1 - from.1) * t)
-        })
-        .collect()
-}
-
 /// A drag's `moves` default, and the ms between moves unless `duration_ms`
 /// spreads them otherwise.
 pub(crate) const DRAG_MOVES: usize = 12;
 pub(crate) const DRAG_STEP_MS: u64 = 15;
-/// Bounds of a drag's `moves`, its `path` waypoints and its `duration_ms`.
+/// Bounds of a drag's `moves` and its `duration_ms`; the `path` bound is
+/// `mcp_types::drag::DRAG_PATH_MAX`.
 pub(crate) const DRAG_MOVES_MAX: usize = 200;
-pub(crate) const DRAG_PATH_MAX: usize = 200;
 pub(crate) const DRAG_DURATION_MAX_MS: u64 = 10_000;
 
 /// A drag's `moves` argument: 2 to [`DRAG_MOVES_MAX`].
@@ -601,39 +588,6 @@ pub(crate) fn drag_duration(v: Option<f64>) -> Result<Option<u64>, String> {
     Ok(Some(ms.round() as u64))
 }
 
-/// A drag's `path`: 1 to [`DRAG_PATH_MAX`] waypoints, each `{x, y}` or
-/// `[x, y]`, in the frame of `to_x`/`to_y`.
-pub(crate) fn parse_drag_path(v: Option<&serde_json::Value>) -> Result<Vec<(f64, f64)>, String> {
-    let Some(v) = v.filter(|v| !v.is_null()) else {
-        return Ok(Vec::new());
-    };
-    let Some(list) = v.as_array() else {
-        return Err("'path' must be an array of points, each {x, y}".into());
-    };
-    if list.is_empty() || list.len() > DRAG_PATH_MAX {
-        return Err(format!(
-            "'path' holds 1 to {DRAG_PATH_MAX} points, got {}",
-            list.len()
-        ));
-    }
-    list.iter()
-        .enumerate()
-        .map(|(i, p)| {
-            let pair = match p {
-                serde_json::Value::Object(o) => (o.get("x"), o.get("y")),
-                serde_json::Value::Array(a) if a.len() == 2 => (a.first(), a.get(1)),
-                _ => (None, None),
-            };
-            match (pair.0.and_then(coord), pair.1.and_then(coord)) {
-                (Some(x), Some(y)) => Ok((x, y)),
-                _ => Err(format!(
-                    "'path' point {i} must be {{x, y}} with numbers, got {p}"
-                )),
-            }
-        })
-        .collect()
-}
-
 /// How a drag is paced: its move count and the ms between moves. The default
 /// is [`DRAG_MOVES`] moves [`DRAG_STEP_MS`] apart; `duration_ms` spreads the
 /// moves over that long instead, and a route with more waypoints than moves
@@ -649,68 +603,6 @@ pub(crate) fn drag_timing(
         None => DRAG_STEP_MS,
     };
     (moves, step_ms)
-}
-
-/// The points of a drag from `from` through each waypoint in turn, the last
-/// of them where it releases: `steps` moves in all, spread over the segments
-/// by length with at least one per segment, so every waypoint is landed on
-/// exactly.
-pub(crate) fn drag_route(
-    from: (f64, f64),
-    waypoints: &[(f64, f64)],
-    steps: usize,
-) -> Vec<(f64, f64)> {
-    if waypoints.is_empty() {
-        return Vec::new();
-    }
-    let mut prev = from;
-    let lengths: Vec<f64> = waypoints
-        .iter()
-        .map(|&w| {
-            let d = ((w.0 - prev.0).powi(2) + (w.1 - prev.1).powi(2)).sqrt();
-            prev = w;
-            d
-        })
-        .collect();
-    let total: f64 = lengths.iter().sum();
-    let n = steps.max(waypoints.len());
-    let spare = n - waypoints.len();
-    // One step per segment, the rest shared by length (largest remainders
-    // first so the sum is exactly `n`).
-    let mut per: Vec<usize> = vec![1; waypoints.len()];
-    if spare > 0 {
-        let shares: Vec<f64> = lengths
-            .iter()
-            .map(|l| {
-                if total > 0.0 {
-                    l / total * spare as f64
-                } else {
-                    spare as f64 / waypoints.len() as f64
-                }
-            })
-            .collect();
-        let mut given = 0;
-        for (p, s) in per.iter_mut().zip(&shares) {
-            *p += s.floor() as usize;
-            given += s.floor() as usize;
-        }
-        let mut order: Vec<usize> = (0..waypoints.len()).collect();
-        order.sort_by(|a, b| {
-            (shares[*b] - shares[*b].floor())
-                .partial_cmp(&(shares[*a] - shares[*a].floor()))
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        for i in order.into_iter().take(spare - given) {
-            per[i] += 1;
-        }
-    }
-    let mut out = Vec::with_capacity(n);
-    let mut prev = from;
-    for (&w, &k) in waypoints.iter().zip(&per) {
-        out.extend(drag_path(prev, w, k));
-        prev = w;
-    }
-    out
 }
 
 /// How far to wheel-scroll: `(delta_x, delta_y)` in CSS px. Explicit `dx` /
@@ -861,8 +753,38 @@ pub(crate) fn page_effects(page: &serde_json::Value) -> Fx {
     {
         fx.insert("focus".into(), json!(f));
     }
+    if let Some(o) = overlay_effect(page) {
+        fx.insert("overlay".into(), o);
+    }
     fx
 }
+
+/// A new layer in the way, from the facts the page script collected
+/// (`overlays`: text, ref, how many controls it now covers, whether it is
+/// modal, the share of the viewport it fills). It is in the way when it covers
+/// a control that was clickable before, is modal (the page behind it is inert
+/// whatever it covers), or fills a quarter of the viewport; a toast or a menu
+/// beside the controls is not. The first such layer is reported, as
+/// `{text, ref, covers}`, with `covers` left out when it is 0.
+pub(crate) fn overlay_effect(page: &serde_json::Value) -> Option<serde_json::Value> {
+    use serde_json::{json, Value};
+    let facts = page.get("overlays")?.as_array()?;
+    let o = facts.iter().find(|o| {
+        o.get("covers").and_then(Value::as_u64).unwrap_or(0) > 0
+            || o.get("modal").and_then(Value::as_bool) == Some(true)
+            || o.get("area").and_then(Value::as_f64).unwrap_or(0.0) >= OVERLAY_AREA
+    })?;
+    let text = |k: &str| o.get(k).and_then(Value::as_str).unwrap_or("");
+    let mut out = json!({ "text": clip(text("text"), 100), "ref": text("ref") });
+    let covers = o.get("covers").and_then(Value::as_u64).unwrap_or(0);
+    if covers > 0 {
+        out["covers"] = json!(covers);
+    }
+    Some(out)
+}
+
+/// The share of the viewport a layer fills to count as in the way by size alone.
+const OVERLAY_AREA: f64 = 0.25;
 
 #[cfg(test)]
 mod tests {
@@ -1015,15 +937,6 @@ mod tests {
     }
 
     #[test]
-    fn a_drag_path_is_even_and_ends_on_the_target() {
-        let p = drag_path((0.0, 0.0), (100.0, 50.0), 10);
-        assert_eq!(p.len(), 10);
-        assert_eq!(p[0], (10.0, 5.0));
-        assert_eq!(*p.last().unwrap(), (100.0, 50.0));
-        assert_eq!(drag_path((1.0, 1.0), (1.0, 1.0), 0), vec![(1.0, 1.0)]);
-    }
-
-    #[test]
     fn scroll_defaults_to_a_page_down() {
         let vp = (800.0, 600.0);
         assert_eq!(scroll_delta(None, None, None, vp), Ok((0.0, 600.0)));
@@ -1124,43 +1037,7 @@ mod tests {
     }
 
     #[test]
-    fn a_drag_route_lands_on_every_waypoint_in_order() {
-        let from = (0.0, 0.0);
-        let way = [(100.0, 0.0), (100.0, 100.0), (0.0, 100.0)];
-        let route = drag_route(from, &way, 12);
-        assert_eq!(route.len(), 12);
-        let hits: Vec<usize> = way
-            .iter()
-            .map(|w| {
-                route
-                    .iter()
-                    .position(|p| p == w)
-                    .expect("waypoint on route")
-            })
-            .collect();
-        assert_eq!(
-            hits,
-            [3, 7, 11],
-            "equal segments share the steps: {route:?}"
-        );
-        assert_eq!(route.last(), Some(&(0.0, 100.0)));
-        // Fewer steps than waypoints: one step per waypoint, nothing skipped.
-        let short = drag_route(from, &way, 2);
-        assert_eq!(short, way.to_vec());
-        // A long segment gets more of the steps than a short one.
-        let uneven = drag_route(from, &[(10.0, 0.0), (110.0, 0.0)], 12);
-        assert_eq!(uneven.len(), 12);
-        assert_eq!(uneven.iter().filter(|p| p.0 <= 10.0).count(), 2);
-        assert!(drag_route(from, &[], 12).is_empty());
-        assert_eq!(
-            drag_route(from, &[(5.0, 5.0)], 4),
-            drag_path(from, (5.0, 5.0), 4)
-        );
-    }
-
-    #[test]
     fn drag_pacing_defaults_and_bounds() {
-        use serde_json::json;
         assert_eq!(drag_timing(None, None, 1), (DRAG_MOVES, DRAG_STEP_MS));
         assert_eq!(drag_timing(Some(20), Some(1000), 1), (20, 50));
         assert_eq!(drag_timing(Some(4), None, 10), (10, DRAG_STEP_MS));
@@ -1172,16 +1049,6 @@ mod tests {
         assert_eq!(drag_duration(Some(10_000.0)), Ok(Some(10_000)));
         assert!(drag_duration(Some(10_001.0)).is_err());
         assert!(drag_duration(Some(-1.0)).is_err());
-        assert_eq!(
-            parse_drag_path(Some(&json!([{"x": 1, "y": "2"}, [3, 4]]))),
-            Ok(vec![(1.0, 2.0), (3.0, 4.0)])
-        );
-        assert_eq!(parse_drag_path(None), Ok(Vec::new()));
-        assert!(parse_drag_path(Some(&json!([]))).is_err());
-        assert!(parse_drag_path(Some(&json!([{"x": 1}]))).is_err());
-        assert!(parse_drag_path(Some(&json!("1,2"))).is_err());
-        let many: Vec<_> = (0..201).map(|i| json!({"x": i, "y": 0})).collect();
-        assert!(parse_drag_path(Some(&json!(many))).is_err());
     }
 
     #[test]
@@ -1278,6 +1145,32 @@ mod tests {
         );
         assert_eq!(location_of(&a, "A"), Some(home));
         assert_eq!(location_of(&a, "Z"), None);
+    }
+
+    #[test]
+    fn an_overlay_is_reported_when_it_covers_controls_or_is_modal_or_large() {
+        use serde_json::json;
+        let covering = json!({ "overlays": [
+            { "text": "Toast", "ref": "/a", "covers": 0, "modal": false, "area": 0.01 },
+            { "text": "Session  expiring. OK Cancel", "ref": "//div[@id='popup']", "covers": 3, "modal": false, "area": 0.02 },
+        ]});
+        let o = overlay_effect(&covering).expect("the covering layer, not the toast");
+        assert_eq!(o["text"], "Session expiring. OK Cancel");
+        assert_eq!(o["ref"], "//div[@id='popup']");
+        assert_eq!(o["covers"], 3);
+        let modal = json!({ "overlays": [{ "text": "Sure?", "ref": "/d", "covers": 0, "modal": true, "area": 0.05 }]});
+        let o = overlay_effect(&modal).expect("a modal blocks the page");
+        assert!(o.get("covers").is_none(), "no covers when 0: {o}");
+        let large = json!({ "overlays": [{ "text": "Cookies", "ref": "/c", "covers": 0, "modal": false, "area": 0.4 }]});
+        assert!(overlay_effect(&large).is_some());
+        let small = json!({ "overlays": [{ "text": "Toast", "ref": "/t", "covers": 0, "modal": false, "area": 0.05 }]});
+        assert!(overlay_effect(&small).is_none());
+        assert!(overlay_effect(&json!({})).is_none());
+        // Reaches the effects only through page_effects, and not for a new document.
+        assert!(page_effects(&covering).contains_key("overlay"));
+        let mut nav = covering.clone();
+        nav["navigated"] = json!(true);
+        assert!(page_effects(&nav).is_empty());
     }
 
     #[test]

@@ -17,6 +17,9 @@ use crate::nav::NavPolicy;
 #[derive(Debug, Clone)]
 pub enum BrowserError {
     PermissionDenied(String),
+    /// Refused by the operator's `foreground` setting before anything was
+    /// done: it would raise a window or take focus. Mapped to `POLICY_DENIED`.
+    Refused(String),
     NotFound(String),
     Unsupported(String),
     Timeout(String),
@@ -686,6 +689,18 @@ pub struct CdpBackend {
     observers: Mutex<HashMap<String, Observer>>,
     /// Video recordings (`browser_screencast`), each on its own session.
     screencasts: crate::screencast::ScreencastHub,
+    /// The operator's `foreground` setting. `Allow` leaves every operation as
+    /// it always was; the others stop a visible browser from raising windows
+    /// (see [`crate::foreground`]).
+    foreground: mcp_types::Foreground,
+    /// Under `never` and `polite`: one idle DevTools session per tab that
+    /// holds `Emulation.setFocusEmulationEnabled`, by target id. Focus
+    /// emulation ends with the session that set it and every tool call opens
+    /// its own, so without a session that stays, a page behind other windows
+    /// would see a blur at the end of each call and lose `:focus` between
+    /// calls. The browser's own `Page.bringToFront` is what gives a page
+    /// lasting focus under `allow`, and is the thing not sent here.
+    focus_holders: Mutex<HashMap<String, (String, CdpConn)>>,
 }
 
 /// Longest semantic intent kept in a snapshot node. Mirrors `INTENT_MAX` in
@@ -1219,6 +1234,26 @@ impl CdpBackend {
             nav_pending: Mutex::new(HashMap::new()),
             observers: Mutex::new(HashMap::new()),
             screencasts: crate::screencast::ScreencastHub::default(),
+            foreground: mcp_types::Foreground::Allow,
+            focus_holders: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Apply the operator's `foreground` setting (composition root only).
+    pub fn with_foreground(mut self, foreground: mcp_types::Foreground) -> Self {
+        self.foreground = foreground;
+        self
+    }
+
+    /// What `op` becomes under the configured setting; a refusal is an error
+    /// before anything has been started or changed.
+    fn planned(
+        &self,
+        op: crate::foreground::Raise,
+    ) -> Result<crate::foreground::Plan, BrowserError> {
+        match crate::foreground::plan(self.foreground, op) {
+            crate::foreground::Plan::Refuse(r) => Err(BrowserError::Refused(r.one_line())),
+            other => Ok(other),
         }
     }
 
@@ -1557,8 +1592,52 @@ impl CdpBackend {
         }
     }
 
+    /// Make sure a session that holds focus emulation for `target` exists
+    /// (see [`CdpBackend::focus_holders`]). Best effort: a tab that refuses is
+    /// still driven, it just sees focus come and go with each call.
+    async fn hold_focus(&self, target: &str, ws: &str) {
+        let have = self
+            .focus_holders
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(target);
+        if have {
+            return;
+        }
+        let Ok(mut holder) = CdpConn::connect(ws).await else {
+            return;
+        };
+        if holder
+            .call(
+                "Emulation.setFocusEmulationEnabled",
+                json!({ "enabled": true }),
+            )
+            .await
+            .is_err()
+        {
+            return;
+        }
+        self.focus_holders
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(target.to_string(), (ws.to_string(), holder));
+    }
+
+    /// End the focus sessions held on one browser, so an attached browser is
+    /// left as it was found.
+    fn release_focus(&self, port: u16) {
+        let tag = format!(":{port}/");
+        self.focus_holders
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|_, (ws, _)| !ws.contains(&tag));
+    }
+
     async fn conn(&self, target: &str) -> Result<CdpConn, BrowserError> {
         let ws = self.resolve_ws(target).await?;
+        if self.foreground != mcp_types::Foreground::Allow {
+            self.hold_focus(target, &ws).await;
+        }
         let mut c = CdpConn::connect(&ws).await?;
         // Page must be enabled on *every* connection, not just the navigating
         // one: it is what routes `javascriptDialogOpening` to us. Without it an
@@ -2502,6 +2581,16 @@ impl CdpBackend {
     /// blur events) even when its window is behind another. Best effort. The
     /// emulation belongs to the DevTools session that asked for it and ends
     /// with it, so it cannot be set once and left.
+    async fn emulate_focus_for(&self, c: &mut CdpConn) {
+        // Under `never` and `polite` the session kept per tab holds it (see
+        // `focus_holders`). Asking again here would end it for everyone when
+        // this connection closes: Chrome turns emulation off for the page
+        // when any session that enabled it goes away.
+        if self.foreground == mcp_types::Foreground::Allow {
+            Self::emulate_focus(c).await;
+        }
+    }
+
     async fn emulate_focus(c: &mut CdpConn) {
         c.call(
             "Emulation.setFocusEmulationEnabled",
@@ -3125,16 +3214,32 @@ function __visible(el){
   return !!(el.getClientRects && el.getClientRects().length);
 }
 var __ACTIONABLE = 'button, a[href], input:not([type=hidden]), select, textarea, summary, label, [role=button], [role=link], [role=menuitem], [role=option], [role=tab], [role=checkbox], [role=radio], [role=switch], [role=treeitem], [onclick], [contenteditable=true]';
+// How a person would find an element's text worth clicking, best first: 2 for
+// a control (or inside one), 1 for text a pointer cursor or a tabindex marks
+// as clickable (a list row with a click handler: `cursor` is inherited, so the
+// words inside the row show it too), 0 for plain prose.
+function __click_rank(el, act){
+  if(act) return 2;
+  return __clickable(el) ? 1 : 0;
+}
 // Text matches, best first: exact before substring (and when any is exact the
-// substring ones are dropped), visible before hidden, clickable before not,
-// then document order. A
+// substring ones are dropped), visible before hidden, clickable before not
+// (see `__click_rank`), then document order. A
 // candidate is the innermost element whose text holds the query, lifted to the
 // control around it, so `<button><span>Next</span></button>` is the button and
-// the sentence `Click on "next"` only ranks as a last resort.
+// the sentence `Click on "next"` only ranks as a last resort. `root` is one
+// root or an array of them (a `within` that matches several containers).
 function __text_matches(root, q){
   q = __norm(q);
-  if(!q || !root.querySelectorAll) return [];
-  var all = __deep(root).els, n = all.length, has = new Array(n), tx = new Array(n), skip = /^(SCRIPT|STYLE|NOSCRIPT|TEMPLATE|HEAD|TITLE|META|LINK)$/;
+  var roots = Array.isArray(root) ? root : [root];
+  var all = [], seen = new Set();
+  for(var r = 0; r < roots.length; r++){
+    if(!roots[r].querySelectorAll) continue;
+    var els = __deep(roots[r]).els;
+    for(var e = 0; e < els.length; e++) if(!seen.has(els[e])){ seen.add(els[e]); all.push(els[e]); }
+  }
+  if(!q || !all.length) return [];
+  var n = all.length, has = new Array(n), tx = new Array(n), skip = /^(SCRIPT|STYLE|NOSCRIPT|TEMPLATE|HEAD|TITLE|META|LINK)$/;
   var pos = new Map();
   for(var i=0; i<n; i++){
     pos.set(all[i], i);
@@ -3148,7 +3253,7 @@ function __text_matches(root, q){
     for(var k=0; k<kids.length; k++){ if(has[pos.get(kids[k])]){ inner = false; break; } }
     if(!inner) continue;
     var el = all[j], lifted = el.closest ? el.closest(__ACTIONABLE) : null;
-    var act = !!(lifted && (lifted === root || pos.has(lifted)));
+    var act = !!(lifted && (roots.indexOf(lifted) >= 0 || pos.has(lifted)));
     if(!act) lifted = el;
     var exact = tx[j].indexOf(q) >= 0;
     if(!exact && act){
@@ -3156,7 +3261,7 @@ function __text_matches(root, q){
       exact = li !== undefined && tx[li].indexOf(q) >= 0;
     }
     var prev = best.get(lifted);
-    if(!prev) best.set(lifted, {el: lifted, exact: exact, act: act, vis: __visible(lifted), ord: j});
+    if(!prev) best.set(lifted, {el: lifted, exact: exact, act: __click_rank(lifted, act), vis: __visible(lifted), ord: j});
     else if(exact) prev.exact = true;
   }
   var list = Array.from(best.values());
@@ -3211,29 +3316,43 @@ function __find(by, q, within, textFilter, index){
   return matches[idx] || null;
 }
 function __find_all(by, q, within, textFilter){
-  var root = document;
+  var root = document, roots = null;
   if(within) {
     // Decide XPath vs CSS first: an XPath string is a CSS syntax error, so
     // trying querySelector first threw before the XPath branch was reached.
+    // Every element the selector matches is a root, in document order: a page
+    // with one `.email-thread` per row has many, and the target may be in any.
     var isXp = within.charAt(0) === '/' || within.charAt(0) === '(';
-    var w = null;
+    roots = [];
     try {
       if(isXp) {
-        w = document.evaluate(within, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
+        var wr = document.evaluate(within, document, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
+        for(var wi = 0; wi < wr.snapshotLength; wi++) roots.push(wr.snapshotItem(wi));
       } else {
-        w = document.querySelector(within);
+        roots = Array.prototype.slice.call(document.querySelectorAll(within));
       }
     } catch(e) {
       throw new Error("invalid 'within' " + (isXp ? 'xpath' : 'selector') + ' ' + within + ': ' + (e && e.message ? e.message : e));
     }
     // Never widen: a missing scope root is an error, not "search everything".
-    if(!w) throw new Error("'within' root not found: " + within);
-    if(!w.querySelectorAll) throw new Error("'within' root is not an element: " + within);
-    root = w;
+    if(!roots.length) throw new Error("'within' root not found: " + within);
+    for(var ri = 0; ri < roots.length; ri++)
+      if(!roots[ri].querySelectorAll) throw new Error("'within' root is not an element: " + within);
+    root = roots[0];
   }
-  var matches = [], via = by;
+  var matches = [], via = by, scope = roots || [document];
+  // One search per root, joined in root order without repeats (a root inside
+  // another would otherwise report its matches twice).
+  function each(find){
+    var out = [], got = new Set();
+    for(var si = 0; si < scope.length; si++){
+      var part = find(scope[si]);
+      for(var pi = 0; pi < part.length; pi++) if(!got.has(part[pi])){ got.add(part[pi]); out.push(part[pi]); }
+    }
+    return out;
+  }
   if(by==='css') {
-    matches = __css_all(root, q);
+    matches = each(function(rt){ return __css_all(rt, q); });
   } else if(by==='auto') {
     // No `by` was given. A query is CSS when it parses and matches; one that
     // does not parse ("Section #1") or matches nothing ("Gilli" is the tag
@@ -3241,11 +3360,11 @@ function __find_all(by, q, within, textFilter){
     // CSS-only find is: act does not poll for an element to appear, so a valid
     // selector for something still to come is a miss now, as before, and `wait`
     // is what waits for it.
-    try { matches = __css_all(root, q); via = 'css'; } catch(e){}
-    if(matches.length === 0) { matches = __text_matches(root, q); via = 'text'; }
+    try { matches = each(function(rt){ return __css_all(rt, q); }); via = 'css'; } catch(e){}
+    if(matches.length === 0) { matches = __text_matches(scope, q); via = 'text'; }
   } else if(by==='xpath'){
     var xq = q;
-    if(root !== document) {
+    if(roots) {
       // An absolute path ignores the context node and would search the whole
       // document, i.e. silently escape `within`.
       var t = xq.replace(/^\s+/, '');
@@ -3256,13 +3375,17 @@ function __find_all(by, q, within, textFilter){
       }
     }
     try {
-      var r = document.evaluate(xq, root, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
-      for(var i=0; i<r.snapshotLength; i++) matches.push(r.snapshotItem(i));
+      matches = each(function(rt){
+        var xr = document.evaluate(xq, rt, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null), xs = [];
+        for(var i=0; i<xr.snapshotLength; i++) xs.push(xr.snapshotItem(i));
+        return xs;
+      });
     } catch(e){}
   } else if(by==='role'){
-    matches = __role_matches(root, __role_parse(q));
+    var spec = __role_parse(q);
+    matches = each(function(rt){ return __role_matches(rt, spec); });
   } else { // text
-    matches = __text_matches(root, q);
+    matches = __text_matches(scope, q);
   }
 
   if(textFilter && typeof textFilter === 'string' && textFilter.length > 0) {
@@ -3601,6 +3724,7 @@ const EFFECT_SETTLE_MS: u64 = 120;
 fn effects_js(before: bool) -> String {
     EFFECTS_JS
         .replace("__XPATH__", JS_XPATH)
+        .replace("__COVER__", JS_COVER)
         .replace("__MODE__", if before { "before" } else { "after" })
 }
 
@@ -3610,8 +3734,45 @@ fn page_location(v: &Value) -> Option<crate::input::Location> {
     Some((text("url")?, text("title")?))
 }
 
+/// What is on top of a point and which layer it belongs to, for telling that a
+/// control is now covered (`effects.overlay`) or is covered as `fill_form`
+/// goes to click it. A layer is a dialog or an element positioned out of the
+/// flow; a plain element stacked above another by source order is not one.
+const JS_COVER: &str = r##"
+function __top_at(x, y){
+  var t = document.elementFromPoint(x, y);
+  while(t && t.shadowRoot){
+    var u = t.shadowRoot.elementFromPoint(x, y);
+    if(!u || u === t) break;
+    t = u;
+  }
+  return t;
+}
+function __layer(top){
+  for(var e = top; e && e.nodeType === 1 && e !== document.body && e !== document.documentElement; e = e.parentElement){
+    var role = e.getAttribute('role');
+    if(e.tagName === 'DIALOG' || role === 'dialog' || role === 'alertdialog') return e;
+    var pos = getComputedStyle(e).position;
+    if(pos === 'fixed' || pos === 'absolute' || pos === 'sticky') return e;
+  }
+  return null;
+}
+// The layer covering `el` at its centre, or null: nothing is on top, what is
+// on top is `el` itself, part of it or something it sits inside, or the
+// centre is off screen.
+function __covered_by(el){
+  var r = el.getBoundingClientRect(), x = r.left + r.width / 2, y = r.top + r.height / 2;
+  if(x < 0 || y < 0 || x >= innerWidth || y >= innerHeight) return null;
+  var t = __top_at(x, y);
+  if(!t || el.contains(t) || t.contains(el)) return null;
+  var l = __layer(t);
+  return l && !l.contains(el) ? l : null;
+}
+"##;
+
 const EFFECTS_JS: &str = r##"(function(mode){
 __XPATH__
+__COVER__
 try {
   var MAX = 1500;
   var IROLE = {button:1,link:1,menuitem:1,menuitemcheckbox:1,menuitemradio:1,option:1,tab:1,checkbox:1,radio:1,'switch':1,textbox:1,combobox:1,searchbox:1,slider:1,spinbutton:1,treeitem:1};
@@ -3708,9 +3869,17 @@ try {
   }
   function fkey(a){ return a ? roleOf(a) + '|' + (a.id || '') + '|' + nameOf(a, false) : ''; }
   function fdesc(a){ var nm = nameOf(a, false); return roleOf(a) + (nm ? ' "' + nm + '"' : '') + ' ref=' + __xp(a); }
+  function clipText(el){ return clip(el.innerText || el.textContent, 100); }
   if(mode === 'before'){
-    var f = focused();
-    Object.defineProperty(window, '__agentctl_fx', {value: {map: scan(), focus: fkey(f)}, configurable: true, writable: true});
+    var f = focused(), m0 = scan(), ctl = [];
+    // The controls on screen now and the layer already over each, so a layer
+    // that only now covers one is the action's doing.
+    m0.forEach(function(e){
+      if(e.kind !== 'i' || ctl.length >= 40) return;
+      var r = e.el.getBoundingClientRect();
+      ctl.push({el: e.el, x: r.left, y: r.top, layer: __covered_by(e.el)});
+    });
+    Object.defineProperty(window, '__agentctl_fx', {value: {map: m0, focus: fkey(f), ctl: ctl}, configurable: true, writable: true});
     return {ok: true, url: location.href, title: document.title};
   }
   var prev = window.__agentctl_fx;
@@ -3733,6 +3902,31 @@ try {
   }
   var f2 = focused();
   if(f2 && fkey(f2) !== prev.focus) out.focus = fdesc(f2);
+  // Layers now on top of what was clickable: a control that has not moved but
+  // is under a layer it was not under. Modal dialogs and large new layers are
+  // reported too, with nothing under them to count.
+  var layers = new Map();
+  prev.ctl.forEach(function(c){
+    if(!c.el.isConnected || !shown(c.el)) return;
+    var r = c.el.getBoundingClientRect();
+    if(Math.abs(r.left - c.x) > 1 || Math.abs(r.top - c.y) > 1) return;
+    var l = __covered_by(c.el);
+    if(!l || l === c.layer) return;
+    var g = layers.get(l);
+    if(g) g.covers++; else layers.set(l, {el: l, covers: 1});
+  });
+  added.forEach(function(a){
+    if(a.e.kind !== 'c' || layers.has(a.e.el)) return;
+    layers.set(a.e.el, {el: a.e.el, covers: 0});
+  });
+  var facts = [];
+  layers.forEach(function(g){
+    var el = g.el, r = el.getBoundingClientRect();
+    var w = Math.max(0, Math.min(r.right, innerWidth) - Math.max(r.left, 0)), h = Math.max(0, Math.min(r.bottom, innerHeight) - Math.max(r.top, 0));
+    var modal = el.getAttribute('aria-modal') === 'true' || (el.tagName === 'DIALOG' && el.open && el.matches(':modal'));
+    if(shown(el)) facts.push({text: clipText(el), ref: __xp(el), covers: g.covers, modal: modal, area: Math.round(100 * w * h / Math.max(1, innerWidth * innerHeight)) / 100});
+  });
+  if(facts.length) out.overlays = facts.slice(0, 4);
   return out;
 } catch(e) { return {error: String(e && e.message ? e.message : e)}; }
 })('__MODE__')"##;
@@ -4053,6 +4247,7 @@ const JS_FILL_FORM: &str = r##"(async function(){
   {JS_ARM}
   {JS_SET_VALUE}
   {JS_SELECT}
+  {JS_COVER}
   {JS_SHOWCASE_INIT}
   var fields = __FIELDS__;
   var submit = __SUBMIT__;
@@ -4140,22 +4335,36 @@ const JS_FILL_FORM: &str = r##"(async function(){
       errors.push({field: f.selector || f.ref || ('index_' + i), error: String(err)});
     }
   }
-  var submitted = false;
+  var submitted = false, blocked = null;
   if(submit && errors.length === 0){
     var subEl = resolve(submit);
+    // A script's click() reaches a control a person could not: a disabled one
+    // ignores it, and one under a dialog would get it from nobody. Filling a
+    // field can raise that dialog (a popup on focus), so look now and say so
+    // instead of reporting a submit that did not happen.
     if(subEl){
+      if(subEl.matches && subEl.matches(':disabled')) blocked = 'disabled';
+      else {
+        if(subEl.scrollIntoView) subEl.scrollIntoView({block:'nearest', inline:'nearest', behavior:'instant'});
+        var cover = __covered_by(subEl);
+        if(cover) blocked = 'covered by "' + String(cover.innerText || cover.textContent || cover.tagName).replace(/\s+/g, ' ').trim().slice(0, 60) + '"';
+      }
+    }
+    if(subEl && !blocked){
       {JS_SHOWCASE_SUBMIT}
       __arm(subEl, 'click');
       if(subEl.click) subEl.click();
       else if(subEl.form && subEl.form.requestSubmit) subEl.form.requestSubmit();
       else if(subEl.form && subEl.form.submit) subEl.form.submit();
       submitted = true;
-    } else if(submit.selector || submit.ref){
+    } else if(!subEl && (submit.selector || submit.ref)){
       errors.push({field: 'submit', error: 'submit: ' + missing(submit)});
     }
   }
   } finally { __disarm(); }
-  return { ok: errors.length === 0, filled: filled, submitted: submitted, errors: errors };
+  var res = { ok: errors.length === 0, filled: filled, submitted: submitted, errors: errors };
+  if(blocked) res.submit_blocked = blocked;
+  return res;
 })()"##;
 
 /// In-page script that extracts structured data according to a schema.
@@ -4257,6 +4466,9 @@ impl BrowserBackend for CdpBackend {
                         )));
                     }
                 }
+                // Before anything is probed or started: a refusal leaves
+                // nothing running, and reads the same on every platform.
+                self.planned(crate::foreground::Raise::LaunchSafari)?;
                 if !crate::safari::is_safari_available() {
                     return Err(BrowserError::Unsupported(
                         "Safari WebDriver is only supported on macOS with safaridriver installed"
@@ -4328,6 +4540,14 @@ impl BrowserBackend for CdpBackend {
         let (host, port, started) = if let Some(p) = attach_port {
             ("127.0.0.1".to_string(), p, None)
         } else if let Some(spec) = launch {
+            // Judged before anything is spawned: a visible browser cannot be
+            // started without the OS activating it.
+            self.planned(crate::foreground::Raise::LaunchChromium {
+                headless: spec
+                    .get("headless")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+            })?;
             let (h, p, child, dir) = launch_browser(&spec).await?;
             (h, p, Some((child, dir)))
         } else {
@@ -4380,7 +4600,14 @@ impl BrowserBackend for CdpBackend {
             "browser": ver.get("Browser"),
             "protocol": ver.get("Protocol-Version"),
         });
-        out["foregrounded"] = json!(self.foreground_active_page(id).await);
+        // Bringing the page forward is what the setting exists to stop; the
+        // focus emulation each scripted session sets is the substitute.
+        out["foregrounded"] = json!(
+            match self.planned(crate::foreground::Raise::BringToFront)? {
+                crate::foreground::Plan::Skip => false,
+                _ => self.foreground_active_page(id).await,
+            }
+        );
         self.report_tabs(id, &mut out).await;
         // Only a profile we created (and will delete on disconnect) is reported.
         if let Some(dir) = owned_profile {
@@ -4450,6 +4677,9 @@ impl BrowserBackend for CdpBackend {
         }
 
         self.screencasts.abort_browser(browser_id);
+        if let Some(b) = self.browsers().into_iter().find(|b| b.id == browser_id) {
+            self.release_focus(b.port);
+        }
         let existed = {
             let mut g = self.browsers.lock().expect("browsers mutex");
             let before = g.len();
@@ -4585,6 +4815,14 @@ impl BrowserBackend for CdpBackend {
                 if let Err(denied) = self.nav.check(u).await {
                     return Err(BrowserError::PermissionDenied(denied.message()));
                 }
+                if self.planned(crate::foreground::Raise::OpenTab)?
+                    == crate::foreground::Plan::Background
+                {
+                    // `/json/new` activates the tab it creates; the browser
+                    // endpoint's `createTarget` can be told not to.
+                    let id = create_background_tab(host, port, u).await?;
+                    return Ok(json!({ "target_id": id, "url": u }));
+                }
                 let path = format!("/json/new?{u}");
                 // Modern Chrome requires PUT; older builds accept GET.
                 let r = match http_json(host, port, "PUT", &path).await {
@@ -4596,6 +4834,10 @@ impl BrowserBackend for CdpBackend {
             "activate" => {
                 let t = target_id
                     .ok_or_else(|| BrowserError::Failed("activate needs target_id".into()))?;
+                // A headless browser has no window to raise; a visible one is
+                // refused (an unreadable answer counts as visible).
+                let headless = endpoint_is_headless(host, port).await;
+                self.planned(crate::foreground::Raise::ActivateTab { headless })?;
                 http_json(host, port, "GET", &format!("/json/activate/{t}")).await?;
                 Ok(json!({ "activated": t }))
             }
@@ -5250,7 +5492,7 @@ impl BrowserBackend for CdpBackend {
         // call opens its own: ask for it here so a headed window sitting
         // behind others still sees focus/blur and `:focus` during the act.
         if let Some(c) = c_opt.as_mut() {
-            Self::emulate_focus(c).await;
+            self.emulate_focus_for(c).await;
         }
         // While this tab is being recorded, the script runs in the recorder's
         // isolated world: the DOM is the same, but there it can tell the
@@ -5779,7 +6021,7 @@ impl BrowserBackend for CdpBackend {
             )));
         }
         let mut c = self.conn(target).await?;
-        Self::emulate_focus(&mut c).await;
+        self.emulate_focus_for(&mut c).await;
         // A click may start a navigation: mark the document it happens on, as
         // `act_opts` does, so a following `wait navigation` can tell.
         let clicks = matches!(
@@ -6162,8 +6404,24 @@ impl BrowserBackend for CdpBackend {
     ) -> Result<Value, BrowserError> {
         require_cdp_target(target, "browser_screencast")?;
         let (b, _) = self.browser_ws_for_target(target).await?;
+        let to_front = self.planned(crate::foreground::Raise::ScreencastToFront)?
+            != crate::foreground::Plan::Skip;
+        // Under `never` and `polite` the per-tab holder keeps focus emulation
+        // for the recording too (see `focus_holders`).
+        let emulate = self.foreground == mcp_types::Foreground::Allow;
+        if !emulate {
+            let ws = self.resolve_ws(target).await?;
+            self.hold_focus(target, &ws).await;
+        }
         self.screencasts
-            .start((b.id, &b.host, b.port), target, media_dir, opts)
+            .start(
+                (b.id, &b.host, b.port),
+                target,
+                media_dir,
+                opts,
+                to_front,
+                emulate,
+            )
             .await
     }
 
@@ -6333,7 +6591,7 @@ impl BrowserBackend for CdpBackend {
         let mut c = self.conn(target).await?;
         // Focus emulation lives and dies with this connection, so each
         // session that runs page script asks for it again.
-        Self::emulate_focus(&mut c).await;
+        self.emulate_focus_for(&mut c).await;
         c.call("Runtime.enable", json!({})).await.ok();
 
         let timeout_ms = clamp_eval_timeout(opts.timeout_ms);
@@ -7200,6 +7458,7 @@ impl BrowserBackend for CdpBackend {
             )
             .replace("{JS_SET_VALUE}", JS_SET_VALUE)
             .replace("{JS_SELECT}", JS_SELECT)
+            .replace("{JS_COVER}", JS_COVER)
             .replace("{JS_SHOWCASE_INIT}", &showcase_init)
             .replace("{JS_SHOWCASE_FIELD}", &showcase_field)
             .replace("{JS_SHOWCASE_SUBMIT}", &showcase_submit)
@@ -7440,12 +7699,13 @@ impl BrowserBackend for CdpBackend {
 
         // 5. Create the new target in that context; dispose the context again
         // if that fails so nothing leaks.
-        let created = b_conn
-            .call(
-                "Target.createTarget",
-                json!({ "url": url, "browserContextId": ctx_id }),
-            )
-            .await;
+        let mut create = json!({ "url": url, "browserContextId": ctx_id });
+        if self.planned(crate::foreground::Raise::OpenBranchTab)?
+            == crate::foreground::Plan::Background
+        {
+            create["background"] = json!(true);
+        }
+        let created = b_conn.call("Target.createTarget", create).await;
         let branch_target_id = match created {
             Ok(r) => match r.get("targetId").and_then(Value::as_str) {
                 Some(t) => t.to_string(),
@@ -8148,6 +8408,7 @@ fn now_ms() -> u64 {
 fn berr_msg(e: &BrowserError) -> String {
     match e {
         BrowserError::PermissionDenied(m)
+        | BrowserError::Refused(m)
         | BrowserError::NotFound(m)
         | BrowserError::Unsupported(m)
         | BrowserError::Timeout(m)
@@ -8281,6 +8542,7 @@ fn browser_close_blocking(host: &str, port: u16) {
 fn err_msg(e: &BrowserError) -> String {
     match e {
         BrowserError::PermissionDenied(m)
+        | BrowserError::Refused(m)
         | BrowserError::NotFound(m)
         | BrowserError::Unsupported(m)
         | BrowserError::Timeout(m)
@@ -8294,6 +8556,7 @@ fn ctx_err(e: BrowserError, what: &str) -> BrowserError {
     let m = format!("{what}: {}", err_msg(&e));
     match e {
         BrowserError::PermissionDenied(_) => BrowserError::PermissionDenied(m),
+        BrowserError::Refused(_) => BrowserError::Refused(m),
         BrowserError::NotFound(_) => BrowserError::NotFound(m),
         BrowserError::Unsupported(_) => BrowserError::Unsupported(m),
         BrowserError::Timeout(_) => BrowserError::Timeout(m),
@@ -8653,6 +8916,44 @@ pub(crate) fn chrome_launch_flags(
         flags.push(format!("--disable-features={}", features.join(",")));
     }
     flags
+}
+
+/// Whether the browser behind `host:port` has no window, from its user agent.
+/// Unlike [`CdpBackend::target_is_headless`] an answer that cannot be read
+/// counts as *visible*: this decides whether a tab may be raised, and the
+/// cautious answer is the one that does not raise.
+async fn endpoint_is_headless(host: &str, port: u16) -> bool {
+    match http_json(host, port, "GET", "/json/version").await {
+        Ok(v) => v
+            .get("User-Agent")
+            .and_then(Value::as_str)
+            .is_some_and(|ua| ua.contains("Headless")),
+        Err(_) => false,
+    }
+}
+
+/// Open a tab without bringing it forward: `Target.createTarget` on the
+/// browser endpoint with `background: true`. `/json/new`, the usual way, has
+/// no such option and activates the tab it makes.
+async fn create_background_tab(host: &str, port: u16, url: &str) -> Result<String, BrowserError> {
+    let ver = http_json(host, port, "GET", "/json/version").await?;
+    let ws = ver
+        .get("webSocketDebuggerUrl")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            BrowserError::Failed("the browser endpoint gave no webSocketDebuggerUrl".into())
+        })?;
+    let mut c = CdpConn::connect(ws).await?;
+    let r = c
+        .call(
+            "Target.createTarget",
+            json!({ "url": url, "background": true }),
+        )
+        .await?;
+    r.get("targetId")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| BrowserError::Failed("no targetId in createTarget response".into()))
 }
 
 /// Launch a dedicated Chromium instance with a debugging port and poll until
@@ -9218,6 +9519,19 @@ mod tests {
     /// as a flatpak is still found.
     #[test]
     fn candidates_include_native_then_flatpak() {
+        // Put HOME back afterwards, panic or not: it is process-wide, and a
+        // test that starts a real Chrome later in this binary would otherwise
+        // run it with a home directory that does not exist and stall.
+        struct RestoreHome(Option<std::ffi::OsString>);
+        impl Drop for RestoreHome {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(h) => std::env::set_var("HOME", h),
+                    None => std::env::remove_var("HOME"),
+                }
+            }
+        }
+        let _restore = RestoreHome(std::env::var_os("HOME"));
         std::env::set_var("HOME", "/home/tester");
         let c = browser_bin_candidates();
         // native paths come from the const, in order, at the front.

@@ -178,10 +178,7 @@ fn is_blocked_v6(ip: &Ipv6Addr) -> bool {
     // 64:ff9b:1::/48 is local-use NAT64 (RFC 8215): the embedded address sits
     // at a prefix-dependent offset we cannot know, and a local-use translation
     // prefix is never a legitimate public destination. Refuse the range.
-    if seg[0] == 0x0064 && seg[1] == 0xff9b && seg[2] == 0x0001 {
-        return true;
-    }
-    false
+    seg[0] == 0x0064 && seg[1] == 0xff9b && seg[2] == 0x0001
 }
 
 /// Extract the IPv4 address embedded by a transition mechanism, if any.

@@ -4,9 +4,10 @@ use std::path::{Path, PathBuf};
 use mcp_types::{Category, Tier, ToolDescriptor};
 use serde::{Deserialize, Serialize};
 
-/// Role Profile for Enterprise Role-Based Access Control (RBAC).
-/// Constrains tool execution by tier, category, specific tool allow/deny lists,
-/// and consent requirements.
+/// A role: an optional preset that narrows what a session may call, by tier,
+/// category and tool allow/deny lists, and can add consent requirements. It
+/// never widens anything. The built-in presets are `readonly`, `qa`, `browser`
+/// and `browser-core`; `[roles.<name>]` tables define custom ones.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RoleProfile {
     pub name: String,
@@ -25,8 +26,6 @@ pub struct RoleProfile {
     pub require_consent_for_tiers: Vec<Tier>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub require_consent_for_tools: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_denials: Option<usize>,
 }
 
 impl RoleProfile {
@@ -42,7 +41,6 @@ impl RoleProfile {
             denied_tools: Vec::new(),
             require_consent_for_tiers: Vec::new(),
             require_consent_for_tools: Vec::new(),
-            max_denials: None,
         }
     }
 
@@ -72,7 +70,6 @@ impl RoleProfile {
             ],
             require_consent_for_tiers: Vec::new(),
             require_consent_for_tools: Vec::new(),
-            max_denials: Some(5),
         }
     }
 
@@ -101,7 +98,6 @@ impl RoleProfile {
             denied_tools: vec!["browser_eval".into()],
             require_consent_for_tiers: Vec::new(),
             require_consent_for_tools: Vec::new(),
-            max_denials: None,
         }
     }
 
@@ -120,7 +116,6 @@ impl RoleProfile {
             denied_tools: Vec::new(),
             require_consent_for_tiers: Vec::new(),
             require_consent_for_tools: Vec::new(),
-            max_denials: None,
         }
     }
 
@@ -157,11 +152,11 @@ impl RoleProfile {
             denied_tools: Vec::new(),
             require_consent_for_tiers: Vec::new(),
             require_consent_for_tools: Vec::new(),
-            max_denials: None,
         }
     }
 
-    /// Standard Human-in-the-Loop Operator profile.
+    /// Deprecated: `access = "ask"` is the documented way to say this. Kept so a
+    /// config that names the role keeps behaving as it did.
     /// General operations permitted; dangerous actions require interactive consent.
     pub fn operator() -> Self {
         RoleProfile {
@@ -175,11 +170,11 @@ impl RoleProfile {
             denied_tools: Vec::new(),
             require_consent_for_tiers: vec![Tier::Dangerous],
             require_consent_for_tools: Vec::new(),
-            max_denials: None,
         }
     }
 
-    /// Full administrative privileges.
+    /// Deprecated: it grants nothing, so dropping the role changes nothing.
+    /// Kept so a config that names it still starts.
     pub fn admin() -> Self {
         RoleProfile {
             name: "admin".to_string(),
@@ -191,7 +186,6 @@ impl RoleProfile {
             denied_tools: Vec::new(),
             require_consent_for_tiers: Vec::new(),
             require_consent_for_tools: Vec::new(),
-            max_denials: None,
         }
     }
 
@@ -496,6 +490,28 @@ pub fn check_arguments_invariants(
 ) -> Result<(), String> {
     check_value(args, None, invariants)
         .map_err(|why| format!("hard policy invariant violation: {why}"))
+}
+
+/// A startup warning for a role name that still resolves but is no longer
+/// documented, naming what to use instead. `None` for a documented built-in, a
+/// custom role (which wins over a built-in of the same name) or an unknown name.
+pub fn deprecated_role_note(
+    name: &str,
+    custom_roles: &HashMap<String, RoleProfile>,
+) -> Option<String> {
+    if custom_roles.contains_key(name) {
+        return None;
+    }
+    let instead = match name.to_ascii_lowercase().as_str() {
+        "operator" => "use access = \"ask\" (dangerous tools ask a human) instead",
+        "admin" | "superadmin" => "it grants nothing; remove the role",
+        "auditor" => "use role = \"readonly\" instead",
+        "tester" => "use role = \"qa\" instead",
+        _ => return None,
+    };
+    Some(format!(
+        "role '{name}' is deprecated and still works as before: {instead}"
+    ))
 }
 
 /// Helper resolving a role name against built-in roles and custom configuration.

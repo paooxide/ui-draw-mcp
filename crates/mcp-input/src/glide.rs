@@ -434,8 +434,11 @@ mod tests {
             _: u64,
             _: SemanticAction,
             _: Option<&str>,
-        ) -> Result<(), InputError> {
-            Ok(())
+        ) -> Result<crate::Route, InputError> {
+            Ok(crate::Route::Ax)
+        }
+        fn route_for(&self, _: SemanticAction) -> crate::Route {
+            crate::Route::Ax
         }
         async fn set_value(&self, _: u64, _: &str) -> Result<(), InputError> {
             Ok(())
@@ -485,12 +488,17 @@ mod tests {
         async fn drag(
             &self,
             _: (f64, f64),
-            _: (f64, f64),
+            _: &[(f64, f64)],
             _: &[String],
-            _: u32,
             _: u64,
             _: u64,
         ) -> Result<(), InputError> {
+            Ok(())
+        }
+        async fn key_down(&self, _: &str) -> Result<(), InputError> {
+            Ok(())
+        }
+        async fn key_up(&self, _: &str) -> Result<(), InputError> {
             Ok(())
         }
         async fn clipboard_read(&self, format: ClipFormat) -> Result<ClipData, InputError> {

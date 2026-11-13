@@ -5,13 +5,21 @@
 //! This crate is the dependency root: engines and the core both depend on it,
 //! it depends on nothing in the workspace. See `docs/architecture.md` §4.
 
+pub mod apps;
 pub mod args;
 mod context;
 mod descriptor;
+mod desk;
+pub mod drag;
 mod envelope;
+mod foreground;
 mod module;
+mod screen;
 
 pub use context::{CallCtx, CancelToken, Notifier, Progress};
 pub use descriptor::{Category, Tier, ToolDescriptor};
+pub use desk::{Desk, Loan};
 pub use envelope::{Envelope, ErrorCode, ImageContent, ToolError};
+pub use foreground::{Foreground, Refusal};
 pub use module::ToolModule;
+pub use screen::{screen_refusal, ScreenRefusal, ScreenState};

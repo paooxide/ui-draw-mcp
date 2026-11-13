@@ -45,10 +45,11 @@ impl Mode {
     }
 }
 
-/// A one-word permission profile that spares the operator the chore of
-/// enabling each category and naming each dangerous tool. Setting it turns on
-/// every capability and picks how risk is handled; the granular fields
-/// (`categories`, `enable`) are then unnecessary and ignored.
+/// The one permission choice: how much a session may do before a human is
+/// involved. It turns on every capability category (the scope lists, and
+/// `categories` if the file names it, narrow that) and picks how risk is
+/// handled. `enable` and `mode` are older spellings of the same choice and are
+/// ignored once it is set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Access {
     /// Read and act freely; a dangerous tool or a high-impact action asks the
@@ -81,6 +82,29 @@ impl Access {
         }
     }
 
+    /// What the level means, in the words the README, `config.example.toml`,
+    /// `agentctl doctor` and the threat model all use. A test keeps them equal.
+    pub fn describe(self) -> &'static str {
+        match self {
+            Access::Ask => "act freely; dangerous tools and high-impact actions ask a human",
+            Access::Auto => "unattended; nothing prompts; clearly destructive actions are refused",
+            Access::Bypass => {
+                "everything runs; only the kill switch, human override and hard invariants remain"
+            }
+        }
+    }
+
+    /// How much a level lets through, lowest first: `ask` is the most
+    /// restrictive and `bypass` the least. Only used to decide whether a
+    /// request moves a level toward `ask` (allowed) or away from it (refused).
+    pub fn permissiveness(self) -> u8 {
+        match self {
+            Access::Ask => 0,
+            Access::Auto => 1,
+            Access::Bypass => 2,
+        }
+    }
+
     /// The interaction mode this profile implies.
     pub fn mode(self) -> Mode {
         match self {
@@ -90,7 +114,51 @@ impl Access {
     }
 }
 
-/// Every capability category, for the `access` profiles that enable them all.
+/// Where the effective `access` came from, for `agentctl doctor`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AccessSource {
+    /// Nothing set it: `categories`, `enable` and `mode` decide.
+    #[default]
+    Default,
+    /// `policy.access` in the config file.
+    File,
+    /// The `--access` command-line flag.
+    Flag,
+    /// The `AGENTCTL_ACCESS` environment variable.
+    Env,
+}
+
+impl AccessSource {
+    pub fn describe(self) -> &'static str {
+        match self {
+            AccessSource::Default => "default",
+            AccessSource::File => "config file",
+            AccessSource::Flag => "--access flag",
+            AccessSource::Env => "AGENTCTL_ACCESS",
+        }
+    }
+}
+
+/// A config key the loader does not read, with the nearest key it does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnknownKey {
+    pub key: String,
+    pub suggestion: Option<String>,
+}
+
+/// What the loader accepted but wants the operator to see: collected so
+/// `agentctl doctor` can list them, and logged once at load.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ConfigNotes {
+    /// Settings that are older spellings, ignored, or have no effect. Each is
+    /// a full sentence saying what to do.
+    pub warnings: Vec<String>,
+    /// Keys nothing reads (usually typos).
+    pub unknown_keys: Vec<UnknownKey>,
+    pub access_source: AccessSource,
+}
+
+/// Every capability category, for the `access` levels that enable them all.
 pub fn all_categories() -> Vec<Category> {
     use Category::*;
     vec![
@@ -117,9 +185,13 @@ pub struct PolicyConfig {
     pub categories: Vec<Category>,
     /// Dangerous tools opted in by exact name.
     pub enable: Vec<String>,
+    /// Legacy spelling of the interaction mode; derived from `access` when that
+    /// is set. Also carries dry run, which works with every level.
     pub mode: Mode,
-    /// The one-word permission profile. When `Some`, it enables all categories
-    /// and all dangerous tools and sets `mode`; the granular fields are ignored.
+    /// The one permission choice. When `Some`, every category is on (narrowed
+    /// by `categories` if the file lists it), every dangerous tool is callable
+    /// under the level's rules, and `mode` follows the level; `enable` is
+    /// ignored.
     pub access: Option<Access>,
     /// Apps that `launch` (and app-targeted actions) are allowed to touch.
     pub allowed_apps: Vec<String>,
@@ -134,8 +206,6 @@ pub struct PolicyConfig {
     /// The System One judge (`[judge]`). Off by default; when on, a judgment
     /// may tighten a decision or rank candidates, never loosen anything.
     pub judge: mcp_judge::JudgeConfig,
-    /// Session aborts after this many denied calls (anti-spin).
-    pub max_denials: usize,
     /// How many times one session may interrupt a human for approval. Past this
     /// every further request is denied without prompting, so an agent cannot
     /// train the operator to click Allow (consent fatigue).
@@ -172,6 +242,16 @@ pub struct PolicyConfig {
     pub human_override_px: u32,
     /// How long after an action the server still counts as driving.
     pub human_override_grace_ms: u64,
+    /// Whether tools may take the user's pointer, keyboard or foreground. Set
+    /// here or by `AGENTCTL_FOREGROUND` only: no tool, argument or role can
+    /// change it, and `access = "bypass"` does not loosen it.
+    pub foreground: mcp_types::Foreground,
+    /// With `foreground = "polite"`: how long the person must have been idle
+    /// before a call borrows the pointer or keyboard, in milliseconds.
+    pub polite_idle_ms: u64,
+    /// With `foreground = "polite"`: the longest a call waits for that idle
+    /// time before giving up with a retryable error, in milliseconds.
+    pub polite_max_wait_ms: u64,
     /// Shells `pty_spawn` may start, by absolute path.
     pub allowed_shells: Vec<String>,
     pub max_pty_sessions: usize,
@@ -216,7 +296,7 @@ pub struct PolicyConfig {
     /// Off by default: it rewrites every result, including IP addresses and
     /// phone-like numbers in network and system output.
     pub anonymize: bool,
-    /// Active RBAC role profile name for this session (e.g. "readonly", "qa", "operator", "admin").
+    /// Active role preset name for this session (e.g. "readonly", "qa").
     pub active_role: Option<String>,
     /// Configured role definitions, mapping role name to RoleProfile.
     pub roles: std::collections::HashMap<String, crate::role::RoleProfile>,
@@ -228,6 +308,9 @@ pub struct PolicyConfig {
     pub demo: bool,
     /// Demo speed preset ("cinematic", "demo", "snappy", "instant" / "off").
     pub demo_speed: String,
+    /// What loading found worth reporting. Not policy: nothing reads it to
+    /// decide a call.
+    pub notes: ConfigNotes,
 }
 
 impl PolicyConfig {
@@ -261,7 +344,6 @@ impl Default for PolicyConfig {
             allowed_origins: Vec::new(),
             browser_allow_private: false,
             judge: mcp_judge::JudgeConfig::default(),
-            max_denials: 5,
             max_consent_prompts: 20,
             kill_switch_file: base.join("STOP"),
             audit_dir: base.join("audit"),
@@ -279,6 +361,9 @@ impl Default for PolicyConfig {
             human_override: true,
             human_override_px: 12,
             human_override_grace_ms: 1_500,
+            foreground: mcp_types::Foreground::Allow,
+            polite_idle_ms: 1_500,
+            polite_max_wait_ms: 15_000,
             allowed_shells: ["/bin/zsh", "/bin/bash", "/bin/sh"]
                 .iter()
                 .map(|s| s.to_string())
@@ -306,6 +391,7 @@ impl Default for PolicyConfig {
             http_allowed_origins: Vec::new(),
             demo: false,
             demo_speed: "demo".to_string(),
+            notes: ConfigNotes::default(),
         }
     }
 }
@@ -376,7 +462,6 @@ impl PolicyConfig {
                 "access": self.access.map(|a| a.as_str()),
                 "anonymize": self.anonymize,
                 "allowed_apps": self.allowed_apps,
-                "max_denials": self.max_denials,
                 "max_consent_prompts": self.max_consent_prompts,
                 "kill_switch_file": self.kill_switch_file.display().to_string(),
                 "audit_dir": self.audit_dir.display().to_string(),
@@ -387,6 +472,9 @@ impl PolicyConfig {
                 "human_override": self.human_override,
                 "human_override_px": self.human_override_px,
                 "human_override_grace_ms": self.human_override_grace_ms,
+                "foreground": self.foreground.as_str(),
+                "polite_idle_ms": self.polite_idle_ms,
+                "polite_max_wait_ms": self.polite_max_wait_ms,
             },
             "fs": { "roots": paths(&self.fs_roots) },
             "terminal": {

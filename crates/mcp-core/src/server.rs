@@ -281,7 +281,6 @@ impl Server {
             pre.args_redacted = Some(redacted_args);
             pre.decision = Some(format!("deny (invariant violation: {reason})"));
             self.policy.audit(&pre);
-            self.policy.record_denial();
             return Envelope::fail(
                 name,
                 ErrorCode::PolicyDenied,
@@ -303,7 +302,6 @@ impl Server {
             pre.args_redacted = Some(redacted_args);
             pre.decision = Some("deny (pii token outside input sink)".into());
             self.policy.audit(&pre);
-            self.policy.record_denial();
             return Envelope::fail(name, ErrorCode::PolicyDenied, reason);
         }
 
@@ -371,7 +369,6 @@ impl Server {
             Decision::Deny { code, reason } => {
                 pre.decision = Some("deny".into());
                 self.policy.audit(&pre);
-                self.policy.record_denial();
                 return Envelope::fail(name, *code, reason.clone());
             }
             Decision::NeedConsent { prompt } => {
@@ -386,7 +383,6 @@ impl Server {
                 pre.decision = Some(format!("consent:{outcome:?}").to_lowercase());
                 self.policy.audit(&pre);
                 if !outcome.approved() {
-                    self.policy.record_denial();
                     return Envelope::fail(
                         name,
                         ErrorCode::ConsentRequired,

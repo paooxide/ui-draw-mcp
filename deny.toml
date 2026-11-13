@@ -12,7 +12,15 @@ all-features = true
 # RustSec advisory DB at check time.
 version = 2
 yanked = "deny"
-ignore = []
+ignore = [
+    # zvariant, zvariant_derive and zbus_names were folded into the zbus repository and are no longer
+    # published as standalone crates (https://github.com/z-galaxy/zbus/issues/2043). They are not
+    # vulnerable; there is no version to move to until zbus, ashpd and atspi release against the merged
+    # crate. Linux only. Remove these three when that release is in the lock file.
+    { id = "RUSTSEC-2026-0370", reason = "zvariant: folded into zbus, no upgrade published yet" },
+    { id = "RUSTSEC-2026-0371", reason = "zbus_names: folded into zbus, no upgrade published yet" },
+    { id = "RUSTSEC-2026-0372", reason = "zvariant_derive: folded into zbus, no upgrade published yet" },
+]
 
 [licenses]
 version = 2

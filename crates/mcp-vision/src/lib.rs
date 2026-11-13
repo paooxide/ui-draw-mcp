@@ -12,13 +12,14 @@ mod backend;
 mod config;
 pub mod find;
 pub mod grid;
+pub mod marks;
 #[cfg(feature = "ocr")]
 pub mod ocr;
 mod tools;
 
 pub use backend::{
-    CaptureOpts, CaptureResult, Detail, DisplayInfo, OcrLine, OcrOpts, OcrResult, OcrTarget,
-    VisionBackend, VisionError,
+    CaptureOpts, CaptureResult, Covering, Detail, DisplayInfo, OcrLine, OcrOpts, OcrResult,
+    OcrTarget, VisionBackend, VisionError, WindowSubject,
 };
 pub use config::VisionConfig;
 pub use tools::VisionModule;

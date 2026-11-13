@@ -18,8 +18,12 @@ use serde_json::{json, Value};
 
 use crate::backend::{WindowBackend, WindowInfo};
 
-/// How often the condition is re-checked.
+/// How often the condition is re-checked when the app gives no events.
 const POLL_MS: u64 = 150;
+/// How often it is re-checked as a safety net when it does: many apps post
+/// notifications unreliably or not at all for some changes, so events speed
+/// a wait up and the timer keeps it correct.
+const SAFETY_POLL_MS: u64 = 500;
 /// Ceiling on any wait, so a bad condition cannot hold a session open.
 const MAX_TIMEOUT_MS: u64 = 30_000;
 /// Default for `wait_for` called on its own.
@@ -53,12 +57,20 @@ pub struct WaitSpec {
     pub conditions: Vec<WaitCondition>,
     pub app: Option<String>,
     pub timeout_ms: u64,
+    /// Observe without becoming the target: the polls neither pin `app` nor
+    /// replace the elements the refs of the last `get_ui_tree` point at.
+    /// `wait_for` is passive. An `expect` clause is not: it installs what it
+    /// last saw as the snapshot the next call's refs resolve against, so the
+    /// backend has to have kept the same elements.
+    pub passive: bool,
 }
 
 /// What a wait ended up doing.
 pub struct WaitOutcome {
     pub met: bool,
     pub waited_ms: u64,
+    /// What noticed the condition holding. Meaningful when `met`.
+    pub woke_by: WokeBy,
     /// The judge's last probability for a `judge` condition, when one was
     /// asked, whether or not it cleared the threshold.
     pub judge_probability: Option<f64>,
@@ -105,6 +117,7 @@ pub fn parse_wait_spec(v: &Value, default_timeout_ms: u64) -> Result<WaitSpec, S
             .and_then(Value::as_u64)
             .unwrap_or(default_timeout_ms)
             .min(MAX_TIMEOUT_MS),
+        passive: false,
     })
 }
 
@@ -151,27 +164,87 @@ pub fn window_condition_holds(title: &str, windows: &[WindowInfo]) -> bool {
         .any(|w| w.title.as_deref().is_some_and(|t| t.contains(title)))
 }
 
+/// What made a wait's condition come true.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WokeBy {
+    /// It held at the first look, before any waiting.
+    Immediate,
+    /// It was seen true after the app announced a change.
+    Event,
+    /// It was seen true on a timed re-check: the app gave no event (or none
+    /// was available), so the poll is what noticed.
+    Poll,
+}
+
+impl WokeBy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Immediate => "immediate",
+            Self::Event => "event",
+            Self::Poll => "poll",
+        }
+    }
+}
+
+/// Least time between two looks when events are arriving. Typing makes dozens
+/// of notifications a second and each look is a tree walk; the next look
+/// still sees everything that happened, so nothing is lost by coalescing.
+const MIN_LOOK_GAP_MS: u64 = 40;
+/// How often a sleeping wait notices the kill switch. Cancellation is a flag,
+/// not something to await, so the wait looks at it this often even when no
+/// event or poll is due.
+const CANCEL_TICK_MS: u64 = 50;
+
 /// Poll `probe` until it returns true or the deadline passes.
 ///
-/// Separated from any backend so the loop itself — first check before any
-/// sleep, honouring cancellation, reporting elapsed time — is testable.
+/// A timer-only [`wait_loop`]: kept for callers with no event source.
 pub async fn poll_until<F, Fut>(
     timeout_ms: u64,
     interval_ms: u64,
     cancel: &CancelToken,
-    mut probe: F,
+    probe: F,
 ) -> (bool, u64)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let (met, waited, _) = wait_loop(timeout_ms, interval_ms, cancel, None, probe).await;
+    (met, waited)
+}
+
+/// Look with `probe` until it returns true or the deadline passes, looking
+/// again when `wake` fires or `poll_ms` has passed since the last look,
+/// whichever is first, and say which of the two it was.
+///
+/// Separated from any backend so the loop itself — first look before any
+/// sleep, honouring cancellation, never past the deadline, reporting elapsed
+/// time and what noticed — is testable. With `wake` of `None` this is a plain
+/// timer and every success after the first look is [`WokeBy::Poll`].
+pub async fn wait_loop<F, Fut>(
+    timeout_ms: u64,
+    poll_ms: u64,
+    cancel: &CancelToken,
+    wake: Option<&tokio::sync::Notify>,
+    mut probe: F,
+) -> (bool, u64, WokeBy)
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = bool>,
 {
     let start = Instant::now();
     let deadline = start + Duration::from_millis(timeout_ms);
+    let elapsed = || start.elapsed().as_millis() as u64;
+    let mut cause = WokeBy::Immediate;
+    let mut last_look: Option<Instant> = None;
     loop {
-        // Check before sleeping: a condition that is already true must not cost
+        // Look before sleeping: a condition that is already true must not cost
         // a poll interval, which is most of them after a fast action.
         if cancel.is_cancelled() {
-            return (false, start.elapsed().as_millis() as u64);
+            return (false, elapsed(), cause);
+        }
+        if let (WokeBy::Event, Some(t)) = (cause, last_look) {
+            let ready = t + Duration::from_millis(MIN_LOOK_GAP_MS);
+            tokio::time::sleep(ready.saturating_duration_since(Instant::now())).await;
         }
         // The probe itself is raced against the deadline. Observing a busy
         // application can take seconds, and checking the clock only *after* the
@@ -180,19 +253,35 @@ where
         // snapshotting Finder. A cap that a slow probe can ignore is not a cap.
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            return (false, start.elapsed().as_millis() as u64);
+            return (false, elapsed(), cause);
         }
+        last_look = Some(Instant::now());
         match tokio::time::timeout(remaining, probe()).await {
-            Ok(true) => return (true, start.elapsed().as_millis() as u64),
+            Ok(true) => return (true, elapsed(), cause),
             Ok(false) => {}
-            Err(_) => return (false, start.elapsed().as_millis() as u64),
+            Err(_) => return (false, elapsed(), cause),
         }
-        let elapsed = start.elapsed().as_millis() as u64;
-        if elapsed >= timeout_ms {
-            return (false, elapsed);
-        }
-        let left = timeout_ms - elapsed;
-        tokio::time::sleep(Duration::from_millis(interval_ms.min(left))).await;
+        // Sleep until an event, the next timed look, the deadline or the next
+        // glance at the kill switch.
+        let next_poll = Instant::now() + Duration::from_millis(poll_ms);
+        cause = loop {
+            let now = Instant::now();
+            if cancel.is_cancelled() || now >= deadline {
+                return (false, elapsed(), cause);
+            }
+            if now >= next_poll {
+                break WokeBy::Poll;
+            }
+            let nap = (next_poll.min(deadline) - now).min(Duration::from_millis(CANCEL_TICK_MS));
+            match wake {
+                Some(n) => {
+                    if tokio::time::timeout(nap, n.notified()).await.is_ok() {
+                        break WokeBy::Event;
+                    }
+                }
+                None => tokio::time::sleep(nap).await,
+            }
+        };
     }
 }
 
@@ -254,91 +343,105 @@ impl WaitEvaluator {
         let last_probability: std::sync::Mutex<Option<f64>> = std::sync::Mutex::new(None);
         let started = Instant::now();
         let describe = describe(spec);
-        let (met, waited_ms) = poll_until(spec.timeout_ms, POLL_MS, &ctx.cancel, || async {
-            // A wait is the one place this server is deliberately slow, so it
-            // is the one place silence is ambiguous between "working" and
-            // "hung". Costs nothing unless the client asked for reports.
-            ctx.progress(
-                started.elapsed().as_millis() as f64,
-                Some(spec.timeout_ms as f64),
-                Some(&describe),
-            );
-            // One observation per poll, shared by every text condition: three
-            // conditions must not mean three traversals of the same tree.
-            let tree = if needs_tree {
-                let req = SnapshotRequest {
-                    app: spec.app.clone(),
-                    ..Default::default()
-                };
-                match self.a11y.snapshot(&req).await {
-                    Ok(raw) => {
-                        let f = flatten(
-                            &raw.root,
-                            raw.app.as_deref(),
-                            raw.window.as_deref(),
-                            "wait",
-                            &FlattenConfig {
-                                // No budget: a condition must not fail because
-                                // the text it waits for fell off the end.
-                                max_chars: usize::MAX,
-                                terminal_app: raw.terminal_app,
-                                ..FlattenConfig::default()
-                            },
-                        );
-                        *last.lock().unwrap_or_else(|e| e.into_inner()) = Some(raw);
-                        Some(f.text)
-                    }
-                    Err(_) => None,
-                }
-            } else {
-                None
-            };
-            let windows = if needs_windows {
-                self.window.list_windows(spec.app.as_deref()).await.ok()
-            } else {
-                None
-            };
-            // The structural conditions first; the judge is asked only when
-            // they all hold, so a wait never pays for a judgment it will
-            // not use, and a judgment can never stand in for a structural
-            // condition that failed.
-            let structural = spec.conditions.iter().all(|c| match c {
-                WaitCondition::Window(t) => windows
-                    .as_deref()
-                    .is_some_and(|ws| window_condition_holds(t, ws)),
-                WaitCondition::Judged(_) => true,
-                other => tree
-                    .as_deref()
-                    .is_some_and(|t| text_condition_holds(other, t)),
-            });
-            if !structural {
-                return false;
-            }
-            let mut judged_ok = true;
-            for c in &spec.conditions {
-                let WaitCondition::Judged(claim) = c else {
-                    continue;
-                };
-                let (Some(j), Some(t)) = (self.judge.as_ref(), tree.as_deref()) else {
-                    return false;
-                };
-                match judged_claim_holds(j, claim, t).await {
-                    Some(p) => {
-                        *last_probability.lock().unwrap_or_else(|e| e.into_inner()) = Some(p);
-                        if p < j.threshold() {
-                            judged_ok = false;
+        // Subscribe before the first look so a change between the two cannot
+        // be missed. The watch lives to the end of this function, and so is
+        // torn down on success, timeout and cancellation alike, and when this
+        // future is dropped.
+        let watch = self.window.watch_changes(spec.app.as_deref()).await;
+        let poll_ms = if watch.is_some() {
+            SAFETY_POLL_MS
+        } else {
+            POLL_MS
+        };
+        let wake = watch.as_ref().map(|w| &*w.changed);
+        let (met, waited_ms, woke_by) =
+            wait_loop(spec.timeout_ms, poll_ms, &ctx.cancel, wake, || async {
+                // A wait is the one place this server is deliberately slow, so it
+                // is the one place silence is ambiguous between "working" and
+                // "hung". Costs nothing unless the client asked for reports.
+                ctx.progress(
+                    started.elapsed().as_millis() as f64,
+                    Some(spec.timeout_ms as f64),
+                    Some(&describe),
+                );
+                // One observation per poll, shared by every text condition: three
+                // conditions must not mean three traversals of the same tree.
+                let tree = if needs_tree {
+                    let req = SnapshotRequest {
+                        app: spec.app.clone(),
+                        passive: spec.passive,
+                        ..Default::default()
+                    };
+                    match self.a11y.snapshot(&req).await {
+                        Ok(raw) => {
+                            let f = flatten(
+                                &raw.root,
+                                raw.app.as_deref(),
+                                raw.window.as_deref(),
+                                "wait",
+                                &FlattenConfig {
+                                    // No budget: a condition must not fail because
+                                    // the text it waits for fell off the end.
+                                    max_chars: usize::MAX,
+                                    terminal_app: raw.terminal_app,
+                                    ..FlattenConfig::default()
+                                },
+                            );
+                            *last.lock().unwrap_or_else(|e| e.into_inner()) = Some(raw);
+                            Some(f.text)
                         }
+                        Err(_) => None,
                     }
-                    None => judged_ok = false,
+                } else {
+                    None
+                };
+                let windows = if needs_windows {
+                    self.window.list_windows(spec.app.as_deref()).await.ok()
+                } else {
+                    None
+                };
+                // The structural conditions first; the judge is asked only when
+                // they all hold, so a wait never pays for a judgment it will
+                // not use, and a judgment can never stand in for a structural
+                // condition that failed.
+                let structural = spec.conditions.iter().all(|c| match c {
+                    WaitCondition::Window(t) => windows
+                        .as_deref()
+                        .is_some_and(|ws| window_condition_holds(t, ws)),
+                    WaitCondition::Judged(_) => true,
+                    other => tree
+                        .as_deref()
+                        .is_some_and(|t| text_condition_holds(other, t)),
+                });
+                if !structural {
+                    return false;
                 }
-            }
-            judged_ok
-        })
-        .await;
+                let mut judged_ok = true;
+                for c in &spec.conditions {
+                    let WaitCondition::Judged(claim) = c else {
+                        continue;
+                    };
+                    let (Some(j), Some(t)) = (self.judge.as_ref(), tree.as_deref()) else {
+                        return false;
+                    };
+                    match judged_claim_holds(j, claim, t).await {
+                        Some(p) => {
+                            *last_probability.lock().unwrap_or_else(|e| e.into_inner()) = Some(p);
+                            if p < j.threshold() {
+                                judged_ok = false;
+                            }
+                        }
+                        None => judged_ok = false,
+                    }
+                }
+                judged_ok
+            })
+            .await;
 
         WaitOutcome {
             met,
             waited_ms,
+            woke_by,
             judge_probability: last_probability.into_inner().unwrap_or(None),
             last: last.into_inner().unwrap_or(None),
         }
@@ -528,9 +631,11 @@ mod tests {
         let ws = vec![WindowInfo {
             id: 0,
             app: Some("TextEdit".into()),
+            pid: Some(1),
             title: Some("Untitled 4".into()),
             bounds: None,
             minimized: false,
+            state: crate::backend::WindowState::Onscreen,
         }];
         assert!(window_condition_holds("Untitled", &ws));
         assert!(!window_condition_holds("Report", &ws));
@@ -593,5 +698,132 @@ mod tests {
         let (met, waited) = poll_until(30_000, 100, &cancel, || async { false }).await;
         assert!(!met);
         assert!(waited < 100);
+    }
+
+    fn spawn_notify_after(
+        n: &Arc<tokio::sync::Notify>,
+        ms: u64,
+        flag: Option<Arc<std::sync::atomic::AtomicBool>>,
+    ) {
+        let n = n.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(ms)).await;
+            if let Some(f) = flag {
+                f.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            n.notify_one();
+        });
+    }
+
+    #[tokio::test]
+    async fn a_condition_already_true_is_immediate() {
+        let n = tokio::sync::Notify::new();
+        let (met, waited, by) =
+            wait_loop(5_000, 500, &CancelToken::new(), Some(&n), || async { true }).await;
+        assert!(met && by == WokeBy::Immediate && waited < 100);
+    }
+
+    /// The point of events: the change is seen when announced, far inside the
+    /// safety poll, and the wait says an event did it.
+    #[tokio::test]
+    async fn an_announced_change_wakes_the_wait_before_the_safety_poll() {
+        let n = Arc::new(tokio::sync::Notify::new());
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        spawn_notify_after(&n, 100, Some(flag.clone()));
+        let (met, waited, by) = wait_loop(5_000, 4_000, &CancelToken::new(), Some(&n), || {
+            let f = flag.clone();
+            async move { f.load(std::sync::atomic::Ordering::SeqCst) }
+        })
+        .await;
+        assert!(met);
+        assert_eq!(by, WokeBy::Event);
+        assert!((100..400).contains(&waited), "waited {waited}ms");
+    }
+
+    /// A change nobody announced is still found, by the timer, and is not
+    /// reported as an event.
+    #[tokio::test]
+    async fn a_silent_change_is_found_by_the_safety_poll_and_said_so() {
+        let n = tokio::sync::Notify::new();
+        let started = Instant::now();
+        let (met, _, by) = wait_loop(5_000, 120, &CancelToken::new(), Some(&n), || {
+            let late = started.elapsed() > Duration::from_millis(200);
+            async move { late }
+        })
+        .await;
+        assert!(met);
+        assert_eq!(by, WokeBy::Poll);
+    }
+
+    /// A notification that does not change the condition costs one look and
+    /// the wait carries on to the real change.
+    #[tokio::test]
+    async fn an_irrelevant_event_does_not_end_the_wait() {
+        let n = Arc::new(tokio::sync::Notify::new());
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        spawn_notify_after(&n, 60, None);
+        spawn_notify_after(&n, 250, Some(flag.clone()));
+        let looks = std::sync::atomic::AtomicUsize::new(0);
+        let (met, waited, by) = wait_loop(5_000, 4_000, &CancelToken::new(), Some(&n), || {
+            looks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let f = flag.clone();
+            async move { f.load(std::sync::atomic::Ordering::SeqCst) }
+        })
+        .await;
+        assert!(met && by == WokeBy::Event, "{by:?}");
+        assert!((250..500).contains(&waited), "waited {waited}ms");
+        assert_eq!(looks.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    /// A storm of notifications is looked at no faster than the gap allows.
+    #[tokio::test]
+    async fn a_burst_of_events_is_coalesced() {
+        let n = Arc::new(tokio::sync::Notify::new());
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (n2, stop2) = (n.clone(), stop.clone());
+        tokio::spawn(async move {
+            while !stop2.load(std::sync::atomic::Ordering::SeqCst) {
+                n2.notify_one();
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        });
+        let looks = std::sync::atomic::AtomicUsize::new(0);
+        let (met, ..) = wait_loop(400, 4_000, &CancelToken::new(), Some(&n), || {
+            looks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async { false }
+        })
+        .await;
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(!met);
+        let looks = looks.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(looks <= 400 / MIN_LOOK_GAP_MS as usize + 2, "{looks} looks");
+    }
+
+    /// Events must not stretch a wait past its deadline either.
+    #[tokio::test]
+    async fn events_cannot_hold_a_wait_past_the_timeout() {
+        let n = Arc::new(tokio::sync::Notify::new());
+        let started = Instant::now();
+        let (met, waited, _) = wait_loop(200, 4_000, &CancelToken::new(), Some(&n), || async {
+            false
+        })
+        .await;
+        assert!(!met);
+        assert!(started.elapsed() < Duration::from_millis(500), "{waited}");
+    }
+
+    #[tokio::test]
+    async fn the_kill_switch_ends_a_sleeping_event_wait_quickly() {
+        let n = tokio::sync::Notify::new();
+        let cancel = CancelToken::new();
+        let c2 = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            c2.cancel();
+        });
+        let started = Instant::now();
+        let (met, ..) = wait_loop(30_000, 20_000, &cancel, Some(&n), || async { false }).await;
+        assert!(!met);
+        assert!(started.elapsed() < Duration::from_millis(400));
     }
 }

@@ -58,11 +58,8 @@ fn server() -> Server {
     let registry = Registry::build(vec![Arc::new(FuzzModule)]).unwrap();
     let cfg = PolicyConfig {
         categories: vec![Category::Vision],
-        // Autonomous: never block on a human. A high denial budget keeps the
-        // kill switch from tripping early and short-circuiting the rest of the
-        // run, which would leave most iterations testing nothing.
+        // Autonomous: never block on a human.
         mode: Mode::Autonomous,
-        max_denials: usize::MAX,
         ..PolicyConfig::default()
     };
     let policy = Arc::new(Policy::new(cfg, AuditSink::memory(), Redactor::empty()));

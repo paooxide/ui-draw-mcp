@@ -206,7 +206,6 @@ async fn disabled_category_is_denied_and_engine_never_runs() {
         0,
         "engine must not run on deny"
     );
-    assert_eq!(policy.denial_count(), 1);
 
     let recs = policy.audit_sink().memory_records();
     assert_eq!(recs.len(), 1);
@@ -405,7 +404,6 @@ async fn prompt_budget_caps_interruptions() {
     let cfg = PolicyConfig {
         categories: vec![Category::Vision],
         mode: Mode::Interactive,
-        max_denials: 1000,
         max_consent_prompts: 3,
         ..PolicyConfig::default()
     };

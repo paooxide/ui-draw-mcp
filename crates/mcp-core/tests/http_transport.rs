@@ -55,7 +55,6 @@ async fn start(allowed_origins: Vec<String>, max_body_bytes: usize) -> Fixture {
     let cfg = PolicyConfig {
         categories: vec![Category::Vision],
         mode: Mode::Autonomous,
-        max_denials: usize::MAX,
         ..PolicyConfig::default()
     };
     let policy = Arc::new(Policy::new(cfg, AuditSink::memory(), Redactor::empty()));

@@ -17,8 +17,16 @@ pub enum DesktopError {
 pub struct IdleStatus {
     /// Seconds since the last human input event.
     pub idle_seconds: u64,
-    /// Screen is locked.
+    /// Screen is locked. The older spelling of [`IdleStatus::screen_locked`],
+    /// kept so existing callers keep working; the two are always equal.
     pub locked: bool,
+    /// The lock screen is up. While it is, key and pointer events a program
+    /// posts are discarded (see `input_state`).
+    pub screen_locked: bool,
+    /// Whether the session can receive synthetic input: `ok`, `locked`,
+    /// `off_console` (another user's session has the console) or `unknown`
+    /// (this platform or session cannot say).
+    pub input_state: &'static str,
     /// Someone is plausibly at the keyboard.
     pub user_present: bool,
 }

@@ -17,8 +17,8 @@ use atspi::proxy::proxy_ext::ProxyExt;
 use atspi::{Interface, Role, State};
 use mcp_input::{
     list_options, missing_message, pick_option, same_option, Choice, ClipData, ClipFormat,
-    InputBackend, InputError, MouseKind, OptionItem, Pick, Reading, ScrollDir, SemanticAction,
-    SetPoint,
+    InputBackend, InputError, MouseKind, OptionItem, Pick, Reading, Route, ScrollDir, Selection,
+    SemanticAction, SetPoint,
 };
 use tokio::time::sleep;
 use xkeysym::Keysym;
@@ -61,8 +61,11 @@ impl LinuxBackend {
     }
 
     async fn press_modifiers(&self, mods: &[Modifier], down: bool) -> Result<(), InputError> {
+        // A modifier held by `key_down` is already down and stays down.
+        let held = self.lock().held_mods.clone();
+        let mods: Vec<Modifier> = mods.iter().copied().filter(|m| !held.contains(m)).collect();
         let order: Vec<Modifier> = if down {
-            mods.to_vec()
+            mods
         } else {
             mods.iter().rev().copied().collect()
         };
@@ -105,55 +108,10 @@ impl LinuxBackend {
         Ok(())
     }
 
-    /// Bring the target application's window forward before typing, so
-    /// keystrokes land where the snapshot came from rather than in whatever
-    /// the person last clicked. Best effort, and verified: refuses to type
-    /// when the target could not be raised.
-    async fn ensure_target_active(&self) -> Result<(), InputError> {
-        let Some(target) = self.pinned_target().await else {
-            tracing::debug!("no pinned target; keys go to whatever the compositor has focused");
-            return Ok(());
-        };
-        let conn = self.conn().await.map_err(InputError::Failed)?;
-        let is_active =
-            |ws: &[a11y::WindowRef]| ws.iter().any(|w| w.states.contains(State::Active));
-        let app = target.clone();
-        if let Ok(ws) = a11y::windows_of(&conn, &app).await {
-            if is_active(&ws) {
-                return Ok(());
-            }
-        }
-        crate::window::activate_app(&conn, &app).await?;
-        for _ in 0..24 {
-            sleep(Duration::from_millis(50)).await;
-            if let Ok(ws) = a11y::windows_of(&conn, &app).await {
-                if is_active(&ws) {
-                    tracing::debug!(app = %target.name, "target raised and active");
-                    // Active in the tree is not yet keyboard focus at the
-                    // compositor; let the raise settle before keys are sent.
-                    sleep(Duration::from_millis(120)).await;
-                    return Ok(());
-                }
-            }
-        }
-        // Fail safe: keystrokes go to whatever the compositor has focused, so
-        // typing without confirming the target is active would leak input into
-        // another application. Refuse, and name the focus-independent paths.
-        Err(InputError::Failed(format!(
-            "refusing to type: {}",
-            crate::window::cannot_foreground_msg(&target.name)
-        )))
-    }
-}
-
-#[async_trait]
-impl InputBackend for LinuxBackend {
-    async fn perform(
-        &self,
-        node_id: u64,
-        action: SemanticAction,
-        _option: Option<&str>,
-    ) -> Result<(), InputError> {
+    /// Do `action` on an element. Every arm asks the widget through AT-SPI
+    /// except `RightClick`, which clicks at the element's centre; keep
+    /// [`route_of`] in step with that.
+    async fn act_on(&self, node_id: u64, action: SemanticAction) -> Result<(), InputError> {
         let conn = self.conn().await.map_err(InputError::Failed)?;
         let nref = self.node_ref(node_id)?;
         let obj = a11y::relocate(&conn, &nref)
@@ -258,7 +216,92 @@ impl InputBackend for LinuxBackend {
             SemanticAction::Click | SemanticAction::DoubleClick | SemanticAction::Toggle => {
                 do_press(&p, interfaces, &label).await
             }
+            // AT-SPI has no context-menu or pick action of its own. Toolkits
+            // that offer one name it in the Action list; look for that rather
+            // than falling back to a pointer.
+            SemanticAction::ShowMenu => {
+                named_action(&p, interfaces, &label, MENU_ACTIONS, "a context menu").await
+            }
+            SemanticAction::Pick => {
+                named_action(&p, interfaces, &label, PICK_ACTIONS, "pick").await
+            }
+            SemanticAction::Increment | SemanticAction::Decrement => {
+                if !interfaces.contains(Interface::Value) {
+                    return Err(InputError::Unsupported(format!(
+                        "'{label}' has no Value interface, so it cannot be stepped"
+                    )));
+                }
+                let v = value_iface(&p).await?;
+                let (cur, min, max, inc) = futures_util::try_join!(
+                    v.current_value(),
+                    v.minimum_value(),
+                    v.maximum_value(),
+                    v.minimum_increment()
+                )
+                .map_err(|e| iface_err("value", e))?;
+                let next = step_value(cur, min, max, inc, action == SemanticAction::Increment);
+                v.set_current_value(next)
+                    .await
+                    .map_err(|e| iface_err("step", e))
+            }
         }
+    }
+
+    /// Bring the target application's window forward before typing, so
+    /// keystrokes land where the snapshot came from rather than in whatever
+    /// the person last clicked. Best effort, and verified: refuses to type
+    /// when the target could not be raised.
+    async fn ensure_target_active(&self) -> Result<(), InputError> {
+        let Some(target) = self.pinned_target().await else {
+            tracing::debug!("no pinned target; keys go to whatever the compositor has focused");
+            return Ok(());
+        };
+        let conn = self.conn().await.map_err(InputError::Failed)?;
+        let is_active =
+            |ws: &[a11y::WindowRef]| ws.iter().any(|w| w.states.contains(State::Active));
+        let app = target.clone();
+        if let Ok(ws) = a11y::windows_of(&conn, &app).await {
+            if is_active(&ws) {
+                return Ok(());
+            }
+        }
+        crate::window::activate_app(&conn, &app).await?;
+        for _ in 0..24 {
+            sleep(Duration::from_millis(50)).await;
+            if let Ok(ws) = a11y::windows_of(&conn, &app).await {
+                if is_active(&ws) {
+                    tracing::debug!(app = %target.name, "target raised and active");
+                    // Active in the tree is not yet keyboard focus at the
+                    // compositor; let the raise settle before keys are sent.
+                    sleep(Duration::from_millis(120)).await;
+                    return Ok(());
+                }
+            }
+        }
+        // Fail safe: keystrokes go to whatever the compositor has focused, so
+        // typing without confirming the target is active would leak input into
+        // another application. Refuse, and name the focus-independent paths.
+        Err(InputError::Failed(format!(
+            "refusing to type: {}",
+            crate::window::cannot_foreground_msg(&target.name)
+        )))
+    }
+}
+
+#[async_trait]
+impl InputBackend for LinuxBackend {
+    async fn perform(
+        &self,
+        node_id: u64,
+        action: SemanticAction,
+        _option: Option<&str>,
+    ) -> Result<Route, InputError> {
+        self.act_on(node_id, action).await?;
+        Ok(route_of(action))
+    }
+
+    fn route_for(&self, action: SemanticAction) -> Route {
+        route_of(action)
     }
 
     async fn read_element(&self, node_id: u64) -> Result<Reading, InputError> {
@@ -442,6 +485,100 @@ impl InputBackend for LinuxBackend {
         )))
     }
 
+    async fn selection(&self, node_id: Option<u64>) -> Result<Selection, InputError> {
+        let Some(node_id) = node_id else {
+            return Err(InputError::Unsupported(
+                "the focused element cannot be found through AT-SPI here; give a ref or a name"
+                    .into(),
+            ));
+        };
+        let conn = self.conn().await.map_err(InputError::Failed)?;
+        let nref = self.node_ref(node_id)?;
+        let obj = a11y::relocate(&conn, &nref)
+            .await
+            .map_err(InputError::NotFound)?;
+        let p = a11y::proxy_for(&conn, &obj)
+            .await
+            .map_err(InputError::Failed)?;
+        read_selection_at(&p).await
+    }
+
+    async fn select_range(
+        &self,
+        node_id: u64,
+        start: usize,
+        end: usize,
+    ) -> Result<Selection, InputError> {
+        let conn = self.conn().await.map_err(InputError::Failed)?;
+        let nref = self.node_ref(node_id)?;
+        let obj = a11y::relocate(&conn, &nref)
+            .await
+            .map_err(InputError::NotFound)?;
+        let p = a11y::proxy_for(&conn, &obj)
+            .await
+            .map_err(InputError::Failed)?;
+        let label = nref.name.clone().unwrap_or_default();
+        if p.get_role().await.ok() == Some(Role::PasswordText) {
+            return Err(InputError::InvalidArgs(
+                "this is a password field; its text is never read or selected".into(),
+            ));
+        }
+        let interfaces = p
+            .get_interfaces()
+            .await
+            .map_err(|e| InputError::Failed(format!("interfaces: {e}")))?;
+        if !interfaces.contains(Interface::Text) {
+            return Err(InputError::Unsupported(format!(
+                "'{label}' ({}) exposes no Text interface, so its selection cannot be set; \
+                 select_text does not fall back to dragging the pointer",
+                nref.role
+            )));
+        }
+        let t = text_iface(&p).await?;
+        let to_i32 = |n: usize| {
+            i32::try_from(n)
+                .map_err(|_| InputError::InvalidArgs(format!("offset {n} is out of range")))
+        };
+        let (s, e) = (to_i32(start)?, to_i32(end)?);
+        let existing = t
+            .get_n_selections()
+            .await
+            .map_err(|e| iface_err("selections", e))?;
+        let ok = if start == end {
+            // An empty range is a caret, which AT-SPI sets separately from
+            // a selection; clear any selection first.
+            for _ in 0..existing {
+                let _ = t.remove_selection(0).await;
+            }
+            t.set_caret_offset(s)
+                .await
+                .map_err(|e| iface_err("caret", e))?
+        } else if existing > 0 {
+            t.set_selection(0, s, e)
+                .await
+                .map_err(|e| iface_err("select", e))?
+        } else {
+            t.add_selection(s, e)
+                .await
+                .map_err(|e| iface_err("select", e))?
+        };
+        if !ok {
+            return Err(InputError::Failed(format!(
+                "'{label}' declined the selection (read-only, or the toolkit refused)"
+            )));
+        }
+        // A toolkit may apply the range on its next main-loop turn.
+        let mut got = read_selection_at(&p).await?;
+        for _ in 0..5 {
+            if (got.start, got.end) == (start, end) {
+                break;
+            }
+            sleep(Duration::from_millis(40)).await;
+            got = read_selection_at(&p).await?;
+        }
+        Ok(got)
+    }
+
     async fn type_text(&self, text: &str) -> Result<(), InputError> {
         // Open the portal (and answer its dialog) before settling focus: the
         // dialog steals focus, so confirming the target first would be stale
@@ -472,6 +609,50 @@ impl InputBackend for LinuxBackend {
         // Always release what was pressed, even if the key itself failed.
         let released = self.press_modifiers(&parsed.modifiers, false).await;
         r.and(released)
+    }
+
+    async fn key_down(&self, key: &str) -> Result<(), InputError> {
+        // `fn` is a hardware modifier the compositor never sees.
+        if key == "fn" {
+            return Ok(());
+        }
+        let sym = match Modifier::parse(key) {
+            Some(m) => m.keysym(),
+            None => keys::keysym_for(key)
+                .ok_or_else(|| InputError::Unsupported(format!("no keysym for '{key}'")))?,
+        };
+        self.portal.ensure_ready().await?;
+        self.ensure_target_active().await?;
+        self.portal.key(sym, true).await?;
+        if let Some(m) = Modifier::parse(key) {
+            let mut st = self.lock();
+            if !st.held_mods.contains(&m) {
+                st.held_mods.push(m);
+            }
+        }
+        Ok(())
+    }
+
+    async fn key_up(&self, key: &str) -> Result<(), InputError> {
+        if key == "fn" {
+            return Ok(());
+        }
+        let modifier = Modifier::parse(key);
+        let Some(sym) = modifier
+            .map(Modifier::keysym)
+            .or_else(|| keys::keysym_for(key))
+        else {
+            return Ok(());
+        };
+        // Forgotten before the release is sent: if it fails the record must
+        // not claim a key is down that this backend has given up on, and a
+        // later chord must be free to press and release it.
+        if let Some(m) = modifier {
+            self.lock().held_mods.retain(|h| *h != m);
+        }
+        // No check of where focus is: a release that can be refused is a
+        // stuck key.
+        self.portal.key(sym, false).await
     }
 
     async fn mouse(
@@ -551,6 +732,37 @@ impl InputBackend for LinuxBackend {
         turned.and(released)
     }
 
+    async fn scroll_pixels(
+        &self,
+        x: f64,
+        y: f64,
+        ev: &mcp_input::trackpad::PixelScroll,
+        modifiers: &[String],
+    ) -> Result<(), InputError> {
+        use mcp_input::trackpad::Phase;
+        // The compositor makes its own coast when it sees `finish`, so the
+        // planner is never asked for momentum here (`pixel_momentum`); a stray
+        // one is dropped rather than doubled.
+        if ev.phase.is_momentum() {
+            return Ok(());
+        }
+        let mods = keys::pointer_modifiers(modifiers).map_err(InputError::Failed)?;
+        if ev.phase == Phase::Began {
+            self.portal.pointer_abs(x, y).await?;
+            self.note_pointer(x, y);
+            sleep(Duration::from_millis(10)).await;
+        }
+        // Modifiers are real key presses on this path, as for `scroll_at`, so
+        // they are held only for the event and released even if it fails.
+        self.press_modifiers(&mods, true).await?;
+        let sent = self
+            .portal
+            .axis_smooth(ev.dx as f64, ev.dy as f64, ev.phase == Phase::Ended)
+            .await;
+        let released = self.press_modifiers(&mods, false).await;
+        sent.and(released)
+    }
+
     async fn hover(&self, x: f64, y: f64) -> Result<(), InputError> {
         self.portal.pointer_abs(x, y).await?;
         self.note_pointer(x, y);
@@ -560,12 +772,16 @@ impl InputBackend for LinuxBackend {
     async fn drag(
         &self,
         from: (f64, f64),
-        to: (f64, f64),
+        route: &[(f64, f64)],
         modifiers: &[String],
-        steps: u32,
         hold_ms: u64,
         since_takeover: u64,
     ) -> Result<(), InputError> {
+        if route.is_empty() {
+            return Err(InputError::InvalidArgs(
+                "a drag needs somewhere to go".into(),
+            ));
+        }
         let mods = keys::pointer_modifiers(modifiers).map_err(InputError::Failed)?;
         self.portal.pointer_abs(from.0, from.1).await?;
         self.note_pointer(from.0, from.1);
@@ -574,30 +790,29 @@ impl InputBackend for LinuxBackend {
         self.portal.button(0x110, true).await?;
         // `hold_ms` is for drag sources that wait to tell a drag from a click.
         sleep(Duration::from_millis(30 + hold_ms)).await;
-        let steps = steps.clamp(1, 200);
-        let mut last = from;
-        for i in 1..=steps {
+        // However the moves end, the button and modifiers are let go below: a
+        // failed move must not leave the person's button held.
+        let mut moved = Ok(());
+        for &p in route {
             if self.takeover_generation() != since_takeover {
-                let _ = self.portal.button(0x110, false).await;
-                let _ = self.press_modifiers(&mods, false).await;
-                return Err(InputError::Failed(
+                moved = Err(InputError::Failed(
                     "drag aborted: a human took over the pointer".into(),
                 ));
+                break;
             }
-            let t = i as f64 / steps as f64;
-            let p = (from.0 + (to.0 - from.0) * t, from.1 + (to.1 - from.1) * t);
-            self.portal.pointer_abs(p.0, p.1).await?;
+            if let Err(e) = self.portal.pointer_abs(p.0, p.1).await {
+                moved = Err(e);
+                break;
+            }
             self.note_pointer(p.0, p.1);
-            last = p;
             sleep(Duration::from_millis(8)).await;
         }
-        if last != to {
-            self.portal.pointer_abs(to.0, to.1).await?;
+        if moved.is_ok() {
+            sleep(Duration::from_millis(60)).await;
         }
-        sleep(Duration::from_millis(60)).await;
-        let r = self.portal.button(0x110, false).await;
-        self.press_modifiers(&mods, false).await?;
-        r
+        let released = self.portal.button(0x110, false).await;
+        let mods_up = self.press_modifiers(&mods, false).await;
+        moved.and(released).and(mods_up)
     }
 
     async fn clipboard_read(&self, format: ClipFormat) -> Result<ClipData, InputError> {
@@ -988,6 +1203,143 @@ async fn read_text(p: &Acc<'_>) -> Option<String> {
     t.get_text(0, count).await.ok()
 }
 
+/// Action names toolkits use for a context menu, lower case.
+const MENU_ACTIONS: &[&str] = &[
+    "menu",
+    "popup",
+    "show menu",
+    "showmenu",
+    "show_menu",
+    "context menu",
+];
+/// Action names toolkits use for picking an item, lower case.
+const PICK_ACTIONS: &[&str] = &["pick"];
+
+/// Which route `perform` took. `RightClick` is the one action that clicks at
+/// the element's centre (see `act_on`); every other action asks the widget.
+fn route_of(action: SemanticAction) -> Route {
+    if action == SemanticAction::RightClick {
+        Route::Hid
+    } else {
+        Route::Ax
+    }
+}
+
+/// The index of the first offered action whose lower-cased name is in `names`.
+fn find_action(offered: &[String], names: &[&str]) -> Option<usize> {
+    offered
+        .iter()
+        .position(|o| names.iter().any(|n| *n == o.to_lowercase()))
+}
+
+/// The value one step above or below `cur`, kept inside `[min, max]`.
+///
+/// The step is the widget's own minimum increment; one that reports none
+/// (zero) gets a hundredth of the range, else 1.
+fn step_value(cur: f64, min: f64, max: f64, inc: f64, up: bool) -> f64 {
+    let range = max - min;
+    let step = if inc > 0.0 {
+        inc
+    } else if range.is_finite() && range > 0.0 {
+        range / 100.0
+    } else {
+        1.0
+    };
+    let next = if up { cur + step } else { cur - step };
+    if min.is_finite() && max.is_finite() && min <= max {
+        next.clamp(min, max)
+    } else {
+        next
+    }
+}
+
+/// Perform the action whose name is one of `names`, or say what the widget
+/// does offer.
+async fn named_action(
+    p: &atspi::proxy::accessible::AccessibleProxy<'_>,
+    interfaces: atspi::InterfaceSet,
+    label: &str,
+    names: &[&str],
+    what: &str,
+) -> Result<(), InputError> {
+    if !interfaces.contains(Interface::Action) {
+        return Err(InputError::Unsupported(format!(
+            "'{label}' exposes no actions, so it cannot do {what}"
+        )));
+    }
+    let a = action_iface(p).await?;
+    let actions = a
+        .get_actions()
+        .await
+        .map_err(|e| InputError::Failed(format!("actions: {e}")))?;
+    let offered: Vec<String> = actions.iter().map(|x| x.name.clone()).collect();
+    let Some(idx) = find_action(&offered, names) else {
+        return Err(InputError::Unsupported(format!(
+            "'{label}' does not offer {what}; it offers {}",
+            if offered.is_empty() {
+                "no actions".to_string()
+            } else {
+                offered.join(", ")
+            }
+        )));
+    };
+    let ok = a
+        .do_action(idx as i32)
+        .await
+        .map_err(|e| InputError::Failed(format!("{what}: {e}")))?;
+    if ok {
+        Ok(())
+    } else {
+        Err(InputError::Failed(format!(
+            "'{label}' declined the '{}' action",
+            offered[idx]
+        )))
+    }
+}
+
+/// The text selection of a text widget, in characters. A password field is
+/// refused before its text is touched.
+async fn read_selection_at(p: &Acc<'_>) -> Result<Selection, InputError> {
+    let role = p.get_role().await.map_err(|e| iface_err("role", e))?;
+    if role == Role::PasswordText {
+        return Err(InputError::InvalidArgs(
+            "this is a password field; its text is never read".into(),
+        ));
+    }
+    let t = text_iface(p).await?;
+    let selections = t
+        .get_n_selections()
+        .await
+        .map_err(|e| iface_err("selections", e))?;
+    let (start, end) = if selections > 0 {
+        let (a, b) = t
+            .get_selection(0)
+            .await
+            .map_err(|e| iface_err("selection", e))?;
+        (a.min(b).max(0) as usize, a.max(b).max(0) as usize)
+    } else {
+        let caret = t
+            .caret_offset()
+            .await
+            .map_err(|e| iface_err("caret", e))?
+            .max(0) as usize;
+        (caret, caret)
+    };
+    let text = if end > start {
+        t.get_text(start as i32, end as i32)
+            .await
+            .map_err(|e| iface_err("text", e))?
+    } else {
+        String::new()
+    };
+    Ok(Selection {
+        start,
+        end,
+        text,
+        role: Some(format!("{role:?}")),
+    })
+}
+
 /// Press a widget through its Action interface: the first action whose name
 /// is one of the conventional press verbs, else action 0.
 async fn do_press(
@@ -1142,5 +1494,41 @@ mod clip_tests {
             matches!(e, mcp_input::InputError::InvalidArgs(_)),
             "expected InvalidArgs, got {e:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod route_tests {
+    use super::*;
+
+    #[test]
+    fn only_a_right_click_uses_the_pointer() {
+        assert_eq!(route_of(SemanticAction::RightClick), Route::Hid);
+        for a in [
+            SemanticAction::Click,
+            SemanticAction::ShowMenu,
+            SemanticAction::Increment,
+            SemanticAction::Pick,
+            SemanticAction::ScrollIntoView,
+        ] {
+            assert_eq!(route_of(a), Route::Ax, "{a:?}");
+        }
+    }
+
+    #[test]
+    fn a_step_moves_by_the_increment_and_stops_at_the_ends() {
+        assert_eq!(step_value(5.0, 0.0, 10.0, 2.0, true), 7.0);
+        assert_eq!(step_value(5.0, 0.0, 10.0, 2.0, false), 3.0);
+        assert_eq!(step_value(9.5, 0.0, 10.0, 2.0, true), 10.0);
+        assert_eq!(step_value(0.0, 0.0, 10.0, 2.0, false), 0.0);
+        // No increment reported: a hundredth of the range.
+        assert_eq!(step_value(50.0, 0.0, 100.0, 0.0, true), 51.0);
+    }
+
+    #[test]
+    fn actions_are_found_by_lower_cased_name() {
+        let offered = vec!["Click".to_string(), "Menu".to_string()];
+        assert_eq!(find_action(&offered, MENU_ACTIONS), Some(1));
+        assert_eq!(find_action(&offered, PICK_ACTIONS), None);
     }
 }

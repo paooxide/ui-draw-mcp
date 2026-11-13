@@ -10,6 +10,18 @@ pub struct SnapshotRequest {
     pub root_ref: Option<String>,
     pub max_depth: Option<usize>,
     pub surface: Option<String>,
+    /// A read for waiting or checking, not for acting on. It must not pin the
+    /// application it names, and must not replace the elements the refs of
+    /// the last `get_ui_tree` point at: a poll of another application would
+    /// otherwise leave `@e5` meaning an element of the wrong one.
+    pub passive: bool,
+    /// Install the refs of this read so `ui_action` can act on them, but
+    /// leave the session's pinned application alone. A read for acting on
+    /// normally makes the application it reads the one every later call
+    /// follows; `observe` reads a window it was merely asked about and must
+    /// not change which application the session is driving. Ignored when
+    /// `passive` is set, which installs nothing.
+    pub without_pin: bool,
 }
 
 /// A raw accessibility snapshot from a backend: the root node plus labels. The
@@ -28,6 +40,17 @@ pub struct RawSnapshot {
     /// it", because an agent that cannot tell will conclude the button it needs
     /// does not exist.
     pub partial: bool,
+    /// The application the snapshot is of and why that one; `None` for a
+    /// backend that does not say.
+    pub target: Option<SnapshotTarget>,
+}
+
+/// Which application a snapshot read, and how the call came to read it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotTarget {
+    pub pid: Option<u32>,
+    /// `named` (the call's `app`), `pinned` or `frontmost`.
+    pub from: &'static str,
 }
 
 /// Why a backend snapshot failed. Mapped to `ErrorCode` by the tool layer.

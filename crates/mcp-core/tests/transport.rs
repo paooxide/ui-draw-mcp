@@ -39,7 +39,6 @@ fn server() -> Server {
     let cfg = PolicyConfig {
         categories: vec![Category::Vision],
         mode: Mode::Autonomous,
-        max_denials: usize::MAX,
         ..PolicyConfig::default()
     };
     let policy = Arc::new(Policy::new(cfg, AuditSink::memory(), Redactor::empty()));

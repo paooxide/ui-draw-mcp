@@ -7,13 +7,17 @@ use mcp_a11y::{
     SnapshotArena, SnapshotRequest,
 };
 use mcp_types::args::{as_f64, i64_arg, u64_arg};
+use mcp_types::drag::{drag_route, parse_drag_path};
 use mcp_types::{CallCtx, Category, Envelope, ErrorCode, Tier, ToolDescriptor, ToolModule};
 use serde_json::{json, Value};
 
 use crate::backend::{
-    ClipFormat, InputBackend, InputError, MouseKind, Reading, ScrollDir, SemanticAction,
+    BackgroundTarget, ClipFormat, FocusedText, InputBackend, InputError, MouseKind, Reading, Route,
+    ScrollDir, Selection, SemanticAction,
 };
-use crate::combo::{parse_combo, Os};
+use crate::combo::{parse_combo, parse_hold, Os};
+use crate::hold::{mono_ms, HeldKeys};
+use crate::selection::{clip_echo, judge_selection, resolve, RangeSpec};
 
 /// Per-action policy the input engine enforces (the tier/category gate already
 /// ran in `mcp-core`; these are the input-specific checks).
@@ -31,6 +35,12 @@ pub struct InputPolicy {
     pub destructive_patterns: Vec<String>,
     /// The judge, consulted after the patterns and only able to add a flag.
     pub judge: Option<std::sync::Arc<mcp_policy::mcp_judge::Judge>>,
+    /// `never` refuses every call that would move the real pointer, post
+    /// synthetic keys or scroll events, or bring an app forward. See
+    /// [`crate::foreground`].
+    pub foreground: mcp_types::Foreground,
+    /// How long `foreground = "polite"` waits for the person to be idle.
+    pub polite: crate::polite::PoliteConfig,
 }
 
 /// Apps whose keystrokes may be shell input.
@@ -139,6 +149,8 @@ impl Default for InputPolicy {
             bypass: false,
             destructive_patterns: mcp_policy::default_destructive_patterns(),
             judge: None,
+            foreground: mcp_types::Foreground::Allow,
+            polite: crate::polite::PoliteConfig::default(),
         }
     }
 }
@@ -154,12 +166,90 @@ const EXPECTING: &[&str] = &[
     "keyboard_type",
     "keyboard_shortcut",
     "mouse_action",
+    "select_text",
 ];
 
+/// Tools that report `effects`: those that can change what is on screen. A
+/// scroll, hover or drag moves the view or the pointer and is left out; the
+/// read tools change nothing.
+const EFFECTING: &[&str] = &[
+    "ui_action",
+    "set_value",
+    "ui_fill_form",
+    "keyboard_type",
+    "keyboard_shortcut",
+    "mouse_action",
+    "select_text",
+];
+
+/// The tier `input_steps` is admitted at. A step above it is refused.
+const BATCH_TIER: Tier = Tier::Standard;
+
+/// What the docs say about `input_steps` and `effects`, kept off the wire.
+const BATCH_DETAILS: &str = "`steps` is a list of `{tool, args}`, at most 20. The tools that can run in a batch are ui_action, set_value, \
+    select_text, ui_fill_form, keyboard_type, keyboard_shortcut, mouse_action, scroll, hover, drag_drop and clipboard_write; \
+    anything else, and a step that is not `{tool, args}`, is an INVALID_ARGS error naming the step, before any step runs.\n\n\
+    Each step goes through the same gate as a call made on its own: the policy tier, the role's allowed and denied tools, \
+    consent, the hard invariants, the kill switch and the audit log (every step is its own entry, and a \
+    step flagged `secret` is redacted in it). So a batch can do nothing that the same calls made one at a time could not, \
+    and a step the role or `foreground = \"never\"` refuses ends the batch. Under `never` the whole batch is checked first, \
+    so one refused step means no step ran. A synthetic personal-data token cannot be passed in a batch; type it with its \
+    own call.\n\n\
+    Steps run in order and the first failure stops the batch; the steps after it do not run. The result is {ran, total, \
+    failed_at (the 0-based step that failed, absent when all succeeded), elapsed_ms, steps: [{i, tool, ok, ...that step's \
+    result, error}]}. The batch has 30 seconds: a step still running then is cancelled and the rest are not run. The \
+    kill switch, a human taking the pointer and a client cancel are checked between steps. A key held with \
+    keyboard_shortcut down stays held across the batch, and a step that fails releases held keys as it would alone. \
+    A step that names an element by `name` resolves it against the snapshot at that moment, so an earlier step that \
+    changes the screen can change what the next one finds: use `ref`s from the same get_ui_tree for a run of \
+    steps on one screen, and put a step that opens a dialog last in the batch.";
+
+/// The `effects` an action reports. Appended to the descriptors of the tools that report them.
+const EFFECTS_DETAILS: &str = "`effects` is added to the result of an action when something it changed was seen: `app` (the frontmost \
+    application changed), `focus` ({role, name} of the newly focused element), `appeared` and `disappeared` (titles of \
+    the target application's windows, at most 5 each), `retitled` ({from, to} when one window was renamed), `overlay` \
+    ({kind: sheet|dialog|alert|popover|menu, title, text, buttons} of one that opened) and `overlay_closed`, and `value` \
+    or `checked` of the element a `ui_action` pressed by `ref`. It is read from a small fixed set of facts before and \
+    after the action, about 120 ms apart, not from a new snapshot, and without raising a window or moving focus, so it \
+    works under `foreground = \"never\"`. A fact the platform cannot read is left out, never guessed. No `effects` means \
+    nothing was seen to change among those facts, which is not proof that nothing did: an app may react later, and a \
+    change inside a window's own contents is not among them. Linux reads the window list, dialogs and the frontmost \
+    application only. `effects: false` skips the reads and the wait, and `expect` replaces it with its own delta.";
+
+const RECORD_DETAILS: &str = "Recording listens to the keyboard and mouse through a listen-only event tap (macOS, `kCGEventTapOptionListenOnly`), \
+    which needs the Input Monitoring permission and Accessibility for the app that runs agentctl; without them the call \
+    returns PERM_DENIED naming which and records nothing. It never acts. Each click is resolved through accessibility to the \
+    element under the pointer (role, title, parents up to the window, and the point as a fallback hint); each run of typing \
+    becomes one `type` step on the field that had the focus; chords and non-printing keys become `shortcut` steps; a click \
+    on a menu item keeps its menu path. Text typed into a secure field is cleared as it is read and the step holds only a \
+    `secret_ref`, supplied as `secrets` when the flow runs. Events whose application is not in `allowed_apps` are counted \
+    (`dropped_other_apps`) and not stored; so are events with no readable element (`dropped_unlocated`). A session stops \
+    by itself after `max_seconds` (at most 600) or 4000 events, and a marker file in the state directory makes \
+    `agentctl doctor` report it while it runs. Dangerous tier: it records a person's real input, so it needs to be named in \
+    `policy.enable` and is not available by default. Starting does not arm the human-override watcher, but a recording \
+    that starts within its grace period (1.5 s) of an agent input call is still inside it. Linux has no listen-only tap in \
+    the remote-desktop portal (it can inject input, not observe it), so it returns UNSUPPORTED_OS there; flows written \
+    with `desktop_flow save` replay on both.";
+
+const FLOW_DETAILS: &str = "A flow is a list of steps `{op, locator, text | combo | secret_ref, ...}` kept in `desktop_flows.json` beside the \
+    config. `run` takes a snapshot of each step's application without pinning it, finds the element whose role and title \
+    match and whose parents agree (exact), or whose title merely contains the recorded one or whose surroundings changed \
+    (fuzzy), and performs the step as the ordinary call it stands for: `ui_action` for a click (an accessibility press, so \
+    it can run with the app in the background), `keyboard_type` or `set_value` for text, `keyboard_shortcut` for a chord. \
+    Only when nothing matches does a click fall back to the recorded point with `mouse_action`, which \
+    `foreground = \"never\"` refuses like any pointer action. Two elements that fit equally well are an error, not a guess. \
+    Each step in the result has `matched` (exact, fuzzy or coordinate), `route` (`ax`, `hid` or `pid_event`, as the tool \
+    reported) and the ref used; the first failure stops the run with `failed_at` and what to do. Under `never` the steps \
+    that would use the keyboard are refused before anything runs. `value set` steps are written by hand with `save` \
+    (op `set`); the recorder cannot see a value being set, only keys.";
+
+const EFFECTS_SEE_ALSO: &str = "The result carries `effects` when the action changed something that was seen (a sheet or window opened, \
+    focus moved, ...); see ui_action for what it holds and what its absence means. `effects: false` skips it.";
+
 pub struct InputModule {
-    backend: Arc<dyn InputBackend>,
-    arena: Arc<Mutex<SnapshotArena>>,
-    policy: InputPolicy,
+    pub(crate) backend: Arc<dyn InputBackend>,
+    pub(crate) arena: Arc<Mutex<SnapshotArena>>,
+    pub(crate) policy: InputPolicy,
     /// Runs `expect` clauses. `None` where there is no window backend to
     /// observe with, in which case an `expect` is refused rather than ignored.
     verifier: Option<std::sync::Arc<crate::postcondition::Verifier>>,
@@ -169,9 +259,67 @@ pub struct InputModule {
     /// Takes a snapshot when a call names an element before anything has been
     /// observed. `None` where the composition root wired none, in which case
     /// a name needs a prior `get_ui_tree`.
-    observer: Option<Arc<dyn A11yBackend>>,
+    pub(crate) observer: Option<Arc<dyn A11yBackend>>,
     /// Configured cursor glide for demo/showcase movements.
     glide: Mutex<crate::glide::GlideConfig>,
+    /// Keys held across calls, shared with the watchdog that releases them.
+    ledger: Arc<Mutex<Ledger>>,
+    /// Whether the kill switch is engaged, for the watchdog. The switch also
+    /// refuses every later call, `up` included, so a held key could never be
+    /// released through the tools once it trips; this is how it still is.
+    pub(crate) halt: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+    /// Reads the facts `effects` compares. `None` where nothing can, in which
+    /// case no result carries `effects`.
+    probe: Option<Arc<dyn crate::effects::UiProbe>>,
+    /// The way back into the server's gate for the steps of `input_steps`.
+    /// `None` refuses the batch: running a step any other way would skip the
+    /// checks a call on its own gets.
+    pub(crate) relay: Option<Arc<crate::steps::StepRelay>>,
+    /// Wall time a batch may spend; [`crate::steps::MAX_BATCH_MS`] outside tests.
+    batch_ms: u64,
+    /// Set while an `input_steps` batch holds a polite loan, so its steps run
+    /// inside that one borrow instead of waiting and restoring each.
+    batch_loan: std::sync::atomic::AtomicBool,
+    /// Recording and the flows it makes; empty until the composition root
+    /// wires a listener and a store.
+    pub(crate) rec: crate::record_tools::RecordSupport,
+}
+
+/// What the module holds down.
+struct Ledger {
+    keys: HeldKeys,
+    /// Whether a watchdog task is running. Kept under the same lock as the
+    /// keys so a `down` can never find the watchdog gone just as it exits.
+    watching: bool,
+}
+
+/// How often the watchdog looks for a trip or an expiry.
+const WATCH_EVERY: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Why every held key must go now, if it must.
+fn release_reason(halted: bool, taken_over: bool) -> Option<&'static str> {
+    match (halted, taken_over) {
+        (true, _) => Some("the kill switch is engaged"),
+        (_, true) => Some("a human took over the pointer"),
+        _ => None,
+    }
+}
+
+/// Release `keys`, last pressed first, trying every one even if some fail.
+/// Returns the first failure.
+async fn release_keys(backend: &dyn InputBackend, keys: &[String]) -> Option<InputError> {
+    let mut first = None;
+    for k in keys.iter().rev() {
+        if let Err(e) = backend.key_up(k).await {
+            tracing::error!(key = %k, error = ?e, "could not release a held key");
+            first.get_or_insert(e);
+        }
+    }
+    first
+}
+
+fn lock_ledger(l: &Mutex<Ledger>) -> std::sync::MutexGuard<'_, Ledger> {
+    l.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 impl InputModule {
@@ -188,7 +336,59 @@ impl InputModule {
             activity: None,
             observer: None,
             glide: Mutex::new(crate::glide::GlideConfig::default()),
+            ledger: Arc::new(Mutex::new(Ledger {
+                keys: HeldKeys::default(),
+                watching: false,
+            })),
+            halt: None,
+            probe: None,
+            relay: None,
+            batch_ms: crate::steps::MAX_BATCH_MS,
+            batch_loan: std::sync::atomic::AtomicBool::new(false),
+            rec: crate::record_tools::RecordSupport::default(),
         }
+    }
+
+    /// Wire recording and replay of human demonstrations (composition root
+    /// only): the listener, the flow store, the `allowed_apps` a recording is
+    /// held to, and the marker file `agentctl doctor` reads.
+    pub fn with_recording(mut self, rec: crate::record_tools::RecordSupport) -> Self {
+        self.rec = rec;
+        self
+    }
+
+    /// Shorten the batch's time, so a test need not wait 30 s.
+    #[cfg(test)]
+    fn with_batch_limit(mut self, ms: u64) -> Self {
+        self.batch_ms = ms;
+        self
+    }
+
+    /// Attach the reader of the facts behind `effects` (composition root only).
+    pub fn with_probe(mut self, p: Arc<dyn crate::effects::UiProbe>) -> Self {
+        self.probe = Some(p);
+        self
+    }
+
+    /// Attach the handle that carries `input_steps` back through the server's
+    /// gate (composition root only).
+    pub fn with_steps(mut self, r: Arc<crate::steps::StepRelay>) -> Self {
+        self.relay = Some(r);
+        self
+    }
+
+    /// Say how to tell the kill switch is engaged (composition root only), so
+    /// held keys are released when it trips.
+    pub fn with_halt_probe(mut self, halted: Arc<dyn Fn() -> bool + Send + Sync>) -> Self {
+        self.halt = Some(halted);
+        self
+    }
+
+    /// Shorten how long a key may stay held, so a test need not wait 30 s.
+    #[cfg(test)]
+    fn with_hold_limit(self, ms: u64) -> Self {
+        lock_ledger(&self.ledger).keys = HeldKeys::with_ttl(ms);
+        self
     }
 
     /// Attach the driving-activity marker (composition root only).
@@ -270,7 +470,10 @@ impl InputModule {
     fn target_by_ref(&self, tool: &str, reff: &str, need: Need) -> Result<Target, Envelope> {
         let arena = self.arena.lock().unwrap_or_else(|e| e.into_inner());
         match arena.resolve_latest(reff) {
-            Ok(info) => Target::from_info(tool, reff, info, need, None),
+            Ok(info) => Target::from_info(tool, reff, info, need, None).map(|mut t| {
+                t.app = arena.current().and_then(|s| s.app.clone());
+                t
+            }),
             Err(RefError::Stale) => Err(Envelope::fail_with(
                 tool,
                 ErrorCode::StaleRef,
@@ -340,6 +543,10 @@ impl InputModule {
             need,
             Some(tied_with_best(&ranked)),
         )
+        .map(|mut t| {
+            t.app = snap.app.clone();
+            t
+        })
     }
 
     /// Take a fresh snapshot of the target application and install it, for a
@@ -448,7 +655,16 @@ impl InputModule {
         if self.policy.bypass {
             return None;
         }
-        let target = self.backend.input_target().or_else(|| self.current_app());
+        // On the per-process route the text goes to the pinned app whether or
+        // not it is in front, so that app is the one screened. It is asked
+        // for by name here rather than left to `input_target`, so the gate
+        // does not depend on a backend answering both questions the same way.
+        let target = self
+            .backend
+            .background_key_target()
+            .map(|b| b.name)
+            .or_else(|| self.backend.input_target())
+            .or_else(|| self.current_app());
         let is_term = screens_as_terminal(target.as_deref(), &self.policy.terminal_apps);
         if !is_term {
             return None;
@@ -574,28 +790,35 @@ impl InputModule {
             Some(o) => o.to_string(),
             None if entry => target.name.clone().unwrap_or_default(),
             None => {
-                self.backend
+                let route = self
+                    .backend
                     .perform(node_id, SemanticAction::Select, None)
                     .await
                     .map_err(|e| input_err(tool, e))?;
-                return Ok(json!({ "ok": true }));
+                return Ok(with_route(json!({ "ok": true }), route));
             }
         };
         match self.backend.choose_option(node_id, &wanted).await {
-            Ok(c) => Ok(json!({
-                "ok": true,
-                "selected": c.selected.clone().unwrap_or_else(|| c.item.clone()),
-                "changed": c.changed,
-                "verified": c.selected.is_some(),
-            })),
+            // Choosing walks the control's own popup through the
+            // accessibility API on every backend; it has no pointer path.
+            Ok(c) => Ok(with_route(
+                json!({
+                    "ok": true,
+                    "selected": c.selected.clone().unwrap_or_else(|| c.item.clone()),
+                    "changed": c.changed,
+                    "verified": c.selected.is_some(),
+                }),
+                Route::Ax,
+            )),
             // A menu item in a menu bar has no popup to resolve to; pressing
             // it is the whole job, as it always was.
             Err(InputError::Unsupported(_)) if entry => {
-                self.backend
+                let route = self
+                    .backend
                     .perform(node_id, SemanticAction::Select, None)
                     .await
                     .map_err(|e| input_err(tool, e))?;
-                Ok(json!({ "ok": true }))
+                Ok(with_route(json!({ "ok": true }), route))
             }
             Err(e) => Err(input_err(tool, e)),
         }
@@ -625,7 +848,8 @@ impl InputModule {
         if action != SemanticAction::Toggle && before.is_some() && before == want {
             return Ok(json!({ "ok": true, "checked": before, "changed": false }));
         }
-        self.backend
+        let route = self
+            .backend
             .perform(node_id, action, None)
             .await
             .map_err(|e| input_err(tool, e))?;
@@ -649,11 +873,51 @@ impl InputModule {
                 ));
             }
         }
-        Ok(json!({
-            "ok": true,
-            "checked": after,
-            "changed": before.zip(after).map(|(b, a)| b != a),
-        }))
+        Ok(with_route(
+            json!({
+                "ok": true,
+                "checked": after,
+                "changed": before.zip(after).map(|(b, a)| b != a),
+            }),
+            route,
+        ))
+    }
+
+    /// One step up or down on a slider, stepper or scroll bar, reading the
+    /// value before and after. A step that leaves the value alone is reported
+    /// as `changed: false` (the control is at its limit, or ignored the
+    /// request), never as a change.
+    #[allow(clippy::result_large_err)] // Err is a ready-to-return Envelope
+    async fn step(
+        &self,
+        tool: &str,
+        node_id: u64,
+        action: SemanticAction,
+    ) -> Result<Value, Envelope> {
+        let before = self
+            .backend
+            .read_element(node_id)
+            .await
+            .ok()
+            .and_then(|r| r.value);
+        let route = self
+            .backend
+            .perform(node_id, action, None)
+            .await
+            .map_err(|e| input_err(tool, e))?;
+        let after = self
+            .settle(node_id, |r| r.value != before)
+            .await
+            .and_then(|r| r.value);
+        let mut data = with_route(json!({ "ok": true }), route);
+        match after {
+            Some(a) => {
+                data["changed"] = json!(before.as_deref() != Some(a.as_str()));
+                data["value_after"] = json!(a);
+            }
+            None => data["verified"] = json!(false),
+        }
+        Ok(data)
     }
 
     /// One semantic action on a resolved element, with the read-backs the
@@ -678,12 +942,16 @@ impl InputModule {
             SemanticAction::Check | SemanticAction::Uncheck | SemanticAction::Toggle => {
                 self.set_checked(tool, node_id, action).await
             }
+            SemanticAction::Increment | SemanticAction::Decrement => {
+                self.step(tool, node_id, action).await
+            }
             _ => {
-                self.backend
+                let route = self
+                    .backend
                     .perform(node_id, action, option)
                     .await
                     .map_err(|e| input_err(tool, e))?;
-                Ok(json!({ "ok": true }))
+                Ok(with_route(json!({ "ok": true }), route))
             }
         }
     }
@@ -722,6 +990,7 @@ impl InputModule {
             text,
             secret || target.secure,
         )
+        .map(|d| with_route(d, Route::Ax))
         .map_err(|m| {
             Envelope::fail_with(
                 tool,
@@ -730,6 +999,202 @@ impl InputModule {
                 "the field may be read-only or may validate input; try keyboard_type",
             )
         })
+    }
+
+    // ---- effects ------------------------------------------------------------
+
+    /// The facts to compare against, read before the action.
+    async fn facts_before(&self, tool: &str, args: &Value) -> EffectState {
+        let facts = match &self.probe {
+            Some(p) => p.probe(None).await,
+            None => crate::effects::UiFacts::default(),
+        };
+        let element = match self.effect_element(tool, args) {
+            Some((node, secure)) => self
+                .backend
+                .read_element(node)
+                .await
+                .ok()
+                .map(|reading| (node, crate::effects::ElementFacts { reading, secure })),
+            None => None,
+        };
+        EffectState { facts, element }
+    }
+
+    /// The element a `ui_action` pressed by `ref`, for the actions that do not
+    /// read their target back themselves. A lookup by `name` is left out: the
+    /// element it means is only known once the action has run.
+    fn effect_element(&self, tool: &str, args: &Value) -> Option<(u64, bool)> {
+        if tool != "ui_action" {
+            return None;
+        }
+        let action = SemanticAction::parse(&snake(args.get("action")?.as_str()?))?;
+        let reads_itself = matches!(
+            action,
+            SemanticAction::Check
+                | SemanticAction::Uncheck
+                | SemanticAction::Toggle
+                | SemanticAction::Increment
+                | SemanticAction::Decrement
+                | SemanticAction::Select
+        );
+        if reads_itself {
+            return None;
+        }
+        let reff = parse_ref(args.get("ref").filter(|v| !v.is_null())?)?;
+        let arena = self.arena.lock().unwrap_or_else(|e| e.into_inner());
+        let info = arena.resolve_latest(&reff).ok()?;
+        Some((info.node_id?, info.secure))
+    }
+
+    /// Wait for the app to react, read the facts again and add what differs
+    /// to the result as `effects`. Adds nothing when nothing differs.
+    async fn attach_effects(&self, env: &mut Envelope, before: EffectState) {
+        let Some(probe) = &self.probe else { return };
+        tokio::time::sleep(std::time::Duration::from_millis(crate::effects::SETTLE_MS)).await;
+        let known = before.facts.overlays.clone().unwrap_or_default();
+        let after = probe.probe(Some(&known)).await;
+        let element_after = match &before.element {
+            Some((node, was)) => self.backend.read_element(*node).await.ok().map(|reading| {
+                crate::effects::ElementFacts {
+                    reading,
+                    secure: was.secure,
+                }
+            }),
+            None => None,
+        };
+        let element = match (&before.element, &element_after) {
+            (Some((_, b)), Some(a)) => Some((b, a)),
+            _ => None,
+        };
+        let Some(fx) = crate::effects::diff_facts(&before.facts, &after, element) else {
+            return;
+        };
+        if let Some(Value::Object(d)) = env.data.as_mut() {
+            d.insert("effects".into(), fx);
+        }
+    }
+
+    // ---- input_steps --------------------------------------------------------
+
+    /// Run a batch. The steps are validated first, all of them, and then each
+    /// goes back through the server's gate (see [`crate::steps`]); nothing here
+    /// runs a step directly.
+    async fn input_steps(&self, args: &Value, ctx: &CallCtx) -> Envelope {
+        use crate::steps::parse_steps;
+        let tool = "input_steps";
+        let own = self.descriptors();
+        let steps = match parse_steps(
+            args,
+            &|t| own.iter().find(|d| d.name == t).map(|d| d.tier),
+            BATCH_TIER,
+        ) {
+            Ok(s) => s,
+            Err(m) => return Envelope::fail(tool, ErrorCode::InvalidArgs, m),
+        };
+        let Some(dispatch) = self.relay.as_ref().and_then(|r| r.get()) else {
+            return Envelope::fail_with(
+                tool,
+                ErrorCode::UnsupportedOs,
+                "input_steps is not connected to this server's gate, so it will not run steps",
+                "call the tools one at a time",
+            );
+        };
+        let since = self.backend.takeover_generation();
+        let started = std::time::Instant::now();
+        let deadline =
+            tokio::time::Instant::now() + std::time::Duration::from_millis(self.batch_ms);
+        let mut rows: Vec<Value> = Vec::with_capacity(steps.len());
+        let mut ran = 0usize;
+        let mut failed: Option<(usize, ErrorCode, String, Option<String>)> = None;
+
+        for (i, step) in steps.iter().enumerate() {
+            // Between steps the batch asks, before the gate does, whether it
+            // should go on at all.
+            let halted = self.halt.as_ref().is_some_and(|h| h());
+            let why = if halted {
+                Some((ErrorCode::Timeout, "the kill switch is engaged"))
+            } else if self.backend.takeover_generation() != since {
+                Some((ErrorCode::Timeout, "a human took over the pointer"))
+            } else if ctx.cancel.is_cancelled() {
+                Some((ErrorCode::Timeout, "the call was cancelled"))
+            } else if tokio::time::Instant::now() >= deadline {
+                Some((
+                    ErrorCode::Timeout,
+                    "the batch ran out of time before this step",
+                ))
+            } else {
+                None
+            };
+            if let Some((code, why)) = why {
+                rows.push(json!({
+                    "i": i, "tool": step.tool, "ok": false, "skipped": true,
+                    "error": { "code": code, "message": why },
+                }));
+                failed = Some((
+                    i,
+                    code,
+                    format!("stopped before step {i} ({}): {why}", step.tool),
+                    Some(format!("steps from {i} on did not run; send them again when it is safe to continue")),
+                ));
+                break;
+            }
+
+            let env = watch(&*dispatch, step, ctx, deadline).await;
+            ran += 1;
+            let mut row = serde_json::Map::new();
+            row.insert("i".into(), json!(i));
+            row.insert("tool".into(), json!(step.tool));
+            if let Some(Value::Object(d)) = &env.data {
+                row.extend(d.clone());
+            }
+            row.insert("ok".into(), json!(env.ok));
+            if let Some(e) = &env.error {
+                row.insert(
+                    "error".into(),
+                    json!({ "code": e.code, "message": e.message }),
+                );
+            }
+            rows.push(Value::Object(row));
+            if !env.ok {
+                let (code, msg, hint) = env
+                    .error
+                    .map_or((ErrorCode::ActionFailed, String::new(), None), |e| {
+                        (e.code, e.message, e.suggestion)
+                    });
+                failed = Some((
+                    i,
+                    code,
+                    format!("step {i} ({}) failed: {msg}", step.tool),
+                    hint,
+                ));
+                break;
+            }
+        }
+
+        let mut data = serde_json::Map::new();
+        data.insert("ran".into(), json!(ran));
+        data.insert("total".into(), json!(steps.len()));
+        if let Some((i, ..)) = &failed {
+            data.insert("failed_at".into(), json!(i));
+        }
+        data.insert(
+            "elapsed_ms".into(),
+            json!(started.elapsed().as_millis() as u64),
+        );
+        data.insert("steps".into(), Value::Array(rows));
+        match failed {
+            None => Envelope::ok(tool, Value::Object(data)),
+            Some((i, code, msg, hint)) => Envelope::fail_with_data(
+                tool,
+                code,
+                msg,
+                hint.unwrap_or_else(|| {
+                    format!("steps before {i} ran; fix step {i} and send it and the rest again")
+                }),
+                Value::Object(data),
+            ),
+        }
     }
 
     // ---- tools --------------------------------------------------------------
@@ -775,6 +1240,98 @@ impl InputModule {
         match self.write_text(tool, &target, node_id, text, secret).await {
             Ok(data) => Envelope::ok(tool, target.annotate(data)),
             Err(e) => e,
+        }
+    }
+
+    /// Select text in an element through the accessibility API and read the
+    /// selection back. The text is read first, so a request made as text or
+    /// as offsets means the same characters on every platform, and the range
+    /// the element reports afterwards must equal the range asked for.
+    async fn select_text(&self, args: &Value) -> Envelope {
+        let tool = "select_text";
+        let spec = match parse_range(args) {
+            Ok(s) => s,
+            Err(m) => return Envelope::fail(tool, ErrorCode::InvalidArgs, m),
+        };
+        let target = match self.resolve(tool, args, Need::Handle).await {
+            Ok(t) => t,
+            Err(e) => return e,
+        };
+        if target.secure {
+            return Envelope::fail(
+                tool,
+                ErrorCode::InvalidArgs,
+                "this is a password field; its text is never read or selected",
+            );
+        }
+        let node_id = target.node_id.unwrap_or_default();
+        let text = match self.backend.read_element(node_id).await {
+            Ok(Reading { value: Some(t), .. }) => t,
+            Ok(_) => {
+                return Envelope::fail_with(
+                    tool,
+                    ErrorCode::ActionFailed,
+                    "the element's text cannot be read, so a range in it cannot be resolved",
+                    "target a text field or text area",
+                )
+            }
+            Err(e) => return input_err(tool, e),
+        };
+        let (start, end) = match resolve(&text, &spec) {
+            Ok(r) => r,
+            Err(m) => return Envelope::fail(tool, ErrorCode::InvalidArgs, m),
+        };
+        let got = match self.backend.select_range(node_id, start, end).await {
+            Ok(g) => g,
+            Err(e) => return input_err(tool, e),
+        };
+        if let Err(m) = judge_selection((start, end), &got) {
+            return Envelope::fail_with(
+                tool,
+                ErrorCode::ActionFailed,
+                m,
+                "the element may snap selections to words or lines, or ignore the request",
+            );
+        }
+        Envelope::ok(tool, target.annotate(selection_data(&got)))
+    }
+
+    /// The text selected in an element, or in the focused one, unchanged.
+    async fn get_selection(&self, args: &Value) -> Envelope {
+        let tool = "get_selection";
+        let aimed = args.get("ref").is_some_and(|v| !v.is_null())
+            || args
+                .get("name")
+                .and_then(Value::as_str)
+                .is_some_and(|n| !n.trim().is_empty());
+        let target = if aimed {
+            match self.resolve(tool, args, Need::Handle).await {
+                Ok(t) => Some(t),
+                Err(e) => return e,
+            }
+        } else {
+            None
+        };
+        if target.as_ref().is_some_and(|t| t.secure) {
+            return Envelope::fail(
+                tool,
+                ErrorCode::InvalidArgs,
+                "this is a password field; its text is never read",
+            );
+        }
+        let node = target.as_ref().map(|t| t.node_id.unwrap_or_default());
+        match self.backend.selection(node).await {
+            Ok(sel) => {
+                let data = selection_data(&sel);
+                Envelope::ok(
+                    tool,
+                    match target {
+                        Some(t) => t.annotate(data),
+                        None => data,
+                    },
+                )
+            }
+            Err(e) => input_err(tool, e),
         }
     }
 
@@ -966,6 +1523,9 @@ impl InputModule {
                 .get("name")
                 .and_then(Value::as_str)
                 .is_some_and(|n| !n.trim().is_empty());
+        if let Some(bg) = self.backend.background_key_target() {
+            return self.type_to_background(args, text, secret, aimed, bg).await;
+        }
         let mut target = None;
         let mut before = None;
         if aimed {
@@ -994,7 +1554,10 @@ impl InputModule {
         }
         let typed = text.chars().count();
         let Some(t) = target else {
-            return Envelope::ok(tool, json!({ "ok": true, "typed": typed }));
+            return Envelope::ok(
+                tool,
+                with_route(json!({ "ok": true, "typed": typed }), Route::Hid),
+            );
         };
         let hide = secret || t.secure;
         let after = if typed == 0 {
@@ -1004,7 +1567,10 @@ impl InputModule {
                 .await
                 .and_then(|r| r.value)
         };
-        let mut data = json!({ "ok": true, "typed": typed });
+        // The element was focused through the accessibility API, but the
+        // characters are posted as system key events, so the app must be
+        // frontmost: this is the HID route.
+        let mut data = with_route(json!({ "ok": true, "typed": typed }), Route::Hid);
         if let Some(a) = &after {
             let changed = before.as_deref() != Some(a.as_str());
             // Typing that left a text field exactly as it was did not land:
@@ -1032,8 +1598,14 @@ impl InputModule {
         Envelope::ok(tool, t.annotate(data))
     }
 
-    async fn keyboard_shortcut(&self, args: &Value) -> Envelope {
+    async fn keyboard_shortcut(&self, args: &Value, since: u64) -> Envelope {
         let tool = "keyboard_shortcut";
+        match shortcut_action(args) {
+            Ok(HoldAction::Press) => {}
+            Ok(HoldAction::Down) => return self.keys_down(args, since).await,
+            Ok(HoldAction::Up) => return self.keys_up(args).await,
+            Err(m) => return Envelope::fail(tool, ErrorCode::InvalidArgs, m),
+        }
         let Some(combo) = args.get("combo").and_then(Value::as_str) else {
             return Envelope::fail(tool, ErrorCode::InvalidArgs, "missing 'combo'");
         };
@@ -1049,9 +1621,384 @@ impl InputModule {
                 )
             }
         };
+        if let Some(bg) = self.backend.background_key_target() {
+            return self.press_in_background(&parsed, bg).await;
+        }
         match self.backend.key_combo(&parsed).await {
-            Ok(()) => Envelope::ok(tool, json!({ "ok": true, "pressed": parsed })),
+            Ok(()) => Envelope::ok(
+                tool,
+                with_route(json!({ "ok": true, "pressed": parsed }), Route::Hid),
+            ),
             Err(e) => input_err(tool, e),
+        }
+    }
+
+    /// The error for a key route that cannot be used while keys are held.
+    /// Held modifiers are applied to the events agentctl posts to the system;
+    /// a per-process event carries none of them, and a route that silently
+    /// dropped Shift would type the wrong thing.
+    fn held_blocks_pid(&self, tool: &str, bg: &BackgroundTarget) -> Option<Envelope> {
+        let held = lock_ledger(&self.ledger).keys.names();
+        if held.is_empty() {
+            return None;
+        }
+        Some(Envelope::fail_with(
+            tool,
+            ErrorCode::ActionFailed,
+            format!(
+                "keys are held down ({}) and '{}' is in the background: held keys are applied \
+                 only to events sent to the frontmost app, so sending to '{}' directly would \
+                 drop them",
+                held.join(", "),
+                bg.name,
+                bg.name
+            ),
+            "release them with keyboard_shortcut action up, or bring the app forward with \
+             focus_app (activate true)",
+        ))
+    }
+
+    /// Wait for the focused element of `pid` to read differently from
+    /// `before`, up to the settle window, and return the last read.
+    async fn focused_after(&self, pid: i32, before: &FocusedText) -> Option<FocusedText> {
+        let mut last = None;
+        for attempt in 0..SETTLE_READS {
+            let Ok(now) = self.backend.read_focused_text(pid).await else {
+                break;
+            };
+            let moved = crate::pid_route::changed(before, &now) != Some(false);
+            last = Some(now);
+            if moved {
+                break;
+            }
+            if attempt + 1 < SETTLE_READS {
+                tokio::time::sleep(SETTLE_GAP).await;
+            }
+        }
+        last
+    }
+
+    /// `keyboard_type` while the pinned app is in the background: per-process
+    /// events, read back, and an error rather than a guess when the read-back
+    /// cannot show the text arrived. Never raises the app, and never falls
+    /// back to the system event stream, which would type into whatever the
+    /// person is using.
+    async fn type_to_background(
+        &self,
+        args: &Value,
+        text: &str,
+        secret: bool,
+        aimed: bool,
+        bg: BackgroundTarget,
+    ) -> Envelope {
+        let tool = "keyboard_type";
+        if let Some(e) = self.held_blocks_pid(tool, &bg) {
+            return e;
+        }
+        let typed = text.chars().count();
+        let mut target = None;
+        if aimed {
+            let t = match self.resolve(tool, args, Need::Handle).await {
+                Ok(t) => t,
+                Err(e) => return e,
+            };
+            // Focus through accessibility, which does not bring the app up;
+            // the keys then land in the element and not wherever the app last
+            // had its caret.
+            if let Err(e) = self
+                .backend
+                .perform(t.node_id.unwrap_or_default(), SemanticAction::Focus, None)
+                .await
+            {
+                return input_err(tool, e);
+            }
+            target = Some(t);
+        }
+        let hide = secret || target.as_ref().is_some_and(|t| t.secure);
+        let before = self
+            .backend
+            .read_focused_text(bg.pid)
+            .await
+            .unwrap_or_default();
+        if typed > 0 {
+            if let Err(e) = self.backend.type_text_to_pid(bg.pid, text).await {
+                return input_err(tool, e);
+            }
+        }
+        let after = if typed == 0 {
+            before.clone()
+        } else {
+            self.focused_after(bg.pid, &before)
+                .await
+                .unwrap_or_default()
+        };
+        match crate::pid_route::judge_typed(&before, &after, text) {
+            crate::pid_route::Delivery::Landed => {
+                let mut data = with_route(
+                    json!({ "ok": true, "typed": typed, "verified": true,
+                            "background_app": bg.name }),
+                    Route::PidEvent,
+                );
+                if !hide {
+                    if let Some(v) = &after.value {
+                        data["value_after"] = json!(v);
+                    }
+                }
+                match target {
+                    Some(t) => Envelope::ok(tool, t.annotate(data)),
+                    None => Envelope::ok(tool, data),
+                }
+            }
+            crate::pid_route::Delivery::NotLanded => Envelope::fail_with(
+                tool,
+                ErrorCode::ActionFailed,
+                format!(
+                    "sent {typed} characters to '{}' without bringing it forward, but its focused \
+                     element did not change: the app dropped them or the field refused them",
+                    bg.name
+                ),
+                BACKGROUND_ALTERNATIVES,
+            ),
+            crate::pid_route::Delivery::Unverifiable => Envelope::fail_with(
+                tool,
+                ErrorCode::ActionFailed,
+                format!(
+                    "sent {typed} characters to '{}' without bringing it forward, but its focused \
+                     element cannot be read back (a password field, or an app with no readable \
+                     text), so it is not known whether they arrived. They may have: check the \
+                     app before typing again",
+                    bg.name
+                ),
+                BACKGROUND_ALTERNATIVES,
+            ),
+        }
+    }
+
+    /// `keyboard_shortcut` press while the pinned app is in the background.
+    /// There is usually no read-back for a chord, so the result says
+    /// `verified: false` unless the focused element visibly changed.
+    async fn press_in_background(&self, combo: &str, bg: BackgroundTarget) -> Envelope {
+        let tool = "keyboard_shortcut";
+        if let Some(e) = self.held_blocks_pid(tool, &bg) {
+            return e;
+        }
+        let before = self.backend.read_focused_text(bg.pid).await.ok();
+        if let Err(e) = self.backend.key_combo_to_pid(bg.pid, combo).await {
+            return input_err(tool, e);
+        }
+        let changed = match &before {
+            Some(b) => self
+                .focused_after(bg.pid, b)
+                .await
+                .and_then(|a| crate::pid_route::changed(b, &a)),
+            None => None,
+        };
+        let verified = changed == Some(true);
+        let mut data = with_route(
+            json!({ "ok": true, "pressed": combo, "verified": verified,
+                    "background_app": bg.name }),
+            Route::PidEvent,
+        );
+        if !verified {
+            data["note"] = json!(format!(
+                "sent to '{}' without bringing it forward; the focused element did not change, \
+                 and a chord has no other read-back, so it is not known that the app acted on \
+                 it. Check its state before relying on it",
+                bg.name
+            ));
+        }
+        Envelope::ok(tool, data)
+    }
+
+    /// `action: "down"`: press the keys and leave them down.
+    ///
+    /// Each key goes in the ledger before it is pressed, so there is no moment
+    /// at which a key is down and nothing knows to release it.
+    async fn keys_down(&self, args: &Value, since: u64) -> Envelope {
+        let tool = "keyboard_shortcut";
+        let Some(combo) = args.get("combo").and_then(Value::as_str) else {
+            return Envelope::fail(
+                tool,
+                ErrorCode::InvalidArgs,
+                "missing 'combo': the key or keys to hold",
+            );
+        };
+        let os = Os::from_platform(self.backend.platform());
+        let keys = match parse_hold(combo, os) {
+            Ok(k) => k,
+            Err(msg) => {
+                return Envelope::fail_with(
+                    tool,
+                    ErrorCode::InvalidArgs,
+                    msg,
+                    "e.g. shift, cmd+shift, a",
+                )
+            }
+        };
+        let (fresh, start_watchdog, limit) = {
+            let mut l = lock_ledger(&self.ledger);
+            if let Err(m) = l.keys.check_room(&keys) {
+                return Envelope::fail(tool, ErrorCode::InvalidArgs, m);
+            }
+            let now = mono_ms();
+            let fresh: Vec<String> = keys
+                .iter()
+                .filter(|k| l.keys.hold(k, now))
+                .cloned()
+                .collect();
+            let start = !l.watching;
+            l.watching = true;
+            (fresh, start, l.keys.ttl_ms())
+        };
+        if start_watchdog {
+            self.spawn_watchdog(since);
+        }
+        for (i, k) in fresh.iter().enumerate() {
+            if let Err(e) = self.backend.key_down(k).await {
+                {
+                    let mut l = lock_ledger(&self.ledger);
+                    for k in &fresh {
+                        l.keys.release(k);
+                    }
+                }
+                // The key that failed may be half down; release it too.
+                release_keys(&*self.backend, &fresh[..=i]).await;
+                return input_err(tool, e);
+            }
+        }
+        if self.backend.takeover_generation() != since {
+            let all = lock_ledger(&self.ledger).keys.take_all();
+            release_keys(&*self.backend, &all).await;
+            return Envelope::fail(
+                tool,
+                ErrorCode::ActionFailed,
+                "a human took over the pointer; held keys were released",
+            );
+        }
+        Envelope::ok(
+            tool,
+            json!({
+                "ok": true,
+                "held": lock_ledger(&self.ledger).keys.names(),
+                "pressed": fresh,
+                "auto_release_ms": limit,
+            }),
+        )
+    }
+
+    /// `action: "up"`: release the named keys, or every held key when none
+    /// is named.
+    async fn keys_up(&self, args: &Value) -> Envelope {
+        let tool = "keyboard_shortcut";
+        let named = match args.get("combo").filter(|v| !v.is_null()) {
+            None => None,
+            Some(c) => {
+                let os = Os::from_platform(self.backend.platform());
+                match c.as_str().map(|c| parse_hold(c, os)) {
+                    Some(Ok(k)) => Some(k),
+                    Some(Err(msg)) => {
+                        return Envelope::fail_with(
+                            tool,
+                            ErrorCode::InvalidArgs,
+                            msg,
+                            "e.g. shift, cmd+shift, a; omit 'combo' to release everything held",
+                        )
+                    }
+                    None => {
+                        return Envelope::fail(
+                            tool,
+                            ErrorCode::InvalidArgs,
+                            "'combo' must be a string",
+                        )
+                    }
+                }
+            }
+        };
+        let (released, not_held) = {
+            let mut l = lock_ledger(&self.ledger);
+            match named {
+                None => (l.keys.take_all(), Vec::new()),
+                Some(keys) => keys.into_iter().partition(|k| l.keys.release(k)),
+            }
+        };
+        let failure = release_keys(&*self.backend, &released).await;
+        if let Some(e) = failure {
+            return input_err(tool, e);
+        }
+        Envelope::ok(
+            tool,
+            json!({
+                "ok": true,
+                "released": released,
+                "not_held": not_held,
+                "held": lock_ledger(&self.ledger).keys.names(),
+            }),
+        )
+    }
+
+    /// Release held keys when the kill switch trips, a human takes the
+    /// pointer, or a key outlives its time limit, until nothing is held.
+    ///
+    /// `baseline` is the takeover generation as read when the first key's call
+    /// began, so a takeover that landed since is seen.
+    fn spawn_watchdog(&self, baseline: u64) {
+        let backend = self.backend.clone();
+        let ledger = self.ledger.clone();
+        let halt = self.halt.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(WATCH_EVERY).await;
+                let reason = release_reason(
+                    halt.as_ref().is_some_and(|h| h()),
+                    backend.takeover_generation() != baseline,
+                );
+                let (keys, done) = {
+                    let mut l = lock_ledger(&ledger);
+                    let keys = match reason {
+                        Some(_) => l.keys.take_all(),
+                        None => l.keys.take_expired(mono_ms()),
+                    };
+                    let done = l.keys.is_empty();
+                    if done {
+                        l.watching = false;
+                    }
+                    (keys, done)
+                };
+                if !keys.is_empty() {
+                    tracing::warn!(
+                        ?keys,
+                        reason = reason.unwrap_or("held past the time limit"),
+                        "releasing held keys"
+                    );
+                    release_keys(&*backend, &keys).await;
+                }
+                if done {
+                    break;
+                }
+            }
+        });
+    }
+
+    /// After a failed call, let go of whatever is held and say so. A held
+    /// Shift that outlives the step it was for changes what the next step
+    /// does, so a failure ends the hold rather than leaving it for a retry
+    /// that no longer means what it did.
+    async fn release_after_failure(&self, env: &mut Envelope) {
+        let keys = lock_ledger(&self.ledger).keys.take_all();
+        if keys.is_empty() {
+            return;
+        }
+        let failure = release_keys(&*self.backend, &keys).await;
+        if let Some(err) = env.error.as_mut() {
+            err.message.push_str(&format!(
+                " (held keys released: {}{})",
+                keys.join(", "),
+                if failure.is_some() {
+                    "; a release failed"
+                } else {
+                    ""
+                }
+            ));
         }
     }
 
@@ -1141,12 +2088,15 @@ impl InputModule {
         };
         match self.backend.mouse(kind, x, y, button, &modifiers).await {
             Ok(()) => {
-                let data = json!({
-                    "ok": true,
-                    "at": { "x": x, "y": y },
-                    "modifiers": modifiers,
-                    "glided": waypoints > 0
-                });
+                let data = with_route(
+                    json!({
+                        "ok": true,
+                        "at": { "x": x, "y": y },
+                        "modifiers": modifiers,
+                        "glided": waypoints > 0
+                    }),
+                    Route::Hid,
+                );
                 Envelope::ok(
                     tool,
                     match target {
@@ -1159,8 +2109,19 @@ impl InputModule {
         }
     }
 
-    async fn scroll(&self, args: &Value) -> Envelope {
+    async fn scroll(&self, args: &Value, cancel: &mcp_types::CancelToken, since: u64) -> Envelope {
         let tool = "scroll";
+        let present = |k: &str| args.get(k).is_some_and(|v| !v.is_null());
+        if let Some(g) = args.get("gesture").filter(|v| !v.is_null()) {
+            let name = g.as_str().map(snake).unwrap_or_default();
+            return match crate::trackpad::gesture_unsupported(&name) {
+                Ok(m) => Envelope::fail(tool, ErrorCode::UnsupportedOs, m),
+                Err(m) => Envelope::fail(tool, ErrorCode::InvalidArgs, m),
+            };
+        }
+        if present("dx") || present("dy") {
+            return self.scroll_pixels(args, cancel, since).await;
+        }
         let Some(dir) = args
             .get("direction")
             .and_then(Value::as_str)
@@ -1187,7 +2148,10 @@ impl InputModule {
         }
         match self.backend.scroll_at(x, y, dir, amount, &modifiers).await {
             Ok(()) => {
-                let data = json!({ "ok": true, "at": { "x": x, "y": y }, "modifiers": modifiers });
+                let data = with_route(
+                    json!({ "ok": true, "at": { "x": x, "y": y }, "modifiers": modifiers }),
+                    Route::Hid,
+                );
                 Envelope::ok(
                     tool,
                     match target {
@@ -1198,6 +2162,142 @@ impl InputModule {
             }
             Err(e) => input_err(tool, e),
         }
+    }
+
+    /// `scroll` with `dx` / `dy`: a trackpad-style gesture of pixel events with
+    /// phases and optional momentum. The schedule is planned first (pure, and
+    /// refused if over the caps) and the events are then posted one by one at
+    /// their times. A gesture left open, with no `ended`, would leave the app
+    /// waiting for a finger that never lifts, so every way out of the loop
+    /// after the first event, a cancel or a person taking the pointer
+    /// included, posts the closing phase before it returns.
+    async fn scroll_pixels(
+        &self,
+        args: &Value,
+        cancel: &mcp_types::CancelToken,
+        since: u64,
+    ) -> Envelope {
+        use crate::trackpad::{plan, Phase};
+        let tool = "scroll";
+        if args.get("direction").is_some_and(|v| !v.is_null())
+            || args.get("amount").is_some_and(|v| !v.is_null())
+        {
+            return Envelope::fail(
+                tool,
+                ErrorCode::InvalidArgs,
+                "give either direction (with amount, in wheel lines) or dx / dy (in pixels), not both",
+            );
+        }
+        let axis = |k: &str| -> Result<i32, String> {
+            match args.get(k).filter(|v| !v.is_null()) {
+                None => Ok(0),
+                Some(_) => i64_arg(args, k)
+                    .and_then(|v| i32::try_from(v).ok())
+                    .ok_or_else(|| format!("'{k}' must be a whole number of pixels")),
+            }
+        };
+        let (dx, dy) = match (axis("dx"), axis("dy")) {
+            (Ok(dx), Ok(dy)) => (dx, dy),
+            (Err(m), _) | (_, Err(m)) => return Envelope::fail(tool, ErrorCode::InvalidArgs, m),
+        };
+        let duration = match args.get("duration_ms").filter(|v| !v.is_null()) {
+            None => None,
+            Some(_) => match u64_arg(args, "duration_ms") {
+                Some(d) => Some(d),
+                None => {
+                    return Envelope::fail(
+                        tool,
+                        ErrorCode::InvalidArgs,
+                        "'duration_ms' must be a whole number of milliseconds",
+                    )
+                }
+            },
+        };
+        let asked_momentum = args
+            .get("momentum")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let momentum = asked_momentum && self.backend.pixel_momentum();
+        let plan = match plan(dx, dy, duration, momentum) {
+            Ok(p) => p,
+            Err(m) => return Envelope::fail(tool, ErrorCode::InvalidArgs, m),
+        };
+        let modifiers = match parse_modifiers(tool, args) {
+            Ok(m) => m,
+            Err(e) => return e,
+        };
+        let ((x, y), target) = match self.parse_point(tool, args).await {
+            Ok(p) => p,
+            Err(e) => return e,
+        };
+        if let Some(deny) = self.clamp_check(tool, x, y) {
+            return deny;
+        }
+        let start = tokio::time::Instant::now();
+        let mut last: Option<Phase> = None;
+        let mut failure: Option<InputError> = None;
+        for ev in &plan.events {
+            tokio::time::sleep_until(start + std::time::Duration::from_millis(ev.at_ms)).await;
+            if last.is_some() {
+                if cancel.is_cancelled() {
+                    failure = Some(InputError::Failed(
+                        "scroll aborted: the call was cancelled".into(),
+                    ));
+                } else if self.backend.takeover_generation() != since {
+                    failure = Some(InputError::Failed(
+                        "scroll aborted: a human took over the pointer".into(),
+                    ));
+                }
+                if failure.is_some() {
+                    break;
+                }
+            }
+            if let Err(e) = self.backend.scroll_pixels(x, y, ev, &modifiers).await {
+                failure = Some(e);
+                break;
+            }
+            last = Some(ev.phase);
+        }
+        if let (Some(phase), Some(_)) = (last, &failure) {
+            if !matches!(phase, Phase::Ended | Phase::MomentumEnded) {
+                let close = crate::trackpad::PixelScroll {
+                    phase: phase.closing(),
+                    dx: 0,
+                    dy: 0,
+                    at_ms: 0,
+                };
+                // Best effort: the error being reported is the first one.
+                let _ = self.backend.scroll_pixels(x, y, &close, &modifiers).await;
+            }
+        }
+        if let Some(e) = failure {
+            return input_err(tool, e);
+        }
+        let mut data = json!({
+            "ok": true,
+            "at": { "x": x, "y": y },
+            "modifiers": modifiers,
+            "dx": plan.body_dx,
+            "dy": plan.body_dy,
+            "events": plan.events.len(),
+            "duration_ms": plan.events.last().map_or(0, |e| e.at_ms),
+            "momentum": momentum,
+            "momentum_dx": plan.momentum_dx,
+            "momentum_dy": plan.momentum_dy,
+        });
+        if asked_momentum && !momentum {
+            data["note"] = json!(
+                "momentum was not sent: on this platform the toolkit coasts a finished gesture itself"
+            );
+        }
+        let data = with_route(data, Route::Hid);
+        Envelope::ok(
+            tool,
+            match target {
+                Some(t) => t.annotate(data),
+                None => data,
+            },
+        )
     }
 
     async fn hover(&self, args: &Value, cancel: &mcp_types::CancelToken, since: u64) -> Envelope {
@@ -1227,7 +2327,10 @@ impl InputModule {
         };
         match self.backend.hover(x, y).await {
             Ok(()) => {
-                let data = json!({ "ok": true, "at": { "x": x, "y": y }, "glided": waypoints > 0 });
+                let data = with_route(
+                    json!({ "ok": true, "at": { "x": x, "y": y }, "glided": waypoints > 0 }),
+                    Route::Hid,
+                );
                 Envelope::ok(
                     tool,
                     match target {
@@ -1242,23 +2345,53 @@ impl InputModule {
 
     async fn drag_drop(&self, args: &Value, since: u64) -> Envelope {
         let tool = "drag_drop";
+        let path = match parse_drag_path(args.get("path")) {
+            Ok(p) => p,
+            Err(m) => return Envelope::fail(tool, ErrorCode::InvalidArgs, m),
+        };
         let from_spec = match endpoint(tool, args, "from") {
             Ok(s) => s,
             Err(e) => return e,
         };
-        let to_spec = match endpoint(tool, args, "to") {
-            Ok(s) => s,
-            Err(e) => return e,
+        // With a path the drag ends at its last point; a second destination
+        // would be one the drag silently ignored.
+        let to_spec = if path.is_empty() {
+            match endpoint(tool, args, "to") {
+                Ok(s) => Some(s),
+                Err(e) => return e,
+            }
+        } else {
+            if let Some(k) = ["to", "to_ref", "to_name", "to_role", "to_x", "to_y"]
+                .into_iter()
+                .find(|k| args.get(k).is_some_and(|v| !v.is_null()))
+            {
+                return Envelope::fail(
+                    tool,
+                    ErrorCode::InvalidArgs,
+                    format!("with 'path', drop '{k}': the drag ends at the last path point"),
+                );
+            }
+            None
         };
         let (from, from_target) = match self.parse_point(tool, &from_spec).await {
             Ok(p) => p,
             Err(e) => return e,
         };
-        let (to, to_target) = match self.parse_point(tool, &to_spec).await {
-            Ok(p) => p,
-            Err(e) => return e,
+        let (to, to_target) = match &to_spec {
+            Some(spec) => match self.parse_point(tool, spec).await {
+                Ok((p, t)) => (Some(p), t),
+                Err(e) => return e,
+            },
+            None => (None, None),
         };
-        for (x, y) in [from, to] {
+        // Waypoints sit in the frame of the start: offsets from the element
+        // when it was named, else absolute, the same as `from` itself.
+        let origin = from_target
+            .as_ref()
+            .and_then(|t| t.bounds)
+            .map_or((0.0, 0.0), |b| (b.x, b.y));
+        let waypoints = drag_waypoints(to, &path, origin);
+        for &(x, y) in std::iter::once(&from).chain(&waypoints) {
             if let Some(deny) = self.clamp_check(tool, x, y) {
                 return deny;
             }
@@ -1269,29 +2402,35 @@ impl InputModule {
         };
         // Enough intermediate moves that a drop target sees motion, capped so a
         // caller cannot turn one gesture into thousands of synthetic events.
-        let steps = u64_arg(args, "steps").unwrap_or(20).clamp(2, 100) as u32;
+        let steps = u64_arg(args, "steps").unwrap_or(20).clamp(2, 100) as usize;
         let hold_ms = u64_arg(args, "hold_ms").unwrap_or(0).min(MAX_HOLD_MS);
+        let route = drag_route(from, &waypoints, steps);
+        let end = *waypoints.last().unwrap_or(&from);
         match self
             .backend
-            .drag(from, to, &modifiers, steps, hold_ms, since)
+            .drag(from, &route, &modifiers, hold_ms, since)
             .await
         {
             Ok(()) => {
-                let end = |p: (f64, f64), t: Option<Target>| match t {
+                let at = |p: (f64, f64), t: Option<Target>| match t {
                     Some(t) => t.annotate(json!({ "x": p.0, "y": p.1 })),
                     None => json!({ "x": p.0, "y": p.1 }),
                 };
-                Envelope::ok(
-                    tool,
+                let mut data = with_route(
                     json!({
                         "ok": true,
-                        "from": end(from, from_target),
-                        "to": end(to, to_target),
-                        "steps": steps,
+                        "from": at(from, from_target),
+                        "to": at(end, to_target),
+                        "steps": route.len(),
                         "hold_ms": hold_ms,
                         "modifiers": modifiers,
                     }),
-                )
+                    Route::Hid,
+                );
+                if !path.is_empty() {
+                    data["waypoints"] = json!(path.len());
+                }
+                Envelope::ok(tool, data)
             }
             Err(e) => input_err(tool, e),
         }
@@ -1378,12 +2517,34 @@ impl InputModule {
     }
 }
 
+/// What to offer when keys sent to a background app cannot be shown to have
+/// arrived. Not the system event stream: that is the route that takes over
+/// the person's keyboard, and an automatic fallback to it would do so unasked.
+const BACKGROUND_ALTERNATIVES: &str = "set_value writes the field through accessibility and works \
+    in the background; or bring the app forward with focus_app (activate true) and type again, \
+    which is refused under foreground = \"never\"";
+
 /// How many candidates a failed name lookup offers.
 const MAX_CANDIDATES: usize = 5;
 /// Reads while waiting for an app to apply a change, and the gap between
 /// them: about 0.4s in all, enough for a run-loop turn or two.
 const SETTLE_READS: usize = 10;
 const SETTLE_GAP: std::time::Duration = std::time::Duration::from_millis(40);
+/// The points a drag passes through after the press: its `path` shifted by
+/// `origin`, else just the destination.
+fn drag_waypoints(
+    to: Option<(f64, f64)>,
+    path: &[(f64, f64)],
+    origin: (f64, f64),
+) -> Vec<(f64, f64)> {
+    if path.is_empty() {
+        return to.into_iter().collect();
+    }
+    path.iter()
+        .map(|p| (origin.0 + p.0, origin.1 + p.1))
+        .collect()
+}
+
 /// Longest a drag may hold the button before moving.
 const MAX_HOLD_MS: u64 = 2_000;
 
@@ -1416,6 +2577,10 @@ struct Target {
     secure: bool,
     /// For a lookup by name: how many elements matched as well as this one.
     matches: Option<usize>,
+    /// The application the snapshot holding this element is of. A ref belongs
+    /// to one application, which need not be the frontmost one, so a result
+    /// says which it acted in.
+    app: Option<String>,
 }
 
 impl Target {
@@ -1445,6 +2610,7 @@ impl Target {
             name: info.name.clone(),
             secure: info.secure,
             matches,
+            app: None,
         })
     }
 
@@ -1454,6 +2620,9 @@ impl Target {
         let mut extra = json!({ "ref": self.reff });
         if let Some(n) = self.matches {
             extra["matches"] = json!(n);
+        }
+        if let Some(app) = &self.app {
+            extra["app"] = json!(app);
         }
         merge(data, extra)
     }
@@ -1467,6 +2636,102 @@ fn merge(mut base: Value, extra: Value) -> Value {
         }
     }
     base
+}
+
+/// A selection as a result reports it. The text is echoed up to a limit, so
+/// selecting a whole document does not put the document in the result.
+fn selection_data(sel: &Selection) -> Value {
+    let (text, truncated) = clip_echo(&sel.text);
+    let mut data = with_route(
+        json!({
+            "ok": true,
+            "start": sel.start,
+            "end": sel.end,
+            "length": sel.end.saturating_sub(sel.start),
+            "text": text,
+        }),
+        Route::Ax,
+    );
+    if truncated {
+        data["truncated"] = json!(true);
+    }
+    if let Some(role) = &sel.role {
+        data["role"] = json!(role);
+    }
+    data
+}
+
+/// A non-negative whole number argument, as a number or a numeric string.
+fn index_arg(args: &Value, key: &str) -> Result<Option<usize>, String> {
+    let Some(v) = args.get(key).filter(|v| !v.is_null()) else {
+        return Ok(None);
+    };
+    match as_f64(v) {
+        Some(n) if n >= 0.0 && n.fract() == 0.0 && n <= 1e9 => Ok(Some(n as usize)),
+        _ => Err(format!("'{key}' must be a whole number, 0 or more")),
+    }
+}
+
+/// A non-empty string argument.
+fn str_arg<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
+    args.get(key)
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+}
+
+/// Which text `select_text` was asked for. Exactly one of `all`,
+/// `start`+`end`, `text` (with `occurrence`), or `from_text`+`to_text`: two
+/// ways at once would mean one of them was silently ignored.
+fn parse_range(args: &Value) -> Result<RangeSpec, String> {
+    const HELP: &str = "give one of: all, start and end, text, or from_text and to_text";
+    let all = args.get("all").and_then(Value::as_bool).unwrap_or(false);
+    let start = index_arg(args, "start")?;
+    let end = index_arg(args, "end")?;
+    let text = str_arg(args, "text");
+    let from = str_arg(args, "from_text");
+    let to = str_arg(args, "to_text");
+    let occurrence = index_arg(args, "occurrence")?;
+    let ways = [
+        all,
+        start.is_some() || end.is_some(),
+        text.is_some(),
+        from.is_some() || to.is_some(),
+    ];
+    match ways.iter().filter(|w| **w).count() {
+        0 => return Err(format!("nothing to select: {HELP}")),
+        1 => {}
+        _ => return Err(format!("more than one way to choose the text: {HELP}")),
+    }
+    if occurrence.is_some() && text.is_none() {
+        return Err("'occurrence' goes with 'text'".into());
+    }
+    if all {
+        return Ok(RangeSpec::All);
+    }
+    if start.is_some() || end.is_some() {
+        return match (start, end) {
+            (Some(start), Some(end)) => Ok(RangeSpec::Offsets { start, end }),
+            _ => Err("'start' and 'end' go together".into()),
+        };
+    }
+    if let Some(needle) = text {
+        return Ok(RangeSpec::Text {
+            needle: needle.to_string(),
+            occurrence: occurrence.unwrap_or(1),
+        });
+    }
+    match (from, to) {
+        (Some(f), Some(t)) => Ok(RangeSpec::Between {
+            from: f.to_string(),
+            to: t.to_string(),
+        }),
+        _ => Err("'from_text' and 'to_text' go together".into()),
+    }
+}
+
+/// `data` with the route that acted on the UI, as `input`.
+fn with_route(data: Value, route: Route) -> Value {
+    merge(data, json!({ "input": route.as_str() }))
 }
 
 /// `Double-Click` and `double click` as `double_click`.
@@ -1641,17 +2906,179 @@ fn expect_schema() -> serde_json::Value {
     )
 }
 
+/// Marks a batch as holding the loan for as long as it lives.
+struct BatchLoan<'a>(&'a std::sync::atomic::AtomicBool);
+
+impl<'a> BatchLoan<'a> {
+    fn begin(flag: &'a std::sync::atomic::AtomicBool) -> Self {
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        BatchLoan(flag)
+    }
+}
+
+impl Drop for BatchLoan<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl InputModule {
+    /// `foreground = "polite"`: a call that needs the pointer, keyboard or
+    /// foreground waits for the person to be idle, borrows the desk, and gives
+    /// it back on every path out, including an error and a cancelled call
+    /// (the loan's `Drop`). A batch borrows once for all its steps and gives
+    /// back once at the end; a person who takes the pointer part way ends the
+    /// action with a retryable error, and the pointer is left with them.
+    async fn call_politely(&self, name: &str, args: Value, ctx: &CallCtx) -> Envelope {
+        use crate::polite::Loan;
+        if let Some(why) = crate::foreground::polite_refusal(name, &args) {
+            return Envelope::fail_with(
+                name,
+                ErrorCode::PolicyDenied,
+                why,
+                "press the key instead, or hold it with the foreground setting at allow",
+            );
+        }
+        // A step of a batch that has already borrowed: the batch settles up.
+        if name != "input_steps" && self.batch_loan.load(std::sync::atomic::Ordering::SeqCst) {
+            return self.run_call(name, args, ctx).await;
+        }
+        if !crate::foreground::takes_foreground(&*self.backend, name, &args) {
+            return self.run_call(name, args, ctx).await;
+        }
+        let halt = self.halt.clone();
+        let cancel = ctx.cancel.clone();
+        let loan = match Loan::borrow(self.backend.clone(), self.policy.polite, move || {
+            if halt.as_ref().is_some_and(|h| h()) {
+                Some("the kill switch is engaged")
+            } else if cancel.is_cancelled() {
+                Some("the call was cancelled")
+            } else {
+                None
+            }
+        })
+        .await
+        {
+            Ok(l) => l,
+            Err(e) => return e.envelope(name),
+        };
+        let _batch = (name == "input_steps").then(|| BatchLoan::begin(&self.batch_loan));
+        let since = self.backend.takeover_generation();
+        let env = self.run_call(name, args, ctx).await;
+        crate::polite::settle(loan, &*self.backend, since, env).await
+    }
+
+    /// The call itself, once the foreground setting has had its say.
+    async fn run_call(&self, name: &str, args: Value, ctx: &CallCtx) -> Envelope {
+        // Read before anything can await: a takeover from here on is this
+        // call's to honour, whenever its first pointer move happens to be.
+        let since = self.backend.takeover_generation();
+
+        // Held for the whole call, including any `expect` wait: the pointer is
+        // ours for that entire window, so a divergence during it is somebody
+        // else's hand.
+        // Watching a person is not driving: a recording call must not arm the
+        // human-override watcher, whose point is that the person's hand on the
+        // mouse is the agent's cue to stop, not what is being recorded.
+        let _driving = (name != "desktop_record")
+            .then(|| self.activity.as_ref().map(crate::Activity::begin))
+            .flatten();
+
+        // An `expect` clause is parsed *before* the action: discovering the
+        // expectation was malformed after clicking is too late to be useful.
+        let spec = if EXPECTING.contains(&name) {
+            match crate::postcondition::Verifier::parse(name, &args) {
+                Ok(s) => s,
+                Err(e) => return *e,
+            }
+        } else {
+            None
+        };
+        if spec.is_some() && self.verifier.is_none() {
+            return Envelope::fail_with(
+                name,
+                ErrorCode::UnsupportedOs,
+                "postconditions need a UI to observe, and none is wired on this platform",
+                "drop 'expect' and confirm separately with wait_for",
+            );
+        }
+        // The comparison point has to be captured before the action, not after.
+        let before = match (&spec, self.verifier.as_ref()) {
+            (Some(_), Some(v)) => v.before(),
+            _ => None,
+        };
+        // `effects` is validated with the rest of the arguments, so a typo is
+        // refused before the action instead of discovered after it. An `expect`
+        // brings its own delta, which makes the second report redundant.
+        let reporting = if EFFECTING.contains(&name) {
+            match crate::effects::wanted(&args) {
+                Ok(on) => on && spec.is_none() && effects_apply(name, &args),
+                Err(m) => return Envelope::fail(name, ErrorCode::InvalidArgs, m),
+            }
+        } else {
+            false
+        };
+        let seen_before = match (&self.probe, reporting) {
+            (Some(_), true) => Some(self.facts_before(name, &args).await),
+            _ => None,
+        };
+
+        let mut env = match name {
+            "ui_action" => self.ui_action(&args).await,
+            "set_value" => self.set_value(&args).await,
+            "select_text" => self.select_text(&args).await,
+            "get_selection" => self.get_selection(&args).await,
+            "ui_fill_form" => self.ui_fill_form(&args).await,
+            "keyboard_type" => self.keyboard_type(&args).await,
+            "keyboard_shortcut" => self.keyboard_shortcut(&args, since).await,
+            "mouse_action" => self.mouse_action(&args, &ctx.cancel, since).await,
+            "scroll" => self.scroll(&args, &ctx.cancel, since).await,
+            "hover" => self.hover(&args, &ctx.cancel, since).await,
+            "drag_drop" => self.drag_drop(&args, since).await,
+            "clipboard_read" => self.clipboard_read(&args).await,
+            "clipboard_write" => self.clipboard_write(&args).await,
+            "input_showcase" => self.input_showcase(&args).await,
+            "input_steps" => self.input_steps(&args, ctx).await,
+            "desktop_record" => self.desktop_record(&args).await,
+            "desktop_flow" => self.desktop_flow(&args, ctx).await,
+            other => Envelope::fail(other, ErrorCode::InvalidArgs, "unknown tool"),
+        };
+        if let (Some(before), true) = (seen_before, env.ok) {
+            self.attach_effects(&mut env, before).await;
+        }
+
+        let mut env = match (spec, self.verifier.as_ref()) {
+            (Some(spec), Some(v)) => {
+                let verified = v.verify(&spec, before, ctx).await;
+                crate::postcondition::attach(env, name, verified)
+            }
+            _ => env,
+        };
+        // `down` and `up` settle their own holds, and so does each step of a
+        // batch: one that reached the module and failed has released them, and
+        // one the gate refused never touched them, as when called alone.
+        let manages_holds = name == "input_steps"
+            || name == "desktop_flow"
+            || (name == "keyboard_shortcut"
+                && !matches!(shortcut_action(&args), Ok(HoldAction::Press) | Err(_)));
+        if !env.ok && !manages_holds {
+            self.release_after_failure(&mut env).await;
+        }
+        env
+    }
+}
+
 #[async_trait]
 impl ToolModule for InputModule {
     fn descriptors(&self) -> Vec<ToolDescriptor> {
-        vec![
+        let mut tools = vec![
             ToolDescriptor::new(
                 "ui_action",
                 Category::Input,
                 Tier::Standard,
-                "Perform a semantic action on an element by ref or name (accessibility action, no cursor). select with option chooses a popup or combo box entry by its text.",
+                "Perform a semantic action on an element by ref or name (accessibility action, no cursor, app need not be frontmost). select with option chooses a popup or combo box entry by its text. An action the element does not offer is an error naming the ones it does.",
                 target_schema(json!({
-                    "action":{"type":"string","enum":["click","double_click","right_click","focus","toggle","check","uncheck","expand","collapse","select","scroll_into_view"]},
+                    "action":{"type":"string","enum":["click","double_click","right_click","focus","toggle","check","uncheck","expand","collapse","select","scroll_into_view","show_menu","increment","decrement","pick"]},
                     "option":{"type":"string","description":"entry text for select"},
                     "expect": expect_schema()
                 }), &["action"]),
@@ -1666,7 +3093,21 @@ impl ToolModule for InputModule {
                 `check`, `uncheck` and `toggle` read the state first (checking a checked box changes nothing) and \
                 again afterwards, and report `checked` and `changed`; a press that did not take is an error.\n\n\
                 macOS opens a popup button with the accessibility press and presses its menu item; a combo box takes \
-                the text. Linux invokes the combo box's menu or list item through AT-SPI."),
+                the text. Linux invokes the combo box's menu or list item through AT-SPI.\n\n\
+                `show_menu` opens the element's context menu (AXShowMenu) without a right click, `increment` and \
+                `decrement` take one step on a slider, stepper or scroll bar and report `value_after` and `changed` \
+                (`changed: false` means the control is at its limit or ignored the step), `pick` picks the element \
+                in a list or picker (AXPick), and `scroll_to_visible` is accepted for `scroll_into_view`. On macOS \
+                these four are checked against the element's own action list first, so an element that lacks one \
+                gets an error listing what it does support, never an `ok`. Linux has no context-menu action: \
+                `show_menu` looks for a menu or popup action on the element and otherwise says what it has; \
+                `increment` and `decrement` move an AT-SPI Value by its minimum increment, clamped to its range.\n\n\
+                Every result carries `input`: `ax` when the accessibility API acted (no pointer, the app can stay \
+                in the background) `pid_event` for keys sent to one background process (`keyboard_type`, `keyboard_shortcut`), or `hid` when \
+                synthetic system input was needed (the real cursor moved). \
+                `right_click` and `double_click` are an accessibility press on macOS, which has no distinct \
+                double or secondary press; on Linux `right_click` clicks at the element's centre, so it is `hid`. \
+                `input` is absent when nothing needed doing (checking a checked box)."),
             ToolDescriptor::new(
                 "set_value",
                 Category::Input,
@@ -1682,6 +3123,46 @@ impl ToolModule for InputModule {
                 than what was written (a number field turning 1000 into 1,000 is fine). A field that keeps its old \
                 value and does not show the new text is an error, not an `ok`. `verified: false` means the platform \
                 could not read the value back."),
+            ToolDescriptor::new(
+                "select_text",
+                Category::Input,
+                Tier::Standard,
+                "Select text in a text field or text area by ref or name, through the accessibility API (no drag, no focus needed), and read the selection back. Give one of: all; start and end (character offsets); text (with occurrence); from_text and to_text.",
+                target_schema(json!({
+                    "all":{"type":"boolean","description":"select everything"},
+                    "start":{"type":"integer","description":"first character offset, from 0"},
+                    "end":{"type":"integer","description":"offset after the last character; equal to start places the caret"},
+                    "text":{"type":"string","description":"select this text"},
+                    "occurrence":{"type":"integer","description":"which match of text, from 1 (default 1)"},
+                    "from_text":{"type":"string","description":"select from the start of this text..."},
+                    "to_text":{"type":"string","description":"...to the end of the next match of this"},
+                    "expect": expect_schema()}), &[]),
+            ).idempotent(true).details(TARGET_DETAILS.to_string() + "\n\n\
+                Offsets count characters (Unicode scalar values) from 0 with `end` exclusive, on every platform: \
+                a combining accent is its own character, and a character outside the Basic Multilingual Plane is \
+                one, not two. `text` matches exactly (case and accents count), non-overlapping, and `occurrence` \
+                picks the Nth. `from_text`/`to_text` select from the start of the first `from_text` through the end \
+                of the first `to_text` that follows it. The element's text is read first and the request is \
+                resolved against it.\n\n\
+                The result carries `start`, `end`, `length` and `text` as the element reports them after the \
+                change (`text` is cut at 2000 characters, with `truncated`), and `input: ax`. If the element \
+                reports a different range than was asked for (some editors snap to words or ignore the request), \
+                the call fails and says what it reports. macOS sets `AXSelectedTextRange`; an element where that \
+                is not settable is an `UNSUPPORTED_OS` error. There is no pointer fallback: dragging to select is \
+                not attempted, so use `drag_drop` or shift-click with `mouse_action` for those. Linux uses the \
+                AT-SPI Text interface (`set_selection`). Password fields are refused. Which apps honour the \
+                selection has not been verified beyond TextEdit."),
+            ToolDescriptor::new(
+                "get_selection",
+                Category::Input,
+                Tier::Standard,
+                "Read the text selected in an element (ref or name), or in the focused element when none is given, without changing it.",
+                target_schema(json!({}), &[]),
+            ).details(TARGET_DETAILS.to_string() + "\n\n\
+                Returns `start`, `end` (character offsets, as in `select_text`), `length`, `text` (cut at 2000 \
+                characters, with `truncated`) and `role`; a caret with nothing selected is `length: 0`. Without a \
+                target it reads the focused element of the app being driven (macOS only; on Linux give a ref). \
+                Password fields are refused."),
             ToolDescriptor::new(
                 "ui_fill_form",
                 Category::Input,
@@ -1722,7 +3203,7 @@ impl ToolModule for InputModule {
                 "keyboard_type",
                 Category::Input,
                 Tier::Standard,
-                "Type Unicode text into the focused window. If a target (ref or name) is given, focus it first and read its value back. Does not press return. Set 'secret' when typing a password so it is kept out of the audit log and never sent to the judge.",
+                "Type Unicode text into the focused window. If a target (ref or name) is given, focus it first and read its value back. Does not press return. When the app pinned with focus_app is not frontmost, the text is sent to that app directly (input \"pid_event\") without raising it. Set 'secret' when typing a password so it is kept out of the audit log and never sent to the judge.",
                 target_schema(json!({
                     "text":{"type":"string"},
                     "secret":{"type":"boolean","description":"the text is a password or other secret: keep it out of the audit log and never send it to the judge"},
@@ -1731,14 +3212,24 @@ impl ToolModule for InputModule {
                 With a target, the element's value is read before and after. The result carries `value_after` \
                 (never for a `secret` or a password field) and `changed`; typing into a text field that then shows \
                 the same value is an error. Without a target, the keystrokes go wherever focus is and nothing is \
-                read back."),
+                read back.\n\n\
+                When the app pinned with `focus_app` is not the frontmost one (pin it with `activate: false`), \
+                the text is sent to that process with per-process key events, so it does not bring the app \
+                forward and the frontmost app receives nothing. The result's `input` is `pid_event` and \
+                `verified: true` means the app's focused element changed as typed. Some apps drop these events \
+                while they are in the background; then the call is an error that says so (or that delivery \
+                could not be read back, for a password field or an app with no readable text) and does not \
+                retry through the foreground. Use `set_value` for those, or `focus_app` with `activate: true` \
+                and type again. Not available on Linux, where keys always go to the focused window. It is \
+                refused while keys are held with `keyboard_shortcut` `down`."),
             ToolDescriptor::new(
                 "keyboard_shortcut",
                 Category::Input,
                 Tier::Standard,
-                "Press a key or chord, e.g. Return, Escape, cmd+s, Control+A, cmd+shift+z.",
+                "Press a key or chord, e.g. Return, Escape, cmd+s, Control+A, cmd+shift+z. action down holds keys (e.g. shift across several clicks) until action up; held keys auto-release after 30 s.",
                 json!({"type":"object","properties":{"combo":{"type":"string"},
-                    "expect": expect_schema()},"required":["combo"]}),
+                    "action":{"type":"string","enum":["press","down","up"],"description":"press (default) taps the chord; down holds the key or modifiers; up releases them (no combo: everything held)"},
+                    "expect": expect_schema()},"required":[]}),
             ).details("Modifiers then exactly one key, joined by `+` (or `-` when there is no `+`). Case does not \
                 matter: `Control+A`, `ctrl-a` and `CTRL+a` are one chord. Modifiers: cmd/command, ctrl/control, \
                 shift, alt/opt/option, fn, super/meta/win; `mod` (also `cmdorctrl`, `primary`) is Command on macOS \
@@ -1748,7 +3239,24 @@ impl ToolModule for InputModule {
                 punctuation as the character or its name (minus, equal, plus, comma, period, slash, backslash, \
                 semicolon, quote, grave, leftbracket, rightbracket), and a literal `+` as `plus` or a trailing \
                 `cmd++`. More than one key is an error, never a silent drop. The result's `pressed` is the \
-                canonical chord that was sent."),
+                canonical chord that was sent.\n\n\
+                `action: \"down\"` takes the same names but also a lone modifier (`shift`, `cmd+shift`) or one key, \
+                and leaves them down across later calls: every click, drag, scroll and chord until the matching \
+                `action: \"up\"` carries the held modifiers, whatever `modifiers` the call itself names. Holding \
+                a key already held renews its time limit and presses nothing. At most 6 keys are held at once. \
+                A key is released by `up` (with no `combo`, all of them), after 30 s unless renewed (the result's \
+                `auto_release_ms`), when any other input call fails (the error says so), when the kill switch \
+                trips or a human takes the mouse, and when the server stops. `keyboard_type` ignores held \
+                modifiers: the text carries its own case. On macOS a held modifier is applied to the events \
+                agentctl posts and is not a physical key press, so it cannot stay latched in the system; \
+                other software that polls the keyboard state does not see it. On Linux it is a real key press.\n\n\
+                A chord pressed while the app pinned with `focus_app` is in the background is sent to that \
+                process (`input` is `pid_event`) and does not bring it forward. Text-editing chords such as \
+                `shift+left` arrive; menu key equivalents such as `cmd+a` and `cmd+s` were not delivered to \
+                TextEdit this way. A chord has no read-back, so the result's `verified` is `true` only when \
+                the focused element visibly changed and `false` otherwise, with a `note`: `false` means \
+                not known, not that it failed. `action: \"down\"` and `up` always use the frontmost app \
+                (and `down` brings a pinned app forward); a pid press is refused while keys are held."),
             ToolDescriptor::new(
                 "mouse_action",
                 Category::Input,
@@ -1773,19 +3281,35 @@ impl ToolModule for InputModule {
                 "scroll",
                 Category::Input,
                 Tier::Standard,
-                "Scroll at an element (ref or name) or a point. 'modifiers' holds keys down for the wheel, e.g. [\"cmd\"] or [\"ctrl\"] to zoom.",
+                "Scroll at an element (ref or name) or a point: wheel lines by 'direction', or smooth trackpad-style pixels by 'dx'/'dy' with optional momentum. 'modifiers' holds keys down for the wheel, e.g. [\"cmd\"] or [\"ctrl\"] to zoom.",
                 target_schema(json!({
                     "x":{"type":"number","description":"screen x, or offset from the element's left"},
                     "y":{"type":"number","description":"screen y, or offset from the element's top"},
                     "direction":{"type":"string","enum":["up","down","left","right","page_up","page_down"]},
                     "amount":{"type":"integer","description":"wheel lines (default 3); a page is ten lines"},
-                    "modifiers":{"type":"array","items":{"type":"string","enum":["cmd","shift","opt","alt","ctrl","fn"]}}}), &["direction"]),
+                    "dx":{"type":"integer","description":"smooth scroll right by this many pixels (negative: left); with dy, used instead of direction and amount"},
+                    "dy":{"type":"integer","description":"smooth scroll down by this many pixels (negative: up)"},
+                    "duration_ms":{"type":"integer","description":"how long the fingers-down part takes with dx/dy (default 250, at most 3000)"},
+                    "momentum":{"type":"boolean","description":"with dx/dy, keep coasting after release as a flick does (macOS)"},
+                    "gesture":{"type":"string","enum":["pinch","rotate","swipe"],"description":"always UNSUPPORTED_OS; the error names the working equivalent"},
+                    "modifiers":{"type":"array","items":{"type":"string","enum":["cmd","shift","opt","alt","ctrl","fn"]}}}), &[]),
             ).details(TARGET_DETAILS.to_string() + "\n\n\
                 With a target, `x` and `y` are offsets from the element's top-left (default its centre); without \
                 one they are absolute screen coordinates. `modifiers` takes the same names as `mouse_action` and \
                 `drag_drop` and is held for the whole gesture: `[\"cmd\"]` (macOS) or `[\"ctrl\"]` zooms in most \
                 documents, maps and canvases, `[\"shift\"]` scrolls sideways where an app binds it. The result's \
-                `modifiers` is what was held."),
+                `modifiers` is what was held.\n\n\
+                Give `direction` (with `amount`) for wheel lines, or `dx` and/or `dy` for a smooth trackpad scroll in \
+                pixels (positive is right and down). That sends a stream of pixel events with gesture phases \
+                (began, changed, ended) over `duration_ms`, and with `momentum: true` the coast of a flick after \
+                release. Caps: 10000 px per axis, 3000 ms, momentum at most 3000 px and 60 events; over them is \
+                INVALID_ARGS. The deltas sum exactly to the request; the result's `dx`, `dy`, `events` and \
+                `momentum_dx` / `momentum_dy` say what was sent. Either form moves the real pointer to the target, so \
+                `foreground = \"never\"` refuses it (use `ui_action scroll_into_view`, or increment / decrement on a \
+                scroll bar) and `polite` waits for the person to be idle. Pinch, rotate and swipe have no public \
+                system API to synthesise and are not attempted: `gesture` returns UNSUPPORTED_OS naming the app's own \
+                command (zoom: `cmd+plus` / `cmd+minus` or ctrl-scroll; rotate: its menu item; swipe: back / forward \
+                shortcut, or `ctrl+left` / `ctrl+right` between spaces)."),
             ToolDescriptor::new(
                 "hover",
                 Category::Input,
@@ -1812,12 +3336,19 @@ impl ToolModule for InputModule {
                     "to_ref":{"type":"string"},"to_name":{"type":"string"},"to_x":{"type":"number"},"to_y":{"type":"number"},
                     "steps":{"type":"integer","description":"intermediate moves, 2-100 (default 20)"},
                     "hold_ms":{"type":"integer","description":"hold the button this long before moving, 0-2000"},
+                    "path":{"type":"array","description":"up to 200 waypoints to pass through in order, releasing at the last; replaces 'to'. Offsets from the 'from' element's top-left when it is a ref/name, else screen points","items":{"type":"object","properties":{"x":{"type":"number"},"y":{"type":"number"}}}},
                     "modifiers":{"type":"array","items":{"type":"string","enum":["cmd","shift","opt","alt","ctrl","fn"]}}},
                     "required":[]}),
             ).details("Each end is `from`/`to` as an object (`{ref}`, `{name}` with an optional `role`, or \
                 `{x, y}`), or the flat `from_ref`/`from_x`/... spelling. With a ref or name, `x` and `y` are offsets \
                 in points from the element's top-left (default its centre); otherwise absolute screen coordinates. \
-                Both points are checked against the allowed window bounds. `hold_ms` keeps the button down before \
+                Both points are checked against the allowed window bounds. `path` is up to 200 waypoints `{x, y}` \
+                (the same argument as `browser_act drag`) for brush strokes and freehand shapes: the drag presses at \
+                `from`, passes through each waypoint in order and releases at the last, so give no `to`. Waypoints \
+                are in the frame of `from`: offsets from its top-left when it is a ref or name, else absolute \
+                screen points. `steps` moves are spread over the segments by length, at least one landing on every \
+                waypoint; every waypoint is checked against the allowed window bounds before anything moves. The \
+                result's `waypoints` is the number of path points and `steps` the moves made. `hold_ms` keeps the button down before \
                 the first move, for drag sources (Finder icons, list rows) that wait to tell a drag from a click."),
             ToolDescriptor::new(
                 "clipboard_read",
@@ -1848,66 +3379,205 @@ impl ToolModule for InputModule {
                     "speed":{"type":"string","enum":["cinematic","demo","snappy","instant","off"],"description":"speed preset (cinematic: 350ms, demo: 200ms, snappy: 100ms, instant: 0ms)"},
                     "duration_ms":{"type":"integer","description":"custom duration in milliseconds, 0-2000"}}}),
             ).idempotent(true),
-        ]
+            ToolDescriptor::new(
+                "input_steps",
+                Category::Input,
+                BATCH_TIER,
+                "Run up to 20 input actions in one call, in order, stopping at the first that fails. Each step is {tool, args}: the tool's name and the arguments you would give it alone. Every step is checked, allowed and logged exactly as if you had called it yourself.",
+                json!({"type":"object","properties":{
+                    "steps":{"type":"array","description":"actions to run in order (max 20)","items":{"type":"object","properties":{
+                        "tool":{"type":"string","enum":crate::steps::BATCHABLE},
+                        "args":{"type":"object","description":"the tool's own arguments"}
+                    },"required":["tool"]}}
+                },"required":["steps"]}),
+            ).details(BATCH_DETAILS),
+            ToolDescriptor::new(
+                "desktop_record",
+                Category::Input,
+                Tier::Dangerous,
+                "Watch a person demonstrate a task and turn it into a desktop_flow: start, stop (name saves it) or status. Keeps what was clicked or typed as what it was (role, title, ancestry), never typed secrets. Only allowed_apps; bounded in time and size. Dangerous tier.",
+                json!({"type":"object","properties":{
+                    "action":{"type":"string","enum":["start","stop","status"],"description":"default status"},
+                    "name":{"type":"string","description":"stop: flow name to save"},
+                    "max_seconds":{"type":"integer","description":"start: stop listening after this long (default 120, at most 600)"}}}),
+            ).details(RECORD_DETAILS),
+            ToolDescriptor::new(
+                "desktop_flow",
+                Category::Input,
+                BATCH_TIER,
+                "Keep and replay recorded desktop flows: list, get, save, delete, run (name, secrets). Run finds each step's element by role, title and ancestry and performs it through the normal tools, so policy and audit see every step; stops at the first failure.",
+                json!({"type":"object","properties":{
+                    "action":{"type":"string","enum":["list","get","save","delete","run"],"description":"default list"},
+                    "name":{"type":"string","description":"the flow"},
+                    "steps":{"type":"array","description":"save: the steps, as desktop_flow get shows them","items":{"type":"object"}},
+                    "secrets":{"type":"object","description":"run: values for the flow's secret_refs, used in memory only"}}}),
+            ).details(FLOW_DETAILS),
+        ];
+        // The same optional switch on every tool that reports `effects`, added
+        // here so the wording cannot drift between them.
+        for t in tools
+            .iter_mut()
+            .filter(|t| EFFECTING.contains(&t.name.as_str()))
+        {
+            if let Some(props) = t
+                .input_schema
+                .get_mut("properties")
+                .and_then(Value::as_object_mut)
+            {
+                props.insert(
+                    "effects".into(),
+                    json!({"type":"boolean","description":"false: do not report what changed (saves a short wait)"}),
+                );
+            }
+            // The full account once, on the tool an agent reaches for first.
+            let fx = if t.name == "ui_action" {
+                EFFECTS_DETAILS
+            } else {
+                EFFECTS_SEE_ALSO
+            };
+            t.details = Some(match t.details.take() {
+                Some(d) => format!("{d}\n\n{fx}"),
+                None => fx.to_string(),
+            });
+        }
+        tools
     }
 
     async fn call(&self, name: &str, args: Value, ctx: &CallCtx) -> Envelope {
-        // Read before anything can await: a takeover from here on is this
-        // call's to honour, whenever its first pointer move happens to be.
-        let since = self.backend.takeover_generation();
-
-        // Held for the whole call, including any `expect` wait: the pointer is
-        // ours for that entire window, so a divergence during it is somebody
-        // else's hand.
-        let _driving = self.activity.as_ref().map(crate::Activity::begin);
-
-        // An `expect` clause is parsed *before* the action: discovering the
-        // expectation was malformed after clicking is too late to be useful.
-        let spec = if EXPECTING.contains(&name) {
-            match crate::postcondition::Verifier::parse(name, &args) {
-                Ok(s) => s,
-                Err(e) => return *e,
+        // First, before the activity marker, the `expect` parse or a snapshot:
+        // a refused call must not have touched anything, not even to look.
+        if self.policy.foreground.is_never() {
+            if let Some(refusal) = crate::foreground::tool_refusal(&*self.backend, name, &args) {
+                return refusal.envelope(name);
             }
-        } else {
-            None
-        };
-        if spec.is_some() && self.verifier.is_none() {
-            return Envelope::fail_with(
-                name,
-                ErrorCode::UnsupportedOs,
-                "postconditions need a UI to observe, and none is wired on this platform",
-                "drop 'expect' and confirm separately with wait_for",
-            );
         }
-        // The comparison point has to be captured before the action, not after.
-        let before = match (&spec, self.verifier.as_ref()) {
-            (Some(_), Some(v)) => v.before(),
-            _ => None,
-        };
+        // Before polite waits for the person to go idle: a locked screen
+        // means they are away, and waiting for idle to post into it would
+        // only drop the events later.
+        if let Some(refusal) = crate::screen::tool_screen_refusal(&*self.backend, name, &args) {
+            return refusal;
+        }
+        if self.policy.foreground.is_polite() {
+            return self.call_politely(name, args, ctx).await;
+        }
+        self.run_call(name, args, ctx).await
+    }
 
-        let env = match name {
-            "ui_action" => self.ui_action(&args).await,
-            "set_value" => self.set_value(&args).await,
-            "ui_fill_form" => self.ui_fill_form(&args).await,
-            "keyboard_type" => self.keyboard_type(&args).await,
-            "keyboard_shortcut" => self.keyboard_shortcut(&args).await,
-            "mouse_action" => self.mouse_action(&args, &ctx.cancel, since).await,
-            "scroll" => self.scroll(&args).await,
-            "hover" => self.hover(&args, &ctx.cancel, since).await,
-            "drag_drop" => self.drag_drop(&args, since).await,
-            "clipboard_read" => self.clipboard_read(&args).await,
-            "clipboard_write" => self.clipboard_write(&args).await,
-            "input_showcase" => self.input_showcase(&args).await,
-            other => Envelope::fail(other, ErrorCode::InvalidArgs, "unknown tool"),
+    /// Server stop: nothing may stay down once the process that pressed it is
+    /// gone. Synchronous because it runs on shutdown paths, so the release is
+    /// handed to the runtime and waited for a bounded time.
+    fn shutdown(&self) {
+        // The dispatcher holds a server that holds this module.
+        if let Some(r) = &self.relay {
+            r.release();
+        }
+        let keys = lock_ledger(&self.ledger).keys.take_all();
+        if keys.is_empty() {
+            return;
+        }
+        let backend = self.backend.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let release = async move {
+            release_keys(&*backend, &keys).await;
+            let _ = tx.send(());
         };
-
-        match (spec, self.verifier.as_ref()) {
-            (Some(spec), Some(v)) => {
-                let verified = v.verify(&spec, before, ctx).await;
-                crate::postcondition::attach(env, name, verified)
+        match tokio::runtime::Handle::try_current() {
+            Ok(rt) => {
+                rt.spawn(release);
+                // Two seconds is long for a key-up and short enough that a
+                // wedged backend cannot hold the process open.
+                let _ = rx.recv_timeout(std::time::Duration::from_secs(2));
             }
-            _ => env,
+            Err(_) => {
+                if let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    rt.block_on(release);
+                }
+            }
         }
+    }
+}
+
+/// What was read before an action, to compare with after it.
+struct EffectState {
+    facts: crate::effects::UiFacts,
+    element: Option<(u64, crate::effects::ElementFacts)>,
+}
+
+/// Whether this call is the kind that reports `effects`: a shortcut that only
+/// presses (holding or releasing a key changes nothing on its own) and a
+/// pointer action that clicks (a move, a press or a release alone does not).
+fn effects_apply(tool: &str, args: &Value) -> bool {
+    match tool {
+        "keyboard_shortcut" => matches!(shortcut_action(args), Ok(HoldAction::Press)),
+        "mouse_action" => matches!(
+            args.get("type")
+                .and_then(Value::as_str)
+                .map(snake)
+                .as_deref(),
+            Some("click" | "double" | "triple" | "right_click")
+        ),
+        _ => true,
+    }
+}
+
+/// Run one step through the gate, watching for a cancel and the batch's time.
+///
+/// The call is not dropped when either happens: the dispatcher is asked to
+/// stop and the step is awaited, so an action is never abandoned half done
+/// (a key left down, a drag left pressed) and what it returns is reported.
+async fn watch(
+    dispatch: &dyn crate::steps::StepDispatch,
+    step: &crate::steps::Step,
+    ctx: &CallCtx,
+    deadline: tokio::time::Instant,
+) -> Envelope {
+    let mut call = dispatch.dispatch(&step.tool, step.args.clone());
+    let mut stopping = false;
+    loop {
+        match tokio::time::timeout(WATCH_EVERY, &mut call).await {
+            Ok(env) => return env,
+            Err(_) if !stopping => {
+                if ctx.cancel.is_cancelled() || tokio::time::Instant::now() >= deadline {
+                    stopping = true;
+                    dispatch.cancel();
+                }
+            }
+            Err(_) => {}
+        }
+    }
+}
+
+/// One step of a flow through the gate, bounded to a minute.
+pub(crate) async fn watch_call(
+    dispatch: &dyn crate::steps::StepDispatch,
+    step: &crate::steps::Step,
+    ctx: &CallCtx,
+) -> Envelope {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+    watch(dispatch, step, ctx, deadline).await
+}
+
+/// What `keyboard_shortcut` was asked to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HoldAction {
+    Press,
+    Down,
+    Up,
+}
+
+/// The `action` of a `keyboard_shortcut`: `press` unless it says otherwise.
+fn shortcut_action(args: &Value) -> Result<HoldAction, String> {
+    match args.get("action").filter(|v| !v.is_null()) {
+        None => Ok(HoldAction::Press),
+        Some(v) => match v.as_str().map(str::to_ascii_lowercase).as_deref() {
+            Some("press") => Ok(HoldAction::Press),
+            Some("down") => Ok(HoldAction::Down),
+            Some("up") => Ok(HoldAction::Up),
+            _ => Err("'action' must be press, down or up".into()),
+        },
     }
 }
 
@@ -1918,6 +3588,7 @@ fn input_err(tool: &str, e: InputError) -> Envelope {
         InputError::Unsupported(m) => (ErrorCode::UnsupportedOs, m),
         InputError::InvalidArgs(m) => (ErrorCode::InvalidArgs, m),
         InputError::Failed(m) => (ErrorCode::ActionFailed, m),
+        InputError::Refused(m) => (ErrorCode::PolicyDenied, m),
     };
     Envelope::fail(tool, code, msg)
 }
@@ -2019,9 +3690,21 @@ mod tests {
         /// Every pointer event, in order, of any kind.
         pointer: std::sync::Mutex<Vec<(MouseKind, f64, f64)>>,
         drags: std::sync::Mutex<Vec<Drag>>,
+        /// The full route of each drag, parallel to `drags`.
+        routes: std::sync::Mutex<Vec<Vec<(f64, f64)>>>,
+        /// Key presses and releases in order, as `down:shift` / `up:shift`.
+        key_events: std::sync::Mutex<Vec<String>>,
+        /// Makes the next `key_down` of this key fail, to exercise the cleanup.
+        fail_key_down: std::sync::Mutex<Option<String>>,
         scrolls: std::sync::Mutex<Vec<(f64, f64, i32)>>,
         /// The modifiers handed to each scroll, in the same order as `scrolls`.
         scroll_modifiers: std::sync::Mutex<Vec<Vec<String>>>,
+        /// Every pixel-scroll event handed to the backend, as sent.
+        pixel_events: std::sync::Mutex<Vec<crate::trackpad::PixelScroll>>,
+        /// Whether this backend says it understands momentum phases.
+        momentum_ok: std::sync::atomic::AtomicBool,
+        /// Cancels the token once this many pixel events have been posted.
+        cancel_after_pixels: std::sync::Mutex<Option<(usize, mcp_types::CancelToken)>>,
         typed: std::sync::Mutex<Vec<String>>,
         /// What `read_element` returns per node, one entry per read; the last
         /// one repeats. Scripts the *tool layer's* judging of a read-back, not
@@ -2030,6 +3713,21 @@ mod tests {
         reads: std::sync::Mutex<std::collections::HashMap<u64, usize>>,
         /// What `choose_option` answers, when it should not just succeed.
         choice: std::sync::Mutex<Option<Result<Choice, InputError>>>,
+        /// The route `perform` reports, when it should not be `Ax`. Scripts
+        /// what the tool layer is told, not what an OS did.
+        route: std::sync::Mutex<Option<Route>>,
+        /// The pinned background app, when the tool layer should take the
+        /// per-process route. Scripts what the backend reports, not what an
+        /// OS does with the keys: that is measured in the live tests.
+        background: std::sync::Mutex<Option<BackgroundTarget>>,
+        /// What `read_focused_text` returns, one per read; the last repeats.
+        focused: std::sync::Mutex<Vec<FocusedText>>,
+        focused_reads: std::sync::atomic::AtomicUsize,
+        pid_typed: std::sync::Mutex<Vec<(i32, String)>>,
+        pid_keys: std::sync::Mutex<Vec<(i32, String)>>,
+        /// What the backend says about the session; unset is `Unknown`. Scripts
+        /// what the tool layer is told, not what an OS does with the events.
+        screen: std::sync::Mutex<Option<mcp_types::ScreenState>>,
     }
 
     impl MockBackend {
@@ -2085,12 +3783,15 @@ mod tests {
             node_id: u64,
             action: SemanticAction,
             option: Option<&str>,
-        ) -> Result<(), InputError> {
+        ) -> Result<Route, InputError> {
             self.actions
                 .lock()
                 .unwrap()
                 .push((node_id, action, option.map(|s| s.to_string())));
-            Ok(())
+            Ok(self.route.lock().unwrap().unwrap_or(Route::Ax))
+        }
+        fn route_for(&self, _: SemanticAction) -> Route {
+            self.route.lock().unwrap().unwrap_or(Route::Ax)
         }
         async fn set_value(&self, node_id: u64, text: &str) -> Result<(), InputError> {
             self.values
@@ -2106,6 +3807,27 @@ mod tests {
         async fn key_combo(&self, combo: &str) -> Result<(), InputError> {
             self.keys.lock().unwrap().push(combo.to_string());
             Ok(())
+        }
+        fn background_key_target(&self) -> Option<BackgroundTarget> {
+            self.background.lock().unwrap().clone()
+        }
+        async fn type_text_to_pid(&self, pid: i32, text: &str) -> Result<(), InputError> {
+            self.pid_typed.lock().unwrap().push((pid, text.to_string()));
+            Ok(())
+        }
+        async fn key_combo_to_pid(&self, pid: i32, combo: &str) -> Result<(), InputError> {
+            self.pid_keys.lock().unwrap().push((pid, combo.to_string()));
+            Ok(())
+        }
+        async fn read_focused_text(&self, _pid: i32) -> Result<FocusedText, InputError> {
+            let script = self.focused.lock().unwrap();
+            let n = self
+                .focused_reads
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            script
+                .get(n.min(script.len().saturating_sub(1)))
+                .cloned()
+                .ok_or_else(|| InputError::Unsupported("no scripted read".into()))
         }
         async fn mouse(
             &self,
@@ -2136,6 +3858,25 @@ mod tests {
                 .push(modifiers.to_vec());
             Ok(())
         }
+        async fn scroll_pixels(
+            &self,
+            _x: f64,
+            _y: f64,
+            event: &crate::trackpad::PixelScroll,
+            _modifiers: &[String],
+        ) -> Result<(), InputError> {
+            let mut events = self.pixel_events.lock().unwrap();
+            events.push(*event);
+            if let Some((n, token)) = &*self.cancel_after_pixels.lock().unwrap() {
+                if events.len() == *n {
+                    token.cancel();
+                }
+            }
+            Ok(())
+        }
+        fn pixel_momentum(&self) -> bool {
+            self.momentum_ok.load(std::sync::atomic::Ordering::SeqCst)
+        }
         async fn hover(&self, _x: f64, _y: f64) -> Result<(), InputError> {
             Ok(())
         }
@@ -2158,13 +3899,28 @@ mod tests {
         async fn drag(
             &self,
             from: (f64, f64),
-            to: (f64, f64),
+            route: &[(f64, f64)],
             _modifiers: &[String],
-            steps: u32,
             hold_ms: u64,
             _since_takeover: u64,
         ) -> Result<(), InputError> {
-            self.drags.lock().unwrap().push((from, to, steps, hold_ms));
+            let to = *route.last().expect("a drag route is never empty");
+            self.drags
+                .lock()
+                .unwrap()
+                .push((from, to, route.len() as u32, hold_ms));
+            self.routes.lock().unwrap().push(route.to_vec());
+            Ok(())
+        }
+        async fn key_down(&self, key: &str) -> Result<(), InputError> {
+            if self.fail_key_down.lock().unwrap().as_deref() == Some(key) {
+                return Err(InputError::Failed(format!("cannot press {key}")));
+            }
+            self.key_events.lock().unwrap().push(format!("down:{key}"));
+            Ok(())
+        }
+        async fn key_up(&self, key: &str) -> Result<(), InputError> {
+            self.key_events.lock().unwrap().push(format!("up:{key}"));
             Ok(())
         }
         async fn clipboard_read(&self, format: ClipFormat) -> Result<ClipData, InputError> {
@@ -2182,6 +3938,9 @@ mod tests {
         }
         fn platform(&self) -> &'static str {
             "mock"
+        }
+        fn screen_state(&self) -> mcp_types::ScreenState {
+            (*self.screen.lock().unwrap()).unwrap_or(mcp_types::ScreenState::Unknown)
         }
     }
 
@@ -2922,6 +4681,7 @@ mod tests {
                     window: None,
                     terminal_app: false,
                     partial: false,
+                    target: None,
                 })
             }
             fn platform(&self) -> &'static str {
@@ -3107,6 +4867,118 @@ mod tests {
         assert!(env.ok, "{env:?}");
         assert_eq!(backend.scrolls.lock().unwrap()[0], (130.0, 210.0, 4));
         assert_eq!(env.data.unwrap()["ref"], "@e1");
+    }
+
+    #[tokio::test]
+    async fn pixel_scroll_posts_the_planned_phases_and_reports_what_was_sent() {
+        use crate::trackpad::Phase;
+        let (module, backend, _arena) = test_module();
+        backend
+            .momentum_ok
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let env = call(
+            &module,
+            "scroll",
+            json!({ "x": 10, "y": 20, "dy": 300, "dx": -40, "duration_ms": 64, "momentum": true }),
+        )
+        .await;
+        assert!(env.ok, "{env:?}");
+        let sent = backend.pixel_events.lock().unwrap().clone();
+        assert_eq!(sent.first().unwrap().phase, Phase::Began);
+        assert_eq!(sent.last().unwrap().phase, Phase::MomentumEnded);
+        assert!(sent.iter().any(|e| e.phase == Phase::Ended));
+        let body: i32 = sent
+            .iter()
+            .filter(|e| !e.phase.is_momentum())
+            .map(|e| e.dy)
+            .sum();
+        assert_eq!(body, 300);
+        let data = env.data.unwrap();
+        assert_eq!(data["dy"], 300);
+        assert_eq!(data["dx"], -40);
+        assert_eq!(data["events"], sent.len());
+        assert_eq!(data["momentum"], true);
+        assert!(data["momentum_dy"].as_i64().unwrap() > 0);
+        assert_eq!(data["input"], "hid");
+        // Plain wheel lines were not used.
+        assert!(backend.scrolls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn momentum_a_backend_cannot_do_is_left_out_and_said_so() {
+        let (module, backend, _arena) = test_module();
+        let env = call(
+            &module,
+            "scroll",
+            json!({ "x": 1, "y": 1, "dy": 200, "duration_ms": 32, "momentum": true }),
+        )
+        .await;
+        assert!(env.ok, "{env:?}");
+        assert!(backend
+            .pixel_events
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|e| !e.phase.is_momentum()));
+        let data = env.data.unwrap();
+        assert_eq!(data["momentum"], false);
+        assert!(data["note"].as_str().unwrap().contains("momentum"));
+    }
+
+    #[tokio::test]
+    async fn pixel_scroll_refuses_bad_requests_before_touching_anything() {
+        let (module, backend, _arena) = test_module();
+        for args in [
+            json!({ "x": 1, "y": 1, "dy": 20000 }),
+            json!({ "x": 1, "y": 1, "dy": 10, "duration_ms": 99999 }),
+            json!({ "x": 1, "y": 1, "dy": 0, "dx": 0 }),
+            json!({ "x": 1, "y": 1, "dy": 10, "direction": "down" }),
+            json!({ "x": 1, "y": 1, "dy": "lots" }),
+        ] {
+            let env = call(&module, "scroll", args.clone()).await;
+            assert_eq!(env.error.unwrap().code, ErrorCode::InvalidArgs, "{args}");
+        }
+        assert!(backend.pixel_events.lock().unwrap().is_empty());
+    }
+
+    /// A cancelled gesture must not leave the app with fingers still down.
+    #[tokio::test]
+    async fn a_cancelled_pixel_scroll_still_ends_the_gesture() {
+        use crate::trackpad::Phase;
+        let (module, backend, _arena) = test_module();
+        let token = mcp_types::CancelToken::new();
+        *backend.cancel_after_pixels.lock().unwrap() = Some((2, token.clone()));
+        let ctx = CallCtx::new("t", token);
+        let env = module
+            .call(
+                "scroll",
+                json!({ "x": 1, "y": 1, "dy": 500, "duration_ms": 320 }),
+                &ctx,
+            )
+            .await;
+        assert!(!env.ok);
+        let sent = backend.pixel_events.lock().unwrap().clone();
+        assert_eq!(sent.len(), 3, "two events, then the closing one: {sent:?}");
+        assert_eq!(sent.last().unwrap().phase, Phase::Ended);
+        assert_eq!(sent.last().unwrap().dy, 0);
+    }
+
+    #[tokio::test]
+    async fn pinch_rotate_and_swipe_are_unsupported_and_name_the_equivalent() {
+        let (module, backend, _arena) = test_module();
+        for (g, hint) in [
+            ("pinch", "cmd+plus"),
+            ("rotate", "rotate command"),
+            ("swipe", "ctrl+left"),
+        ] {
+            let env = call(&module, "scroll", json!({ "gesture": g, "x": 1, "y": 1 })).await;
+            let e = env.error.unwrap();
+            assert_eq!(e.code, ErrorCode::UnsupportedOs);
+            assert!(e.message.contains(hint), "{g}: {}", e.message);
+        }
+        let env = call(&module, "scroll", json!({ "gesture": "shake" })).await;
+        assert_eq!(env.error.unwrap().code, ErrorCode::InvalidArgs);
+        assert!(backend.pixel_events.lock().unwrap().is_empty());
     }
 
     /// Cmd+wheel is zoom in most apps, and `scroll` had no way to ask for it.
@@ -3328,6 +5200,188 @@ mod tests {
         let env = call(&module, "keyboard_type", json!({ "text": "x" })).await;
         assert!(env.ok);
         assert!(env.data.unwrap().get("value_after").is_none());
+    }
+
+    // ---- per-process key delivery (route pid_event) -------------------------
+
+    fn field(value: &str, caret: usize) -> FocusedText {
+        FocusedText {
+            value: Some(value.into()),
+            selection: Some((caret, caret)),
+            secure: false,
+        }
+    }
+
+    /// A module over a mock whose pinned app is `app`, in the background, with
+    /// the default (screening) policy: the destructive gate is on.
+    fn background_module(app: &str, reads: Vec<FocusedText>) -> (InputModule, Arc<MockBackend>) {
+        let backend = Arc::new(MockBackend::default());
+        *backend.background.lock().unwrap() = Some(BackgroundTarget {
+            pid: 4242,
+            name: app.into(),
+        });
+        *backend.focused.lock().unwrap() = reads;
+        let arena = Arc::new(Mutex::new(SnapshotArena::new()));
+        let module = InputModule::new(backend.clone(), arena, InputPolicy::default());
+        (module, backend)
+    }
+
+    #[tokio::test]
+    async fn typing_at_a_background_app_goes_by_pid_and_is_read_back() {
+        let (module, backend) = background_module(
+            "Notes",
+            vec![field("ab", 2), field("ab", 2), field("abcd", 4)],
+        );
+        let env = call(&module, "keyboard_type", json!({ "text": "cd" })).await;
+        assert!(env.ok, "{env:?}");
+        let d = env.data.unwrap();
+        assert_eq!(d["input"], "pid_event");
+        assert_eq!(d["verified"], true);
+        assert_eq!(d["value_after"], "abcd");
+        assert_eq!(d["background_app"], "Notes");
+        assert_eq!(
+            *backend.pid_typed.lock().unwrap(),
+            vec![(4242, "cd".to_string())]
+        );
+        assert!(
+            backend.typed.lock().unwrap().is_empty(),
+            "nothing may go to the frontmost app"
+        );
+    }
+
+    #[tokio::test]
+    async fn typing_that_changed_nothing_is_an_error_and_never_falls_back_to_hid() {
+        let (module, backend) = background_module("Notes", vec![field("ab", 2)]);
+        let env = call(&module, "keyboard_type", json!({ "text": "cd" })).await;
+        let err = env.error.expect("an error, not ok");
+        assert_eq!(err.code, ErrorCode::ActionFailed);
+        assert!(err.message.contains("did not change"), "{}", err.message);
+        let hint = err.suggestion.unwrap_or_default();
+        assert!(
+            hint.contains("set_value") && hint.contains("focus_app"),
+            "{hint}"
+        );
+        assert!(
+            backend.typed.lock().unwrap().is_empty()
+                && backend.key_events.lock().unwrap().is_empty(),
+            "a failed delivery must not retype through the system event stream"
+        );
+    }
+
+    #[tokio::test]
+    async fn typing_into_something_unreadable_is_not_reported_as_delivered() {
+        let (module, _) = background_module("Notes", vec![FocusedText::default()]);
+        let env = call(&module, "keyboard_type", json!({ "text": "cd" })).await;
+        let err = env.error.expect("unverified delivery is an error");
+        assert!(err.message.contains("not known whether"), "{}", err.message);
+        assert!(err.message.contains("may have"), "{}", err.message);
+
+        let secure = FocusedText {
+            secure: true,
+            ..Default::default()
+        };
+        let (module, _) = background_module("Notes", vec![secure]);
+        let env = call(
+            &module,
+            "keyboard_type",
+            json!({ "text": "hunter2", "secret": true }),
+        )
+        .await;
+        let err = env.error.expect("a password field cannot be read back");
+        assert!(!err.message.contains("hunter2"));
+    }
+
+    #[tokio::test]
+    async fn a_shortcut_at_a_background_app_says_when_it_could_not_be_verified() {
+        let (module, backend) = background_module("Notes", vec![field("abc", 0)]);
+        let env = call(&module, "keyboard_shortcut", json!({ "combo": "cmd+a" })).await;
+        assert!(env.ok, "{env:?}");
+        let d = env.data.unwrap();
+        assert_eq!(d["input"], "pid_event");
+        assert_eq!(d["verified"], false);
+        assert!(d["note"].as_str().unwrap().contains("not known"));
+        assert_eq!(
+            *backend.pid_keys.lock().unwrap(),
+            vec![(4242, "cmd+a".to_string())]
+        );
+        assert!(backend.keys.lock().unwrap().is_empty());
+
+        let (module, _) = background_module("Notes", vec![field("abc", 0), field("abc", 3)]);
+        let env = call(&module, "keyboard_shortcut", json!({ "combo": "End" })).await;
+        let d = env.data.unwrap();
+        assert_eq!(
+            (d["verified"].clone(), d.get("note").is_none()),
+            (json!(true), true)
+        );
+    }
+
+    #[tokio::test]
+    async fn keys_held_down_block_the_background_route_rather_than_being_dropped() {
+        let (module, backend) = background_module("Notes", vec![field("ab", 2)]);
+        for (tool, args) in [
+            ("keyboard_type", json!({ "text": "x" })),
+            ("keyboard_shortcut", json!({ "combo": "left" })),
+        ] {
+            // A failed input call releases whatever is held (that is the
+            // contract for held keys), so shift is held afresh each time.
+            let env = call(
+                &module,
+                "keyboard_shortcut",
+                json!({ "combo": "shift", "action": "down" }),
+            )
+            .await;
+            assert!(env.ok, "{env:?}");
+            let env = call(&module, tool, args).await;
+            let err = env.error.expect("refused while shift is held");
+            assert!(err.message.contains("shift"), "{}", err.message);
+        }
+        assert!(backend.pid_typed.lock().unwrap().is_empty());
+        assert!(backend.pid_keys.lock().unwrap().is_empty());
+    }
+
+    /// The destructive screen follows the app the keys are sent to. The mock's
+    /// frontmost app is a harmless one; the pinned background app is Terminal.
+    #[tokio::test]
+    async fn a_destructive_command_at_a_background_terminal_meets_the_same_gate() {
+        let (module, backend) = background_module("Terminal", vec![field("$ ", 2)]);
+        let env = call(&module, "keyboard_type", json!({ "text": "rm -rf /" })).await;
+        let err = env.error.expect("the gate must stop it");
+        assert_eq!(err.code, ErrorCode::ConsentRequired, "{}", err.message);
+        assert!(backend.pid_typed.lock().unwrap().is_empty());
+
+        // Autonomous: a denial, as on the foreground route.
+        let backend = Arc::new(MockBackend::default());
+        *backend.background.lock().unwrap() = Some(BackgroundTarget {
+            pid: 1,
+            name: "iTerm2".into(),
+        });
+        let arena = Arc::new(Mutex::new(SnapshotArena::new()));
+        let policy = InputPolicy {
+            autonomous: true,
+            ..InputPolicy::default()
+        };
+        let module = InputModule::new(backend.clone(), arena, policy);
+        let env = call(&module, "keyboard_type", json!({ "text": "rm -rf /" })).await;
+        assert_eq!(env.error.unwrap().code, ErrorCode::PolicyDenied);
+        assert!(backend.pid_typed.lock().unwrap().is_empty());
+
+        // The same text at a background app that is not a terminal is let
+        // through (it is only text there).
+        let (module, backend) =
+            background_module("Notes", vec![field("", 0), field("rm -rf /", 8)]);
+        let env = call(&module, "keyboard_type", json!({ "text": "rm -rf /" })).await;
+        assert!(env.ok, "{env:?}");
+        assert_eq!(backend.pid_typed.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn with_nothing_in_the_background_keys_still_take_the_ordinary_route() {
+        let (module, backend, _) = test_module();
+        let env = call(&module, "keyboard_type", json!({ "text": "x" })).await;
+        assert_eq!(env.data.unwrap()["input"], "hid");
+        assert_eq!(backend.typed.lock().unwrap().len(), 1);
+        let env = call(&module, "keyboard_shortcut", json!({ "combo": "a" })).await;
+        assert_eq!(env.data.unwrap()["input"], "hid");
     }
 
     #[tokio::test]
@@ -3597,5 +5651,1953 @@ mod tests {
             .details
             .as_deref()
             .is_some_and(|t| t.contains("cmdorctrl")));
+    }
+
+    // ---- drag_drop path -----------------------------------------------------
+
+    #[test]
+    fn waypoints_are_the_path_shifted_into_the_frame_or_just_the_end() {
+        assert_eq!(
+            drag_waypoints(Some((9.0, 9.0)), &[], (100.0, 200.0)),
+            [(9.0, 9.0)]
+        );
+        assert_eq!(
+            drag_waypoints(None, &[(1.0, 2.0), (3.0, 4.0)], (100.0, 200.0)),
+            [(101.0, 202.0), (103.0, 204.0)]
+        );
+        assert_eq!(
+            drag_waypoints(None, &[(1.0, 2.0)], (0.0, 0.0)),
+            [(1.0, 2.0)]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_drag_path_passes_every_waypoint_in_order_and_reports_them() {
+        let (module, backend, arena) = test_module();
+        let way = [(110.0, 10.0), (110.0, 110.0), (10.0, 110.0)];
+        let env = call(
+            &module,
+            "drag_drop",
+            json!({
+                "from": { "x": 10, "y": 10 },
+                "path": [{ "x": 110, "y": 10 }, [110, 110], { "x": "10", "y": "110" }],
+                "steps": 12,
+            }),
+        )
+        .await;
+        assert!(env.ok, "{env:?}");
+        let d = env.data.unwrap();
+        assert_eq!(d["waypoints"], 3);
+        assert_eq!(d["steps"], 12);
+        assert_eq!(d["to"]["x"], 10.0);
+        assert_eq!(d["to"]["y"], 110.0);
+        {
+            let routes = backend.routes.lock().unwrap();
+            let route = &routes[0];
+            let hits: Vec<_> = way
+                .iter()
+                .map(|w| {
+                    route
+                        .iter()
+                        .position(|p| p == w)
+                        .expect("waypoint landed on")
+                })
+                .collect();
+            assert!(hits.windows(2).all(|h| h[0] < h[1]), "in order: {hits:?}");
+            assert_eq!(route.last(), Some(&(10.0, 110.0)), "released at the last");
+        }
+
+        // Named element: waypoints are offsets from its top-left, like `from`.
+        install(
+            &arena,
+            vec![(
+                "@e1",
+                el("canvas", "Canvas", 1, Some((100.0, 200.0, 300.0, 300.0))),
+            )],
+        );
+        let env = call(
+            &module,
+            "drag_drop",
+            json!({ "from": { "ref": "@e1", "x": 5, "y": 5 }, "path": [[20, 30], [40, 60]] }),
+        )
+        .await;
+        assert!(env.ok, "{env:?}");
+        let drags = backend.drags.lock().unwrap();
+        assert_eq!((drags[1].0, drags[1].1), ((105.0, 205.0), (140.0, 260.0)));
+        assert!(backend.routes.lock().unwrap()[1].contains(&(120.0, 230.0)));
+    }
+
+    #[tokio::test]
+    async fn a_drag_without_a_path_reports_no_waypoints() {
+        let (module, _, _) = test_module();
+        let env = call(
+            &module,
+            "drag_drop",
+            json!({ "from": { "x": 1, "y": 1 }, "to": { "x": 2, "y": 2 } }),
+        )
+        .await;
+        assert!(env.data.unwrap().get("waypoints").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_bad_path_is_refused_before_anything_moves() {
+        let (module, backend, _) = test_module();
+        let from = json!({ "x": 1, "y": 1 });
+        let too_many: Vec<_> = (0..201).map(|i| json!({ "x": i, "y": 0 })).collect();
+        for (why, args) in [
+            ("empty", json!({ "from": from, "path": [] })),
+            ("not points", json!({ "from": from, "path": [{ "x": 1 }] })),
+            ("too many", json!({ "from": from, "path": too_many })),
+            (
+                "a second destination",
+                json!({ "from": from, "path": [{ "x": 5, "y": 5 }], "to": { "x": 9, "y": 9 } }),
+            ),
+            (
+                "a flat second destination",
+                json!({ "from": from, "path": [{ "x": 5, "y": 5 }], "to_x": 9 }),
+            ),
+        ] {
+            let env = call(&module, "drag_drop", args).await;
+            assert_eq!(env.error.expect(why).code, ErrorCode::InvalidArgs, "{why}");
+        }
+        assert!(backend.drags.lock().unwrap().is_empty());
+    }
+
+    /// Every waypoint goes through the same bounds check as the endpoints, not
+    /// only the last one: a stroke that wanders out of the window is refused
+    /// whole, before the button goes down.
+    #[tokio::test]
+    async fn a_waypoint_outside_the_allowed_bounds_denies_the_whole_drag() {
+        let backend = Arc::new(MockBackend::default());
+        let arena = Arc::new(Mutex::new(SnapshotArena::new()));
+        with_button(&arena);
+        let module = InputModule::new(backend.clone(), arena, InputPolicy::default());
+        let env = call(
+            &module,
+            "drag_drop",
+            json!({ "from": { "ref": "@e1" }, "path": [[5, 5], [9999, 5], [10, 10]] }),
+        )
+        .await;
+        assert_eq!(env.error.unwrap().code, ErrorCode::PolicyDenied);
+        assert!(backend.drags.lock().unwrap().is_empty());
+        let env = call(
+            &module,
+            "drag_drop",
+            json!({ "from": { "ref": "@e1" }, "path": [[5, 5], [10, 10]] }),
+        )
+        .await;
+        assert!(env.ok, "{env:?}");
+    }
+
+    // ---- held keys ----------------------------------------------------------
+
+    fn events(b: &MockBackend) -> Vec<String> {
+        b.key_events.lock().unwrap().clone()
+    }
+
+    async fn until(mut done: impl FnMut() -> bool) -> bool {
+        for _ in 0..60 {
+            if done() {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        done()
+    }
+
+    fn bare(backend: &Arc<MockBackend>) -> InputModule {
+        let arena = Arc::new(Mutex::new(SnapshotArena::new()));
+        InputModule::new(backend.clone(), arena, InputPolicy::default())
+    }
+
+    #[test]
+    fn what_ends_a_hold_is_decided_in_one_place() {
+        assert_eq!(release_reason(false, false), None);
+        assert!(release_reason(true, false).unwrap().contains("kill switch"));
+        assert!(release_reason(false, true).unwrap().contains("human"));
+        assert!(release_reason(true, true).is_some());
+    }
+
+    #[test]
+    fn the_shortcut_action_defaults_to_press() {
+        assert_eq!(shortcut_action(&json!({})), Ok(HoldAction::Press));
+        assert_eq!(
+            shortcut_action(&json!({ "action": null })),
+            Ok(HoldAction::Press)
+        );
+        assert_eq!(
+            shortcut_action(&json!({ "action": "Down" })),
+            Ok(HoldAction::Down)
+        );
+        assert_eq!(
+            shortcut_action(&json!({ "action": "up" })),
+            Ok(HoldAction::Up)
+        );
+        assert!(shortcut_action(&json!({ "action": "hold" })).is_err());
+        assert!(shortcut_action(&json!({ "action": 3 })).is_err());
+    }
+
+    #[tokio::test]
+    async fn a_key_is_held_across_calls_until_it_is_released() {
+        let backend = Arc::new(MockBackend::default());
+        let module = bare(&backend);
+        let env = call(
+            &module,
+            "keyboard_shortcut",
+            json!({ "combo": "Shift", "action": "down" }),
+        )
+        .await;
+        assert!(env.ok, "{env:?}");
+        let d = env.data.unwrap();
+        assert_eq!(d["held"], json!(["shift"]));
+        assert_eq!(d["auto_release_ms"], 30_000);
+
+        // Another call in between does not disturb it; a chord still presses.
+        let env = call(&module, "keyboard_shortcut", json!({ "combo": "cmd+s" })).await;
+        assert!(env.ok);
+        assert_eq!(*backend.keys.lock().unwrap(), ["cmd+s"]);
+
+        // Re-sending a held key presses nothing new.
+        let env = call(
+            &module,
+            "keyboard_shortcut",
+            json!({ "combo": "cmd+shift", "action": "down" }),
+        )
+        .await;
+        assert_eq!(env.data.as_ref().unwrap()["pressed"], json!(["cmd"]));
+        assert_eq!(env.data.unwrap()["held"], json!(["shift", "cmd"]));
+        assert_eq!(events(&backend), ["down:shift", "down:cmd"]);
+
+        let env = call(
+            &module,
+            "keyboard_shortcut",
+            json!({ "combo": "shift", "action": "up" }),
+        )
+        .await;
+        let d = env.data.unwrap();
+        assert_eq!(
+            (&d["released"], &d["held"]),
+            (&json!(["shift"]), &json!(["cmd"]))
+        );
+        let env = call(
+            &module,
+            "keyboard_shortcut",
+            json!({ "combo": "shift", "action": "up" }),
+        )
+        .await;
+        assert_eq!(env.data.unwrap()["not_held"], json!(["shift"]));
+        assert_eq!(events(&backend), ["down:shift", "down:cmd", "up:shift"]);
+
+        // No combo: everything still held.
+        let env = call(&module, "keyboard_shortcut", json!({ "action": "up" })).await;
+        assert_eq!(env.data.unwrap()["released"], json!(["cmd"]));
+        assert_eq!(events(&backend).last().unwrap(), "up:cmd");
+        let env = call(&module, "keyboard_shortcut", json!({ "action": "up" })).await;
+        assert_eq!(env.data.unwrap()["released"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn an_unknown_key_or_action_presses_nothing() {
+        let backend = Arc::new(MockBackend::default());
+        let module = bare(&backend);
+        for args in [
+            json!({ "combo": "shift+nope", "action": "down" }),
+            json!({ "combo": "a+b", "action": "down" }),
+            json!({ "action": "down" }),
+            json!({ "combo": "shift", "action": "hold" }),
+        ] {
+            let env = call(&module, "keyboard_shortcut", args.clone()).await;
+            assert_eq!(
+                env.error.expect("refused").code,
+                ErrorCode::InvalidArgs,
+                "{args}"
+            );
+        }
+        let env = call(
+            &module,
+            "keyboard_shortcut",
+            json!({ "combo": "nope", "action": "up" }),
+        )
+        .await;
+        assert_eq!(env.error.unwrap().code, ErrorCode::InvalidArgs);
+        assert!(events(&backend).is_empty());
+    }
+
+    #[tokio::test]
+    async fn no_more_than_the_cap_may_be_held() {
+        let backend = Arc::new(MockBackend::default());
+        let module = bare(&backend);
+        for k in ["a", "b", "c", "d", "e", "f"] {
+            let env = call(
+                &module,
+                "keyboard_shortcut",
+                json!({ "combo": k, "action": "down" }),
+            )
+            .await;
+            assert!(env.ok, "{k}: {env:?}");
+        }
+        let env = call(
+            &module,
+            "keyboard_shortcut",
+            json!({ "combo": "g", "action": "down" }),
+        )
+        .await;
+        let err = env.error.unwrap();
+        assert_eq!(err.code, ErrorCode::InvalidArgs);
+        assert!(err.message.contains("at most 6"), "{}", err.message);
+        assert!(!events(&backend).contains(&"down:g".to_string()));
+        // The refused call did not release what was already held.
+        assert_eq!(events(&backend).len(), 6);
+        call(&module, "keyboard_shortcut", json!({ "action": "up" })).await;
+    }
+
+    #[tokio::test]
+    async fn a_key_that_fails_mid_sequence_releases_the_ones_before_it() {
+        let backend = Arc::new(MockBackend::default());
+        *backend.fail_key_down.lock().unwrap() = Some("b".into());
+        let module = bare(&backend);
+        let env = call(
+            &module,
+            "keyboard_shortcut",
+            json!({ "combo": "cmd+b", "action": "down" }),
+        )
+        .await;
+        assert_eq!(env.error.unwrap().code, ErrorCode::ActionFailed);
+        assert_eq!(events(&backend), ["down:cmd", "up:b", "up:cmd"]);
+        let env = call(&module, "keyboard_shortcut", json!({ "action": "up" })).await;
+        assert_eq!(
+            env.data.unwrap()["released"],
+            json!([]),
+            "nothing left held"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_call_releases_what_is_held_and_says_so() {
+        let backend = Arc::new(MockBackend::default());
+        let module = bare(&backend);
+        call(
+            &module,
+            "keyboard_shortcut",
+            json!({ "combo": "shift", "action": "down" }),
+        )
+        .await;
+        let env = call(&module, "mouse_action", json!({ "type": "nonsense" })).await;
+        let err = env.error.unwrap();
+        assert!(
+            err.message.contains("held keys released: shift"),
+            "{}",
+            err.message
+        );
+        assert_eq!(events(&backend), ["down:shift", "up:shift"]);
+        // A failure while nothing is held adds nothing.
+        let env = call(&module, "mouse_action", json!({ "type": "nonsense" })).await;
+        assert!(!env.error.unwrap().message.contains("released"));
+    }
+
+    #[tokio::test]
+    async fn a_human_taking_the_pointer_releases_held_keys() {
+        let backend = Arc::new(MockBackend::default());
+        let module = bare(&backend);
+        call(
+            &module,
+            "keyboard_shortcut",
+            json!({ "combo": "shift+a", "action": "down" }),
+        )
+        .await;
+        backend.cancel_pending();
+        assert!(
+            until(|| events(&backend).len() == 4).await,
+            "{:?}",
+            events(&backend)
+        );
+        assert_eq!(events(&backend)[2..], ["up:a", "up:shift"]);
+    }
+
+    #[tokio::test]
+    async fn the_kill_switch_releases_held_keys_though_every_call_is_refused() {
+        let backend = Arc::new(MockBackend::default());
+        let tripped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = tripped.clone();
+        let module = bare(&backend).with_halt_probe(Arc::new(move || {
+            flag.load(std::sync::atomic::Ordering::SeqCst)
+        }));
+        call(
+            &module,
+            "keyboard_shortcut",
+            json!({ "combo": "shift", "action": "down" }),
+        )
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        assert_eq!(events(&backend), ["down:shift"], "no trip, no release");
+        tripped.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(until(|| events(&backend).len() == 2).await);
+        assert_eq!(events(&backend)[1], "up:shift");
+    }
+
+    #[tokio::test]
+    async fn a_key_is_released_when_its_time_is_up() {
+        let backend = Arc::new(MockBackend::default());
+        let module = bare(&backend).with_hold_limit(150);
+        let env = call(
+            &module,
+            "keyboard_shortcut",
+            json!({ "combo": "shift", "action": "down" }),
+        )
+        .await;
+        assert_eq!(env.data.unwrap()["auto_release_ms"], 150);
+        assert!(until(|| events(&backend).len() == 2).await);
+        assert_eq!(events(&backend)[1], "up:shift");
+        let env = call(&module, "keyboard_shortcut", json!({ "action": "up" })).await;
+        assert_eq!(env.data.unwrap()["released"], json!([]));
+        // The watchdog ends with the last key, and the next hold starts a new one.
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        call(
+            &module,
+            "keyboard_shortcut",
+            json!({ "combo": "cmd", "action": "down" }),
+        )
+        .await;
+        assert!(until(|| events(&backend).len() == 4).await);
+        assert_eq!(events(&backend)[3], "up:cmd");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stopping_the_server_releases_held_keys() {
+        let backend = Arc::new(MockBackend::default());
+        let module = bare(&backend);
+        call(
+            &module,
+            "keyboard_shortcut",
+            json!({ "combo": "cmd+shift", "action": "down" }),
+        )
+        .await;
+        module.shutdown();
+        assert_eq!(events(&backend)[2..], ["up:shift", "up:cmd"]);
+        // Idempotent.
+        module.shutdown();
+        assert_eq!(events(&backend).len(), 4);
+    }
+
+    #[test]
+    fn the_shortcut_descriptor_offers_hold_and_release_within_the_budget() {
+        let (module, _, _) = test_module();
+        let all = module.descriptors();
+        let key = all.iter().find(|d| d.name == "keyboard_shortcut").unwrap();
+        assert_eq!(
+            key.input_schema["properties"]["action"]["enum"],
+            json!(["press", "down", "up"])
+        );
+        assert_eq!(key.input_schema["required"], json!([]));
+        let drag = all.iter().find(|d| d.name == "drag_drop").unwrap();
+        assert!(drag.input_schema["properties"]["path"]["description"]
+            .as_str()
+            .is_some_and(|d| d.contains("200")));
+    }
+
+    // ---- input route, new actions, text selection ---------------------------
+
+    /// The route is whatever the backend reports, not something the tool
+    /// layer decides: a backend that fell back to the pointer says so.
+    #[tokio::test]
+    async fn ui_action_reports_the_route_the_backend_took() {
+        let (module, backend, _) = test_module();
+        let env = call(
+            &module,
+            "ui_action",
+            json!({ "ref": "@e4", "action": "click" }),
+        )
+        .await;
+        assert_eq!(env.data.unwrap()["input"], "ax");
+
+        *backend.route.lock().unwrap() = Some(Route::Hid);
+        let env = call(
+            &module,
+            "ui_action",
+            json!({ "ref": "@e4", "action": "right_click" }),
+        )
+        .await;
+        assert!(env.ok, "{env:?}");
+        assert_eq!(env.data.unwrap()["input"], "hid");
+    }
+
+    /// A ref belongs to one application, which need not be the frontmost one,
+    /// so a result says which it acted in.
+    #[tokio::test]
+    async fn an_action_by_ref_says_which_app_the_ref_belongs_to() {
+        let (module, _, _) = test_module();
+        let by_ref = call(
+            &module,
+            "ui_action",
+            json!({ "ref": "@e4", "action": "click" }),
+        )
+        .await;
+        let app = by_ref.data.unwrap()["app"].clone();
+        assert_eq!(app, "Settings");
+        let by_set = call(
+            &module,
+            "set_value",
+            json!({ "ref": "@e4", "text": "hello" }),
+        )
+        .await;
+        assert_eq!(by_set.data.unwrap_or_default()["app"], app);
+    }
+
+    #[tokio::test]
+    async fn the_new_actions_reach_the_backend_under_their_own_names() {
+        let (module, backend, _) = test_module();
+        for (name, want) in [
+            ("show_menu", SemanticAction::ShowMenu),
+            ("increment", SemanticAction::Increment),
+            ("decrement", SemanticAction::Decrement),
+            ("pick", SemanticAction::Pick),
+            ("scroll_to_visible", SemanticAction::ScrollIntoView),
+            ("Show-Menu", SemanticAction::ShowMenu),
+        ] {
+            let env = call(
+                &module,
+                "ui_action",
+                json!({ "ref": "@e4", "action": name }),
+            )
+            .await;
+            assert!(env.ok, "{name}: {env:?}");
+            assert_eq!(backend.actions.lock().unwrap().last().unwrap().1, want);
+        }
+        let env = call(
+            &module,
+            "ui_action",
+            json!({ "ref": "@e4", "action": "squeeze" }),
+        )
+        .await;
+        assert_eq!(env.error.unwrap().code, ErrorCode::InvalidArgs);
+    }
+
+    #[tokio::test]
+    async fn a_step_reports_the_value_and_whether_it_moved() {
+        let (module, backend, _) = test_module();
+        backend.script(104, vec![shown("3"), shown("4")]);
+        let env = call(
+            &module,
+            "ui_action",
+            json!({ "ref": "@e4", "action": "increment" }),
+        )
+        .await;
+        let d = env.data.unwrap();
+        assert_eq!(
+            (d["value_after"].as_str(), d["changed"].as_bool()),
+            (Some("4"), Some(true))
+        );
+
+        backend.script(104, vec![shown("10")]);
+        let env = call(
+            &module,
+            "ui_action",
+            json!({ "ref": "@e4", "action": "increment" }),
+        )
+        .await;
+        let d = env.data.unwrap();
+        assert_eq!(
+            d["changed"], false,
+            "a step that moved nothing is not a change"
+        );
+        assert_eq!(d["ok"], true);
+
+        // A control that cannot be read back says so rather than claiming a move.
+        backend.script(104, vec![Reading::default()]);
+        let env = call(
+            &module,
+            "ui_action",
+            json!({ "ref": "@e4", "action": "decrement" }),
+        )
+        .await;
+        let d = env.data.unwrap();
+        assert_eq!(d["verified"], false);
+        assert!(d.get("changed").is_none());
+    }
+
+    #[tokio::test]
+    async fn set_value_is_accessibility_and_pointer_tools_are_not() {
+        let (module, backend, _) = test_module();
+        backend.script(101, vec![shown(""), shown("hi")]);
+        let env = call(&module, "set_value", json!({ "ref": "@e1", "text": "hi" })).await;
+        assert_eq!(env.data.unwrap()["input"], "ax");
+
+        for (tool, args) in [
+            ("mouse_action", json!({ "type": "click", "x": 5, "y": 6 })),
+            ("scroll", json!({ "x": 5, "y": 6, "direction": "down" })),
+            ("hover", json!({ "x": 5, "y": 6 })),
+            (
+                "drag_drop",
+                json!({ "from": { "x": 1, "y": 1 }, "to": { "x": 9, "y": 9 } }),
+            ),
+            ("keyboard_shortcut", json!({ "combo": "cmd+s" })),
+            ("keyboard_type", json!({ "text": "x" })),
+        ] {
+            let env = call(&module, tool, args).await;
+            assert!(env.ok, "{tool}: {env:?}");
+            assert_eq!(env.data.unwrap()["input"], "hid", "{tool}");
+        }
+    }
+
+    #[tokio::test]
+    async fn keyboard_type_into_an_element_is_hid_even_though_it_focused_through_ax() {
+        let (module, backend, _) = test_module();
+        backend.script(101, vec![shown(""), shown("x")]);
+        let env = call(
+            &module,
+            "keyboard_type",
+            json!({ "ref": "@e1", "text": "x" }),
+        )
+        .await;
+        assert!(env.ok, "{env:?}");
+        assert_eq!(env.data.unwrap()["input"], "hid");
+    }
+
+    #[test]
+    fn a_range_is_one_of_four_shapes() {
+        let p = |v: Value| parse_range(&v);
+        assert_eq!(p(json!({ "all": true })), Ok(RangeSpec::All));
+        assert_eq!(
+            p(json!({ "start": 2, "end": "5" })),
+            Ok(RangeSpec::Offsets { start: 2, end: 5 })
+        );
+        assert_eq!(
+            p(json!({ "text": "cat" })),
+            Ok(RangeSpec::Text {
+                needle: "cat".into(),
+                occurrence: 1
+            })
+        );
+        assert_eq!(
+            p(json!({ "text": "cat", "occurrence": 3 })),
+            Ok(RangeSpec::Text {
+                needle: "cat".into(),
+                occurrence: 3
+            })
+        );
+        assert_eq!(
+            p(json!({ "from_text": "a", "to_text": "b" })),
+            Ok(RangeSpec::Between {
+                from: "a".into(),
+                to: "b".into()
+            })
+        );
+        // `all: false` is not a choice.
+        assert!(p(json!({ "all": false })).is_err());
+    }
+
+    #[test]
+    fn a_range_that_says_two_things_or_half_of_one_is_refused() {
+        let bad = |v: Value| parse_range(&v).unwrap_err();
+        assert!(bad(json!({})).contains("nothing to select"));
+        assert!(bad(json!({ "all": true, "text": "x" })).contains("more than one"));
+        assert!(bad(json!({ "start": 1, "text": "x" })).contains("more than one"));
+        assert!(bad(json!({ "start": 1 })).contains("go together"));
+        assert!(bad(json!({ "end": 1 })).contains("go together"));
+        assert!(bad(json!({ "from_text": "a" })).contains("go together"));
+        assert!(bad(json!({ "occurrence": 2, "all": true })).contains("goes with 'text'"));
+        assert!(bad(json!({ "start": -1, "end": 2 })).contains("whole number"));
+        assert!(bad(json!({ "start": 1.5, "end": 2 })).contains("whole number"));
+        // An empty string is no string.
+        assert!(bad(json!({ "text": "" })).contains("nothing to select"));
+    }
+
+    #[test]
+    fn a_selection_result_carries_the_range_the_route_and_a_clipped_text() {
+        let d = selection_data(&Selection {
+            start: 2,
+            end: 6,
+            text: "word".into(),
+            role: Some("TextArea".into()),
+        });
+        assert_eq!(
+            d,
+            json!({ "ok": true, "input": "ax", "start": 2, "end": 6, "length": 4,
+                    "text": "word", "role": "TextArea" })
+        );
+        let long = selection_data(&Selection {
+            start: 0,
+            end: 5000,
+            text: "x".repeat(5000),
+            role: None,
+        });
+        assert_eq!(long["truncated"], true);
+        assert_eq!(
+            long["text"].as_str().unwrap().len(),
+            crate::selection::ECHO_LIMIT
+        );
+        assert!(long.get("role").is_none());
+    }
+
+    #[tokio::test]
+    async fn select_text_validates_before_it_touches_anything() {
+        let (module, backend, _) = test_module();
+        let env = call(&module, "select_text", json!({ "ref": "@e1" })).await;
+        assert_eq!(env.error.unwrap().code, ErrorCode::InvalidArgs);
+        let env = call(&module, "select_text", json!({ "all": true })).await;
+        assert_eq!(env.error.unwrap().code, ErrorCode::InvalidArgs);
+        assert!(backend.actions.lock().unwrap().is_empty());
+
+        // A password field is refused whatever the range.
+        let env = call(&module, "select_text", json!({ "ref": "@e2", "all": true })).await;
+        assert!(env.error.unwrap().message.contains("password"));
+        let env = call(&module, "get_selection", json!({ "ref": "@e2" })).await;
+        assert!(env.error.unwrap().message.contains("password"));
+    }
+
+    /// A range that is not in the text is the caller's mistake and is told so
+    /// before the element is asked to select anything.
+    #[tokio::test]
+    async fn select_text_names_a_range_the_text_does_not_have() {
+        let (module, backend, _) = test_module();
+        backend.script(101, vec![shown("hello world")]);
+        let env = call(
+            &module,
+            "select_text",
+            json!({ "ref": "@e1", "text": "mars" }),
+        )
+        .await;
+        let e = env.error.unwrap();
+        assert_eq!(e.code, ErrorCode::InvalidArgs);
+        assert!(e.message.contains("not in the text"), "{}", e.message);
+        let env = call(
+            &module,
+            "select_text",
+            json!({ "ref": "@e1", "start": 0, "end": 99 }),
+        )
+        .await;
+        assert!(env.error.unwrap().message.contains("11 characters"));
+    }
+
+    /// With no selection support in the backend the answer is the platform's
+    /// refusal, never an ok.
+    #[tokio::test]
+    async fn select_text_without_backend_support_is_an_error_not_an_ok() {
+        let (module, backend, _) = test_module();
+        backend.script(101, vec![shown("hello world")]);
+        let env = call(
+            &module,
+            "select_text",
+            json!({ "ref": "@e1", "text": "world" }),
+        )
+        .await;
+        assert!(!env.ok);
+        assert_eq!(env.error.unwrap().code, ErrorCode::UnsupportedOs);
+        let env = call(&module, "get_selection", json!({ "ref": "@e1" })).await;
+        assert_eq!(env.error.unwrap().code, ErrorCode::UnsupportedOs);
+    }
+
+    #[test]
+    fn the_new_tools_are_standard_tier_like_set_value() {
+        let (module, _, _) = test_module();
+        let all = module.descriptors();
+        let tier = |n: &str| all.iter().find(|d| d.name == n).unwrap().tier;
+        assert_eq!(tier("select_text"), tier("set_value"));
+        assert_eq!(tier("get_selection"), tier("set_value"));
+        for n in ["select_text", "get_selection"] {
+            let d = all.iter().find(|d| d.name == n).unwrap();
+            for p in ["ref", "name", "role"] {
+                assert!(
+                    d.input_schema["properties"].get(p).is_some(),
+                    "{n} lacks {p}"
+                );
+            }
+        }
+    }
+
+    // ---- foreground = "never" ------------------------------------------------
+
+    fn never_module() -> (InputModule, Arc<MockBackend>) {
+        let (module, backend, _) = test_module();
+        let module = InputModule {
+            policy: InputPolicy {
+                foreground: mcp_types::Foreground::Never,
+                ..module.policy.clone()
+            },
+            ..module
+        };
+        (module, backend)
+    }
+
+    /// True when nothing at all reached the backend that acts: no action, no
+    /// write, no pointer event, no key, no scroll, no typing.
+    fn untouched(b: &MockBackend) -> bool {
+        b.actions.lock().unwrap().is_empty()
+            && b.values.lock().unwrap().is_empty()
+            && b.moves.lock().unwrap().is_empty()
+            && b.keys.lock().unwrap().is_empty()
+            && b.pointer.lock().unwrap().is_empty()
+            && b.drags.lock().unwrap().is_empty()
+            && b.key_events.lock().unwrap().is_empty()
+            && b.scrolls.lock().unwrap().is_empty()
+            && b.pixel_events.lock().unwrap().is_empty()
+            && b.typed.lock().unwrap().is_empty()
+    }
+
+    #[derive(Clone, Copy, PartialEq, Debug)]
+    enum Want {
+        /// Refused with POLICY_DENIED before the backend is touched.
+        Refused,
+        /// Not this setting's business: whatever it returns, it is not a
+        /// foreground refusal.
+        Runs,
+    }
+
+    /// One row per way each tool can be called. A tool with no row here fails
+    /// `every_input_tool_has_a_foreground_decision`, so adding a tool forces a
+    /// decision about the foreground instead of inheriting one.
+    fn foreground_cases() -> Vec<(&'static str, Value, Want)> {
+        use Want::{Refused, Runs};
+        let e = |r: &str| json!({ "ref": r });
+        let with = |r: &str, extra: Value| merge(e(r), extra);
+        vec![
+            ("ui_action", with("@e4", json!({"action":"click"})), Runs),
+            (
+                "ui_action",
+                with("@e4", json!({"action":"double_click"})),
+                Runs,
+            ),
+            (
+                "ui_action",
+                with("@e4", json!({"action":"right_click"})),
+                Runs,
+            ),
+            ("ui_action", with("@e3", json!({"action":"toggle"})), Runs),
+            ("ui_action", with("@e3", json!({"action":"check"})), Runs),
+            (
+                "ui_action",
+                with("@e4", json!({"action":"scroll_into_view"})),
+                Runs,
+            ),
+            (
+                "ui_action",
+                with("@e4", json!({"action":"increment"})),
+                Runs,
+            ),
+            ("ui_action", with("@e4", json!({"action":"pick"})), Runs),
+            ("ui_action", with("@e4", json!({"action":"select"})), Runs),
+            ("ui_action", with("@e4", json!({"action":"nonsense"})), Runs),
+            ("ui_action", with("@e1", json!({"action":"focus"})), Refused),
+            ("ui_action", with("@e1", json!({"action":"Focus"})), Refused),
+            (
+                "ui_action",
+                with("@e4", json!({"action":"show_menu"})),
+                Refused,
+            ),
+            (
+                "ui_action",
+                with("@e5", json!({"action":"select","option":"Dark"})),
+                Refused,
+            ),
+            ("set_value", with("@e1", json!({"text":"hello"})), Runs),
+            ("select_text", with("@e1", json!({"start":0,"end":1})), Runs),
+            ("get_selection", e("@e1"), Runs),
+            ("get_selection", json!({}), Runs),
+            ("clipboard_read", json!({}), Runs),
+            ("clipboard_write", json!({"data":"x"}), Runs),
+            (
+                "ui_fill_form",
+                json!({"fields":[{"ref":"@e1","value":"a"},{"ref":"@e3","value":true}],
+                       "submit":{"ref":"@e4"}}),
+                Runs,
+            ),
+            // The refused field is last: the earlier, harmless one must not
+            // have been written by the time the call is refused.
+            (
+                "ui_fill_form",
+                json!({"fields":[{"ref":"@e1","value":"a"},{"ref":"@e1","action":"focus"}]}),
+                Refused,
+            ),
+            (
+                "ui_fill_form",
+                json!({"fields":[{"ref":"@e1","value":"a"},
+                                 {"ref":"@e5","action":"select","value":"Dark"}]}),
+                Refused,
+            ),
+            (
+                "ui_fill_form",
+                json!({"fields":[{"ref":"@e1","value":"a"}],
+                       "submit":{"ref":"@e4","action":"show_menu"}}),
+                Refused,
+            ),
+            ("keyboard_type", json!({"text":"hi"}), Refused),
+            ("keyboard_type", with("@e1", json!({"text":"hi"})), Refused),
+            ("keyboard_shortcut", json!({"combo":"cmd+s"}), Refused),
+            (
+                "keyboard_shortcut",
+                json!({"combo":"cmd+s","action":"press"}),
+                Refused,
+            ),
+            (
+                "keyboard_shortcut",
+                json!({"combo":"shift","action":"down"}),
+                Refused,
+            ),
+            (
+                "keyboard_shortcut",
+                json!({"combo":"shift","action":"DOWN"}),
+                Refused,
+            ),
+            ("keyboard_shortcut", json!({"action":"up"}), Runs),
+            (
+                "keyboard_shortcut",
+                json!({"combo":"shift","action":"bogus"}),
+                Runs,
+            ),
+            (
+                "mouse_action",
+                json!({"type":"click","x":10,"y":10}),
+                Refused,
+            ),
+            (
+                "mouse_action",
+                with("@e4", json!({"type":"click"})),
+                Refused,
+            ),
+            (
+                "mouse_action",
+                json!({"type":"move","x":10,"y":10,"glide":true}),
+                Refused,
+            ),
+            ("mouse_action", json!({"type":"down","x":1,"y":1}), Refused),
+            (
+                "mouse_action",
+                json!({"type":"triple","x":1,"y":1}),
+                Refused,
+            ),
+            (
+                "mouse_action",
+                json!({"type":"right_click","x":1,"y":1}),
+                Refused,
+            ),
+            ("scroll", json!({"direction":"down","x":5,"y":5}), Refused),
+            (
+                "scroll",
+                json!({"dy":300,"x":5,"y":5,"momentum":true}),
+                Refused,
+            ),
+            ("scroll", with("@e1", json!({"direction":"up"})), Refused),
+            ("hover", json!({"x":5,"y":5}), Refused),
+            ("hover", with("@e4", json!({"glide":true})), Refused),
+            (
+                "drag_drop",
+                json!({"from":{"x":1,"y":1},"to":{"x":50,"y":50}}),
+                Refused,
+            ),
+            (
+                "drag_drop",
+                json!({"from":{"x":1,"y":1},"path":[{"x":5,"y":5},{"x":9,"y":9}]}),
+                Refused,
+            ),
+            ("input_showcase", json!({"enabled":true}), Refused),
+            // A batch is as refused as its least safe step, and is refused
+            // whole: the set_value before the keystroke must not run.
+            (
+                "input_steps",
+                json!({"steps":[
+                    {"tool":"set_value","args":{"ref":"@e4","text":"x"}},
+                    {"tool":"keyboard_type","args":{"text":"y"}}
+                ]}),
+                Refused,
+            ),
+            (
+                "input_steps",
+                json!({"steps":[
+                    {"tool":"set_value","args":{"ref":"@e4","text":"x"}},
+                    {"tool":"ui_action","args":{"ref":"@e4","action":"click"}}
+                ]}),
+                Runs,
+            ),
+            ("desktop_record", json!({ "action": "status" }), Runs),
+            ("desktop_flow", json!({ "action": "list" }), Runs),
+        ]
+    }
+
+    #[tokio::test]
+    async fn every_input_tool_has_a_foreground_decision() {
+        let (module, _) = never_module();
+        let advertised: Vec<String> = module.descriptors().into_iter().map(|d| d.name).collect();
+        let classified: Vec<&str> = crate::foreground::TOOLS.iter().map(|(n, _)| *n).collect();
+        for name in &advertised {
+            assert!(
+                classified.contains(&name.as_str()),
+                "{name} is advertised but has no entry in foreground::TOOLS: decide whether it \
+                 can run with foreground = \"never\" (it is refused until somebody does)"
+            );
+            assert!(
+                foreground_cases().iter().any(|(t, _, _)| t == name),
+                "{name} has no case in foreground_cases"
+            );
+        }
+        for name in &classified {
+            assert!(
+                advertised.iter().any(|a| a == name),
+                "foreground::TOOLS lists {name}, which is not a tool"
+            );
+        }
+        // A tool classified as always-refused must be refused in every case.
+        for (tool, stance) in crate::foreground::TOOLS {
+            if *stance == crate::foreground::Stance::Refused {
+                for (t, args, want) in foreground_cases() {
+                    assert!(
+                        t != *tool || want == Want::Refused,
+                        "{tool} is classified Refused but {args} expects to run"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn under_never_every_synthetic_input_call_is_refused_before_anything_happens() {
+        for (tool, args, want) in foreground_cases() {
+            let (module, backend) = never_module();
+            let env = call(&module, tool, args.clone()).await;
+            let denied = env
+                .error
+                .as_ref()
+                .is_some_and(|e| e.code == ErrorCode::PolicyDenied);
+            match want {
+                Want::Refused => {
+                    assert!(!env.ok && denied, "{tool} {args} was not refused: {env:?}");
+                    let err = env.error.unwrap();
+                    assert!(
+                        err.message.contains("foreground = \"never\"")
+                            && err.message.contains(tool),
+                        "{tool}: the refusal must say what and why: {}",
+                        err.message
+                    );
+                    assert!(
+                        err.suggestion.is_some_and(|s| !s.is_empty()),
+                        "{tool}: the refusal must teach"
+                    );
+                    assert!(untouched(&backend), "{tool} {args} reached the backend");
+                }
+                Want::Runs => assert!(!denied, "{tool} {args} was refused: {env:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn the_default_refuses_nothing() {
+        // `allow` is what every existing user has: the same calls, none of
+        // them touched by this setting.
+        assert_eq!(
+            InputPolicy::default().foreground,
+            mcp_types::Foreground::Allow
+        );
+        for (tool, args, _) in foreground_cases() {
+            let (module, _, _) = test_module();
+            let env = call(&module, tool, args.clone()).await;
+            assert!(
+                env.error
+                    .as_ref()
+                    .is_none_or(|e| e.code != ErrorCode::PolicyDenied),
+                "{tool} {args} was refused under allow: {env:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_accessibility_tools_still_act_under_never() {
+        let (module, backend) = never_module();
+        backend.script(101, vec![shown("old"), shown("hello")]);
+        let env = call(&module, "set_value", json!({"ref":"@e1","text":"hello"})).await;
+        assert!(env.ok, "{env:?}");
+        assert_eq!(env.data.as_ref().unwrap()["input"], "ax");
+        assert_eq!(backend.values.lock().unwrap().len(), 1);
+        let env = call(&module, "ui_action", json!({"ref":"@e4","action":"click"})).await;
+        assert!(env.ok, "{env:?}");
+        assert_eq!(env.data.as_ref().unwrap()["input"], "ax");
+        // Nothing synthetic: no keys, pointer, scroll or typing.
+        assert!(backend.keys.lock().unwrap().is_empty());
+        assert!(backend.pointer.lock().unwrap().is_empty());
+        assert!(backend.typed.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_right_click_that_needs_the_pointer_on_this_platform_is_refused() {
+        // Linux has no accessibility right click; its backend reports `Hid`
+        // for it before acting, and that is what `never` must catch.
+        let (module, backend) = never_module();
+        *backend.route.lock().unwrap() = Some(Route::Hid);
+        let env = call(
+            &module,
+            "ui_action",
+            json!({"ref":"@e4","action":"right_click"}),
+        )
+        .await;
+        assert_eq!(env.error.unwrap().code, ErrorCode::PolicyDenied);
+        assert!(untouched(&backend));
+        // Every other action is reported as `Hid` by this backend too, so each
+        // is refused for that reason, not by name.
+        for a in ["click", "toggle", "expand", "scroll_into_view"] {
+            let env = call(&module, "ui_action", json!({"ref":"@e4","action":a})).await;
+            assert_eq!(env.error.unwrap().code, ErrorCode::PolicyDenied, "{a}");
+        }
+        assert!(untouched(&backend));
+    }
+
+    #[tokio::test]
+    async fn the_backend_wrapper_holds_even_when_the_tool_layer_is_skipped() {
+        // A module built with `allow` has no tool-layer check at all, as a
+        // future tool without a decision would not; the wrapper still posts
+        // nothing.
+        let backend = Arc::new(MockBackend::default());
+        let guarded = Arc::new(crate::ForegroundInput::new(backend.clone()));
+        let (module, _, arena) = test_module();
+        let module = InputModule::new(guarded.clone(), arena, module.policy.clone());
+        for (tool, args, want) in foreground_cases() {
+            if want != Want::Refused {
+                continue;
+            }
+            // The tool layer would have refused these; here they get as far as
+            // the backend, which must.
+            let env = call(&module, tool, args.clone()).await;
+            if tool == "input_showcase" {
+                continue; // configuration, not a backend call
+            }
+            assert!(
+                !env.ok,
+                "{tool} {args} succeeded through the wrapper: {env:?}"
+            );
+            if tool == "ui_fill_form" {
+                // Its harmless first field is written before the refused one
+                // is reached, which is why the tool layer scans the whole
+                // form first; the refused action itself must not have run.
+                assert!(backend.actions.lock().unwrap().is_empty(), "{args}");
+                backend.values.lock().unwrap().clear();
+            }
+            assert!(
+                untouched(&backend),
+                "{tool} {args} reached the real backend"
+            );
+        }
+        // A release never fails, and posts nothing: nothing was pressed.
+        guarded.key_up("shift").await.unwrap();
+        assert!(untouched(&backend));
+    }
+
+    #[tokio::test]
+    async fn the_wrapper_refuses_each_synthetic_method_and_forwards_the_rest() {
+        let backend = Arc::new(MockBackend::default());
+        let g = crate::ForegroundInput::new(backend.clone());
+        let refused = |r: Result<(), InputError>| matches!(r, Err(InputError::Refused(_)));
+        assert!(refused(g.type_text("x").await));
+        assert!(refused(g.key_combo("cmd+s").await));
+        assert!(refused(g.key_down("a").await));
+        assert!(refused(
+            g.mouse(MouseKind::Click, 1.0, 1.0, None, &[]).await
+        ));
+        assert!(refused(
+            g.scroll_at(1.0, 1.0, ScrollDir::Down, 1, &[]).await
+        ));
+        assert!(refused(g.hover(1.0, 1.0).await));
+        assert!(refused(g.drag((0.0, 0.0), &[(1.0, 1.0)], &[], 0, 0).await));
+        assert!(matches!(
+            g.choose_option(1, "x").await,
+            Err(InputError::Refused(_))
+        ));
+        for a in [SemanticAction::Focus, SemanticAction::ShowMenu] {
+            assert!(matches!(
+                g.perform(1, a, None).await,
+                Err(InputError::Refused(_))
+            ));
+        }
+        // Per-process keys are let through only where they were measured (see
+        // `pid_route_is_quiet_on`), and this platform is not one of them.
+        *backend.background.lock().unwrap() = Some(BackgroundTarget {
+            pid: 7,
+            name: "Notes".into(),
+        });
+        assert!(g.background_key_target().is_none());
+        assert!(refused(g.type_text_to_pid(7, "x").await));
+        assert!(refused(g.key_combo_to_pid(7, "cmd+s").await));
+        assert!(backend.pid_typed.lock().unwrap().is_empty());
+        assert!(backend.pid_keys.lock().unwrap().is_empty());
+        assert!(untouched(&backend));
+        // What is background-safe goes through.
+        assert_eq!(
+            g.perform(1, SemanticAction::Click, None).await.unwrap(),
+            Route::Ax
+        );
+        g.set_value(1, "v").await.unwrap();
+        g.read_element(1).await.unwrap();
+        g.clipboard_write(ClipFormat::Text, "c").await.unwrap();
+        g.clipboard_read(ClipFormat::Text).await.unwrap();
+        assert_eq!(backend.actions.lock().unwrap().len(), 1);
+        assert_eq!(backend.values.lock().unwrap().len(), 1);
+        // The sensors the human-override watcher reads are the inner ones.
+        assert_eq!(g.platform(), "mock");
+        assert_eq!(g.input_target().as_deref(), Some("TestApp"));
+        g.cancel_pending();
+        assert_eq!(g.takeover_generation(), 1);
+        assert_eq!(backend.takeover_generation(), 1);
+        assert_eq!(g.route_for(SemanticAction::Click), Route::Ax);
+    }
+
+    #[test]
+    fn the_refusals_name_the_background_alternative_each_tool_has() {
+        let b = MockBackend::default();
+        let said = |tool: &str, args: Value| {
+            let r = crate::foreground::tool_refusal(&b, tool, &args).expect("refused");
+            format!("{} | {}", r.message(), r.suggestion())
+        };
+        assert!(
+            said("mouse_action", json!({"type":"click","ref":"@e4"})).contains("ui_action click")
+        );
+        assert!(said("keyboard_type", json!({"text":"x","ref":"@e1"})).contains("set_value"));
+        assert!(said("scroll", json!({"direction":"down"})).contains("scroll_into_view"));
+        assert!(said("scroll", json!({"dy":300})).contains("scroll_into_view"));
+        assert!(said("ui_action", json!({"ref":"@e1","action":"focus"})).contains("select_text"));
+        for none in [
+            (
+                "drag_drop",
+                json!({"from":{"x":1,"y":1},"to":{"x":2,"y":2}}),
+            ),
+            ("hover", json!({"x":1,"y":1})),
+            ("mouse_action", json!({"type":"move","x":1,"y":1})),
+        ] {
+            let r = crate::foreground::tool_refusal(&b, none.0, &none.1).unwrap();
+            // A tool with a partial alternative says so; one with none says that.
+            if none.0 != "drag_drop" {
+                assert!(r.instead.is_none(), "{}", none.0);
+                assert!(r.suggestion().contains("no background-safe equivalent"));
+            }
+        }
+    }
+
+    // ---- input_steps --------------------------------------------------------
+
+    /// Hands a step to the module the way the server does once its checks have
+    /// passed. It decides nothing, and it is here for the batch's own
+    /// mechanics only (order, stopping, the limits): that a step meets the
+    /// real gate is proven against the real server in
+    /// `agentctl/tests/input_steps.rs`.
+    struct Direct {
+        module: std::sync::OnceLock<Arc<InputModule>>,
+        /// Runs after every step, to stage something that happens mid-batch.
+        after: Box<dyn Fn(usize) + Send + Sync>,
+        steps: std::sync::atomic::AtomicUsize,
+        cancelled: std::sync::atomic::AtomicBool,
+        /// Makes the named tool wait until it is cancelled.
+        hang_on: Option<&'static str>,
+    }
+
+    #[async_trait]
+    impl crate::steps::StepDispatch for Direct {
+        async fn dispatch(&self, tool: &str, args: Value) -> Envelope {
+            if self.hang_on == Some(tool) {
+                while !self.cancelled.load(std::sync::atomic::Ordering::SeqCst) {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+                return Envelope::fail(tool, ErrorCode::Timeout, "cancelled");
+            }
+            let ctx = CallCtx::new("t", mcp_types::CancelToken::new());
+            let env = self.module.get().unwrap().call(tool, args, &ctx).await;
+            let n = self.steps.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            (self.after)(n);
+            env
+        }
+        fn cancel(&self) {
+            self.cancelled
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    fn direct(
+        after: impl Fn(usize) + Send + Sync + 'static,
+        hang_on: Option<&'static str>,
+    ) -> Arc<Direct> {
+        Arc::new(Direct {
+            module: std::sync::OnceLock::new(),
+            after: Box::new(after),
+            steps: Default::default(),
+            cancelled: Default::default(),
+            hang_on,
+        })
+    }
+
+    /// A module whose batches run through `d`.
+    fn batching(
+        d: &Arc<Direct>,
+        tune: impl FnOnce(InputModule) -> InputModule,
+    ) -> (Arc<InputModule>, Arc<MockBackend>) {
+        let (module, backend, _) = test_module();
+        let relay = crate::steps::StepRelay::new();
+        relay.bind(d.clone());
+        let module = Arc::new(tune(module.with_steps(relay)));
+        d.module.set(module.clone()).ok().expect("set once");
+        (module, backend)
+    }
+
+    #[tokio::test]
+    async fn a_batch_runs_its_steps_in_order_and_reports_each() {
+        let d = direct(|_| {}, None);
+        let (module, backend) = batching(&d, |m| m);
+        let env = call(
+            &module,
+            "input_steps",
+            json!({"steps": [
+                {"tool": "set_value", "args": {"ref": "@e1", "text": "alice"}},
+                {"tool": "keyboard_shortcut", "args": {"combo": "cmd+s"}},
+                {"tool": "ui_action", "args": {"ref": "@e4", "action": "click"}}
+            ]}),
+        )
+        .await;
+        assert!(env.ok, "{env:?}");
+        let data = env.data.unwrap();
+        assert_eq!(data["ran"], 3);
+        assert_eq!(data["total"], 3);
+        assert!(data.get("failed_at").is_none());
+        let rows = data["steps"].as_array().unwrap();
+        let tools: Vec<_> = rows.iter().map(|r| r["tool"].as_str().unwrap()).collect();
+        assert_eq!(tools, ["set_value", "keyboard_shortcut", "ui_action"]);
+        assert!(rows.iter().all(|r| r["ok"] == true));
+        assert_eq!(rows[1]["pressed"], "cmd+s");
+        assert_eq!(backend.values.lock().unwrap().len(), 1);
+        assert_eq!(backend.keys.lock().unwrap().as_slice(), ["cmd+s"]);
+        assert_eq!(backend.actions.lock().unwrap().len(), 1);
+    }
+
+    /// The semantics of `browser_act` `steps`: the first failure ends the
+    /// batch, says which step it was, and nothing after it runs.
+    #[tokio::test]
+    async fn the_first_failing_step_ends_the_batch_and_later_steps_never_run() {
+        let d = direct(|_| {}, None);
+        let (module, backend) = batching(&d, |m| m);
+        let env = call(
+            &module,
+            "input_steps",
+            json!({"steps": [
+                {"tool": "set_value", "args": {"ref": "@e1", "text": "alice"}},
+                {"tool": "ui_action", "args": {"ref": "@e999", "action": "click"}},
+                {"tool": "keyboard_shortcut", "args": {"combo": "cmd+s"}}
+            ]}),
+        )
+        .await;
+        assert!(!env.ok);
+        let err = env.error.as_ref().unwrap();
+        assert_eq!(err.code, ErrorCode::NotFound);
+        assert!(
+            err.message.starts_with("step 1 (ui_action) failed"),
+            "{}",
+            err.message
+        );
+        let data = env.data.unwrap();
+        assert_eq!(data["failed_at"], 1);
+        assert_eq!(data["ran"], 2);
+        assert_eq!(data["total"], 3);
+        assert_eq!(data["steps"].as_array().unwrap().len(), 2);
+        assert_eq!(data["steps"][1]["ok"], false);
+        assert_eq!(data["steps"][1]["error"]["code"], "NOT_FOUND");
+        assert!(backend.keys.lock().unwrap().is_empty(), "step 2 ran");
+        assert_eq!(backend.values.lock().unwrap().len(), 1, "step 0 did run");
+    }
+
+    #[tokio::test]
+    async fn a_bad_batch_is_refused_whole_before_any_step_runs() {
+        let d = direct(|_| {}, None);
+        let (module, backend) = batching(&d, |m| m);
+        for (args, want) in [
+            (
+                json!({"steps": [
+                    {"tool": "set_value", "args": {"ref": "@e1", "text": "x"}},
+                    {"tool": "exec", "args": {"command": "ls"}}
+                ]}),
+                "step 1",
+            ),
+            (
+                json!({"steps": [
+                    {"tool": "set_value", "args": {"ref": "@e1", "text": "x"}},
+                    {"tool": "input_steps", "args": {"steps": []}}
+                ]}),
+                "step 1",
+            ),
+            (
+                json!({"steps": [
+                    {"tool": "set_value", "args": {"ref": "@e1", "text": "x"}},
+                    "scroll"
+                ]}),
+                "step 1",
+            ),
+            (
+                json!({"steps": vec![json!({"tool": "scroll"}); 21]}),
+                "1 to 20",
+            ),
+        ] {
+            let env = call(&module, "input_steps", args.clone()).await;
+            let err = env.error.expect("refused");
+            assert_eq!(err.code, ErrorCode::InvalidArgs, "{args}");
+            assert!(err.message.contains(want), "{args}: {}", err.message);
+        }
+        assert!(untouched(&backend), "a refused batch reached the backend");
+    }
+
+    /// With nothing to carry a step back through the gate, a batch does not
+    /// run: executing the step itself would skip the checks.
+    #[tokio::test]
+    async fn a_batch_with_no_way_back_through_the_gate_runs_nothing() {
+        let (module, backend, _) = test_module();
+        let env = call(
+            &module,
+            "input_steps",
+            json!({"steps": [{"tool": "set_value", "args": {"ref": "@e1", "text": "x"}}]}),
+        )
+        .await;
+        assert!(!env.ok);
+        assert!(env.error.unwrap().message.contains("not connected"));
+        assert!(untouched(&backend));
+    }
+
+    #[tokio::test]
+    async fn a_cancel_between_steps_stops_the_batch() {
+        let ctx = CallCtx::new("t", mcp_types::CancelToken::new());
+        let token = ctx.cancel.clone();
+        let d = direct(move |_| token.cancel(), None);
+        let (module, backend) = batching(&d, |m| m);
+        let env = module
+            .call(
+                "input_steps",
+                json!({"steps": [
+                    {"tool": "set_value", "args": {"ref": "@e1", "text": "x"}},
+                    {"tool": "keyboard_shortcut", "args": {"combo": "cmd+s"}}
+                ]}),
+                &ctx,
+            )
+            .await;
+        assert!(!env.ok);
+        let data = env.data.unwrap();
+        assert_eq!(data["ran"], 1);
+        assert_eq!(data["failed_at"], 1);
+        assert_eq!(data["steps"][1]["skipped"], true);
+        assert!(backend.keys.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_kill_switch_engaging_between_steps_stops_the_batch() {
+        let halted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = halted.clone();
+        let d = direct(
+            move |_| flag.store(true, std::sync::atomic::Ordering::SeqCst),
+            None,
+        );
+        let probe = halted.clone();
+        let (module, backend) = batching(&d, move |m| {
+            m.with_halt_probe(Arc::new(move || {
+                probe.load(std::sync::atomic::Ordering::SeqCst)
+            }))
+        });
+        let env = call(
+            &module,
+            "input_steps",
+            json!({"steps": [
+                {"tool": "set_value", "args": {"ref": "@e1", "text": "x"}},
+                {"tool": "keyboard_shortcut", "args": {"combo": "cmd+s"}}
+            ]}),
+        )
+        .await;
+        let err = env.error.as_ref().expect("stopped");
+        assert!(err.message.contains("kill switch"), "{}", err.message);
+        assert_eq!(env.data.unwrap()["ran"], 1);
+        assert!(backend.keys.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_human_taking_the_pointer_between_steps_stops_the_batch() {
+        let slot: Arc<std::sync::OnceLock<Arc<MockBackend>>> = Arc::default();
+        let s2 = slot.clone();
+        let d = direct(
+            move |_| {
+                s2.get()
+                    .unwrap()
+                    .takeovers
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            },
+            None,
+        );
+        let (module, backend) = batching(&d, |m| m);
+        slot.set(backend.clone()).ok();
+        let env = call(
+            &module,
+            "input_steps",
+            json!({"steps": [
+                {"tool": "set_value", "args": {"ref": "@e1", "text": "x"}},
+                {"tool": "keyboard_shortcut", "args": {"combo": "cmd+s"}}
+            ]}),
+        )
+        .await;
+        assert!(env.error.unwrap().message.contains("took over the pointer"));
+        assert!(backend.keys.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_batch_has_a_wall_time_and_a_step_still_running_is_cancelled() {
+        let d = direct(|_| {}, Some("scroll"));
+        let (module, backend) = batching(&d, |m| m.with_batch_limit(150));
+        let started = std::time::Instant::now();
+        let env = call(
+            &module,
+            "input_steps",
+            json!({"steps": [
+                {"tool": "scroll", "args": {"direction": "down"}},
+                {"tool": "keyboard_shortcut", "args": {"combo": "cmd+s"}}
+            ]}),
+        )
+        .await;
+        assert!(!env.ok);
+        // Cancelled by the batch, not left to hang.
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert!(d.cancelled.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(backend.keys.lock().unwrap().is_empty(), "the next step ran");
+        assert_eq!(env.data.unwrap()["failed_at"], 0);
+    }
+
+    /// The rule that a failed input call lets go of held keys holds per step.
+    #[tokio::test]
+    async fn a_failed_step_releases_the_keys_held_before_it() {
+        let d = direct(|_| {}, None);
+        let (module, backend) = batching(&d, |m| m);
+        let env = call(
+            &module,
+            "input_steps",
+            json!({"steps": [
+                {"tool": "keyboard_shortcut", "args": {"combo": "shift", "action": "down"}},
+                {"tool": "ui_action", "args": {"ref": "@e999", "action": "click"}}
+            ]}),
+        )
+        .await;
+        assert!(!env.ok);
+        assert_eq!(
+            events(&backend),
+            ["down:shift", "up:shift"],
+            "the failing step let go of what the first held"
+        );
+    }
+
+    #[test]
+    fn the_batchable_tools_are_all_tools_of_this_module_and_the_rest_are_decided() {
+        let (module, _, _) = test_module();
+        let all: Vec<String> = module.descriptors().into_iter().map(|d| d.name).collect();
+        for t in crate::steps::BATCHABLE {
+            assert!(all.iter().any(|a| a == t), "{t} is not a tool");
+        }
+        // Everything left out is left out on purpose; a new tool has to be
+        // put on one side or the other.
+        let left_out = [
+            "get_selection",
+            "clipboard_read",
+            "input_showcase",
+            "input_steps",
+            // A flow runs recorded steps, and a recording watches a person.
+            "desktop_record",
+            "desktop_flow",
+        ];
+        for a in &all {
+            assert!(
+                crate::steps::BATCHABLE.contains(&a.as_str()) || left_out.contains(&a.as_str()),
+                "{a} is neither batchable nor deliberately left out"
+            );
+        }
+        let batch = module
+            .descriptors()
+            .into_iter()
+            .find(|d| d.name == "input_steps")
+            .unwrap();
+        assert_eq!(batch.tier, Tier::Standard);
+        assert!(
+            module
+                .descriptors()
+                .iter()
+                .filter(|d| crate::steps::BATCHABLE.contains(&d.name.as_str()))
+                .all(|d| d.tier == batch.tier),
+            "a batchable tool above the batch's tier would never run"
+        );
+    }
+
+    // ---- effects ------------------------------------------------------------
+
+    /// Hands out the facts it was given, one reading per call, and notes what
+    /// it was asked. Scripts what the module is *told*; what a real app shows
+    /// is read in `mcp-macos`'s own tests.
+    struct Scripted {
+        readings: std::sync::Mutex<Vec<crate::effects::UiFacts>>,
+        asked: std::sync::Mutex<Vec<Option<Vec<crate::effects::Overlay>>>>,
+    }
+
+    #[async_trait]
+    impl crate::effects::UiProbe for Scripted {
+        async fn probe(
+            &self,
+            describe_new: Option<&[crate::effects::Overlay]>,
+        ) -> crate::effects::UiFacts {
+            self.asked
+                .lock()
+                .unwrap()
+                .push(describe_new.map(<[_]>::to_vec));
+            let mut r = self.readings.lock().unwrap();
+            if r.len() > 1 {
+                r.remove(0)
+            } else {
+                r[0].clone()
+            }
+        }
+    }
+
+    fn scripted(readings: Vec<crate::effects::UiFacts>) -> Arc<Scripted> {
+        Arc::new(Scripted {
+            readings: std::sync::Mutex::new(readings),
+            asked: Default::default(),
+        })
+    }
+
+    fn windows(titles: &[&str]) -> crate::effects::UiFacts {
+        crate::effects::UiFacts {
+            windows: Some(titles.iter().map(|t| t.to_string()).collect()),
+            overlays: Some(Vec::new()),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn an_action_reports_what_changed_and_only_that() {
+        let (module, backend, _) = test_module();
+        let probe = scripted(vec![windows(&["Untitled"]), windows(&["notes.txt"])]);
+        let module = module.with_probe(probe.clone());
+        backend.script(104, vec![shown("same")]);
+        let env = call(
+            &module,
+            "ui_action",
+            json!({"ref": "@e4", "action": "click"}),
+        )
+        .await;
+        assert!(env.ok, "{env:?}");
+        let data = env.data.unwrap();
+        assert_eq!(
+            data["effects"],
+            json!({"retitled": {"from": "Untitled", "to": "notes.txt"}})
+        );
+        // Read twice, and the second reading was told what was already open.
+        let asked = probe.asked.lock().unwrap();
+        assert_eq!(asked.len(), 2);
+        assert_eq!(asked[0], None);
+        assert_eq!(asked[1], Some(Vec::new()));
+    }
+
+    #[tokio::test]
+    async fn an_action_that_changed_nothing_has_no_effects_key() {
+        let (module, _, _) = test_module();
+        let module = module.with_probe(scripted(vec![windows(&["a"])]));
+        let env = call(
+            &module,
+            "ui_action",
+            json!({"ref": "@e4", "action": "click"}),
+        )
+        .await;
+        assert!(env.ok);
+        assert!(env.data.unwrap().get("effects").is_none());
+    }
+
+    #[tokio::test]
+    async fn effects_false_reads_nothing_and_a_typo_is_refused_before_the_action() {
+        let (module, backend, _) = test_module();
+        let probe = scripted(vec![windows(&["a"]), windows(&["b"])]);
+        let module = module.with_probe(probe.clone());
+        let env = call(
+            &module,
+            "ui_action",
+            json!({"ref": "@e4", "action": "click", "effects": false}),
+        )
+        .await;
+        assert!(env.ok);
+        assert!(probe.asked.lock().unwrap().is_empty(), "the probe was read");
+        assert!(env.data.unwrap().get("effects").is_none());
+        let bad = call(
+            &module,
+            "ui_action",
+            json!({"ref": "@e4", "action": "click", "effects": "no"}),
+        )
+        .await;
+        assert_eq!(bad.error.unwrap().code, ErrorCode::InvalidArgs);
+        assert_eq!(
+            backend.actions.lock().unwrap().len(),
+            1,
+            "only the first acted"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_action_pays_for_no_second_reading() {
+        let (module, _, _) = test_module();
+        let probe = scripted(vec![windows(&["a"]), windows(&["b"])]);
+        let module = module.with_probe(probe.clone());
+        let env = call(
+            &module,
+            "ui_action",
+            json!({"ref": "@e999", "action": "click"}),
+        )
+        .await;
+        assert!(!env.ok);
+        assert_eq!(probe.asked.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn only_actions_that_can_change_the_screen_are_read_around() {
+        let (module, _, _) = test_module();
+        let probe = scripted(vec![windows(&["a"]), windows(&["b"])]);
+        let module = module.with_probe(probe.clone());
+        for (tool, args) in [
+            (
+                "keyboard_shortcut",
+                json!({"combo": "shift", "action": "down"}),
+            ),
+            (
+                "keyboard_shortcut",
+                json!({"combo": "shift", "action": "up"}),
+            ),
+            ("mouse_action", json!({"type": "move", "x": 1, "y": 1})),
+            ("scroll", json!({"direction": "down", "x": 1, "y": 1})),
+            ("hover", json!({"x": 1, "y": 1})),
+            ("clipboard_write", json!({"data": "x"})),
+        ] {
+            let env = call(&module, tool, args.clone()).await;
+            assert!(env.ok, "{tool} {args}: {env:?}");
+        }
+        assert!(probe.asked.lock().unwrap().is_empty());
+        assert!(effects_apply(
+            "keyboard_shortcut",
+            &json!({"combo": "cmd+s"})
+        ));
+        assert!(effects_apply(
+            "mouse_action",
+            &json!({"type": "right_click"})
+        ));
+        assert!(!effects_apply("mouse_action", &json!({"type": "down"})));
+        assert!(!effects_apply("mouse_action", &json!({"type": "up"})));
+    }
+
+    #[tokio::test]
+    async fn a_pressed_elements_new_value_is_reported_unless_it_is_a_password() {
+        let (module, backend, _) = test_module();
+        let module = module.with_probe(scripted(vec![windows(&["a"])]));
+        backend.script(101, vec![shown("one"), shown("two")]);
+        let env = call(
+            &module,
+            "ui_action",
+            json!({"ref": "@e1", "action": "click"}),
+        )
+        .await;
+        assert_eq!(env.data.unwrap()["effects"], json!({"value": "two"}));
+        backend.script(102, vec![shown("hunter2"), shown("hunter3")]);
+        let env = call(
+            &module,
+            "ui_action",
+            json!({"ref": "@e2", "action": "click"}),
+        )
+        .await;
+        assert!(env.ok);
+        assert!(env.data.unwrap().get("effects").is_none());
+    }
+
+    /// A batch step reports its own effects like a lone call does.
+    #[tokio::test]
+    async fn each_step_of_a_batch_carries_its_own_effects() {
+        let d = direct(|_| {}, None);
+        let (module, _) = {
+            let (m, b, _) = test_module();
+            let relay = crate::steps::StepRelay::new();
+            relay.bind(d.clone());
+            let m = Arc::new(
+                m.with_steps(relay)
+                    .with_probe(scripted(vec![windows(&["a"]), windows(&["b"])])),
+            );
+            d.module.set(m.clone()).ok().expect("once");
+            (m, b)
+        };
+        let env = call(
+            &module,
+            "input_steps",
+            json!({"steps": [{"tool": "ui_action", "args": {"ref": "@e4", "action": "click"}}]}),
+        )
+        .await;
+        assert!(env.ok, "{env:?}");
+        assert_eq!(
+            env.data.unwrap()["steps"][0]["effects"],
+            json!({"retitled": {"from": "a", "to": "b"}})
+        );
+    }
+
+    // ---- a locked screen -----------------------------------------------------
+
+    fn locked_module(state: mcp_types::ScreenState) -> (InputModule, Arc<MockBackend>) {
+        let (module, backend, _) = test_module();
+        *backend.screen.lock().unwrap() = Some(state);
+        (module, backend)
+    }
+
+    /// Every way of posting key or pointer events is refused with the lock
+    /// named, and nothing reaches the backend: the call is not attempted and
+    /// reported as done.
+    #[tokio::test]
+    async fn a_locked_screen_refuses_every_call_that_would_post_input() {
+        use mcp_types::ScreenState::{Locked, OffConsole};
+        let calls = [
+            ("mouse_action", json!({"type": "click", "x": 5, "y": 5})),
+            ("hover", json!({"x": 5, "y": 5})),
+            ("scroll", json!({"x": 5, "y": 5, "direction": "down"})),
+            (
+                "drag_drop",
+                json!({"from": {"x": 1, "y": 1}, "to": {"x": 9, "y": 9}}),
+            ),
+            ("keyboard_type", json!({"text": "hello"})),
+            ("keyboard_shortcut", json!({"combo": "cmd+s"})),
+            (
+                "keyboard_shortcut",
+                json!({"combo": "shift", "action": "down"}),
+            ),
+            (
+                "input_steps",
+                json!({"steps": [
+                    {"tool": "set_value", "args": {"ref": "@e1", "text": "a"}},
+                    {"tool": "keyboard_type", "args": {"text": "b"}},
+                ]}),
+            ),
+        ];
+        for state in [Locked, OffConsole] {
+            let (module, backend) = locked_module(state);
+            for (tool, args) in &calls {
+                let env = call(&module, tool, args.clone()).await;
+                let err = env
+                    .error
+                    .unwrap_or_else(|| panic!("{tool} was not refused"));
+                assert_eq!(err.code, ErrorCode::ActionFailed, "{tool}");
+                assert!(
+                    err.message.contains("nothing was done"),
+                    "{tool}: {}",
+                    err.message
+                );
+                assert!(
+                    err.suggestion
+                        .as_deref()
+                        .unwrap_or_default()
+                        .starts_with("retryable"),
+                    "{tool}: {err:?}"
+                );
+            }
+            // Even the batch's first step, which posts nothing, did not run.
+            assert!(untouched(&backend));
+        }
+    }
+
+    /// What posts nothing is not this check's to refuse: accessibility
+    /// actions, value writes, the clipboard and a key release.
+    #[tokio::test]
+    async fn a_locked_screen_leaves_calls_that_post_nothing_alone() {
+        let (module, backend) = locked_module(mcp_types::ScreenState::Locked);
+        let env = call(
+            &module,
+            "ui_action",
+            json!({"ref": "@e1", "action": "click"}),
+        )
+        .await;
+        assert!(env.ok, "{env:?}");
+        let env = call(&module, "set_value", json!({"ref": "@e1", "text": "x"})).await;
+        assert!(env.ok, "{env:?}");
+        assert_eq!(backend.actions.lock().unwrap().len(), 1);
+        assert_eq!(backend.values.lock().unwrap().len(), 1);
+        let env = call(
+            &module,
+            "keyboard_shortcut",
+            json!({"combo": "shift", "action": "up"}),
+        )
+        .await;
+        assert_ne!(
+            env.error.map(|e| e.code),
+            Some(ErrorCode::ActionFailed),
+            "a release must not be refused"
+        );
+    }
+
+    /// Unknown and ready sessions act as they always did.
+    #[tokio::test]
+    async fn an_unlocked_or_unknown_session_is_not_refused() {
+        for state in [
+            mcp_types::ScreenState::Ready,
+            mcp_types::ScreenState::Unknown,
+        ] {
+            let (module, backend) = locked_module(state);
+            let env = call(
+                &module,
+                "mouse_action",
+                json!({"type": "click", "x": 5, "y": 5}),
+            )
+            .await;
+            assert!(env.ok, "{state:?}: {env:?}");
+            assert!(!backend.pointer.lock().unwrap().is_empty());
+        }
+    }
+
+    /// Polite waits for the person to be idle before it borrows; a locked
+    /// screen means they are away, so it refuses at once instead of waiting
+    /// and then posting into the void, and no polite report is attached.
+    #[tokio::test]
+    async fn polite_refuses_a_locked_screen_without_waiting() {
+        let (module, backend) = locked_module(mcp_types::ScreenState::Locked);
+        let module = InputModule {
+            policy: InputPolicy {
+                foreground: mcp_types::Foreground::Polite,
+                polite: crate::polite::PoliteConfig {
+                    idle_ms: 60_000,
+                    max_wait_ms: 60_000,
+                },
+                ..module.policy.clone()
+            },
+            ..module
+        };
+        let started = std::time::Instant::now();
+        let env = call(
+            &module,
+            "mouse_action",
+            json!({"type": "click", "x": 5, "y": 5}),
+        )
+        .await;
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        let err = env.error.expect("refused");
+        assert_eq!(err.code, ErrorCode::ActionFailed);
+        assert!(err.message.contains("screen is locked"), "{}", err.message);
+        assert!(
+            env.data.is_none(),
+            "no polite report on a call that never borrowed"
+        );
+        assert!(untouched(&backend));
+    }
+
+    /// The backend boundary: a post that got past the tool layer (a route it
+    /// did not foresee) still fails, and a release still succeeds.
+    #[tokio::test]
+    async fn the_screen_guard_refuses_each_posting_method_and_forwards_the_rest() {
+        let backend = Arc::new(MockBackend::default());
+        *backend.screen.lock().unwrap() = Some(mcp_types::ScreenState::Locked);
+        let g = crate::ScreenGuardInput::new(backend.clone());
+        let failed = |r: Result<(), InputError>| matches!(r, Err(InputError::Failed(m)) if m.contains("screen is locked"));
+        assert!(failed(g.type_text("x").await));
+        assert!(failed(g.key_combo("cmd+s").await));
+        assert!(failed(g.key_down("a").await));
+        assert!(failed(g.mouse(MouseKind::Click, 1.0, 1.0, None, &[]).await));
+        assert!(failed(g.scroll_at(1.0, 1.0, ScrollDir::Down, 1, &[]).await));
+        assert!(failed(g.hover(1.0, 1.0).await));
+        assert!(failed(g.drag((0.0, 0.0), &[(1.0, 1.0)], &[], 0, 0).await));
+        assert!(failed(g.type_text_to_pid(7, "x").await));
+        assert!(failed(g.key_combo_to_pid(7, "cmd+s").await));
+        assert!(untouched(&backend));
+        assert!(backend.pid_typed.lock().unwrap().is_empty());
+        g.key_up("a").await.unwrap();
+        assert_eq!(backend.key_events.lock().unwrap().as_slice(), ["up:a"]);
+        g.set_value(1, "v").await.unwrap();
+        assert_eq!(g.screen_state(), mcp_types::ScreenState::Locked);
+        // Unlocked: everything passes through.
+        *backend.screen.lock().unwrap() = Some(mcp_types::ScreenState::Ready);
+        g.type_text("x").await.unwrap();
+        assert_eq!(backend.typed.lock().unwrap().len(), 1);
     }
 }

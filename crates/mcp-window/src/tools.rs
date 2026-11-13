@@ -5,7 +5,7 @@ use mcp_a11y::A11yBackend;
 use mcp_types::{CallCtx, Category, Envelope, ErrorCode, Tier, ToolDescriptor, ToolModule};
 use serde_json::{json, Value};
 
-use crate::backend::{DialogScope, Rect, WindowAction, WindowBackend, WindowError};
+use crate::backend::{DialogScope, Rect, TargetInfo, WindowAction, WindowBackend, WindowError};
 use crate::wait::{default_wait_timeout, parse_wait_spec, wait_schema, WaitEvaluator};
 
 /// The `window` engine: window/app/menu control and the `wait_for` settle
@@ -16,6 +16,8 @@ pub struct WindowModule {
     evaluator: WaitEvaluator,
     allowed_apps: Vec<String>,
     judge: Option<Arc<mcp_judge::Judge>>,
+    foreground: mcp_types::Foreground,
+    desk: Option<Arc<dyn mcp_types::Desk>>,
 }
 
 impl WindowModule {
@@ -29,7 +31,25 @@ impl WindowModule {
             backend,
             allowed_apps,
             judge: None,
+            foreground: mcp_types::Foreground::Allow,
+            desk: None,
         }
+    }
+
+    /// Apply the operator's `foreground` setting (composition root only).
+    /// With `never`, calls that would bring something forward are refused
+    /// before they reach the backend, and `launch` asks not to activate.
+    pub fn with_foreground(mut self, foreground: mcp_types::Foreground) -> Self {
+        self.foreground = foreground;
+        self
+    }
+
+    /// Where a call borrows the desktop from under `foreground = "polite"`
+    /// (composition root only). Without one, polite refuses the calls that
+    /// would need it rather than raise an app unannounced.
+    pub fn with_desk(mut self, desk: Arc<dyn mcp_types::Desk>) -> Self {
+        self.desk = Some(desk);
+        self
     }
 
     /// Give `wait_for`'s evaluator the judge that answers a `judge` condition,
@@ -41,20 +61,65 @@ impl WindowModule {
     }
 
     fn app_allowed(&self, app: &str) -> bool {
-        let lower = app.to_ascii_lowercase();
-        self.allowed_apps
-            .iter()
-            .any(|a| lower.contains(&a.to_ascii_lowercase()))
+        mcp_types::apps::app_allowed(&self.allowed_apps, app)
+    }
+
+    /// Resolve the application an `app` argument names, for a tool that acts
+    /// on or reads it, and hold it to `allowed_apps`.
+    ///
+    /// The name is checked as given and again as the application it resolves
+    /// to, so a loose spelling cannot reach an application the list excludes.
+    /// A name that matches nothing is `NOT_FOUND` here, before the tool runs,
+    /// so none of them can fall back to another application. `None` when no
+    /// name was given.
+    // Envelope is intentionally large (it can carry an image); it is the Err
+    // type here only as a control-flow shortcut for an early return.
+    #[allow(clippy::result_large_err)]
+    async fn named_target(
+        &self,
+        tool: &str,
+        app: Option<&str>,
+    ) -> Result<Option<TargetInfo>, Envelope> {
+        let Some(name) = app.map(str::trim).filter(|a| !a.is_empty()) else {
+            return Ok(None);
+        };
+        if !self.app_allowed(name) {
+            return Err(denied_app(tool, name));
+        }
+        let info = self
+            .backend
+            .describe_target(Some(name))
+            .await
+            .map_err(|e| win_err(tool, e))?;
+        if !self.app_allowed(&info.app) {
+            return Err(denied_app(tool, &info.app));
+        }
+        Ok(Some(info))
     }
 
     async fn list_windows(&self, args: &Value) -> Envelope {
-        match self
-            .backend
-            .list_windows(str_arg(args, "app").as_deref())
-            .await
-        {
-            Ok(ws) => Envelope::ok("list_windows", json!({ "windows": ws })),
-            Err(e) => win_err("list_windows", e),
+        let tool = "list_windows";
+        let app = str_arg(args, "app");
+        let named = match self.named_target(tool, app.as_deref()).await {
+            Ok(n) => n,
+            Err(e) => return e,
+        };
+        // Naming nothing while nothing is pinned lists every application; the
+        // result says so, so an empty list is not read as one app's.
+        let target = match named {
+            Some(t) => Some(t),
+            None => self.backend.pinned().await,
+        };
+        match self.backend.list_windows(app.as_deref()).await {
+            Ok(ws) => {
+                let mut data = json!({ "windows": ws });
+                match target {
+                    Some(t) => data["target"] = json!(t),
+                    None => data["scope"] = json!("all_apps"),
+                }
+                Envelope::ok(tool, data)
+            }
+            Err(e) => win_err(tool, e),
         }
     }
 
@@ -76,7 +141,15 @@ impl WindowModule {
                 format!("app '{app}' is not in policy.allowed_apps"),
             );
         }
-        match self.backend.launch(&app).await {
+        // `polite` also starts it without activating: a new app that took the
+        // front would be one more thing to give back, and the person never
+        // asked for it.
+        let started = if self.foreground.is_never() || self.foreground.is_polite() {
+            self.backend.launch_in_background(&app).await
+        } else {
+            self.backend.launch(&app).await
+        };
+        match started {
             Ok(()) => Envelope::ok("launch", json!({ "ok": true })),
             Err(e) => win_err("launch", e),
         }
@@ -108,18 +181,50 @@ impl WindowModule {
                 "move/resize need 'bounds'",
             );
         }
+        let app = str_arg(args, "app");
+        let named = match self.named_target("control_window", app.as_deref()).await {
+            Ok(n) => n,
+            Err(e) => return e,
+        };
+        let target = match self
+            .resolved_target("control_window", named, app.as_deref())
+            .await
+        {
+            Ok(t) => t,
+            Err(e) => return e,
+        };
         match self
             .backend
             .control_window(
-                str_arg(args, "app").as_deref(),
+                app.as_deref(),
                 str_arg(args, "title").as_deref(),
                 action,
                 bounds,
             )
             .await
         {
-            Ok(()) => Envelope::ok("control_window", json!({ "ok": true })),
+            Ok(()) => Envelope::ok("control_window", json!({ "ok": true, "target": target })),
             Err(e) => win_err("control_window", e),
+        }
+    }
+
+    /// The application a call acts on: the one its `app` named, else the
+    /// pinned one, else the frontmost, with which of the three it was.
+    // Envelope is intentionally large; see `named_target`.
+    #[allow(clippy::result_large_err)]
+    async fn resolved_target(
+        &self,
+        tool: &str,
+        named: Option<TargetInfo>,
+        app: Option<&str>,
+    ) -> Result<TargetInfo, Envelope> {
+        match named {
+            Some(t) => Ok(t),
+            None => self
+                .backend
+                .describe_target(app)
+                .await
+                .map_err(|e| win_err(tool, e)),
         }
     }
 
@@ -135,13 +240,21 @@ impl WindowModule {
             return Envelope::fail(tool, ErrorCode::InvalidArgs, "'path' must be non-empty");
         }
         let app = str_arg(args, "app");
+        let named = match self.named_target(tool, app.as_deref()).await {
+            Ok(n) => n,
+            Err(e) => return e,
+        };
+        let target = match self.resolved_target(tool, named, app.as_deref()).await {
+            Ok(t) => t,
+            Err(e) => return e,
+        };
         let res = if invoke {
             self.backend.menu_invoke(app.as_deref(), &path).await
         } else {
             self.backend.menu_open(app.as_deref(), &path).await
         };
         match res {
-            Ok(()) => Envelope::ok(tool, json!({ "ok": true })),
+            Ok(()) => Envelope::ok(tool, json!({ "ok": true, "target": target })),
             Err(e) => win_err(tool, e),
         }
     }
@@ -163,11 +276,22 @@ impl WindowModule {
             },
         };
         let intent = str_arg(args, "intent");
-        let ds = match self
-            .backend
-            .list_dialogs(str_arg(args, "app").as_deref(), scope)
-            .await
-        {
+        let app = str_arg(args, "app");
+        // A system sweep reads every application and names none; only a scope
+        // of one application has a target to resolve and an allowlist to meet.
+        let target = if scope == DialogScope::App {
+            let named = match self.named_target(tool, app.as_deref()).await {
+                Ok(n) => n,
+                Err(e) => return e,
+            };
+            match self.resolved_target(tool, named, app.as_deref()).await {
+                Ok(t) => Some(t),
+                Err(e) => return e,
+            }
+        } else {
+            None
+        };
+        let ds = match self.backend.list_dialogs(app.as_deref(), scope).await {
             Ok(ds) => ds,
             Err(e) => return win_err(tool, e),
         };
@@ -179,6 +303,9 @@ impl WindowModule {
             "count": ds.len(),
             "credential_prompt": credential,
         });
+        if let Some(t) = target {
+            data["target"] = json!(t);
+        }
         // When the caller says what it is trying to do, ask the judge which
         // button serves that intent. This only advises: it does not press
         // anything, and the agent still acts through `ui_action` on a ref from
@@ -241,12 +368,20 @@ impl WindowModule {
             })
             .unwrap_or_default();
         let depth = args.get("depth").and_then(Value::as_u64).unwrap_or(1) as u32;
-        match self
-            .backend
-            .menu_list(str_arg(args, "app").as_deref(), &path, depth)
-            .await
-        {
-            Ok(items) => Envelope::ok(tool, json!({ "items": items, "count": items.len() })),
+        let app = str_arg(args, "app");
+        let named = match self.named_target(tool, app.as_deref()).await {
+            Ok(n) => n,
+            Err(e) => return e,
+        };
+        let target = match self.resolved_target(tool, named, app.as_deref()).await {
+            Ok(t) => t,
+            Err(e) => return e,
+        };
+        match self.backend.menu_list(app.as_deref(), &path, depth).await {
+            Ok(items) => Envelope::ok(
+                tool,
+                json!({ "items": items, "count": items.len(), "target": target }),
+            ),
             Err(e) => win_err(tool, e),
         }
     }
@@ -258,10 +393,17 @@ impl WindowModule {
     /// The same evaluator backs every `expect` clause on an input tool, so the
     /// two cannot drift apart.
     async fn wait_for(&self, args: &Value, ctx: &CallCtx) -> Envelope {
-        let spec = match parse_wait_spec(args, default_wait_timeout()) {
+        let mut spec = match parse_wait_spec(args, default_wait_timeout()) {
             Ok(s) => s,
             Err(msg) => return Envelope::fail("wait_for", ErrorCode::InvalidArgs, msg),
         };
+        if let Err(e) = self.named_target("wait_for", spec.app.as_deref()).await {
+            return e;
+        }
+        // Waiting on an application is not choosing to drive it: the polls
+        // must not pin it or replace the elements the last get_ui_tree's refs
+        // point at.
+        spec.passive = true;
         let wants_judge = spec
             .conditions
             .iter()
@@ -276,6 +418,11 @@ impl WindowModule {
         }
         let outcome = self.evaluator.wait(&spec, ctx).await;
         let mut data = json!({ "ok": outcome.met, "waited_ms": outcome.waited_ms });
+        if outcome.met {
+            // What noticed the condition, so a caller (and a test) can tell an
+            // app that announces its changes from one that is only polled.
+            data["woke_by"] = json!(outcome.woke_by.as_str());
+        }
         if let Some(p) = outcome.judge_probability {
             data["judge_probability"] = json!((p * 1000.0).round() / 1000.0);
         }
@@ -298,21 +445,45 @@ impl WindowModule {
 
 impl WindowModule {
     /// Pin (or release) the session's application target.
+    ///
+    /// `activate: false` pins without bringing the application forward or
+    /// touching its windows, which is the only form `foreground = "never"`
+    /// lets through. Any other value of `activate` is the activating form:
+    /// the tool layer has already refused it under `never`, and it is not
+    /// guessed to mean the quiet one.
     async fn focus_app(&self, args: &Value) -> Envelope {
+        let tool = "focus_app";
         let app = str_arg(args, "app");
-        if let Some(a) = app.as_deref() {
-            if !self.app_allowed(a) {
-                return Envelope::fail(
-                    "focus_app",
-                    ErrorCode::PolicyDenied,
-                    format!("app '{a}' is not in policy.allowed_apps"),
-                );
+        let quiet = match args.get("activate") {
+            None | Some(Value::Null) => false,
+            Some(Value::Bool(b)) => !*b,
+            Some(_) => {
+                return Envelope::fail(tool, ErrorCode::InvalidArgs, "'activate' is true or false")
             }
+        };
+        let Some(name) = app.as_deref().map(str::trim).filter(|a| !a.is_empty()) else {
+            return match self.backend.focus_app(None).await {
+                Ok(_) => Envelope::ok(tool, json!({ "target": null, "released": true })),
+                Err(e) => win_err(tool, e),
+            };
+        };
+        // Resolved and held to the allowlist before anything is raised.
+        if let Err(e) = self.named_target(tool, Some(name)).await {
+            return e;
         }
-        match self.backend.focus_app(app.as_deref()).await {
-            Ok(Some(name)) => Envelope::ok("focus_app", json!({ "target": name })),
-            Ok(None) => Envelope::ok("focus_app", json!({ "target": null, "released": true })),
-            Err(e) => win_err("focus_app", e),
+        if quiet {
+            return match self.backend.pin_app(name).await {
+                Ok(t) => Envelope::ok(
+                    tool,
+                    json!({ "target": t.app, "pid": t.pid, "activated": false }),
+                ),
+                Err(e) => win_err(tool, e),
+            };
+        }
+        match self.backend.focus_app(Some(name)).await {
+            Ok(Some(target)) => Envelope::ok(tool, json!({ "target": target, "activated": true })),
+            Ok(None) => Envelope::ok(tool, json!({ "target": null, "released": true })),
+            Err(e) => win_err(tool, e),
         }
     }
 }
@@ -325,11 +496,14 @@ impl ToolModule for WindowModule {
                 "list_windows",
                 Category::Window,
                 Tier::Read,
-                "List open windows: title, position, size, minimised state. With no \
-                 'app', lists every application's windows: start here to see what is \
-                 open. With 'app', lists just that one. After focus_app has pinned an \
-                 application, omitting 'app' means the pinned one. Desktop furniture \
-                 (the Dock, menu bar, overlays) is left out.",
+                "List open windows: title, position, size and state (onscreen, minimized, \
+                 or offscreen: another Space or a hidden app). With no 'app', lists every \
+                 application's windows: start here to see what is open. With 'app', lists \
+                 just that one, running or not frontmost. After focus_app has pinned an \
+                 application, omitting 'app' means the pinned one. Desktop furniture (the \
+                 Dock, menu bar, overlays) is left out. A window's id is its place in its \
+                 own application's list: pass it with that app to capture_window or \
+                 ocr_region. The result's target names the application a list is of.",
                 json!({"type":"object","properties":{"app":{"type":"string",
                     "description":"application name, as list_apps reports it"}},"required":[]}),
             ).untrusted_output(),
@@ -337,10 +511,15 @@ impl ToolModule for WindowModule {
                 "focus_app",
                 Category::Window,
                 Tier::Standard,
-                "Pin this session to an application: bring it forward and make every later \
-                 get_ui_tree/action target it instead of whatever happens to be frontmost. \
-                 Call once before driving an app. Omit 'app' to release the pin.",
-                json!({"type":"object","properties":{"app":{"type":"string"}},"required":[]}),
+                "Pin this session to an application so every later get_ui_tree/action \
+                 targets it instead of whatever happens to be frontmost. By default it \
+                 also brings the app forward; activate=false pins it without raising it or \
+                 touching its windows, to drive an app that stays in the background (the \
+                 only form foreground=\"never\" allows). Omit 'app' to release the pin.",
+                json!({"type":"object","properties":{
+                    "app":{"type":"string","description":"application name, as list_apps reports it"},
+                    "activate":{"type":"boolean","description":"false: pin without bringing the app forward (default true)"}
+                },"required":[]}),
             )
             .idempotent(true),
             ToolDescriptor::new(
@@ -371,7 +550,9 @@ impl ToolModule for WindowModule {
                 "control_window",
                 Category::Window,
                 Tier::Standard,
-                "Focus/move/resize/minimize/maximize/restore/close a window.",
+                "Focus/move/resize/minimize/maximize/restore/close a window of 'app' (else \
+                 the pinned app, else the frontmost) whose title contains 'title' (else its \
+                 main window). The result's target says which app it acted on.",
                 json!({"type":"object","properties":{
                     "app":{"type":"string"},"title":{"type":"string"},
                     "action":{"type":"string","enum":["focus","move","resize","minimize","maximize","restore","close"]},
@@ -430,13 +611,72 @@ impl ToolModule for WindowModule {
                 "Block until the UI settles: text appears, a window appears, text is gone, \
                  or an element takes focus. Synthetic input is asynchronous, so observing \
                  straight after acting reads the previous state: wait first. Several \
-                 conditions must all hold at once.",
+                 conditions must all hold at once. 'app' watches that application without \
+                 pinning it. Where the platform announces UI changes (macOS) it re-checks \
+                 when the app reports one, with a 500 ms safety re-check; the result's \
+                 'woke_by' is 'immediate' (already true), 'event' or 'poll' (found by the \
+                 timer, which is also what happens when the app cannot be observed), with \
+                 'waited_ms'.",
                 wait_schema("what to wait for; all given conditions must hold together"),
             ),
         ]
     }
 
     async fn call(&self, name: &str, args: Value, ctx: &CallCtx) -> Envelope {
+        if self.foreground.is_never() {
+            if let Some(refusal) = crate::foreground::tool_refusal(&*self.backend, name, &args) {
+                return refusal.envelope(name);
+            }
+        }
+        // What polite borrows the desktop for is what needs the session to
+        // be live: raising an app, opening a menu. While the screen is locked
+        // the person is away, so it is refused rather than waited for.
+        let raises = crate::foreground::tool_refusal(&*self.backend, name, &args).is_some();
+        // The allowlist answers first: an app the operator excluded is a
+        // policy refusal whatever the screen is doing, and `dispatch` says so.
+        let named_app_excluded = args
+            .get("app")
+            .and_then(Value::as_str)
+            .is_some_and(|a| !self.app_allowed(a));
+        if raises && !named_app_excluded {
+            if let Some(r) = mcp_types::screen_refusal(self.backend.screen_state(), name) {
+                return r.envelope(name);
+            }
+        }
+        if self.foreground.is_polite() && raises {
+            return self.call_politely(name, args, ctx).await;
+        }
+        self.dispatch(name, args, ctx).await
+    }
+}
+
+impl WindowModule {
+    /// A call that raises an app or window, under `foreground = "polite"`:
+    /// it waits for the person to be idle, runs, and puts the frontmost app
+    /// and the pointer back. `focus_app` and `control_window focus` therefore
+    /// raise the app only for the length of the call; `focus_app` still pins
+    /// it, which is what later calls act on.
+    async fn call_politely(&self, name: &str, args: Value, ctx: &CallCtx) -> Envelope {
+        let Some(desk) = &self.desk else {
+            return Envelope::fail_with(
+                name,
+                ErrorCode::UnsupportedOs,
+                format!(
+                    "{name} would bring an app forward and this server runs with foreground = \
+                     \"polite\" but has no way to borrow the desktop, so nothing was done"
+                ),
+                "use foreground = \"allow\" or \"never\"",
+            );
+        };
+        let loan = match desk.borrow(name, &ctx.cancel).await {
+            Ok(l) => l,
+            Err(e) => return e,
+        };
+        let env = self.dispatch(name, args, ctx).await;
+        loan.settle(env).await
+    }
+
+    async fn dispatch(&self, name: &str, args: Value, ctx: &CallCtx) -> Envelope {
         match name {
             "list_windows" => self.list_windows(&args).await,
             "list_apps" => self.list_apps().await,
@@ -452,6 +692,14 @@ impl ToolModule for WindowModule {
             other => Envelope::fail(other, ErrorCode::InvalidArgs, "unknown tool"),
         }
     }
+}
+
+fn denied_app(tool: &str, app: &str) -> Envelope {
+    Envelope::fail(
+        tool,
+        ErrorCode::PolicyDenied,
+        format!("app '{app}' is not in policy.allowed_apps"),
+    )
 }
 
 fn str_arg(args: &Value, key: &str) -> Option<String> {
@@ -473,6 +721,7 @@ fn win_err(tool: &str, e: WindowError) -> Envelope {
         WindowError::NotFound(m) => (ErrorCode::NotFound, m),
         WindowError::Unsupported(m) => (ErrorCode::UnsupportedOs, m),
         WindowError::Failed(m) => (ErrorCode::ActionFailed, m),
+        WindowError::Refused(m) => (ErrorCode::PolicyDenied, m),
     };
     Envelope::fail(tool, code, msg)
 }
@@ -694,5 +943,426 @@ mod dialog_suggestion_tests {
         assert!(rank_dialog_buttons(&j, "save", &ds, &candidates)
             .await
             .is_err());
+    }
+}
+
+#[cfg(test)]
+mod named_app_tests {
+    use super::*;
+    use crate::backend::{MenuItemInfo, TargetSource, WindowState};
+    use mcp_a11y::{BackendError, RawSnapshot, SnapshotRequest};
+    use mcp_types::CancelToken;
+    use std::sync::Mutex;
+
+    /// Two running applications, an optional pin, and a record of the `app`
+    /// each operation was handed. It stands in for no OS: it shows which
+    /// application the module asked the backend to act on.
+    struct Desk {
+        pin: Mutex<Option<TargetInfo>>,
+        asked: Mutex<Vec<String>>,
+        /// What a name resolves to, when it is not the name itself.
+        resolves: Option<(&'static str, &'static str)>,
+        /// What it says about the session: scripts what the tool layer is
+        /// told, not what an OS does.
+        screen: Mutex<Option<mcp_types::ScreenState>>,
+    }
+
+    impl Desk {
+        fn new() -> Self {
+            Desk {
+                pin: Mutex::new(None),
+                asked: Mutex::new(Vec::new()),
+                resolves: None,
+                screen: Mutex::new(None),
+            }
+        }
+        fn note(&self, what: String) {
+            self.asked.lock().unwrap().push(what);
+        }
+        fn asked(&self) -> Vec<String> {
+            self.asked.lock().unwrap().clone()
+        }
+        fn running(name: &str) -> Option<(&'static str, u32)> {
+            [("TextEdit", 11), ("Finder", 12), ("Safari", 13)]
+                .into_iter()
+                .find(|(n, _)| n.eq_ignore_ascii_case(name))
+        }
+    }
+
+    #[async_trait]
+    impl WindowBackend for Desk {
+        async fn list_windows(
+            &self,
+            app: Option<&str>,
+        ) -> Result<Vec<crate::backend::WindowInfo>, WindowError> {
+            self.note(format!("list_windows {}", app.unwrap_or("-")));
+            Ok(Vec::new())
+        }
+        async fn list_apps(&self) -> Result<Vec<String>, WindowError> {
+            Ok(Vec::new())
+        }
+        async fn launch(&self, _: &str) -> Result<(), WindowError> {
+            Ok(())
+        }
+        async fn close_app(&self, _: &str) -> Result<(), WindowError> {
+            Ok(())
+        }
+        async fn control_window(
+            &self,
+            app: Option<&str>,
+            title: Option<&str>,
+            action: WindowAction,
+            _: Option<Rect>,
+        ) -> Result<(), WindowError> {
+            self.note(format!(
+                "control_window {} {} {action:?}",
+                app.unwrap_or("-"),
+                title.unwrap_or("-")
+            ));
+            Ok(())
+        }
+        fn control_takes_foreground(&self, _: WindowAction) -> bool {
+            false
+        }
+        async fn menu_open(&self, app: Option<&str>, _: &[String]) -> Result<(), WindowError> {
+            self.note(format!("menu_open {}", app.unwrap_or("-")));
+            Ok(())
+        }
+        async fn menu_invoke(&self, app: Option<&str>, _: &[String]) -> Result<(), WindowError> {
+            self.note(format!("menu_invoke {}", app.unwrap_or("-")));
+            Ok(())
+        }
+        async fn list_dialogs(
+            &self,
+            app: Option<&str>,
+            _: DialogScope,
+        ) -> Result<Vec<crate::backend::DialogInfo>, WindowError> {
+            self.note(format!("list_dialogs {}", app.unwrap_or("-")));
+            Ok(Vec::new())
+        }
+        async fn menu_list(
+            &self,
+            app: Option<&str>,
+            _: &[String],
+            _: u32,
+        ) -> Result<Vec<MenuItemInfo>, WindowError> {
+            self.note(format!("menu_list {}", app.unwrap_or("-")));
+            Ok(Vec::new())
+        }
+        async fn focus_app(&self, app: Option<&str>) -> Result<Option<String>, WindowError> {
+            self.note(format!("focus_app {}", app.unwrap_or("-")));
+            Ok(app.map(str::to_string))
+        }
+        async fn pin_app(&self, app: &str) -> Result<TargetInfo, WindowError> {
+            self.note(format!("pin_app {app}"));
+            let (name, pid) = Desk::running(app).ok_or_else(|| {
+                WindowError::NotFound(format!("no running application matching '{app}'"))
+            })?;
+            let t = TargetInfo {
+                app: name.to_string(),
+                pid: Some(pid),
+                from: TargetSource::Named,
+            };
+            *self.pin.lock().unwrap() = Some(TargetInfo {
+                from: TargetSource::Pinned,
+                ..t.clone()
+            });
+            Ok(t)
+        }
+        async fn describe_target(&self, app: Option<&str>) -> Result<TargetInfo, WindowError> {
+            match app {
+                Some(a) => {
+                    let (name, pid) = Desk::running(a).ok_or_else(|| {
+                        WindowError::NotFound(format!("no running application matching '{a}'"))
+                    })?;
+                    let name = match self.resolves {
+                        Some((from, to)) if from == name => to,
+                        _ => name,
+                    };
+                    Ok(TargetInfo {
+                        app: name.to_string(),
+                        pid: Some(pid),
+                        from: TargetSource::Named,
+                    })
+                }
+                None => Ok(self.pin.lock().unwrap().clone().unwrap_or(TargetInfo {
+                    app: "Safari".into(),
+                    pid: Some(13),
+                    from: TargetSource::Frontmost,
+                })),
+            }
+        }
+        async fn pinned(&self) -> Option<TargetInfo> {
+            self.pin.lock().unwrap().clone()
+        }
+        fn platform(&self) -> &'static str {
+            "desk"
+        }
+        fn screen_state(&self) -> mcp_types::ScreenState {
+            (*self.screen.lock().unwrap()).unwrap_or(mcp_types::ScreenState::Unknown)
+        }
+    }
+
+    struct NoTree;
+    #[async_trait]
+    impl A11yBackend for NoTree {
+        async fn snapshot(&self, _: &SnapshotRequest) -> Result<RawSnapshot, BackendError> {
+            Err(BackendError::Unsupported("test".into()))
+        }
+        fn platform(&self) -> &'static str {
+            "desk"
+        }
+    }
+
+    fn module(desk: &Arc<Desk>) -> WindowModule {
+        WindowModule::new(
+            desk.clone(),
+            Arc::new(NoTree),
+            vec!["TextEdit".into(), "Finder".into()],
+        )
+    }
+
+    async fn call(m: &WindowModule, tool: &str, args: Value) -> Envelope {
+        m.call(tool, args, &CallCtx::new("t", CancelToken::new()))
+            .await
+    }
+
+    /// `control_window` used to read the frontmost app whatever `app` said,
+    /// so closing a window of one application closed one of another.
+    #[tokio::test]
+    async fn a_named_app_reaches_the_backend_and_the_result_says_which_app_acted() {
+        let desk = Arc::new(Desk::new());
+        let m = module(&desk);
+        let env = call(
+            &m,
+            "control_window",
+            json!({"app":"textedit","title":"Notes","action":"minimize"}),
+        )
+        .await;
+        assert!(env.ok, "{env:?}");
+        assert_eq!(desk.asked(), ["control_window textedit Notes Minimize"]);
+        let t = &env.data.unwrap()["target"];
+        assert_eq!(t["app"], "TextEdit");
+        assert_eq!(t["pid"], 11);
+        assert_eq!(t["from"], "named");
+    }
+
+    #[tokio::test]
+    async fn with_no_app_the_result_says_whether_the_pin_or_the_frontmost_app_was_used() {
+        let desk = Arc::new(Desk::new());
+        let m = module(&desk);
+        let env = call(&m, "menu_list", json!({})).await;
+        assert_eq!(env.data.unwrap()["target"]["from"], "frontmost");
+        assert!(
+            call(&m, "focus_app", json!({"app":"Finder","activate":false}))
+                .await
+                .ok
+        );
+        let env = call(&m, "menu_list", json!({})).await;
+        let t = env.data.unwrap()["target"].clone();
+        assert_eq!(
+            (t["app"].as_str(), t["from"].as_str()),
+            (Some("Finder"), Some("pinned"))
+        );
+    }
+
+    /// An application that is not running is an error before the operation,
+    /// not a fall-through to whichever app is in front.
+    #[tokio::test]
+    async fn a_name_that_matches_no_running_app_is_not_found_and_nothing_else_is_acted_on() {
+        let desk = Arc::new(Desk::new());
+        let m = module(&desk);
+        for (tool, args) in [
+            ("list_windows", json!({"app":"TextEditt"})),
+            (
+                "control_window",
+                json!({"app":"TextEditt","action":"close"}),
+            ),
+            (
+                "menu_invoke",
+                json!({"app":"TextEditt","path":["File","Save"]}),
+            ),
+            ("menu_list", json!({"app":"TextEditt"})),
+            ("handle_dialogs", json!({"app":"TextEditt"})),
+            ("focus_app", json!({"app":"TextEditt","activate":false})),
+        ] {
+            let env = call(&m, tool, args).await;
+            let err = env.error.unwrap_or_else(|| panic!("{tool} should fail"));
+            // "TextEditt" contains an allowed name, so it passes the list and
+            // fails the lookup: the typo is an error, not the app in front.
+            assert_eq!(err.code, ErrorCode::NotFound, "{tool}: {err:?}");
+            assert!(
+                err.message.contains("'TextEditt'"),
+                "{tool}: {}",
+                err.message
+            );
+        }
+        assert!(desk.asked().is_empty(), "{:?}", desk.asked());
+    }
+
+    #[tokio::test]
+    async fn an_allowed_name_that_is_not_running_is_not_found_and_names_it() {
+        // Finder is allowed; make the lookup fail for it by asking for an
+        // allowed substring that matches nothing running.
+        let desk = Arc::new(Desk::new());
+        let m = WindowModule::new(desk.clone(), Arc::new(NoTree), vec!["Ghost".into()]);
+        let env = call(&m, "list_windows", json!({"app":"Ghost"})).await;
+        let err = env.error.unwrap();
+        assert_eq!(err.code, ErrorCode::NotFound);
+        assert!(err.message.contains("'Ghost'"), "{}", err.message);
+        assert!(desk.asked().is_empty());
+    }
+
+    /// Listing, driving or pinning an application outside `allowed_apps` is
+    /// refused the way `launch` always has been, and nothing reaches the OS.
+    #[tokio::test]
+    async fn every_tool_that_names_an_app_holds_it_to_allowed_apps() {
+        let desk = Arc::new(Desk::new());
+        let m = module(&desk);
+        for (tool, args) in [
+            ("list_windows", json!({"app":"Safari"})),
+            (
+                "control_window",
+                json!({"app":"Safari","action":"minimize"}),
+            ),
+            ("menu_open", json!({"app":"Safari","path":["File"]})),
+            (
+                "menu_invoke",
+                json!({"app":"Safari","path":["File","Save"]}),
+            ),
+            ("menu_list", json!({"app":"Safari"})),
+            ("handle_dialogs", json!({"app":"Safari"})),
+            (
+                "wait_for",
+                json!({"app":"Safari","text":"x","timeout_ms":10}),
+            ),
+            ("focus_app", json!({"app":"Safari"})),
+            ("focus_app", json!({"app":"Safari","activate":false})),
+            ("launch", json!({"app":"Safari"})),
+        ] {
+            let env = call(&m, tool, args.clone()).await;
+            let err = env
+                .error
+                .unwrap_or_else(|| panic!("{tool} {args} was allowed"));
+            assert_eq!(err.code, ErrorCode::PolicyDenied, "{tool} {args}");
+            assert!(
+                err.message.contains("allowed_apps"),
+                "{tool}: {}",
+                err.message
+            );
+        }
+        assert!(desk.asked().is_empty(), "{:?}", desk.asked());
+    }
+
+    /// The allowlist is checked against the application a name resolves to as
+    /// well as the name, so a spelling that contains an allowed name cannot
+    /// reach one that is not.
+    #[tokio::test]
+    async fn a_name_is_also_checked_as_the_app_it_resolves_to() {
+        let mut desk = Desk::new();
+        desk.resolves = Some(("Safari", "Safari"));
+        let desk = Arc::new(desk);
+        let m = WindowModule::new(desk.clone(), Arc::new(NoTree), vec!["Fari".into()]);
+        // The control case: the name and what it resolves to are both covered.
+        assert!(call(&m, "list_windows", json!({"app":"Safari"})).await.ok);
+        // A name the list covers that resolves to an app it does not is refused.
+        let mut desk = Desk::new();
+        desk.resolves = Some(("Finder", "Spotlight"));
+        let desk = Arc::new(desk);
+        let m = module(&desk);
+        let env = call(&m, "list_windows", json!({"app":"Finder"})).await;
+        assert_eq!(env.error.unwrap().code, ErrorCode::PolicyDenied);
+        assert!(desk.asked().is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_quiet_pin_pins_without_activating_and_the_plain_form_still_activates() {
+        let desk = Arc::new(Desk::new());
+        let m = module(&desk);
+        let env = call(&m, "focus_app", json!({"app":"Finder","activate":false})).await;
+        let d = env.data.unwrap();
+        assert_eq!(
+            (
+                d["target"].as_str(),
+                d["activated"].as_bool(),
+                d["pid"].as_u64()
+            ),
+            (Some("Finder"), Some(false), Some(12))
+        );
+        assert_eq!(desk.asked(), ["pin_app Finder"]);
+        let env = call(&m, "focus_app", json!({"app":"Finder"})).await;
+        assert_eq!(env.data.unwrap()["activated"], true);
+        assert_eq!(desk.asked(), ["pin_app Finder", "focus_app Finder"]);
+        let env = call(&m, "focus_app", json!({"app":"Finder","activate":"no"})).await;
+        assert_eq!(env.error.unwrap().code, ErrorCode::InvalidArgs);
+    }
+
+    #[tokio::test]
+    async fn list_windows_says_whether_it_listed_one_app_or_all_of_them() {
+        let desk = Arc::new(Desk::new());
+        let m = module(&desk);
+        let all = call(&m, "list_windows", json!({})).await.data.unwrap();
+        assert_eq!(all["scope"], "all_apps");
+        assert!(all.get("target").is_none());
+        let one = call(&m, "list_windows", json!({"app":"Finder"}))
+            .await
+            .data
+            .unwrap();
+        assert_eq!(one["target"]["app"], "Finder");
+        assert!(one.get("scope").is_none());
+        // Pinned, and naming nothing: the pin is what was listed.
+        call(&m, "focus_app", json!({"app":"TextEdit","activate":false})).await;
+        let pinned = call(&m, "list_windows", json!({})).await.data.unwrap();
+        assert_eq!(pinned["target"]["from"], "pinned");
+    }
+
+    #[test]
+    fn a_window_state_serialises_as_a_lowercase_word() {
+        assert_eq!(
+            serde_json::to_value(WindowState::Offscreen).unwrap(),
+            "offscreen"
+        );
+    }
+
+    /// A locked screen refuses the calls that raise an app (they would be
+    /// answered with nothing on screen) and leaves reads and the quiet pin.
+    #[tokio::test]
+    async fn a_locked_screen_refuses_raising_and_leaves_reads_alone() {
+        let desk = Arc::new(Desk::new());
+        *desk.screen.lock().unwrap() = Some(mcp_types::ScreenState::Locked);
+        let m = module(&desk);
+        for (tool, args) in [
+            ("focus_app", json!({"app": "TextEdit"})),
+            ("menu_open", json!({"app": "TextEdit", "path": ["File"]})),
+            (
+                "control_window",
+                json!({"app": "TextEdit", "action": "focus"}),
+            ),
+        ] {
+            let env = call(&m, tool, args).await;
+            let err = env
+                .error
+                .unwrap_or_else(|| panic!("{tool} was not refused"));
+            assert_eq!(err.code, ErrorCode::ActionFailed, "{tool}");
+            assert!(
+                err.message.contains("screen is locked"),
+                "{tool}: {}",
+                err.message
+            );
+        }
+        assert!(desk.asked().is_empty(), "{:?}", desk.asked());
+        let env = call(&m, "list_windows", json!({"app": "TextEdit"})).await;
+        assert!(env.ok, "{env:?}");
+        let env = call(
+            &m,
+            "focus_app",
+            json!({"app": "TextEdit", "activate": false}),
+        )
+        .await;
+        assert!(env.ok, "{env:?}");
+        // Unlocked, the same raising call goes through.
+        *desk.screen.lock().unwrap() = Some(mcp_types::ScreenState::Ready);
+        let env = call(&m, "focus_app", json!({"app": "TextEdit"})).await;
+        assert!(env.ok, "{env:?}");
     }
 }

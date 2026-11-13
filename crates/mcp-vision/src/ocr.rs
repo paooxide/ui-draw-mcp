@@ -38,10 +38,11 @@ pub struct ModelFile {
 
 /// The models, pinned by digest.
 ///
-/// The files are the unversioned ones that `ocrs` 0.13.1's own
+/// The files are the unversioned ones that `ocrs` 0.14.0's own
 /// `examples/download-models.sh` fetches from these URLs (the crate names
-/// no model version). Digests taken from fresh downloads on 2026-10-10,
-/// matching the copies already in use here. Should the upstream files
+/// no model version, and upstream says the URLs are not guaranteed to stay
+/// up). Digests taken from fresh downloads on 2026-10-10 and checked again
+/// on 2026-11-13 against `ocrs` 0.14.0's script: unchanged. Should the upstream files
 /// change, the download fails verification and these need updating on
 /// purpose, after checking the new files, rather than the server silently
 /// parsing whatever the bucket serves.

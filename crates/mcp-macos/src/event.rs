@@ -13,6 +13,7 @@ use core_graphics::geometry::CGPoint;
 use std::collections::VecDeque;
 use std::sync::Mutex;
 
+use mcp_input::trackpad::{Phase, PixelScroll};
 use mcp_input::{InputError, MouseKind, ScrollDir, SetPoint};
 
 fn fail(what: &str) -> InputError {
@@ -108,6 +109,166 @@ fn display_rects() -> Vec<(f64, f64, f64, f64)> {
         .collect()
 }
 
+extern "C" {
+    fn CGEventSourceSecondsSinceLastEventType(state: i32, event_type: u32) -> f64;
+}
+
+/// `kCGAnyInputEventType`: whichever input event came last.
+const ANY_INPUT_EVENT: u32 = !0;
+/// `kCGEventSourceStateHIDSystemState`: the hardware's own clock, the one
+/// `ioreg`'s `HIDIdleTime` (what `idle_status` reports) reads.
+const HID_SYSTEM_STATE: i32 = 1;
+
+/// Milliseconds since the last input event of any kind, from the person's
+/// devices or from anything that posted synthetic input, this process
+/// included. `None` if the OS gives no answer.
+fn system_idle_ms() -> Option<u64> {
+    let secs = unsafe { CGEventSourceSecondsSinceLastEventType(HID_SYSTEM_STATE, ANY_INPUT_EVENT) };
+    (secs.is_finite() && secs >= 0.0).then_some((secs * 1000.0) as u64)
+}
+
+/// How a person's idleness is told apart from this process's own input.
+///
+/// Measured on macOS: a synthetic pointer move resets the system idle clock
+/// exactly as a real one does. Read raw, the clock would say "the person just
+/// acted" after every call the server itself made, and a polite server would
+/// wait out its own click. So every event posted to the system stream is
+/// recorded here, and the clock is read against it.
+#[derive(Debug, Clone, Copy, Default)]
+struct PostLedger {
+    /// When this process last posted a system-stream event (epoch ms).
+    last_post: Option<u64>,
+    /// When the last event that was not this process's happened (epoch ms),
+    /// as far as it is known. `None` until a post has looked at the clock.
+    person_last: Option<u64>,
+}
+
+/// A person's event must land this much after our own to count as theirs:
+/// the clock has a timestamp per event, and ours is stamped a moment after
+/// the instant recorded around the post.
+const OWN_EVENT_SLACK_MS: u64 = 100;
+
+static POSTS: Mutex<PostLedger> = Mutex::new(PostLedger {
+    last_post: None,
+    person_last: None,
+});
+
+/// Note that this process is about to post to the system stream, keeping
+/// what the clock says about the person up to date first.
+fn note_post(ledger: &mut PostLedger, now: u64, system_idle: Option<u64>) {
+    if let Some(idle) = system_idle {
+        let last_event = now.saturating_sub(idle);
+        let was_ours = ledger
+            .last_post
+            .is_some_and(|p| last_event <= p + OWN_EVENT_SLACK_MS);
+        if !was_ours {
+            ledger.person_last = Some(last_event);
+        }
+    }
+    ledger.last_post = Some(now);
+}
+
+/// Milliseconds since the person last touched the keyboard or pointer.
+///
+/// If the last event on the clock is the server's own, the person's idle time
+/// is counted from their last known event; if nothing is known about them
+/// before the server's first post, from that post (the server has acted only
+/// after waiting for them to be idle). Pure in its inputs, for testing.
+fn person_idle(ledger: &PostLedger, now: u64, system_idle: u64) -> u64 {
+    let last_event = now.saturating_sub(system_idle);
+    match ledger.last_post {
+        Some(p) if last_event <= p + OWN_EVENT_SLACK_MS => {
+            let since = ledger.person_last.unwrap_or(p);
+            now.saturating_sub(since)
+        }
+        _ => system_idle,
+    }
+}
+
+/// Milliseconds since the person last used the keyboard or pointer, not
+/// counting what this process posted. `None` if the OS gives no answer.
+pub fn hid_idle_ms() -> Option<u64> {
+    let sys = system_idle_ms()?;
+    let ledger = *POSTS.lock().unwrap_or_else(|e| e.into_inner());
+    Some(person_idle(&ledger, now_ms(), sys))
+}
+
+/// Post to the system event stream, which the frontmost app reads, and record
+/// that it was us. Every system-stream post goes through here.
+fn post_hid(ev: &CGEvent) {
+    {
+        let idle = system_idle_ms();
+        let mut g = POSTS.lock().unwrap_or_else(|e| e.into_inner());
+        note_post(&mut g, now_ms(), idle);
+    }
+    ev.post(CGEventTapLocation::HID);
+    // Stamped after the post as well: the event's own timestamp falls after
+    // the instant noted before it.
+    POSTS.lock().unwrap_or_else(|e| e.into_inner()).last_post = Some(now_ms());
+}
+
+#[cfg(test)]
+mod idle_tests {
+    use super::*;
+
+    fn ledger(last_post: Option<u64>, person_last: Option<u64>) -> PostLedger {
+        PostLedger {
+            last_post,
+            person_last,
+        }
+    }
+
+    #[test]
+    fn with_no_post_of_ours_the_clock_is_the_person() {
+        assert_eq!(person_idle(&PostLedger::default(), 10_000, 4_000), 4_000);
+    }
+
+    #[test]
+    fn our_own_last_event_is_not_counted_as_the_person() {
+        // The person last acted at t=1000; we posted at t=9000; the clock now
+        // (t=9500) says 500ms. They have been idle since 1000, not for 500.
+        let l = ledger(Some(9_000), Some(1_000));
+        assert_eq!(person_idle(&l, 9_500, 500), 8_500);
+    }
+
+    #[test]
+    fn a_person_acting_after_our_post_resets_their_idle_time() {
+        // We posted at 9000; the clock says the last event was at 9400, well
+        // after, so that was theirs.
+        let l = ledger(Some(9_000), Some(1_000));
+        assert_eq!(person_idle(&l, 9_500, 100), 100);
+    }
+
+    #[test]
+    fn nothing_known_before_our_first_post_counts_from_that_post() {
+        let l = ledger(Some(9_000), None);
+        assert_eq!(person_idle(&l, 9_500, 400), 500);
+    }
+
+    #[test]
+    fn noting_a_post_learns_when_the_person_last_acted() {
+        let mut l = PostLedger::default();
+        // First post at 5000; the clock says the last event was 3000ms ago.
+        note_post(&mut l, 5_000, Some(3_000));
+        assert_eq!(l.person_last, Some(2_000));
+        assert_eq!(l.last_post, Some(5_000));
+        // Second post at 5200: the last event (200ms ago, at 5000) was ours.
+        note_post(&mut l, 5_200, Some(200));
+        assert_eq!(l.person_last, Some(2_000), "our own event must not move it");
+        // A third at 9000 when the clock says 300ms (at 8700): theirs.
+        note_post(&mut l, 9_000, Some(300));
+        assert_eq!(l.person_last, Some(8_700));
+    }
+
+    #[test]
+    fn an_unreadable_clock_leaves_what_is_known_alone() {
+        let mut l = ledger(Some(1_000), Some(500));
+        note_post(&mut l, 2_000, None);
+        assert_eq!(l.person_last, Some(500));
+        assert_eq!(l.last_post, Some(2_000));
+    }
+}
+
 fn source() -> Result<CGEventSource, InputError> {
     CGEventSource::new(CGEventSourceStateID::HIDSystemState)
         .map_err(|_| InputError::Failed("could not create CGEventSource".into()))
@@ -120,6 +281,28 @@ fn source() -> Result<CGEventSource, InputError> {
 /// anything longer is cut silently. [`crate::chunk::chunks`] produces the
 /// pieces; the caller posts them in order.
 pub fn type_chunk(chunk: &str) -> Result<(), InputError> {
+    type_chunk_to(Dest::Hid, chunk)
+}
+
+/// Where a keyboard event goes: the system event stream, which the frontmost
+/// app reads, or one process's own queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dest {
+    Hid,
+    Pid(i32),
+}
+
+impl Dest {
+    fn post(self, ev: &CGEvent) {
+        match self {
+            Dest::Hid => post_hid(ev),
+            Dest::Pid(pid) => ev.post_to_pid(pid),
+        }
+    }
+}
+
+/// [`type_chunk`] to a chosen destination.
+pub fn type_chunk_to(dest: Dest, chunk: &str) -> Result<(), InputError> {
     let src = source()?;
     let down = CGEvent::new_keyboard_event(src.clone(), 0, true).map_err(|_| fail("key down"))?;
     down.set_string(chunk);
@@ -130,18 +313,24 @@ pub fn type_chunk(chunk: &str) -> Result<(), InputError> {
     // every character silently becomes a menu shortcut. The call still reports
     // the full character count, so the agent is told it typed and sees nothing.
     down.set_flags(CGEventFlags::empty());
-    down.post(CGEventTapLocation::HID);
+    dest.post(&down);
     let up = CGEvent::new_keyboard_event(src, 0, false).map_err(|_| fail("key up"))?;
     up.set_string(chunk);
     up.set_flags(CGEventFlags::empty());
-    up.post(CGEventTapLocation::HID);
+    dest.post(&up);
     Ok(())
 }
 
 /// Press a chord in the canonical form `mcp_input::parse_combo` produces:
-/// modifiers, then one key, joined by `+`.
-pub fn key_combo(combo: &str) -> Result<(), InputError> {
-    let mut flags = CGEventFlags::empty();
+/// modifiers, then one key, joined by `+`. `held` are the modifiers already
+/// held down by `key_down`, which the chord carries too.
+pub fn key_combo(combo: &str, held: CGEventFlags) -> Result<(), InputError> {
+    key_combo_to(Dest::Hid, combo, held)
+}
+
+/// [`key_combo`] to a chosen destination.
+pub fn key_combo_to(dest: Dest, combo: &str, held: CGEventFlags) -> Result<(), InputError> {
+    let mut flags = held;
     let mut key: Option<(CGKeyCode, bool)> = None;
     for seg in combo.split('+') {
         match seg {
@@ -174,10 +363,10 @@ pub fn key_combo(combo: &str) -> Result<(), InputError> {
     let down =
         CGEvent::new_keyboard_event(src.clone(), keycode, true).map_err(|_| fail("key down"))?;
     down.set_flags(flags);
-    down.post(CGEventTapLocation::HID);
+    dest.post(&down);
     let up = CGEvent::new_keyboard_event(src, keycode, false).map_err(|_| fail("key up"))?;
     up.set_flags(flags);
-    up.post(CGEventTapLocation::HID);
+    dest.post(&up);
     Ok(())
 }
 
@@ -196,6 +385,130 @@ pub fn modifier_flags(modifiers: &[String]) -> CGEventFlags {
         }
     }
     flags
+}
+
+/// Whether `name` is a modifier rather than a key with a keycode.
+pub(crate) fn is_modifier(name: &str) -> bool {
+    matches!(
+        name,
+        "cmd"
+            | "command"
+            | "meta"
+            | "super"
+            | "shift"
+            | "opt"
+            | "option"
+            | "alt"
+            | "ctrl"
+            | "control"
+            | "fn"
+    )
+}
+
+/// Keys held down across calls (`keyboard_shortcut` `action: "down"`).
+///
+/// A held *modifier* is not posted as a key event at all: it is remembered
+/// and stamped on the flags of every event this backend posts afterwards,
+/// which is how a `modifiers: ["shift"]` click already works. That keeps it
+/// out of the system's HID modifier state, so a crash or kill between `down`
+/// and `up` cannot leave Shift or Command latched for the person using the
+/// machine. The cost is that software reading the keyboard state directly,
+/// rather than an event's flags, does not see it. A held ordinary key is a
+/// real key-down event, released by `key_up`.
+#[derive(Debug, Default)]
+pub struct HeldKeys {
+    keys: Mutex<Vec<String>>,
+}
+
+impl HeldKeys {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<String>> {
+        self.keys.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn add(&self, key: &str) {
+        let mut g = self.lock();
+        if !g.iter().any(|k| k == key) {
+            g.push(key.to_string());
+        }
+    }
+
+    fn remove(&self, key: &str) {
+        self.lock().retain(|k| k != key);
+    }
+
+    /// The flags of the held modifiers.
+    pub fn flags(&self) -> CGEventFlags {
+        modifier_flags(&self.lock())
+    }
+
+    /// `modifiers` plus the held modifiers, so a pointer event carries both.
+    pub fn with_modifiers(&self, modifiers: &[String]) -> Vec<String> {
+        let mut out = modifiers.to_vec();
+        for k in self.lock().iter().filter(|k| is_modifier(k)) {
+            if !out.contains(k) {
+                out.push(k.clone());
+            }
+        }
+        out
+    }
+
+    /// Everything held, newest last.
+    pub fn held(&self) -> Vec<String> {
+        self.lock().clone()
+    }
+}
+
+/// Hold `key` down. Nothing is posted for a modifier (see [`HeldKeys`]).
+pub fn key_down(held: &HeldKeys, key: &str) -> Result<(), InputError> {
+    if is_modifier(key) {
+        held.add(key);
+        return Ok(());
+    }
+    let (keycode, needs_shift) = keycode_for(key)
+        .ok_or_else(|| InputError::Unsupported(format!("no macOS keycode for '{key}'")))?;
+    let mut flags = held.flags();
+    if needs_shift {
+        flags |= CGEventFlags::CGEventFlagShift;
+    }
+    let down =
+        CGEvent::new_keyboard_event(source()?, keycode, true).map_err(|_| fail("key down"))?;
+    down.set_flags(flags);
+    post_hid(&down);
+    held.add(key);
+    Ok(())
+}
+
+/// Release `key`. Forgotten even when the release cannot be posted, so the
+/// record never claims a key is down that this backend has given up on.
+pub fn key_up(held: &HeldKeys, key: &str) -> Result<(), InputError> {
+    let was_held = held.held().iter().any(|k| k == key);
+    // Cleared first, so the key-up carries the modifiers still held without
+    // counting itself.
+    held.remove(key);
+    if is_modifier(key) || !was_held {
+        return Ok(());
+    }
+    let Some((keycode, needs_shift)) = keycode_for(key) else {
+        return Ok(());
+    };
+    let mut flags = held.flags();
+    if needs_shift {
+        flags |= CGEventFlags::CGEventFlagShift;
+    }
+    let up = CGEvent::new_keyboard_event(source()?, keycode, false).map_err(|_| fail("key up"))?;
+    up.set_flags(flags);
+    post_hid(&up);
+    Ok(())
+}
+
+/// Release everything held, last pressed first. For the paths that cannot
+/// await: a human took the mouse, or the server is stopping.
+pub fn release_all(held: &HeldKeys) {
+    for k in held.held().iter().rev() {
+        if let Err(e) = key_up(held, k) {
+            tracing::error!(key = %k, error = ?e, "could not release a held key");
+        }
+    }
 }
 
 /// A mouse button, as the backend tracks it. Its own type because
@@ -376,7 +689,7 @@ fn post_mouse_ex(
     // Record before posting: this is the only place the pointer is written, so
     // it is the only place the override watcher can learn what was ours.
     record_set(pt);
-    ev.post(CGEventTapLocation::HID);
+    post_hid(&ev);
     Ok(())
 }
 
@@ -472,17 +785,6 @@ pub fn drag_end(held: &Held, pt: (f64, f64), modifiers: &[String]) -> Result<(),
     r
 }
 
-/// Interpolate `steps` points from `from` to `to`, exclusive of the start.
-pub fn drag_path(from: (f64, f64), to: (f64, f64), steps: u32) -> Vec<(f64, f64)> {
-    let steps = steps.max(1);
-    (1..=steps)
-        .map(|i| {
-            let t = i as f64 / steps as f64;
-            (from.0 + (to.0 - from.0) * t, from.1 + (to.1 - from.1) * t)
-        })
-        .collect()
-}
-
 /// Wheel deltas in lines for a direction: `(vertical, horizontal)`, positive
 /// meaning up and left as CoreGraphics counts them. A page is ten lines.
 pub fn scroll_deltas(dir: ScrollDir, amount: i32) -> (i32, i32) {
@@ -526,12 +828,62 @@ pub fn scroll(
     let flags = modifier_flags(modifiers);
     // Position the cursor so the scroll targets that location.
     post_motion(held, CGPoint::new(x, y), flags)?;
-    build_scroll_event(dir, amount, flags)?.post(CGEventTapLocation::HID);
+    post_hid(&build_scroll_event(dir, amount, flags)?);
     Ok(())
 }
 
-pub fn hover(held: &Held, x: f64, y: f64) -> Result<(), InputError> {
-    post_motion(held, CGPoint::new(x, y), CGEventFlags::empty())
+/// `kCGScrollWheelEventScrollPhase` and `kCGScrollWheelEventMomentumPhase`, the
+/// public CGEventField numbers from CGEventTypes.h. The crate wrapper does not
+/// name them.
+const SCROLL_PHASE_FIELD: u32 = 99;
+const MOMENTUM_PHASE_FIELD: u32 = 123;
+
+/// The (scroll, momentum) field values for a phase: `CGScrollPhase` while the
+/// fingers are down, `CGMomentumScrollPhase` while coasting, the other zero.
+pub fn phase_fields(phase: Phase) -> (i64, i64) {
+    match phase {
+        Phase::Began => (1, 0),
+        Phase::Changed => (2, 0),
+        Phase::Ended => (4, 0),
+        Phase::MomentumBegan => (0, 1),
+        Phase::MomentumContinue => (0, 2),
+        Phase::MomentumEnded => (0, 3),
+    }
+}
+
+/// Build one pixel-unit scroll event with its gesture phase, without posting.
+/// CoreGraphics counts positive as up and left, so the planner's down / right
+/// deltas are negated.
+fn build_pixel_scroll(ev: &PixelScroll, flags: CGEventFlags) -> Result<CGEvent, InputError> {
+    let out = CGEvent::new_scroll_event(source()?, ScrollEventUnit::PIXEL, 2, -ev.dy, -ev.dx, 0)
+        .map_err(|_| fail("scroll event"))?;
+    let (scroll, momentum) = phase_fields(ev.phase);
+    out.set_integer_value_field(EventField::SCROLL_WHEEL_EVENT_IS_CONTINUOUS, 1);
+    out.set_integer_value_field(SCROLL_PHASE_FIELD, scroll);
+    out.set_integer_value_field(MOMENTUM_PHASE_FIELD, momentum);
+    out.set_flags(flags);
+    Ok(out)
+}
+
+/// Post one event of a trackpad-style scroll. The pointer goes to `(x, y)` with
+/// the first event, since a wheel event is delivered to whatever is under it.
+pub fn scroll_pixels(
+    held: &Held,
+    x: f64,
+    y: f64,
+    ev: &PixelScroll,
+    modifiers: &[String],
+) -> Result<(), InputError> {
+    let flags = modifier_flags(modifiers);
+    if ev.phase == Phase::Began {
+        post_motion(held, CGPoint::new(x, y), flags)?;
+    }
+    post_hid(&build_pixel_scroll(ev, flags)?);
+    Ok(())
+}
+
+pub fn hover(held: &Held, x: f64, y: f64, modifiers: &[String]) -> Result<(), InputError> {
+    post_motion(held, CGPoint::new(x, y), modifier_flags(modifiers))
 }
 
 pub fn clipboard_read_text() -> Result<Option<String>, InputError> {
@@ -565,6 +917,92 @@ pub fn clipboard_write_text(data: &str) -> Result<(), InputError> {
 /// These are physical key positions, so punctuation follows the US layout:
 /// on another layout `cmd+[` presses whatever sits where the US `[` does,
 /// which is what a shortcut bound to a position wants anyway.
+/// The canonical name of a physical key, in `keyboard_shortcut` syntax: the
+/// inverse of [`keycode_for`] over the keys a shortcut can name, for turning a
+/// key a person pressed into a chord. Keys with no name there are `None`.
+pub(crate) fn key_name_for(code: u16) -> Option<&'static str> {
+    const NAMES: &[&str] = &[
+        "a",
+        "b",
+        "c",
+        "d",
+        "e",
+        "f",
+        "g",
+        "h",
+        "i",
+        "j",
+        "k",
+        "l",
+        "m",
+        "n",
+        "o",
+        "p",
+        "q",
+        "r",
+        "s",
+        "t",
+        "u",
+        "v",
+        "w",
+        "x",
+        "y",
+        "z",
+        "0",
+        "1",
+        "2",
+        "3",
+        "4",
+        "5",
+        "6",
+        "7",
+        "8",
+        "9",
+        "return",
+        "tab",
+        "space",
+        "delete",
+        "forwarddelete",
+        "escape",
+        "left",
+        "right",
+        "down",
+        "up",
+        "home",
+        "end",
+        "pageup",
+        "pagedown",
+        "insert",
+        "f1",
+        "f2",
+        "f3",
+        "f4",
+        "f5",
+        "f6",
+        "f7",
+        "f8",
+        "f9",
+        "f10",
+        "f11",
+        "f12",
+        "minus",
+        "equal",
+        "leftbracket",
+        "rightbracket",
+        "backslash",
+        "semicolon",
+        "quote",
+        "comma",
+        "period",
+        "slash",
+        "grave",
+    ];
+    NAMES
+        .iter()
+        .copied()
+        .find(|n| matches!(keycode_for(n), Some((c, false)) if c == code))
+}
+
 fn keycode_for(key: &str) -> Option<(CGKeyCode, bool)> {
     let code: u16 = match key {
         "a" => 0x00,
@@ -682,6 +1120,24 @@ fn keycode_for(key: &str) -> Option<(CGKeyCode, bool)> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_pressed_key_has_the_name_a_shortcut_would_use() {
+        use super::{key_name_for, keycode_for};
+        assert_eq!(key_name_for(0x24), Some("return"));
+        assert_eq!(key_name_for(0x00), Some("a"));
+        assert_eq!(key_name_for(0x7B), Some("left"));
+        assert_eq!(key_name_for(0x1B), Some("minus"));
+        // The caps lock key has no shortcut name.
+        assert_eq!(key_name_for(0x39), None);
+        // Every name it can give is one a replay can press again.
+        for code in 0u16..0x80 {
+            if let Some(n) = key_name_for(code) {
+                assert_eq!(keycode_for(n).map(|(c, _)| c), Some(code), "{n}");
+                assert!(mcp_input::parse_combo(n, mcp_input::Os::Mac).is_ok(), "{n}");
+            }
+        }
+    }
+
     use super::*;
 
     /// A keyboard event built from the HID source inherits the modifiers the
@@ -708,28 +1164,6 @@ mod tests {
             CGEventFlags::empty(),
             "typed text must post with no modifiers held"
         );
-    }
-
-    /// The path must end exactly on the destination — a drop one pixel short
-    /// lands on whatever is next to the target.
-    #[test]
-    fn drag_path_is_monotonic_and_ends_on_target() {
-        let path = drag_path((0.0, 0.0), (100.0, 50.0), 10);
-        assert_eq!(path.len(), 10);
-        assert_eq!(path[9], (100.0, 50.0));
-        for w in path.windows(2) {
-            assert!(w[1].0 > w[0].0 && w[1].1 > w[0].1, "path must advance");
-        }
-    }
-
-    /// A drag between two identical points still has to emit motion: some
-    /// targets only begin tracking on the first drag event.
-    #[test]
-    fn zero_length_drag_still_emits_a_move() {
-        let path = drag_path((5.0, 5.0), (5.0, 5.0), 4);
-        assert_eq!(path.len(), 4);
-        assert!(path.iter().all(|p| *p == (5.0, 5.0)));
-        assert_eq!(drag_path((0.0, 0.0), (1.0, 1.0), 0).len(), 1);
     }
 
     /// Every key the shared parser can emit must have a keycode here, or a
@@ -880,14 +1314,14 @@ mod tests {
 
     #[test]
     fn a_second_key_in_a_chord_is_refused_before_anything_is_posted() {
-        let e = key_combo("a+b").unwrap_err();
+        let e = key_combo("a+b", CGEventFlags::empty()).unwrap_err();
         assert!(matches!(e, InputError::InvalidArgs(_)), "{e:?}");
         assert!(matches!(
-            key_combo("cmd").unwrap_err(),
+            key_combo("cmd", CGEventFlags::empty()).unwrap_err(),
             InputError::Unsupported(_)
         ));
         assert!(matches!(
-            key_combo("cmd+nosuchkey").unwrap_err(),
+            key_combo("cmd+nosuchkey", CGEventFlags::empty()).unwrap_err(),
             InputError::Unsupported(_)
         ));
     }
@@ -1068,6 +1502,47 @@ mod drag_tests {
 mod scroll_tests {
     use super::*;
 
+    /// The phases ride on the public CGEvent fields and read back from the
+    /// event, so a wrong field number or a lost unit shows here and not as an
+    /// app that quietly ignores the gesture.
+    #[test]
+    fn pixel_scroll_events_carry_phase_momentum_and_pixel_deltas() {
+        let mk = |phase, dx, dy| {
+            build_pixel_scroll(
+                &PixelScroll {
+                    phase,
+                    dx,
+                    dy,
+                    at_ms: 0,
+                },
+                CGEventFlags::empty(),
+            )
+            .unwrap()
+        };
+        let began = mk(Phase::Began, 0, 40);
+        assert!(matches!(began.get_type(), CGEventType::ScrollWheel));
+        assert_eq!(began.get_integer_value_field(SCROLL_PHASE_FIELD), 1);
+        assert_eq!(began.get_integer_value_field(MOMENTUM_PHASE_FIELD), 0);
+        assert_eq!(
+            began.get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_IS_CONTINUOUS),
+            1
+        );
+        // Down is negative to CoreGraphics; the pixel field carries it.
+        assert_eq!(
+            began.get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_1),
+            -40
+        );
+        let coast = mk(Phase::MomentumContinue, 12, 0);
+        assert_eq!(coast.get_integer_value_field(SCROLL_PHASE_FIELD), 0);
+        assert_eq!(coast.get_integer_value_field(MOMENTUM_PHASE_FIELD), 2);
+        assert_eq!(
+            coast.get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_2),
+            -12
+        );
+        assert_eq!(phase_fields(Phase::Ended), (4, 0));
+        assert_eq!(phase_fields(Phase::MomentumEnded), (0, 3));
+    }
+
     #[test]
     fn scroll_deltas_follow_direction_and_a_page_is_ten_lines() {
         assert_eq!(scroll_deltas(ScrollDir::Up, 3), (3, 0));
@@ -1153,5 +1628,41 @@ mod pointer_tests {
         if let Ok(Some((x, y))) = pointer_position() {
             assert!(x.is_finite() && y.is_finite());
         }
+    }
+
+    /// A held modifier is a flag on later events, not a key press: nothing is
+    /// posted, so nothing can be left latched in the system.
+    #[test]
+    fn a_held_modifier_rides_on_later_events_and_posts_nothing() {
+        let held = HeldKeys::default();
+        assert!(held.flags().is_empty());
+        key_down(&held, "shift").unwrap();
+        key_down(&held, "cmd").unwrap();
+        key_down(&held, "shift").unwrap();
+        assert_eq!(held.held(), ["shift", "cmd"]);
+        let f = held.flags();
+        assert!(f.contains(CGEventFlags::CGEventFlagShift));
+        assert!(f.contains(CGEventFlags::CGEventFlagCommand));
+        // A call's own modifiers and the held ones both reach the event.
+        assert_eq!(
+            held.with_modifiers(&["opt".into(), "shift".into()]),
+            ["opt", "shift", "cmd"]
+        );
+        key_up(&held, "shift").unwrap();
+        assert_eq!(held.flags(), CGEventFlags::CGEventFlagCommand);
+        release_all(&held);
+        assert!(held.held().is_empty() && held.flags().is_empty());
+        // Releasing what is not held is quiet.
+        key_up(&held, "shift").unwrap();
+    }
+
+    #[test]
+    fn a_key_with_no_keycode_is_refused_before_anything_is_held() {
+        let held = HeldKeys::default();
+        assert!(matches!(
+            key_down(&held, "nosuchkey").unwrap_err(),
+            InputError::Unsupported(_)
+        ));
+        assert!(held.held().is_empty());
     }
 }

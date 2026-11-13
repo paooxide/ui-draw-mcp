@@ -17,15 +17,32 @@ async-trait.workspace = true
 tracing.workspace = true
 # `time` only: drags need real gaps between motion events, and blocking the
 # runtime with `thread::sleep` would stall every other in-flight call.
-tokio = { workspace = true, features = ["time", "process"] }
+tokio = { workspace = true, features = ["time", "process", "sync"] }
 serde_json.workspace = true
 
 # Native frameworks — only on macOS. On other targets this crate is empty.
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = "0.10"
 core-foundation-sys = "0.8"
-core-graphics = { version = "0.25", features = ["highsierra"] }
+core-graphics = { version = "0.25", features = ["highsierra", "elcapitan"] }
+# The raw event pointer, for the one CoreGraphics call the safe wrapper lacks
+# (the characters a key event produced).
+foreign-types = "0.5"
+# ScreenCaptureKit window capture (see src/sck.rs). Feature lists are the
+# minimum the code names; the bindings' defaults would pull in the whole of
+# AVFoundation and the content-sharing picker.
+block2 = { version = "0.6", default-features = false, features = ["std"] }
+objc2 = { version = "0.6", default-features = false, features = ["std"] }
+objc2-core-foundation = { version = "0.3", default-features = false, features = ["std", "CFData", "CFString"] }
+objc2-core-graphics = { version = "0.3", default-features = false, features = ["std", "objc2", "CGImage", "CGDataProvider"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSArray", "NSError", "NSString"] }
+objc2-image-io = { version = "0.3", default-features = false, features = ["std", "objc2-core-graphics", "CGImageDestination"] }
+objc2-screen-capture-kit = { version = "0.3", default-features = false, features = ["std", "block2", "libc", "objc2-core-foundation", "objc2-core-graphics", "SCShareableContent", "SCScreenshotManager", "SCStream"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros"] }
 serde_json = { workspace = true }
+
+# Tests build a real CGImage (no display needed) to exercise the PNG encoder.
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+objc2-core-graphics = { version = "0.3", default-features = false, features = ["CGBitmapContext", "CGColorSpace", "CGContext"] }

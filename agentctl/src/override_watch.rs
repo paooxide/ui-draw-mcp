@@ -93,6 +93,10 @@ pub fn spawn(
                 // Abandon in-flight work first: a drag must release the button
                 // before the person starts moving the mouse in earnest.
                 input.cancel_pending();
+                // Every `foreground` mode trips the switch, `polite` included:
+                // a person taking the pointer mid-action is a stop request, and
+                // polite's idle wait is about not being surprised, not about
+                // being allowed to carry on after they object.
                 policy.trip_kill_switch(&session_id, &reason);
 
                 // Tell the human what just happened and how to undo it. Being

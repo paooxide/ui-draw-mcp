@@ -16,7 +16,7 @@ mod tools;
 mod tree;
 
 pub use arena::{ElementInfo, ElementState, RefError, Snapshot, SnapshotArena};
-pub use backend::{A11yBackend, BackendError, RawSnapshot, SnapshotRequest};
+pub use backend::{A11yBackend, BackendError, RawSnapshot, SnapshotRequest, SnapshotTarget};
 pub use diff::{diff_snapshots, DeltaEntry, SnapshotDelta};
 pub use extract::extract_data;
 pub use flatten::{flatten, FlattenConfig, Flattened};

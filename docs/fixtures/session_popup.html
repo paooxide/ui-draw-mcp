@@ -1,0 +1,53 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Session popup</title>
+<!-- Fixture for the overlay live tests (crates/mcp-browser/tests/overlay_live.rs).
+     Modelled on MiniWoB++ login-user-popup: focusing the username raises a plain
+     absolutely positioned popup (no role, no z-index) over the form. ?mode=disable
+     also disables the form, as the task does; ?mode=cover leaves it enabled but
+     covered; no mode is a form that works. #dlg opens a native modal dialog and
+     #toast a small status line beside the form. -->
+<style>
+  body { margin: 0; font: 12px sans-serif; }
+  #area { position: relative; width: 160px; height: 210px; }
+  #popup { position: absolute; top: 40px; left: 8px; width: 120px; height: 120px; border: 2px solid #888; background: #eee; box-sizing: border-box; }
+  #toast { position: fixed; right: 4px; bottom: 4px; padding: 2px 6px; background: #333; color: #fff; display: none; }
+  #other { position: absolute; left: 400px; top: 10px; }
+</style>
+<body>
+<div id="area">
+  <div id="form">
+    <p><label>Username <input type="text" id="username"></label></p>
+    <p><label>Password <input type="password" id="password"></label></p>
+    <button id="subbtn">OK</button>
+  </div>
+</div>
+<button id="other">Elsewhere</button>
+<button id="dlg">Dialog</button>
+<button id="toastbtn">Toast</button>
+<dialog id="d"><p>Really leave?</p><button id="dclose">Close</button></dialog>
+<div id="toast">Saved</div>
+<script>
+var mode = new URLSearchParams(location.search).get('mode');
+window.L = {submits: 0, popups: 0};
+var shown = false;  // once per page, as the task does
+document.getElementById('subbtn').addEventListener('click', function(){ window.L.submits++; });
+document.getElementById('username').addEventListener('focus', function(){
+  if(!mode || shown) return;
+  shown = true;
+  window.L.popups++;
+  var p = document.createElement('div');
+  p.id = 'popup';
+  p.innerHTML = '<p>Your session is about to expire.</p><p>Exit to home page?</p><p><button id="popup-ok">OK</button> <button id="popup-cancel">Cancel</button></p>';
+  document.getElementById('area').appendChild(p);
+  if(mode === 'disable') document.querySelectorAll('#username, #password, #subbtn').forEach(function(e){ e.disabled = true; });
+  document.getElementById('popup-cancel').addEventListener('click', function(){
+    document.querySelectorAll('#username, #password, #subbtn').forEach(function(e){ e.disabled = false; });
+    p.remove();
+  });
+});
+document.getElementById('dlg').addEventListener('click', function(){ document.getElementById('d').showModal(); });
+document.getElementById('dclose').addEventListener('click', function(){ document.getElementById('d').close(); });
+document.getElementById('toastbtn').addEventListener('click', function(){ document.getElementById('toast').style.display = 'block'; });
+</script>
+</body>

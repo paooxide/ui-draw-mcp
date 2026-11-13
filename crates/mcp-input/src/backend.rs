@@ -14,6 +14,13 @@ pub enum SemanticAction {
     Collapse,
     Select,
     ScrollIntoView,
+    /// Open the element's context menu (AXShowMenu) without a right click.
+    ShowMenu,
+    /// One step up / down on a slider, stepper or scroll bar.
+    Increment,
+    Decrement,
+    /// Pick the element in a list or picker (AXPick).
+    Pick,
 }
 
 impl SemanticAction {
@@ -29,10 +36,82 @@ impl SemanticAction {
             "expand" => Self::Expand,
             "collapse" => Self::Collapse,
             "select" => Self::Select,
-            "scroll_into_view" => Self::ScrollIntoView,
+            // The accessibility API's own name for it, accepted beside ours.
+            "scroll_into_view" | "scroll_to_visible" => Self::ScrollIntoView,
+            "show_menu" => Self::ShowMenu,
+            "increment" => Self::Increment,
+            "decrement" => Self::Decrement,
+            "pick" => Self::Pick,
             _ => return None,
         })
     }
+}
+
+/// How an action reached the UI, so a result can say whether the user's
+/// pointer or foreground was involved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Route {
+    /// The accessibility API acted on the element: no pointer movement, and
+    /// the app need not be frontmost.
+    Ax,
+    /// Synthetic system input: it moves the real cursor or types into the
+    /// frontmost app.
+    Hid,
+    /// Key events addressed to one process (`CGEventPostToPid`): the app
+    /// receives them without being brought forward, and the frontmost app and
+    /// the pointer are not involved. Keys only; a pointer has no per-process
+    /// delivery. Some apps drop such events while they are not the active
+    /// app, which is why every use is read back.
+    PidEvent,
+}
+
+impl Route {
+    /// The value of a result's `input` field.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ax => "ax",
+            Self::Hid => "hid",
+            Self::PidEvent => "pid_event",
+        }
+    }
+}
+
+/// An app that key events can be addressed to without bringing it forward:
+/// the session's pinned app, when it is not the frontmost one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackgroundTarget {
+    pub pid: i32,
+    pub name: String,
+}
+
+/// What a text element shows right now, read to tell whether keys sent to a
+/// background app arrived. Offsets are characters, as in [`Selection`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FocusedText {
+    /// The element's text. `None` when it cannot be read, and always `None`
+    /// for a password field, whose text is never read.
+    pub value: Option<String>,
+    /// The caret or selection, `start..end`.
+    pub selection: Option<(usize, usize)>,
+    /// A password field: nothing typed into it can be read back.
+    pub secure: bool,
+}
+
+/// The application in front, as much as putting it back needs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppRef {
+    pub pid: i32,
+    pub name: String,
+}
+
+/// What a person would notice moving: which app is in front and where the
+/// pointer is. Read before a borrow under `foreground = "polite"` and put
+/// back after it. Either half is `None` when the platform cannot say, and a
+/// half that is unknown is never restored.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DeskState {
+    pub app: Option<AppRef>,
+    pub pointer: Option<(f64, f64)>,
 }
 
 /// A coordinate pointer action.
@@ -140,6 +219,21 @@ pub struct Reading {
     pub checked: Option<bool>,
 }
 
+/// A text selection as the element reports it.
+///
+/// Offsets are characters (Unicode scalar values) from the start of the
+/// element's text, `end` exclusive, whatever unit the platform counts in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Selection {
+    pub start: usize,
+    pub end: usize,
+    /// The selected text, as the element reports it.
+    pub text: String,
+    /// The element's role, when the backend knows it. Useful when the element
+    /// was the focused one rather than a named ref.
+    pub role: Option<String>,
+}
+
 /// The outcome of choosing an option from a popup button or combo box.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Choice {
@@ -163,18 +257,32 @@ pub enum InputError {
     /// is not valid base64).
     InvalidArgs(String),
     Failed(String),
+    /// Refused by the operator's `foreground = "never"` before anything was
+    /// done. Mapped to `POLICY_DENIED`: a policy decided this, not the OS.
+    Refused(String),
 }
 
 /// Platform input backend: semantic AX actions, keyboard, coordinate pointer,
 /// and clipboard. macOS (AX + CGEvent) lands behind `macos-backend`.
 #[async_trait]
 pub trait InputBackend: Send + Sync {
+    /// Act on an element and say which route did it. A backend returns
+    /// [`Route::Hid`] only when it had to fall back to synthetic input; the
+    /// tool layer reports exactly what it is told and never assumes.
     async fn perform(
         &self,
         node_id: u64,
         action: SemanticAction,
         option: Option<&str>,
-    ) -> Result<(), InputError>;
+    ) -> Result<Route, InputError>;
+    /// The route [`InputBackend::perform`] will take for `action`, known before
+    /// it runs. `foreground = "never"` has to refuse a pointer click *before*
+    /// it is posted, and the route a call reports only exists afterwards.
+    ///
+    /// Required, with no default, so a backend cannot be added without saying
+    /// which of its actions need the pointer. It must agree with what
+    /// `perform` returns; answer [`Route::Hid`] when unsure.
+    fn route_for(&self, action: SemanticAction) -> Route;
     /// Choose the entry named `option` from a popup button or combo box, or
     /// from the popup an entry belongs to when `node_id` is itself an entry.
     ///
@@ -192,7 +300,90 @@ pub trait InputBackend: Send + Sync {
     async fn read_element(&self, _node_id: u64) -> Result<Reading, InputError> {
         Ok(Reading::default())
     }
+    /// Write an element's value through the accessibility API. Always
+    /// [`Route::Ax`]: an implementation that would have to type must refuse.
     async fn set_value(&self, node_id: u64, text: &str) -> Result<(), InputError>;
+    /// The current text selection of `node_id`, or of the focused element when
+    /// `None`, without changing it.
+    async fn selection(&self, _node_id: Option<u64>) -> Result<Selection, InputError> {
+        Err(InputError::Unsupported(
+            "reading a text selection is not supported on this platform".into(),
+        ))
+    }
+    /// Select characters `start..end` (see [`Selection`]) of an element's text
+    /// through the accessibility API and return the selection the element then
+    /// reports. Never drags the pointer; an element that will not take the
+    /// range is `Unsupported`, not approximated.
+    async fn select_range(
+        &self,
+        _node_id: u64,
+        _start: usize,
+        _end: usize,
+    ) -> Result<Selection, InputError> {
+        Err(InputError::Unsupported(
+            "selecting text is not supported on this platform".into(),
+        ))
+    }
+    /// The pinned app when key events can be addressed to it directly: it is
+    /// pinned, still running, and not the frontmost app. `None` means keys go
+    /// to the frontmost app as always (nothing pinned, the pinned app is in
+    /// front, or the platform has no per-process delivery, as on Linux).
+    fn background_key_target(&self) -> Option<BackgroundTarget> {
+        None
+    }
+    /// Type `text` into process `pid` with per-process events
+    /// ([`Route::PidEvent`]). Never raises the app and never posts to the
+    /// frontmost one. Delivery is not confirmed here; the caller reads back.
+    async fn type_text_to_pid(&self, _pid: i32, _text: &str) -> Result<(), InputError> {
+        Err(InputError::Unsupported(
+            "per-process key delivery is not available on this platform".into(),
+        ))
+    }
+    /// Press a canonical chord in process `pid`; see [`Self::type_text_to_pid`].
+    async fn key_combo_to_pid(&self, _pid: i32, _combo: &str) -> Result<(), InputError> {
+        Err(InputError::Unsupported(
+            "per-process key delivery is not available on this platform".into(),
+        ))
+    }
+    /// The focused text element of process `pid`, as it is now.
+    async fn read_focused_text(&self, _pid: i32) -> Result<FocusedText, InputError> {
+        Err(InputError::Unsupported(
+            "reading the focused element of another app is not supported on this platform".into(),
+        ))
+    }
+    /// How long the person has gone without touching the keyboard or pointer,
+    /// in milliseconds, or `None` when this platform cannot say. Input this
+    /// server posted itself is not counted as the person (see the macOS
+    /// implementation for how). Without it `foreground = "polite"` cannot
+    /// know when the desktop is free, and refuses to act rather than guess.
+    async fn user_idle_ms(&self) -> Option<u64> {
+        None
+    }
+    /// Whether this session can receive synthetic input at all. While the
+    /// screen is locked, or another user's session has the console, the
+    /// system discards posted key and pointer events and the post still
+    /// succeeds, so the tool layer asks first and refuses rather than report
+    /// an action that went nowhere. The default is "unknown", which never
+    /// refuses: a backend that has no way to ask must not be taken for a
+    /// locked screen.
+    fn screen_state(&self) -> mcp_types::ScreenState {
+        mcp_types::ScreenState::Unknown
+    }
+    /// The frontmost app and the pointer position now.
+    async fn desk_state(&self) -> DeskState {
+        DeskState::default()
+    }
+    /// Put the desk back as `saved` found it: the pointer to where it was
+    /// (when `pointer` is true) and the saved app to the front. Synchronous
+    /// and quick, because it also runs from a `Drop` on an error path; it asks
+    /// for the app to come forward and does not wait for it to. The caller
+    /// reads [`InputBackend::desk_state`] to see whether it did. The pointer
+    /// move is posted the way every other pointer move is, so the
+    /// human-override watcher knows it was the server's.
+    fn restore_desk(&self, _saved: &DeskState, _pointer: bool) {}
+    /// Synthetic system input follows: `type_text`, `key_combo`, `mouse`,
+    /// `scroll_at`, `hover` and `drag` all move the real pointer or type into
+    /// the frontmost app, and the tool layer reports them as [`Route::Hid`].
     async fn type_text(&self, text: &str) -> Result<(), InputError>;
     async fn key_combo(&self, combo: &str) -> Result<(), InputError>;
     async fn mouse(
@@ -215,8 +406,40 @@ pub trait InputBackend: Send + Sync {
         amount: i32,
         modifiers: &[String],
     ) -> Result<(), InputError>;
+    /// Post one event of a trackpad-style scroll (see [`crate::trackpad`]).
+    /// The tool layer paces the events and calls this once per event, so a
+    /// backend holds no gesture state; it moves the pointer to `(x, y)` on the
+    /// [`Phase::Began`](crate::trackpad::Phase::Began) event, because scroll
+    /// events go to whatever is under the pointer. Smooth scrolling is a
+    /// capability, not a given: the default says so.
+    async fn scroll_pixels(
+        &self,
+        _x: f64,
+        _y: f64,
+        _event: &crate::trackpad::PixelScroll,
+        _modifiers: &[String],
+    ) -> Result<(), InputError> {
+        Err(InputError::Unsupported(
+            "pixel scrolling is not available on this platform; scroll with direction and amount"
+                .into(),
+        ))
+    }
+    /// Whether [`InputBackend::scroll_pixels`] understands the momentum
+    /// phases. Where the toolkit makes its own coast from a finished gesture
+    /// (Linux), momentum events would double it, so they are not sent.
+    fn pixel_momentum(&self) -> bool {
+        false
+    }
     async fn hover(&self, x: f64, y: f64) -> Result<(), InputError>;
-    /// Press at `from`, travel to `to` in `steps` intermediate moves, release.
+    /// Press at `from`, move to each point of `route` in order, release on the
+    /// last one.
+    ///
+    /// `route` is never empty and is already spaced: the tool layer spreads
+    /// the moves (a straight line, or a path through waypoints) so the
+    /// backends only play them back. The steps are not decoration: a press
+    /// followed by a single jump is what a teleport looks like, and drag
+    /// targets that track motion (Finder drags, sliders, canvases, reorderable
+    /// lists) ignore it.
     ///
     /// `since_takeover` is [`InputBackend::takeover_generation`] as read when
     /// the call started; the drag aborts (releasing the button) if it has
@@ -225,19 +448,27 @@ pub trait InputBackend: Send + Sync {
     /// `hold_ms` is how long the button stays down before the first move, on
     /// top of the short settle every drag gets. Drag sources that wait to see
     /// whether a press is a click (Finder icons, list rows) need it.
-    ///
-    /// The steps are not decoration: a press followed by a single jump is what
-    /// a teleport looks like, and drag targets that track motion — Finder
-    /// drags, sliders, canvases, reorderable lists — ignore it.
     async fn drag(
         &self,
         from: (f64, f64),
-        to: (f64, f64),
+        route: &[(f64, f64)],
         modifiers: &[String],
-        steps: u32,
         hold_ms: u64,
         since_takeover: u64,
     ) -> Result<(), InputError>;
+    /// Press `key` (a canonical name from [`crate::parse_hold`]: a modifier or
+    /// one key) and leave it down until [`InputBackend::key_up`].
+    ///
+    /// While any key is down, every pointer, scroll and key-chord event this
+    /// backend posts carries the held modifiers, so a click while Shift is
+    /// held is a shift-click whatever modifiers the call itself named. Holding
+    /// a key that is already down is not an error.
+    async fn key_down(&self, key: &str) -> Result<(), InputError>;
+    /// Release a key pressed with [`InputBackend::key_down`]. Releasing one
+    /// that is not down is not an error. Must not refuse for any reason other
+    /// than a failure to post the event: a release that can be vetoed is a
+    /// stuck key.
+    async fn key_up(&self, key: &str) -> Result<(), InputError>;
     async fn clipboard_read(&self, format: ClipFormat) -> Result<ClipData, InputError>;
     /// The application that will receive synthetic input *right now*.
     ///
@@ -344,5 +575,34 @@ mod tests {
         assert_eq!(ScrollDir::parse("page_down"), Some(ScrollDir::PageDown));
         assert_eq!(ScrollDir::parse("pagedown"), Some(ScrollDir::PageDown));
         assert_eq!(ScrollDir::parse("sideways"), None);
+    }
+
+    #[test]
+    fn the_new_actions_parse_in_either_spelling() {
+        assert_eq!(
+            SemanticAction::parse("show_menu"),
+            Some(SemanticAction::ShowMenu)
+        );
+        assert_eq!(
+            SemanticAction::parse("increment"),
+            Some(SemanticAction::Increment)
+        );
+        assert_eq!(
+            SemanticAction::parse("decrement"),
+            Some(SemanticAction::Decrement)
+        );
+        assert_eq!(SemanticAction::parse("pick"), Some(SemanticAction::Pick));
+        assert_eq!(
+            SemanticAction::parse("scroll_to_visible"),
+            Some(SemanticAction::ScrollIntoView)
+        );
+        assert_eq!(SemanticAction::parse("showmenu"), None);
+    }
+
+    #[test]
+    fn a_route_is_spelled_the_way_a_result_reports_it() {
+        assert_eq!(Route::Ax.as_str(), "ax");
+        assert_eq!(Route::Hid.as_str(), "hid");
+        assert_eq!(Route::PidEvent.as_str(), "pid_event");
     }
 }

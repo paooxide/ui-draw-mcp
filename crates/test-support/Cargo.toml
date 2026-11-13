@@ -12,3 +12,7 @@ mcp-policy = { path = "../mcp-policy" }
 mcp-types = { path = "../mcp-types" }
 serde_json.workspace = true
 tokio = { workspace = true, features = ["time"] }
+
+# The GUI gate asks the real session whether it can take synthetic input.
+[target.'cfg(target_os = "macos")'.dependencies]
+mcp-macos = { path = "../mcp-macos" }

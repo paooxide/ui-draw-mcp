@@ -153,6 +153,23 @@ pub struct Wiring {
     /// The judge, built once here so the policy kernel and the engines that
     /// consult it share one set of counters.
     pub judge: Option<Arc<mcp_policy::mcp_judge::Judge>>,
+    /// The input engine and the handle `input_steps` runs its steps through.
+    /// The handle is bound once the policy exists (see
+    /// [`crate::bind_input_steps`]); until then, and wherever there is no
+    /// input engine, a batch is refused.
+    pub steps: Option<(Arc<dyn ToolModule>, Arc<mcp_input::StepRelay>)>,
+}
+
+/// Where recorded desktop flows are kept, beside the browser's.
+pub const DESKTOP_FLOWS_FILE: &str = "desktop_flows.json";
+
+/// Present while a desktop recording is running; `agentctl doctor` reads it.
+pub const RECORDING_MARKER_FILE: &str = "desktop-recording.json";
+
+/// A probe for the input engine: whether the STOP file exists.
+fn stop_file_probe(file: &std::path::Path) -> Arc<dyn Fn() -> bool + Send + Sync> {
+    let file = file.to_path_buf();
+    Arc::new(move || file.exists())
 }
 
 /// Where agentctl keeps state beside the config: the kill switch's directory.
@@ -226,7 +243,11 @@ pub fn build_stack(cfg: &PolicyConfig) -> (Vec<Arc<dyn ToolModule>>, Wiring) {
                 &engines.allowed_origins,
                 engines.browser_allow_private,
             ))
-            .with_showcase(showcase.clone()),
+            .with_showcase(showcase.clone())
+            // A visible browser can raise windows and take focus; under
+            // `never` and `polite` the engine stops it (see
+            // `mcp_browser::foreground`). `allow` changes nothing.
+            .with_foreground(cfg.foreground),
         );
         let mut browser = BrowserModule::new(browser_backend.clone())
             .with_showcase(showcase)
@@ -340,12 +361,21 @@ pub fn build_stack(cfg: &PolicyConfig) -> (Vec<Arc<dyn ToolModule>>, Wiring) {
             bypass,
             terminal_apps,
             judge: Some(judge.clone()),
+            foreground: cfg.foreground,
+            polite: mcp_input::PoliteConfig {
+                idle_ms: cfg.polite_idle_ms,
+                max_wait_ms: cfg.polite_max_wait_ms,
+            },
             ..InputPolicy::default()
         };
+        // Everything that can post input or raise a window is handed the
+        // guarded form of the backend; perception keeps the plain one.
+        let input_backend = guard_screen(guard_input(backend.clone(), cfg.foreground));
+        let window_backend = guard_window(backend.clone(), cfg.foreground);
         // The postcondition verifier shares the wait evaluator with wait_for,
         // so `expect` and an explicit wait cannot disagree about when the UI
         // has settled.
-        let evaluator = mcp_window::WaitEvaluator::new(backend.clone(), backend.clone())
+        let evaluator = mcp_window::WaitEvaluator::new(window_backend.clone(), backend.clone())
             .with_judge(judge.clone());
         let verifier = Arc::new(mcp_input::Verifier::new(
             evaluator,
@@ -353,32 +383,84 @@ pub fn build_stack(cfg: &PolicyConfig) -> (Vec<Arc<dyn ToolModule>>, Wiring) {
             arena.clone(),
         ));
         let activity = mcp_input::Activity::new();
+        let steps = mcp_input::StepRelay::new();
         let glide_preset = demo_glide_preset(&engines.demo_speed);
-        let mut input = InputModule::new(backend.clone(), arena, input_policy)
+        let mut input = InputModule::new(input_backend.clone(), arena, input_policy)
             .with_verifier(verifier)
             .with_activity(activity.clone())
+            // What an action changed is read from the same backend that reads
+            // the tree: attribute reads only, so it is safe whatever
+            // `foreground` says.
+            .with_probe(backend.clone())
+            // Each step of `input_steps` goes back through the server's gate.
+            .with_steps(steps.clone())
             // A call that names an element before anything was observed
             // takes its own snapshot instead of asking for one.
-            .with_observer(backend.clone());
+            .with_observer(backend.clone())
+            // Keys held across calls must come up when the STOP file appears,
+            // although every later call, `up` included, is refused by then.
+            // A human taking the mouse reaches the engine through the
+            // backend's takeover count instead.
+            .with_halt_probe(stop_file_probe(&cfg.kill_switch_file))
+            // Recorded human demonstrations: kept beside the other state, held
+            // to the applications the operator allows, and visible to
+            // `agentctl doctor` through a marker file while one runs.
+            .with_recording(
+                mcp_input::RecordSupport::new(Some(backend.clone()), allowed_apps.clone())
+                    .with_flows(mcp_input::record::FlowStore::new(
+                        state_dir(cfg).join(DESKTOP_FLOWS_FILE),
+                        100,
+                        mcp_input::record::MAX_RECORD_STEPS,
+                    ))
+                    .with_marker(state_dir(cfg).join(RECORDING_MARKER_FILE)),
+            );
         if engines.demo {
             input = input.with_glide(glide_preset.into());
         }
-        let vision = VisionModule::new(backend.clone(), engines.vision);
-        let window = WindowModule::new(backend.clone(), backend.clone(), allowed_apps)
-            .with_judge(judge.clone());
+        let vision = VisionModule::new(backend.clone(), engines.vision)
+            .with_allowed_apps(allowed_apps.clone());
+        // One call that reads a window's tree and, when the tree is sparse, its
+        // text: it shares the refs arena with get_ui_tree and holds `app` to the
+        // same allowlist the vision tools do.
+        let observe = mcp_window::ObserveModule::new(
+            backend.clone(),
+            a11y.arena(),
+            window_backend.clone(),
+            backend.clone(),
+            engines.vision,
+            12_000,
+        )
+        .with_allowed_apps(allowed_apps.clone());
+        let window = WindowModule::new(window_backend, backend.clone(), allowed_apps)
+            .with_judge(judge.clone())
+            .with_foreground(cfg.foreground)
+            // Under `polite`, raising an app borrows the desktop the way an
+            // input call does: wait for the person to be idle, then give the
+            // frontmost app and the pointer back.
+            .with_desk(Arc::new(mcp_input::InputDesk::new(
+                input_backend.clone(),
+                mcp_input::PoliteConfig {
+                    idle_ms: cfg.polite_idle_ms,
+                    max_wait_ms: cfg.polite_max_wait_ms,
+                },
+                Some(stop_file_probe(&cfg.kill_switch_file)),
+            )));
         modules.push(Arc::new(a11y));
-        modules.push(Arc::new(input));
+        let input = Arc::new(input);
+        wiring.steps = Some((input.clone(), steps));
+        modules.push(input);
         modules.push(Arc::new(vision));
         modules.push(Arc::new(window));
+        modules.push(Arc::new(observe));
         // `play_audio` is bounded by the same roots as the filesystem engine:
         // an agent able to name any path could use the speakers to read out a
         // file it was never allowed to open.
-        let desktop_backend = Arc::new(MacosDesktop::new());
+        let desktop_backend = Arc::new(MacosDesktop::new().with_screen(mcp_macos::screen_state));
         modules.push(Arc::new(DesktopModule::new(
             desktop_backend.clone(),
             audio_roots,
         )));
-        wiring.input = Some(backend.clone());
+        wiring.input = Some(input_backend);
         wiring.activity = Some(activity);
         wiring.desktop = Some(desktop_backend);
     }
@@ -406,9 +488,18 @@ pub fn build_stack(cfg: &PolicyConfig) -> (Vec<Arc<dyn ToolModule>>, Wiring) {
             bypass,
             terminal_apps,
             judge: Some(judge.clone()),
+            foreground: cfg.foreground,
+            polite: mcp_input::PoliteConfig {
+                idle_ms: cfg.polite_idle_ms,
+                max_wait_ms: cfg.polite_max_wait_ms,
+            },
             ..InputPolicy::default()
         };
-        let evaluator = mcp_window::WaitEvaluator::new(backend.clone(), backend.clone())
+        // Everything that can post input or raise a window is handed the
+        // guarded form of the backend; perception keeps the plain one.
+        let input_backend = guard_screen(guard_input(backend.clone(), cfg.foreground));
+        let window_backend = guard_window(backend.clone(), cfg.foreground);
+        let evaluator = mcp_window::WaitEvaluator::new(window_backend.clone(), backend.clone())
             .with_judge(judge.clone());
         let verifier = Arc::new(mcp_input::Verifier::new(
             evaluator,
@@ -416,33 +507,123 @@ pub fn build_stack(cfg: &PolicyConfig) -> (Vec<Arc<dyn ToolModule>>, Wiring) {
             arena.clone(),
         ));
         let activity = mcp_input::Activity::new();
+        let steps = mcp_input::StepRelay::new();
         let glide_preset = demo_glide_preset(&engines.demo_speed);
-        let mut input = InputModule::new(backend.clone(), arena, input_policy)
+        let mut input = InputModule::new(input_backend.clone(), arena, input_policy)
             .with_verifier(verifier)
             .with_activity(activity.clone())
+            // What an action changed is read from the same backend that reads
+            // the tree: attribute reads only, so it is safe whatever
+            // `foreground` says.
+            .with_probe(backend.clone())
+            // Each step of `input_steps` goes back through the server's gate.
+            .with_steps(steps.clone())
             // A call that names an element before anything was observed
             // takes its own snapshot instead of asking for one.
-            .with_observer(backend.clone());
+            .with_observer(backend.clone())
+            // Keys held across calls must come up when the STOP file appears,
+            // although every later call, `up` included, is refused by then.
+            // A human taking the mouse reaches the engine through the
+            // backend's takeover count instead.
+            .with_halt_probe(stop_file_probe(&cfg.kill_switch_file))
+            // Recorded human demonstrations: kept beside the other state, held
+            // to the applications the operator allows, and visible to
+            // `agentctl doctor` through a marker file while one runs.
+            .with_recording(
+                mcp_input::RecordSupport::new(Some(backend.clone()), allowed_apps.clone())
+                    .with_flows(mcp_input::record::FlowStore::new(
+                        state_dir(cfg).join(DESKTOP_FLOWS_FILE),
+                        100,
+                        mcp_input::record::MAX_RECORD_STEPS,
+                    ))
+                    .with_marker(state_dir(cfg).join(RECORDING_MARKER_FILE)),
+            );
         if engines.demo {
             input = input.with_glide(glide_preset.into());
         }
-        let vision = VisionModule::new(backend.clone(), engines.vision);
-        let window = WindowModule::new(backend.clone(), backend.clone(), allowed_apps)
-            .with_judge(judge.clone());
+        let vision = VisionModule::new(backend.clone(), engines.vision)
+            .with_allowed_apps(allowed_apps.clone());
+        // One call that reads a window's tree and, when the tree is sparse, its
+        // text: it shares the refs arena with get_ui_tree and holds `app` to the
+        // same allowlist the vision tools do.
+        let observe = mcp_window::ObserveModule::new(
+            backend.clone(),
+            a11y.arena(),
+            window_backend.clone(),
+            backend.clone(),
+            engines.vision,
+            12_000,
+        )
+        .with_allowed_apps(allowed_apps.clone());
+        let window = WindowModule::new(window_backend, backend.clone(), allowed_apps)
+            .with_judge(judge.clone())
+            .with_foreground(cfg.foreground)
+            // Under `polite`, raising an app borrows the desktop the way an
+            // input call does: wait for the person to be idle, then give the
+            // frontmost app and the pointer back.
+            .with_desk(Arc::new(mcp_input::InputDesk::new(
+                input_backend.clone(),
+                mcp_input::PoliteConfig {
+                    idle_ms: cfg.polite_idle_ms,
+                    max_wait_ms: cfg.polite_max_wait_ms,
+                },
+                Some(stop_file_probe(&cfg.kill_switch_file)),
+            )));
         modules.push(Arc::new(a11y));
-        modules.push(Arc::new(input));
+        let input = Arc::new(input);
+        wiring.steps = Some((input.clone(), steps));
+        modules.push(input);
         modules.push(Arc::new(vision));
         modules.push(Arc::new(window));
+        modules.push(Arc::new(observe));
         let desktop_backend = Arc::new(LinuxDesktop::new());
         modules.push(Arc::new(DesktopModule::new(
             desktop_backend.clone(),
             audio_roots,
         )));
-        wiring.input = Some(backend.clone());
+        wiring.input = Some(input_backend);
         wiring.activity = Some(activity);
         wiring.desktop = Some(desktop_backend);
     }
     (modules, wiring)
+}
+
+/// The input backend the engines get: the platform backend itself, or with
+/// `foreground = "never"` that backend behind the wrapper that refuses every
+/// synthetic-input method. With `allow` nothing is wrapped, so behaviour is
+/// exactly what it was before the setting existed.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn guard_input(
+    backend: Arc<dyn mcp_input::InputBackend>,
+    foreground: mcp_types::Foreground,
+) -> Arc<dyn mcp_input::InputBackend> {
+    if foreground.is_never() {
+        Arc::new(mcp_input::ForegroundInput::new(backend))
+    } else {
+        backend
+    }
+}
+
+/// Whatever `foreground` made of the input backend, behind the check that
+/// refuses to post into a session that cannot receive it (locked screen,
+/// session switched away). Applied under every setting: a locked screen
+/// discards the events whether or not the operator minds the foreground.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn guard_screen(backend: Arc<dyn mcp_input::InputBackend>) -> Arc<dyn mcp_input::InputBackend> {
+    Arc::new(mcp_input::ScreenGuardInput::new(backend))
+}
+
+/// As [`guard_input`], for the window backend.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn guard_window(
+    backend: Arc<dyn mcp_window::WindowBackend>,
+    foreground: mcp_types::Foreground,
+) -> Arc<dyn mcp_window::WindowBackend> {
+    if foreground.is_never() {
+        Arc::new(mcp_window::ForegroundWindow::new(backend))
+    } else {
+        backend
+    }
 }
 
 /// What `browser_upload` resolves each path through: the fs engine's jail, so

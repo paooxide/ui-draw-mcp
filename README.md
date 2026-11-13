@@ -57,13 +57,13 @@ heuristic.
 
 ## What it does
 
-124 tools across 12 categories. The full reference, generated from the server's own descriptors, is
+130 tools across 12 categories. The full reference, generated from the server's own descriptors, is
 [`docs/tools.md`](docs/tools.md).
 
 | Category | Tools | Names | Dangerous |
 |---|---|---|---|
-| vision | 8 | `capture_screen`, `capture_window`, `find_elements`, `get_element`, `get_ui_tree`, `list_displays`, `ocr_region`, `ui_extract` | 0 |
-| input | 12 | `clipboard_read`, `clipboard_write`, `drag_drop`, `hover`, `input_showcase`, `keyboard_shortcut`, `keyboard_type`, `mouse_action`, `scroll`, `set_value`, `ui_action`, `ui_fill_form` | 0 |
+| vision | 9 | `capture_screen`, `capture_window`, `find_elements`, `get_element`, `get_ui_tree`, `list_displays`, `observe`, `ocr_region`, `ui_extract` | 0 |
+| input | 16 | `clipboard_read`, `clipboard_write`, `desktop_flow`, `desktop_record`, `drag_drop`, `get_selection`, `hover`, `input_showcase`, `keyboard_shortcut`, `keyboard_type`, `mouse_action`, `scroll`, `select_text`, `set_value`, `ui_action`, `ui_fill_form` | 1 |
 | window | 11 | `close_app`, `control_window`, `focus_app`, `handle_dialogs`, `launch`, `list_apps`, `list_windows`, `menu_invoke`, `menu_list`, `menu_open`, `wait_for` | 0 |
 | desktop | 8 | `idle_status`, `lock_screen`, `media_control`, `notify_user`, `play_audio`, `power_control`, `speak`, `system_settings` | 1 |
 | browser | 27 | `browser_act`, `browser_assert`, `browser_branch`, `browser_capture`, `browser_challenge`, `browser_checkpoint`, `browser_connect`, `browser_cookies`, `browser_dialog`, `browser_disconnect`, `browser_eval`, `browser_extract`, `browser_fill_form`, `browser_flow`, `browser_navigate`, `browser_network`, `browser_profile`, `browser_query`, `browser_record`, `browser_screencast`, `browser_screenshot`, `browser_showcase`, `browser_snapshot`, `browser_tabs`, `browser_upload`, `browser_viewport`, `browser_wait` | 5 |
@@ -129,7 +129,10 @@ cargo binstall --git https://github.com/paooxide/ui-draw-mcp agentctl
 **macOS permissions.** Grant **Accessibility** (and **Screen Recording** if you want captures) to the
 application that *launches* `agentctl` (your terminal, Claude Desktop, Cursor), not to `agentctl` itself.
 macOS attributes a child process's permissions to whoever spawned it. `agentctl doctor` reports what is
-granted; [`docs/clients.md`](docs/clients.md) explains the rest.
+granted; [`docs/clients.md`](docs/clients.md) explains the rest. The macOS binary needs macOS 12.3 or
+later (it links ScreenCaptureKit). `capture_window` reads a window through ScreenCaptureKit on macOS 14 or
+later, so a covered window comes back as itself; on 12.3 to 13, or where ScreenCaptureKit cannot capture a
+window, it falls back to `screencapture`, which shows whatever covers the window and says so in a `warning`.
 
 **Linux.** Nothing to grant up front. Perception reads the AT-SPI accessibility bus, which every graphical
 session has. The first synthetic keystroke or click opens a remote-desktop portal session, and the desktop
@@ -303,21 +306,75 @@ See [`docs/threat-model.md`](docs/threat-model.md) §7.
 
 ---
 
-## Permissions in one word
+## Permissions: three ideas
 
-Granting each category and naming each dangerous tool is a chore. `policy.access` collapses it to one
-setting that turns on every capability and picks how risk is handled:
+Everything in [`config.example.toml`](config.example.toml) belongs to one of three ideas.
 
-| `access` | Capability | Prompts | Destructive action |
+**1. `access`: the one permission choice.** It turns every capability on and picks how risk is handled:
+
+| `access` | What it means | Prompts | Destructive action |
 |---|---|---|---|
-| `ask` | all on | dangerous tools and destructive actions ask you | confirmed via the dialog |
-| `auto` | all on | none | refused rather than done blind |
-| `bypass` | all on | none | gate off; only the kill switch and human-override remain |
+| `ask` | act freely; dangerous tools and high-impact actions ask a human | dangerous tools and high-impact actions ask you | confirmed via the dialog |
+| `auto` | unattended; nothing prompts; clearly destructive actions are refused | none | refused rather than done blind |
+| `bypass` | everything runs; only the kill switch, human override and hard invariants remain | none | gate off; your explicit "I take responsibility" |
 
-`ask` is the safe profile: read and act freely, confirm the dangerous. `bypass` is the explicit "I take
-responsibility". When `access` is set, the granular `categories` and `enable` lists are ignored; leave it
-unset to keep the fine-grained control. The kill switch (`~/.agentctl/STOP`) and the mouse-override stop
-the agent under every profile, including bypass.
+`ask` is the safe level: read and act freely, confirm the dangerous. `bypass` is never a default and is set
+only by the operator. The same choice can be made when starting the server, `agentctl --access auto`, with one rule: when the config file sets `access`, a flag or variable can only move it
+toward `ask`, and an attempt to loosen it is a startup error, not a silent ignore. When the file sets nothing,
+the flag sets it. `AGENTCTL_ACCESS` can only tighten a level the file sets and is never taken on its own (a
+variable is too easy to inherit by accident). Add `dry_run = true` (or `--dry-run`) to
+rehearse at any level: reads run, anything that would change something is only reported.
+
+**2. Scope: what it may touch.** The lists: `categories`, `allowed_apps`, `fs.roots`,
+`terminal.allowed_commands`, `network.allowed_hosts`, `browser.allowed_origins` and the others. They mean the
+same at every level. With `access` set, `categories` narrows it (only the categories you list are on); leave it
+out and the level turns them all on. An empty list closes its engine, except `browser.allowed_origins`, where
+empty means any public origin.
+
+**3. Safety stops.** The kill switch (`~/.agentctl/STOP`), human override (reaching for the mouse),
+`foreground` and the hard invariants. They hold at every level, `bypass` included.
+
+`agentctl doctor` prints the three in effect: `access:` (and where it came from), `scope:` and `stops:`.
+A **role** is an optional preset that narrows a session further (`readonly`, `qa`, `browser`,
+`browser-core`); it never widens anything. The older keys `mode` and `enable` still work exactly as before
+when `access` is not set, and are ignored, with a warning, when it is.
+
+Three recipes:
+
+```toml
+# Drive my desktop and browser, and ask before risky things.
+[policy]
+access = "ask"
+```
+
+```toml
+# Unattended in CI: nothing prompts, destructive actions are refused. Scope it
+# to what the job needs (the agent launches the browser with `headless: true`).
+[policy]
+access = "auto"
+categories = ["browser", "system", "filesystem", "terminal"]
+[fs]
+roots = ["/work"]
+[terminal]
+allowed_commands = ["git", "make"]
+```
+
+```toml
+# A read-only observer: it can look, and it cannot change anything.
+[policy]
+role = "readonly"
+```
+
+Custom roles are an advanced option: a `[roles.<name>]` table (`allowed_categories`, `denied_tools`,
+`require_consent_for`, and the others in the example config) defines a preset of your own, selected with
+`role = "<name>"`. Most setups never need one.
+
+**`browser_eval`.** It runs arbitrary JavaScript in the page, with the page's own authority: it can read what
+the page can read and make the requests the signed-in session is allowed to make, and none of that passes
+through the checks that apply to the other browser tools (the origin allowlist covers `browser_navigate`, not
+what a script does). That is why it is dangerous-tier. The supported way to use it is `access = "ask"`, where
+each call asks a human, or an `auto` or `bypass` the operator chose knowingly. Every call is audited. The
+`readonly` and `qa` roles refuse it outright.
 
 ---
 
@@ -378,7 +435,7 @@ an engine.
 |---|---|
 | `mcp-types` | Shared vocabulary: `Envelope`, `ErrorCode`, `ToolDescriptor`, `Tier`, `Category`, `ToolModule`, `CallCtx`. |
 | `mcp-core` | Protocol: JSON-RPC framing, `initialize`/`tools/list`/`tools/call`, dispatch, registry. |
-| `mcp-policy` | The security kernel: category and tier gates, destructive-input gate, consent, denial budget, kill switch, audit, redaction. |
+| `mcp-policy` | The security kernel: category and tier gates, destructive-input gate, consent, kill switch, audit, redaction. |
 | `mcp-a11y` | Accessibility snapshots, the element-ref arena, tree flattening. |
 | `mcp-vision` | Displays and screen/window capture, with change detection and cost accounting. |
 | `mcp-input` | Semantic and coordinate input, and the destructive-keystroke gate. |

@@ -3,15 +3,24 @@
 //! backend lives in `mcp-macos`.
 
 mod backend;
+mod foreground;
+mod observe;
 mod tools;
 mod wait;
 
 pub use backend::{
-    DialogInfo, DialogScope, MenuItemInfo, Rect, WindowAction, WindowBackend, WindowError,
-    WindowInfo,
+    target_source, window_at, window_index_error, ChangeWatch, DialogInfo, DialogScope,
+    MenuItemInfo, Rect, TargetInfo, TargetSource, WindowAction, WindowBackend, WindowError,
+    WindowInfo, WindowState,
+};
+pub use foreground::{tool_refusal, ForegroundWindow};
+pub use observe::{
+    assess_sparsity, collect as collect_observed, parse_args as parse_observe_args, wants_ocr,
+    ObserveArgs, ObserveModule, OcrMode, SparseItem, SparseReason, Sparsity, SPARSITY_RULE,
 };
 pub use tools::WindowModule;
 pub use wait::{
-    default_wait_timeout, parse_wait_spec, poll_until, text_condition_holds, wait_schema,
-    window_condition_holds, WaitCondition, WaitEvaluator, WaitOutcome, WaitSpec, EXPECT_TIMEOUT_MS,
+    default_wait_timeout, parse_wait_spec, poll_until, text_condition_holds, wait_loop,
+    wait_schema, window_condition_holds, WaitCondition, WaitEvaluator, WaitOutcome, WaitSpec,
+    WokeBy, EXPECT_TIMEOUT_MS,
 };

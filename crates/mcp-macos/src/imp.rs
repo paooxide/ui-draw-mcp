@@ -4,29 +4,30 @@ use std::ptr;
 use std::sync::Mutex;
 
 use async_trait::async_trait;
-use core_foundation::array::CFArray;
+use core_foundation::array::{CFArray, CFArrayRef};
 use core_foundation::base::{CFType, CFTypeRef, TCFType};
 use core_foundation::boolean::CFBoolean;
 use core_foundation::dictionary::CFDictionary;
 use core_foundation::number::{CFNumber, CFNumberRef};
 use core_foundation::string::{CFString, CFStringRef};
-use core_foundation_sys::base::Boolean;
+use core_foundation_sys::base::{Boolean, CFRange};
 use core_graphics::window::{
-    copy_window_info, kCGNullWindowID, kCGWindowBounds, kCGWindowIsOnscreen, kCGWindowLayer,
-    kCGWindowListExcludeDesktopElements, kCGWindowListOptionOnScreenOnly, kCGWindowName,
-    kCGWindowOwnerName, kCGWindowOwnerPID,
+    copy_window_info, kCGNullWindowID, kCGWindowAlpha, kCGWindowBounds, kCGWindowIsOnscreen,
+    kCGWindowLayer, kCGWindowListExcludeDesktopElements, kCGWindowListOptionOnScreenAboveWindow,
+    kCGWindowListOptionOnScreenOnly, kCGWindowName, kCGWindowNumber, kCGWindowOwnerName,
+    kCGWindowOwnerPID,
 };
 
 use mcp_a11y::{
     is_interactive_role, A11yBackend, BackendError, Bounds, RawSnapshot, SnapshotRequest, UiNode,
 };
 use mcp_input::{
-    Choice, ClipData, ClipFormat, InputBackend, InputError, MouseKind, Reading, ScrollDir,
-    SemanticAction,
+    char_range_to_utf16, char_slice, utf16_range_to_char, Choice, ClipData, ClipFormat,
+    InputBackend, InputError, MouseKind, Reading, Route, ScrollDir, Selection, SemanticAction,
 };
 use mcp_window::{
-    DialogInfo, DialogScope, MenuItemInfo, Rect, WindowAction, WindowBackend, WindowError,
-    WindowInfo,
+    DialogInfo, DialogScope, MenuItemInfo, Rect, TargetInfo, TargetSource, WindowAction,
+    WindowBackend, WindowError, WindowInfo, WindowState,
 };
 
 // ---- AXUIElement FFI (ApplicationServices framework) ------------------------
@@ -43,8 +44,8 @@ pub(crate) const KAX_ERROR_CANNOT_COMPLETE: AXError = -25204;
 
 #[link(name = "ApplicationServices", kind = "framework")]
 extern "C" {
-    fn AXUIElementCreateSystemWide() -> AXUIElementRef;
-    fn AXUIElementCreateApplication(pid: c_int) -> AXUIElementRef;
+    pub(crate) fn AXUIElementCreateSystemWide() -> AXUIElementRef;
+    pub(crate) fn AXUIElementCreateApplication(pid: c_int) -> AXUIElementRef;
     fn AXUIElementCopyAttributeValue(
         element: AXUIElementRef,
         attribute: CFStringRef,
@@ -57,6 +58,13 @@ extern "C" {
     ) -> AXError;
     pub(crate) fn AXUIElementPerformAction(element: AXUIElementRef, action: CFStringRef)
         -> AXError;
+    /// The actions an element advertises (create rule).
+    fn AXUIElementCopyActionNames(element: AXUIElementRef, names: *mut CFArrayRef) -> AXError;
+    fn AXUIElementIsAttributeSettable(
+        element: AXUIElementRef,
+        attribute: CFStringRef,
+        settable: *mut Boolean,
+    ) -> AXError;
     /// Bound how long a request to the target app may take. Opening a popup
     /// can run the app's menu tracking, and without a bound a stuck app would
     /// hold this thread for the system default.
@@ -64,7 +72,7 @@ extern "C" {
         element: AXUIElementRef,
         timeout_seconds: f32,
     ) -> AXError;
-    fn AXUIElementGetPid(element: AXUIElementRef, pid: *mut c_int) -> AXError;
+    pub(crate) fn AXUIElementGetPid(element: AXUIElementRef, pid: *mut c_int) -> AXError;
     fn AXIsProcessTrusted() -> Boolean;
     fn AXValueGetValue(value: CFTypeRef, the_type: u32, value_ptr: *mut c_void) -> Boolean;
     fn AXValueCreate(the_type: u32, value_ptr: *const c_void) -> CFTypeRef;
@@ -73,6 +81,7 @@ extern "C" {
 // AXValue wrapped geometry types.
 const KAXVALUE_CGPOINT: u32 = 1;
 const KAXVALUE_CGSIZE: u32 = 2;
+const KAXVALUE_CFRANGE: u32 = 4;
 
 #[repr(C)]
 struct CGPoint {
@@ -212,6 +221,123 @@ pub(crate) fn ax_result(err: AXError, what: &str) -> Result<(), InputError> {
     }
 }
 
+/// The actions an element advertises. `None` when the list cannot be read,
+/// which is not the same as an empty list.
+unsafe fn action_names(elem: CFTypeRef) -> Option<Vec<String>> {
+    let mut raw: CFArrayRef = ptr::null();
+    let err = AXUIElementCopyActionNames(elem, &mut raw);
+    if err != KAX_SUCCESS || raw.is_null() {
+        return None;
+    }
+    // Copy rule: the array is ours to release.
+    let array: CFArray = CFArray::wrap_under_create_rule(raw);
+    Some(
+        array
+            .get_all_values()
+            .into_iter()
+            .filter_map(|p| CFType::wrap_under_get_rule(p).downcast::<CFString>())
+            .map(|s| s.to_string())
+            .collect(),
+    )
+}
+
+/// What to call an element in an error: its title, else its description, else
+/// its role.
+unsafe fn element_label(elem: CFTypeRef) -> String {
+    ["AXTitle", "AXDescription", "AXRole"]
+        .iter()
+        .find_map(|a| copy_attr_string(elem, a).filter(|s| !s.is_empty()))
+        .unwrap_or_default()
+}
+
+/// Perform an AX action on an element.
+///
+/// With `check_list`, the element's own action list is consulted first, so an
+/// element that lacks the action is told apart from one that failed it. Either
+/// way, an element that reports the action unsupported gets an error naming
+/// what it does offer.
+unsafe fn perform_ax_action(elem: CFTypeRef, ax: &str, check_list: bool) -> Result<(), InputError> {
+    if check_list {
+        if let Some(offered) = action_names(elem) {
+            if !offered.iter().any(|a| a == ax) {
+                return Err(InputError::Unsupported(
+                    crate::ax_actions::unsupported_message(&element_label(elem), ax, &offered),
+                ));
+            }
+        }
+    }
+    let act = CFString::new(ax);
+    match AXUIElementPerformAction(elem, act.as_concrete_TypeRef()) {
+        // Apps answer an action they do not have with either code (TextEdit's
+        // text area answers AXScrollToVisible with the attribute one), and
+        // both should name what the element does offer.
+        KAX_ERROR_ACTION_UNSUPPORTED | KAX_ERROR_ATTRIBUTE_UNSUPPORTED => Err(
+            InputError::Unsupported(crate::ax_actions::unsupported_message(
+                &element_label(elem),
+                ax,
+                &action_names(elem).unwrap_or_default(),
+            )),
+        ),
+        err => ax_result(err, ax.trim_start_matches("AX")),
+    }
+}
+
+/// Read an `AXValue`-wrapped `CFRange` attribute as UTF-16 `(location, length)`.
+unsafe fn copy_attr_range(elem: CFTypeRef, name: &str) -> Option<(usize, usize)> {
+    let v = copy_attr(elem, name)?;
+    let mut r = CFRange {
+        location: 0,
+        length: 0,
+    };
+    let ok = AXValueGetValue(
+        v.as_CFTypeRef(),
+        KAXVALUE_CFRANGE,
+        &mut r as *mut CFRange as *mut c_void,
+    );
+    if ok == 0 || r.location < 0 || r.length < 0 {
+        return None;
+    }
+    Some((r.location as usize, r.length as usize))
+}
+
+/// Whether an attribute can be written. A failed query counts as no.
+unsafe fn is_settable(elem: CFTypeRef, name: &str) -> bool {
+    let attr = CFString::new(name);
+    let mut settable: Boolean = 0;
+    AXUIElementIsAttributeSettable(elem, attr.as_concrete_TypeRef(), &mut settable) == KAX_SUCCESS
+        && settable != 0
+}
+
+/// The text selection an element reports, in characters.
+///
+/// A password field is refused before anything is read from it.
+unsafe fn read_selection(elem: CFTypeRef) -> Result<Selection, InputError> {
+    if copy_attr_string(elem, "AXSubrole").as_deref() == Some("AXSecureTextField") {
+        return Err(InputError::InvalidArgs(
+            "this is a password field; its text is never read".into(),
+        ));
+    }
+    let text = copy_attr_string(elem, "AXValue")
+        .ok_or_else(|| InputError::Unsupported("the element has no text".into()))?;
+    let (loc, len) = copy_attr_range(elem, "AXSelectedTextRange").ok_or_else(|| {
+        InputError::Unsupported("the element does not report a selected text range".into())
+    })?;
+    let (start, end) = utf16_range_to_char(&text, loc, len).ok_or_else(|| {
+        InputError::Failed(format!(
+            "the element reports a selection ({loc}, {len} in UTF-16 units) that does not fall \
+             on character boundaries of its text"
+        ))
+    })?;
+    let selected =
+        copy_attr_string(elem, "AXSelectedText").unwrap_or_else(|| char_slice(&text, start, end));
+    Ok(Selection {
+        start,
+        end,
+        text: selected,
+        role: copy_attr_string(elem, "AXRole").map(|r| r.trim_start_matches("AX").to_string()),
+    })
+}
+
 // ---- tree walker ------------------------------------------------------------
 
 /// Identity of a snapshotted node: the child-index path from the app root plus
@@ -336,9 +462,12 @@ impl Walker {
 struct State {
     pid: Option<c_int>,
     paths: HashMap<u64, NodeRef>,
-    /// The app this session is driving. Set by an explicit `app` argument and
-    /// then *followed* — later calls stay on it instead of tracking whatever
-    /// happens to be frontmost.
+    /// The app this session is driving. Set by `focus_app`, or by a
+    /// `get_ui_tree`-family call that names an `app` (or that names none and
+    /// finds nothing pinned, which pins the frontmost app), and then
+    /// *followed* — later calls stay on it instead of tracking whatever
+    /// happens to be frontmost. Window, menu and capture calls that name an
+    /// app act on it without changing this.
     target: Option<AppTarget>,
 }
 
@@ -347,6 +476,24 @@ struct State {
 struct AppTarget {
     pid: c_int,
     name: String,
+}
+
+/// An application a call resolved to, and which of name, pin or frontmost
+/// chose it.
+pub(crate) struct Resolved {
+    pub(crate) pid: c_int,
+    pub(crate) name: String,
+    pub(crate) from: TargetSource,
+}
+
+impl Resolved {
+    pub(crate) fn info(&self) -> TargetInfo {
+        TargetInfo {
+            app: self.name.clone(),
+            pid: u32::try_from(self.pid).ok(),
+            from: self.from,
+        }
+    }
 }
 
 /// Real macOS backend implementing perception (`A11yBackend`) and semantic input
@@ -375,6 +522,8 @@ pub struct MacosBackend {
     /// Which mouse buttons this backend holds down, so a `move` between a
     /// `down` and an `up` goes out as the drag event it is.
     held: crate::event::Held,
+    /// Keys held down across calls; their modifiers ride on every event.
+    keys: crate::event::HeldKeys,
 }
 
 impl Default for MacosBackend {
@@ -390,6 +539,7 @@ impl MacosBackend {
             takeovers: std::sync::atomic::AtomicU64::new(0),
             helper_dir: default_helper_dir(),
             held: crate::event::Held::default(),
+            keys: crate::event::HeldKeys::default(),
         }
     }
 
@@ -399,39 +549,85 @@ impl MacosBackend {
         self
     }
 
+    /// The pinned app, if its process is still alive. A pin whose process has
+    /// gone is dropped here, so it cannot wedge the session on a stale pid.
+    fn live_pin(&self) -> Option<AppTarget> {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let t = st.target.clone()?;
+        if pid_alive(t.pid) {
+            Some(t)
+        } else {
+            st.target = None;
+            None
+        }
+    }
+
+    /// Which app a call would act on, and why that one, with nothing pinned
+    /// or changed. A name given to the call wins; otherwise the pinned app
+    /// while it lives; otherwise the frontmost one. A name that matches no
+    /// running app is an error, never a fall-through to another app: that is
+    /// how a typo used to drive whatever was in front.
+    unsafe fn peek_target(&self, app: Option<&str>) -> Result<Resolved, String> {
+        let pin = self.live_pin();
+        match mcp_window::target_source(app, pin.is_some()) {
+            TargetSource::Named => {
+                let name = app.unwrap_or_default().trim();
+                let (pid, resolved) = resolve_app_pid(name)
+                    .ok_or_else(|| format!("no running application matching '{name}'"))?;
+                Ok(Resolved {
+                    pid,
+                    name: resolved,
+                    from: TargetSource::Named,
+                })
+            }
+            TargetSource::Pinned => pin
+                .map(|t| Resolved {
+                    pid: t.pid,
+                    name: t.name,
+                    from: TargetSource::Pinned,
+                })
+                .ok_or_else(|| "the pinned application is no longer running".to_string()),
+            TargetSource::Frontmost => {
+                let (pid, name) = frontmost_identity().ok_or("no frontmost application")?;
+                Ok(Resolved {
+                    pid,
+                    name,
+                    from: TargetSource::Frontmost,
+                })
+            }
+        }
+    }
+
     /// Resolve which app to drive, and remember it.
     ///
-    /// An explicit `app` wins and becomes the sticky target; otherwise we reuse
-    /// the sticky target while its process is alive; otherwise we fall back to
-    /// the frontmost app. This is what makes the server *follow* the app it is
-    /// working on rather than tracking whatever steals focus.
-    unsafe fn resolve_target(&self, app: Option<&str>) -> Result<(CFType, c_int, String), String> {
-        if let Some(name) = app.map(str::trim).filter(|s| !s.is_empty()) {
-            let (pid, resolved) = resolve_app_pid(name)
-                .ok_or_else(|| format!("no running application matching '{name}'"))?;
-            let elem = app_element(pid).ok_or("cannot open application")?;
-            self.set_target(pid, &resolved);
-            return Ok((elem, pid, resolved));
+    /// An explicit `app` wins and becomes the pinned target; otherwise we reuse
+    /// the pinned target while its process is alive; otherwise we fall back to
+    /// the frontmost app, which then becomes the pin. This is what makes the
+    /// server *follow* the app it is working on rather than tracking whatever
+    /// steals focus. It is for perception and the actions on its refs; the
+    /// window, menu and capture tools use [`Self::peek_app`], which pins nothing.
+    unsafe fn resolve_target(&self, app: Option<&str>) -> Result<(CFType, Resolved), String> {
+        let r = self.peek_target(app)?;
+        let elem = app_element(r.pid).ok_or("cannot open application")?;
+        if r.from != TargetSource::Pinned {
+            self.set_target(r.pid, &r.name);
         }
-        let sticky = {
-            let st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            st.target.clone()
-        };
-        if let Some(t) = sticky {
-            if pid_alive(t.pid) {
-                if let Some(elem) = app_element(t.pid) {
-                    return Ok((elem, t.pid, t.name));
-                }
-            }
-            // Target died — drop it and fall through to the frontmost app.
-            self.state.lock().unwrap_or_else(|e| e.into_inner()).target = None;
+        Ok((elem, r))
+    }
+
+    /// The app a window, menu or dialog call acts on, as an AX element, with
+    /// nothing pinned. Naming an app in one of those calls is saying what to
+    /// act on, not choosing to drive it from now on.
+    unsafe fn peek_app(&self, app: Option<&str>) -> Result<(CFType, Resolved), WindowError> {
+        if AXIsProcessTrusted() == 0 {
+            return Err(WindowError::PermissionDenied(
+                "Accessibility permission not granted".into(),
+            ));
         }
-        let elem = frontmost_app().ok_or("no frontmost application")?;
-        let mut pid: c_int = 0;
-        AXUIElementGetPid(elem.as_CFTypeRef(), &mut pid);
-        let name = copy_attr_string(elem.as_CFTypeRef(), "AXTitle").unwrap_or_default();
-        self.set_target(pid, &name);
-        Ok((elem, pid, name))
+        let r = self.peek_target(app).map_err(WindowError::NotFound)?;
+        let elem = app_element(r.pid)
+            .ok_or_else(|| WindowError::Failed("cannot open application".into()))?;
+        Ok((elem, r))
     }
 
     /// Raise the sticky target app before synthetic keyboard input.
@@ -465,6 +661,18 @@ impl MacosBackend {
              so keystrokes would land in another application",
             t.name, t.pid
         )))
+    }
+
+    /// A per-process event to a pid that is gone goes nowhere and says
+    /// nothing, so the pid is checked first.
+    fn require_live_pid(&self, pid: i32) -> Result<(), InputError> {
+        if pid_alive(pid) {
+            Ok(())
+        } else {
+            Err(InputError::NotFound(format!(
+                "process {pid} is no longer running"
+            )))
+        }
     }
 
     fn set_target(&self, pid: c_int, name: &str) {
@@ -528,7 +736,7 @@ impl MacosBackend {
 }
 
 /// The AX element for a pid.
-unsafe fn app_element(pid: c_int) -> Option<CFType> {
+pub(crate) unsafe fn app_element(pid: c_int) -> Option<CFType> {
     let app = AXUIElementCreateApplication(pid);
     if app.is_null() {
         None
@@ -598,9 +806,20 @@ impl A11yBackend for MacosBackend {
             // An explicit `app` targets that application and becomes sticky;
             // otherwise we follow the app this session is already driving, and
             // only fall back to the frontmost one if there is no target yet.
-            let (app, pid, target_name) = self
-                .resolve_target(req.app.as_deref())
-                .map_err(BackendError::NotFound)?;
+            // A passive read (a wait, a check) names the app it reads without
+            // becoming it.
+            let (app, resolved) = if req.passive || req.without_pin {
+                let r = self
+                    .peek_target(req.app.as_deref())
+                    .map_err(BackendError::NotFound)?;
+                let elem = app_element(r.pid)
+                    .ok_or_else(|| BackendError::NotFound("cannot open application".into()))?;
+                (elem, r)
+            } else {
+                self.resolve_target(req.app.as_deref())
+                    .map_err(BackendError::NotFound)?
+            };
+            let (pid, target_name) = (resolved.pid, resolved.name.clone());
 
             let max_depth = req.max_depth.unwrap_or(40);
             let mut walker = Walker {
@@ -619,7 +838,11 @@ impl A11yBackend for MacosBackend {
                 .or(Some(target_name).filter(|s| !s.is_empty()));
 
             let partial = walker.timed_out || walker.count >= walker.max_nodes;
-            {
+            // The refs of this walk are what ui_action and the rest resolve
+            // against. A passive read keeps the previous walk's: replacing it
+            // would leave `@e5` of the last get_ui_tree pointing into
+            // another application.
+            if !req.passive {
                 let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
                 st.pid = Some(pid);
                 st.paths = walker.paths;
@@ -632,6 +855,10 @@ impl A11yBackend for MacosBackend {
                 window: None,
                 terminal_app: terminal,
                 partial,
+                target: Some(mcp_a11y::SnapshotTarget {
+                    pid: u32::try_from(pid).ok(),
+                    from: resolved.from.as_str(),
+                }),
             })
         }
     }
@@ -648,12 +875,14 @@ impl InputBackend for MacosBackend {
         node_id: u64,
         action: SemanticAction,
         _option: Option<&str>,
-    ) -> Result<(), InputError> {
+    ) -> Result<Route, InputError> {
         unsafe {
             let elem = self.element_for(node_id)?;
             let eref = elem.as_CFTypeRef();
-            match action {
-                SemanticAction::Focus => {
+            // Every branch below goes through the accessibility API: nothing
+            // here moves the pointer or needs the app frontmost.
+            match crate::ax_actions::ax_action_name(action) {
+                None => {
                     let attr = CFString::new("AXFocused");
                     let val = CFBoolean::from(true);
                     let err = AXUIElementSetAttributeValue(
@@ -661,25 +890,107 @@ impl InputBackend for MacosBackend {
                         attr.as_concrete_TypeRef(),
                         val.as_CFTypeRef(),
                     );
-                    ax_result(err, "focus")
-                }
-                SemanticAction::ScrollIntoView => {
-                    let act = CFString::new("AXScrollToVisible");
-                    ax_result(
-                        AXUIElementPerformAction(eref, act.as_concrete_TypeRef()),
-                        "scroll_into_view",
-                    )
+                    ax_result(err, "focus")?;
                 }
                 // Click / toggle / check / select all map to the AXPress action;
                 // AX has no distinct double/right press.
-                _ => {
-                    let act = CFString::new("AXPress");
-                    ax_result(
-                        AXUIElementPerformAction(eref, act.as_concrete_TypeRef()),
-                        "press",
-                    )
+                Some(ax) => {
+                    perform_ax_action(eref, ax, crate::ax_actions::must_be_listed(action))?;
                 }
             }
+            Ok(Route::Ax)
+        }
+    }
+
+    /// Every action is an accessibility action or attribute write; `perform`
+    /// returns [`Route::Ax`] for all of them, including `right_click` and
+    /// `double_click`, which are an `AXPress`.
+    fn route_for(&self, _action: SemanticAction) -> Route {
+        Route::Ax
+    }
+
+    fn screen_state(&self) -> mcp_types::ScreenState {
+        crate::session::screen_state()
+    }
+
+    async fn selection(&self, node_id: Option<u64>) -> Result<Selection, InputError> {
+        unsafe {
+            if let Some(id) = node_id {
+                let elem = self.element_for(id)?;
+                return read_selection(elem.as_CFTypeRef());
+            }
+            if AXIsProcessTrusted() == 0 {
+                return Err(InputError::PermissionDenied(
+                    "accessibility API disabled (grant permission)".into(),
+                ));
+            }
+            let (app, resolved) = self.resolve_target(None).map_err(InputError::NotFound)?;
+            let name = resolved.name;
+            let focused = copy_attr(app.as_CFTypeRef(), "AXFocusedUIElement").ok_or_else(|| {
+                InputError::Failed(format!("nothing has keyboard focus in '{name}'"))
+            })?;
+            read_selection(focused.as_CFTypeRef())
+        }
+    }
+
+    async fn select_range(
+        &self,
+        node_id: u64,
+        start: usize,
+        end: usize,
+    ) -> Result<Selection, InputError> {
+        // No await inside: the AX handles are not `Send`, and the run is short.
+        unsafe {
+            let elem = self.element_for(node_id)?;
+            let e = elem.as_CFTypeRef();
+            // Refuse a password field before reading its text.
+            if copy_attr_string(e, "AXSubrole").as_deref() == Some("AXSecureTextField") {
+                return Err(InputError::InvalidArgs(
+                    "this is a password field; its text is never read or selected".into(),
+                ));
+            }
+            let text = copy_attr_string(e, "AXValue")
+                .ok_or_else(|| InputError::Unsupported("the element has no text".into()))?;
+            let (location, length) = char_range_to_utf16(&text, start, end).ok_or_else(|| {
+                InputError::InvalidArgs(format!(
+                    "range {start}..{end} runs past the text, which is {} characters long",
+                    text.chars().count()
+                ))
+            })?;
+            if !is_settable(e, "AXSelectedTextRange") {
+                return Err(InputError::Unsupported(
+                    "this element does not let its selection be set (AXSelectedTextRange is read-only \
+                     here); select_text does not fall back to dragging the pointer"
+                        .into(),
+                ));
+            }
+            let range = CFRange {
+                location: location as isize,
+                length: length as isize,
+            };
+            let raw = AXValueCreate(KAXVALUE_CFRANGE, &range as *const CFRange as *const c_void);
+            if raw.is_null() {
+                return Err(InputError::Failed(
+                    "could not build the selection range".into(),
+                ));
+            }
+            // Create rule: the wrapper releases it.
+            let value = CFType::wrap_under_create_rule(raw);
+            let attr = CFString::new("AXSelectedTextRange");
+            ax_result(
+                AXUIElementSetAttributeValue(e, attr.as_concrete_TypeRef(), value.as_CFTypeRef()),
+                "select_text",
+            )?;
+            // An app may apply the range on its next run-loop turn.
+            let mut got = read_selection(e)?;
+            for _ in 0..5 {
+                if (got.start, got.end) == (start, end) {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(40));
+                got = read_selection(e)?;
+            }
+            Ok(got)
         }
     }
 
@@ -739,9 +1050,116 @@ impl InputBackend for MacosBackend {
         }
         Ok(())
     }
+    fn background_key_target(&self) -> Option<mcp_input::BackgroundTarget> {
+        let t = self.live_pin()?;
+        // Compared at the moment of asking: an app that was raised a moment
+        // ago is in front, and its keys go through the ordinary route.
+        if unsafe { frontmost_pid() } == Some(t.pid) {
+            return None;
+        }
+        Some(mcp_input::BackgroundTarget {
+            pid: t.pid,
+            name: t.name,
+        })
+    }
+    async fn type_text_to_pid(&self, pid: i32, text: &str) -> Result<(), InputError> {
+        use tokio::time::{sleep, Duration};
+        self.require_live_pid(pid)?;
+        let since = self.takeover_generation();
+        let total = text.chars().count();
+        let mut typed = 0;
+        for chunk in crate::chunk::chunks(text) {
+            if self.takeover_generation() != since {
+                return Err(InputError::Failed(format!(
+                    "typing aborted after {typed} of {total} characters: a human took over"
+                )));
+            }
+            crate::event::type_chunk_to(crate::event::Dest::Pid(pid), chunk)?;
+            typed += chunk.chars().count();
+            sleep(Duration::from_millis(3)).await;
+        }
+        Ok(())
+    }
+    async fn key_combo_to_pid(&self, pid: i32, combo: &str) -> Result<(), InputError> {
+        self.require_live_pid(pid)?;
+        // No held flags: the tool layer refuses this route while keys are held.
+        crate::event::key_combo_to(
+            crate::event::Dest::Pid(pid),
+            combo,
+            core_graphics::event::CGEventFlags::empty(),
+        )
+    }
+    async fn read_focused_text(&self, pid: i32) -> Result<mcp_input::FocusedText, InputError> {
+        unsafe {
+            let app = app_element(pid)
+                .ok_or_else(|| InputError::NotFound("cannot open the application".into()))?;
+            let Some(focused) = copy_attr(app.as_CFTypeRef(), "AXFocusedUIElement") else {
+                return Ok(mcp_input::FocusedText::default());
+            };
+            let e = focused.as_CFTypeRef();
+            if copy_attr_string(e, "AXSubrole").as_deref() == Some("AXSecureTextField") {
+                return Ok(mcp_input::FocusedText {
+                    value: None,
+                    selection: None,
+                    secure: true,
+                });
+            }
+            let value = copy_attr_string(e, "AXValue");
+            let selection = value.as_deref().and_then(|v| {
+                let (loc, len) = copy_attr_range(e, "AXSelectedTextRange")?;
+                utf16_range_to_char(v, loc, len)
+            });
+            Ok(mcp_input::FocusedText {
+                value,
+                selection,
+                secure: false,
+            })
+        }
+    }
+    async fn user_idle_ms(&self) -> Option<u64> {
+        crate::event::hid_idle_ms()
+    }
+    async fn desk_state(&self) -> mcp_input::DeskState {
+        mcp_input::DeskState {
+            app: unsafe { frontmost_app_ref() },
+            pointer: crate::event::pointer_position().ok().flatten(),
+        }
+    }
+    fn restore_desk(&self, saved: &mcp_input::DeskState, pointer: bool) {
+        if pointer {
+            if let (Some((x, y)), Ok(Some(now))) = (saved.pointer, crate::event::pointer_position())
+            {
+                if ((now.0 - x).powi(2) + (now.1 - y).powi(2)).sqrt() > 1.0 {
+                    let _ = crate::event::mouse(&self.held, MouseKind::Move, x, y, None, &[]);
+                }
+            }
+        }
+        if let Some(app) = &saved.app {
+            unsafe {
+                if frontmost_pid() != Some(app.pid) && pid_alive(app.pid) {
+                    if let Some(el) = app_element(app.pid) {
+                        let _ = set_bool_attr(el.as_CFTypeRef(), "AXFrontmost", true);
+                    }
+                }
+            }
+        }
+    }
     async fn key_combo(&self, combo: &str) -> Result<(), InputError> {
         unsafe { self.ensure_target_frontmost()? };
-        crate::event::key_combo(combo)
+        crate::event::key_combo(combo, self.keys.flags())
+    }
+    async fn key_down(&self, key: &str) -> Result<(), InputError> {
+        // Only an ordinary key is typed into the frontmost app, so only it
+        // needs the target raised; a modifier is a flag on later events.
+        if !crate::event::is_modifier(key) {
+            unsafe { self.ensure_target_frontmost()? };
+        }
+        crate::event::key_down(&self.keys, key)
+    }
+    async fn key_up(&self, key: &str) -> Result<(), InputError> {
+        // Never conditional on where focus is: a release that can be refused
+        // is a stuck key.
+        crate::event::key_up(&self.keys, key)
     }
     async fn mouse(
         &self,
@@ -751,7 +1169,8 @@ impl InputBackend for MacosBackend {
         b: Option<&str>,
         modifiers: &[String],
     ) -> Result<(), InputError> {
-        crate::event::mouse(&self.held, k, x, y, b, modifiers)
+        let modifiers = self.keys.with_modifiers(modifiers);
+        crate::event::mouse(&self.held, k, x, y, b, &modifiers)
     }
     async fn scroll_at(
         &self,
@@ -761,7 +1180,21 @@ impl InputBackend for MacosBackend {
         a: i32,
         modifiers: &[String],
     ) -> Result<(), InputError> {
-        crate::event::scroll(&self.held, x, y, d, a, modifiers)
+        let modifiers = self.keys.with_modifiers(modifiers);
+        crate::event::scroll(&self.held, x, y, d, a, &modifiers)
+    }
+    async fn scroll_pixels(
+        &self,
+        x: f64,
+        y: f64,
+        ev: &mcp_input::trackpad::PixelScroll,
+        modifiers: &[String],
+    ) -> Result<(), InputError> {
+        let modifiers = self.keys.with_modifiers(modifiers);
+        crate::event::scroll_pixels(&self.held, x, y, ev, &modifiers)
+    }
+    fn pixel_momentum(&self) -> bool {
+        true
     }
     async fn pointer_position(&self) -> Result<Option<(f64, f64)>, InputError> {
         crate::event::pointer_position()
@@ -776,30 +1209,39 @@ impl InputBackend for MacosBackend {
         // it was holding is no longer its gesture, and the next `move` must
         // not go out as a drag of it.
         self.held.clear();
+        // Keys too: whoever has the mouse now should not find Shift still on.
+        crate::event::release_all(&self.keys);
     }
     fn takeover_generation(&self) -> u64 {
         self.takeovers.load(std::sync::atomic::Ordering::SeqCst)
     }
     async fn hover(&self, x: f64, y: f64) -> Result<(), InputError> {
-        crate::event::hover(&self.held, x, y)
+        let modifiers = self.keys.with_modifiers(&[]);
+        crate::event::hover(&self.held, x, y, &modifiers)
     }
     async fn drag(
         &self,
         from: (f64, f64),
-        to: (f64, f64),
+        route: &[(f64, f64)],
         modifiers: &[String],
-        steps: u32,
         hold_ms: u64,
         since_takeover: u64,
     ) -> Result<(), InputError> {
         use tokio::time::{sleep, Duration};
+        let Some(&to) = route.last() else {
+            return Err(InputError::InvalidArgs(
+                "a drag needs somewhere to go".into(),
+            ));
+        };
+        let modifiers = self.keys.with_modifiers(modifiers);
+        let modifiers = &modifiers[..];
         crate::event::drag_begin(&self.held, from, modifiers)?;
         // Let the press register before motion starts; a drag that begins in
         // the same instant reads as a click to most targets. `hold_ms` adds to
         // that for sources that wait to tell a drag from a click.
         sleep(Duration::from_millis(30 + hold_ms)).await;
         let mut last = from;
-        for p in crate::event::drag_path(from, to, steps) {
+        for &p in route {
             // A cancelled drag must release the button where it is. Returning
             // with it still held would leave the human dragging a selection
             // around with their own mouse.
@@ -871,7 +1313,7 @@ unsafe fn dict_string(dict: &CFDictionary, key: CFStringRef) -> Option<String> {
 }
 
 /// On-screen GUI apps as `(pid, owner name)`, front-to-back, deduplicated.
-unsafe fn window_owners() -> Vec<(c_int, String)> {
+pub(crate) unsafe fn window_owners() -> Vec<(c_int, String)> {
     let mut out: Vec<(c_int, String)> = Vec::new();
     let Some(arr) = copy_window_info(
         kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements,
@@ -963,20 +1405,33 @@ fn pid_alive(pid: c_int) -> bool {
         .unwrap_or(false)
 }
 
-/// Resolve an application name to a running pid. Matches on-screen window
-/// owners first (exact, then case-insensitive substring), then falls back to
-/// `pgrep` so apps without an on-screen window are still reachable.
+/// Resolve an application name to a running pid. Matches window owners
+/// first (exact, then case-insensitive substring), on-screen ones before the
+/// rest, then falls back to `pgrep` so apps without a window are still
+/// reachable.
+///
+/// The off-screen owners matter: an app whose windows are all minimised or on
+/// another Space is running and can be driven, and without them it resolved
+/// only if its process name happened to equal what was typed.
 unsafe fn resolve_app_pid(name: &str) -> Option<(c_int, String)> {
-    let owners = window_owners();
     let want = name.to_ascii_lowercase();
-    if let Some((p, n)) = owners.iter().find(|(_, n)| n.to_ascii_lowercase() == want) {
-        return Some((*p, n.clone()));
+    if want.is_empty() {
+        return None;
     }
-    if let Some((p, n)) = owners
-        .iter()
-        .find(|(_, n)| n.to_ascii_lowercase().contains(&want))
-    {
-        return Some((*p, n.clone()));
+    let onscreen = window_owners();
+    let everything = window_owners_all();
+    for owners in [&onscreen, &everything] {
+        if let Some((p, n)) = owners.iter().find(|(_, n)| n.to_ascii_lowercase() == want) {
+            return Some((*p, n.clone()));
+        }
+    }
+    for owners in [&onscreen, &everything] {
+        if let Some((p, n)) = owners
+            .iter()
+            .find(|(_, n)| n.to_ascii_lowercase().contains(&want))
+        {
+            return Some((*p, n.clone()));
+        }
     }
     let out = std::process::Command::new("/usr/bin/pgrep")
         .args(["-ix", name])
@@ -997,6 +1452,15 @@ unsafe fn dict_i64(dict: &CFDictionary, key: CFStringRef) -> Option<i64> {
         return None;
     }
     CFNumber::wrap_under_get_rule(raw as CFNumberRef).to_i64()
+}
+
+/// Read a floating-point entry out of a CGWindowList dictionary.
+unsafe fn dict_f64(dict: &CFDictionary, key: CFStringRef) -> Option<f64> {
+    let raw = *dict.find(key.cast::<c_void>())?;
+    if raw.is_null() {
+        return None;
+    }
+    CFNumber::wrap_under_get_rule(raw as CFNumberRef).to_f64()
 }
 
 /// Read a boolean entry out of a CGWindowList dictionary.
@@ -1057,6 +1521,17 @@ unsafe fn frontmost_pid() -> Option<c_int> {
     None
 }
 
+/// The app whose window is topmost, as a pid and a name, for putting it back.
+unsafe fn frontmost_app_ref() -> Option<mcp_input::AppRef> {
+    let pid = frontmost_pid()?;
+    let name = window_owners_all()
+        .into_iter()
+        .find(|(p, _)| *p == pid)
+        .map(|(_, n)| n)
+        .unwrap_or_default();
+    Some(mcp_input::AppRef { pid, name })
+}
+
 /// The frontmost application's AX element.
 ///
 /// `AXFocusedApplication` on the system-wide element is unreliable on modern
@@ -1079,53 +1554,95 @@ pub(crate) unsafe fn frontmost_app() -> Option<CFType> {
     }
 }
 
-/// The frontmost application element, as a window-error result. Prefer
-/// [`MacosBackend::target_app_element`], which follows the session target.
-pub(crate) unsafe fn focused_app_element() -> Result<CFType, WindowError> {
-    if AXIsProcessTrusted() == 0 {
-        return Err(WindowError::PermissionDenied(
-            "Accessibility permission not granted".into(),
-        ));
+/// The frontmost application's pid and name. The name is its accessibility
+/// title, else the name the window server gives its windows.
+unsafe fn frontmost_identity() -> Option<(c_int, String)> {
+    let elem = frontmost_app()?;
+    let mut pid: c_int = 0;
+    AXUIElementGetPid(elem.as_CFTypeRef(), &mut pid);
+    if pid <= 0 {
+        return None;
     }
-    frontmost_app().ok_or_else(|| WindowError::NotFound("no frontmost application".into()))
+    let name = copy_attr_string(elem.as_CFTypeRef(), "AXTitle")
+        .filter(|n| !n.is_empty())
+        .or_else(|| {
+            window_owners_all()
+                .into_iter()
+                .find(|(p, _)| *p == pid)
+                .map(|(_, n)| n)
+        })
+        .unwrap_or_default();
+    Some((pid, name))
 }
 
-impl MacosBackend {
-    /// The app element this session is driving: the sticky target when set and
-    /// alive, else the frontmost app. Window/menu ops go through this so they
-    /// stay on the same app as `get_ui_tree`.
-    /// The application this session was pinned to by `focus_app`, if any.
-    fn pinned_target(&self) -> Option<c_int> {
-        self.state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .target
-            .as_ref()
-            .map(|t| t.pid)
-    }
+/// A window resolved for capture: whose it is, where, and the other
+/// applications on top of it (name and share of its area).
+pub(crate) struct CaptureTarget {
+    pub target: Resolved,
+    pub info: WindowInfo,
+    pub bounds: Rect,
+    /// The window server's id for it (`CGWindowID`).
+    pub number: i64,
+    pub covered: Vec<(String, f64)>,
+    /// The same windows as rectangles, clipped to the target's area.
+    pub occluders: Vec<(String, mcp_vision::marks::Rect)>,
+}
 
-    /// Every window of every application that has one.
+/// A window as the window server lists it, with what is needed to capture it.
+pub(crate) struct WindowRow {
+    pub info: WindowInfo,
+    /// The window server's number for it, for asking what is in front of it.
+    pub number: i64,
+}
+
+/// One normal-layer surface of the window server's list, before it is
+/// numbered within its application.
+struct ServerWindow {
+    pid: c_int,
+    owner: String,
+    number: i64,
+    title: Option<String>,
+    bounds: Option<Rect>,
+    onscreen: bool,
+}
+
+/// What the application itself says about one of its windows.
+struct AxWindow {
+    title: Option<String>,
+    bounds: Option<Rect>,
+    minimized: bool,
+}
+
+/// Bound on one accessibility read while enriching the window list: a stuck
+/// app must cost a fraction of a second, not the system default of several.
+const WINDOW_READ_TIMEOUT_S: f32 = 0.25;
+
+impl MacosBackend {
+    /// Every window of every application that has one, numbered within its own
+    /// application.
     ///
-    /// Read from the CoreGraphics window list rather than by walking each
-    /// application's accessibility tree. The window server is authoritative
-    /// about what exists — Chromium, for one, exposes no accessibility tree
-    /// at all until something asks it to, so an AX walk reports a running
-    /// browser as having no windows.
+    /// Which windows exist and how they are numbered come from the window
+    /// server alone, not from any application's accessibility tree: the server
+    /// is authoritative about what exists (Chromium exposes no tree until
+    /// something asks it to), and it is the same list whether the caller asked
+    /// about one application or all of them and whether or not Accessibility is
+    /// granted. That is what makes an id from `list_windows` mean the same
+    /// window to `capture_window` and `ocr_region`.
     ///
     /// Titles come from `kCGWindowName`, which is redacted without the Screen
-    /// Recording permission. A missing title is reported as absent rather than
-    /// guessed at.
-    ///
-    /// Ids are indexes within their own application, so an id here means what
-    /// it would mean in `list_windows { app }`.
-    unsafe fn every_window(&self) -> Result<Vec<WindowInfo>, WindowError> {
+    /// Recording permission. Where it is missing the application's own
+    /// accessibility title is used if Accessibility is granted, matched by
+    /// frame; otherwise the title is reported as absent rather than guessed.
+    /// A window the server does not draw is `minimized` when the application
+    /// says so and `offscreen` otherwise (another Space, or a hidden app).
+    unsafe fn window_rows(&self) -> Result<Vec<WindowRow>, WindowError> {
         let Some(arr) = copy_window_info(kCGWindowListExcludeDesktopElements, kCGNullWindowID)
         else {
             return Err(WindowError::Failed(
                 "the window server returned no window list".into(),
             ));
         };
-        let mut raw_windows: Vec<(String, Option<String>, Option<Rect>, bool)> = Vec::new();
+        let mut raw_windows: Vec<ServerWindow> = Vec::new();
         for raw in arr.get_all_values() {
             if raw.is_null() {
                 continue;
@@ -1137,7 +1654,11 @@ impl MacosBackend {
             if dict_i64(&dict, kCGWindowLayer) != Some(0) {
                 continue;
             }
-            let Some(owner) = dict_string(&dict, kCGWindowOwnerName) else {
+            let (Some(owner), Some(pid), Some(number)) = (
+                dict_string(&dict, kCGWindowOwnerName),
+                dict_i64(&dict, kCGWindowOwnerPID),
+                dict_i64(&dict, kCGWindowNumber),
+            ) else {
                 continue;
             };
             if SYSTEM_UI_OWNERS.contains(&owner.as_str()) {
@@ -1148,14 +1669,18 @@ impl MacosBackend {
             if bounds.is_some_and(|b| b.w < MIN_WINDOW_W || b.h < MIN_WINDOW_H) {
                 continue;
             }
-            raw_windows.push((
+            raw_windows.push(ServerWindow {
+                pid: pid as c_int,
                 owner,
-                dict_string(&dict, kCGWindowName).filter(|t| !t.is_empty()),
+                number,
+                title: dict_string(&dict, kCGWindowName).filter(|t| !t.is_empty()),
                 bounds,
-                // Off-screen on the normal layer means minimised, or on
-                // another Space. Either way it is not in front of anyone.
-                !dict_bool(&dict, kCGWindowIsOnscreen).unwrap_or(true),
-            ));
+                // The window server writes this key only for a window that is
+                // drawn. A minimised window, or one on another Space, has no
+                // such entry, and reading its absence as "on screen" reported
+                // a minimised window as visible.
+                onscreen: dict_bool(&dict, kCGWindowIsOnscreen).unwrap_or(false),
+            });
         }
 
         // An application draws several full-size surfaces per visible window
@@ -1163,39 +1688,183 @@ impl MacosBackend {
         // titled. Dropping the untitled ones is what turns 169 entries into
         // the two dozen a person would point at — but only when titles are
         // readable at all. Without Screen Recording every title is redacted,
-        // and filtering on it would answer "nothing is open".
-        let titles_readable = raw_windows.iter().any(|(_, t, _, _)| t.is_some());
-        let mut out = Vec::new();
-        let mut per_app: HashMap<String, u32> = HashMap::new();
-        for (owner, title, bounds, minimized) in raw_windows {
-            if titles_readable && title.is_none() {
-                continue;
+        // and filtering on it would answer "nothing is open". Membership
+        // depends on nothing else, so ids do not shift with who is asked.
+        let titles_readable = raw_windows.iter().any(|w| w.title.is_some());
+        let kept: Vec<ServerWindow> = raw_windows
+            .into_iter()
+            .filter(|w| !titles_readable || w.title.is_some())
+            .collect();
+
+        let trusted = AXIsProcessTrusted() != 0;
+        let mut ax_by_pid: HashMap<c_int, Vec<AxWindow>> = HashMap::new();
+        if trusted {
+            // Only an application with a window whose state or title the
+            // server cannot give is worth asking.
+            let mut asked: Vec<c_int> = Vec::new();
+            for w in kept.iter().filter(|w| !w.onscreen || w.title.is_none()) {
+                if asked.contains(&w.pid) {
+                    continue;
+                }
+                asked.push(w.pid);
+                if let Some(app) = app_element(w.pid) {
+                    AXUIElementSetMessagingTimeout(app.as_CFTypeRef(), WINDOW_READ_TIMEOUT_S);
+                    let wins = get_windows(app.as_CFTypeRef())
+                        .iter()
+                        .map(|win| {
+                            let r = win.as_CFTypeRef();
+                            AxWindow {
+                                title: copy_attr_string(r, "AXTitle").filter(|t| !t.is_empty()),
+                                bounds: read_bounds(r).map(|b| Rect {
+                                    x: b.x,
+                                    y: b.y,
+                                    w: b.w,
+                                    h: b.h,
+                                }),
+                                minimized: copy_attr_bool(r, "AXMinimized").unwrap_or(false),
+                            }
+                        })
+                        .collect();
+                    ax_by_pid.insert(w.pid, wins);
+                }
             }
-            let index = per_app.entry(owner.clone()).or_insert(0);
-            out.push(WindowInfo {
-                id: *index,
-                app: Some(owner),
-                title,
-                bounds,
-                minimized,
-            });
-            *index += 1;
+        }
+
+        let mut out = Vec::new();
+        let mut per_pid: HashMap<c_int, u32> = HashMap::new();
+        let mut pids: Vec<c_int> = Vec::new();
+        for w in &kept {
+            if !pids.contains(&w.pid) {
+                pids.push(w.pid);
+            }
+        }
+        // Grouped by application in order of first appearance, each group in
+        // the server's order, which is what the ids count.
+        for pid in pids {
+            let group: Vec<&ServerWindow> = kept.iter().filter(|w| w.pid == pid).collect();
+            let ax = ax_by_pid.get(&pid);
+            let frames: Vec<Option<Rect>> = group.iter().map(|w| w.bounds).collect();
+            let ax_frames: Vec<Option<Rect>> = ax
+                .map(|a| a.iter().map(|w| w.bounds).collect())
+                .unwrap_or_default();
+            let paired = crate::geometry::pair_frames(&frames, &ax_frames);
+            for (w, pair) in group.iter().zip(paired) {
+                let ax_win = pair.and_then(|i| ax.and_then(|a| a.get(i)));
+                let state = if w.onscreen {
+                    WindowState::Onscreen
+                } else if ax_win.is_some_and(|a| a.minimized) {
+                    WindowState::Minimized
+                } else {
+                    WindowState::Offscreen
+                };
+                let index = per_pid.entry(pid).or_insert(0);
+                out.push(WindowRow {
+                    info: WindowInfo {
+                        id: *index,
+                        app: Some(w.owner.clone()),
+                        pid: u32::try_from(pid).ok(),
+                        title: w
+                            .title
+                            .clone()
+                            .or_else(|| ax_win.and_then(|a| a.title.clone())),
+                        bounds: w.bounds,
+                        minimized: state == WindowState::Minimized,
+                        state,
+                    },
+                    number: w.number,
+                });
+                *index += 1;
+            }
         }
         Ok(out)
     }
 
-    pub(crate) unsafe fn target_app_element(
-        &self,
-        app: Option<&str>,
-    ) -> Result<CFType, WindowError> {
-        if AXIsProcessTrusted() == 0 {
-            return Err(WindowError::PermissionDenied(
-                "Accessibility permission not granted".into(),
-            ));
+    /// What is on screen in front of a window, front to back: the other
+    /// applications' surfaces that would be in a screen capture of its area.
+    /// Menu bar, Dock and other furniture are above layer 0 or system owners
+    /// and are not counted; neither are clear surfaces.
+    unsafe fn windows_above(&self, number: i64) -> Vec<crate::geometry::Above> {
+        let mut out = Vec::new();
+        let Some(arr) = copy_window_info(
+            kCGWindowListOptionOnScreenAboveWindow | kCGWindowListExcludeDesktopElements,
+            number as u32,
+        ) else {
+            return out;
+        };
+        for raw in arr.get_all_values() {
+            if raw.is_null() {
+                continue;
+            }
+            let dict = CFDictionary::wrap_under_get_rule(raw as _);
+            let (Some(owner), Some(pid), Some(layer), Some(bounds)) = (
+                dict_string(&dict, kCGWindowOwnerName),
+                dict_i64(&dict, kCGWindowOwnerPID),
+                dict_i64(&dict, kCGWindowLayer),
+                dict_rect(&dict, kCGWindowBounds),
+            ) else {
+                continue;
+            };
+            // Floating panels and dialogs sit above layer 0 but below the
+            // menu bar (24) and Dock (20 and up); those are not content.
+            if !(0..20).contains(&layer)
+                || SYSTEM_UI_OWNERS.contains(&owner.as_str())
+                || bounds.w < MIN_WINDOW_W
+                || bounds.h < MIN_WINDOW_H
+                || dict_f64(&dict, kCGWindowAlpha).is_some_and(|a| a < 0.05)
+            {
+                continue;
+            }
+            out.push(crate::geometry::Above {
+                pid: pid as i32,
+                owner,
+                bounds,
+            });
         }
-        self.resolve_target(app)
-            .map(|(elem, _, _)| elem)
-            .map_err(WindowError::NotFound)
+        out
+    }
+
+    /// One window of an application, by its id in that application's list,
+    /// and the other applications whose windows cover it. A window that is not
+    /// drawn is an error; a covered one is not, the caller says so in the result. The application is the one `app` names, else the pinned one, else
+    /// the frontmost; nothing is pinned. An id the application does not have
+    /// is an error saying which application and how many windows it has.
+    pub(crate) unsafe fn window_for_capture(
+        &self,
+        window_id: u32,
+        app: Option<&str>,
+    ) -> Result<CaptureTarget, WindowError> {
+        let target = self.peek_target(app).map_err(WindowError::NotFound)?;
+        let rows: Vec<WindowRow> = self
+            .window_rows()?
+            .into_iter()
+            .filter(|r| r.info.pid == u32::try_from(target.pid).ok())
+            .collect();
+        let infos: Vec<WindowInfo> = rows.iter().map(|r| r.info.clone()).collect();
+        let pid = u32::try_from(target.pid).ok();
+        let info = mcp_window::window_at(&infos, &target.name, pid, window_id)
+            .map_err(WindowError::NotFound)?
+            .clone();
+        let bounds = info.bounds.ok_or_else(|| {
+            WindowError::Failed(format!(
+                "window {window_id} of '{}' reports no bounds",
+                target.name
+            ))
+        })?;
+        if let Some(why) = crate::geometry::capture_obstacle(&target.name, window_id, info.state) {
+            return Err(WindowError::Failed(why));
+        }
+        let number = rows[window_id as usize].number;
+        let above = self.windows_above(number);
+        let covered = crate::geometry::coverage(&bounds, target.pid, &above);
+        let occluders = crate::geometry::occluders(&bounds, target.pid, &above);
+        Ok(CaptureTarget {
+            target,
+            info,
+            bounds,
+            number,
+            covered,
+            occluders,
+        })
     }
 }
 
@@ -1264,38 +1933,35 @@ pub(crate) unsafe fn get_windows(app: CFTypeRef) -> Vec<CFType> {
     }
 }
 
-unsafe fn pick_window(app: CFTypeRef, title: Option<&str>) -> Result<CFType, WindowError> {
+/// The window of `app` whose title contains `title`, else its main window.
+/// The errors name the application and how many windows it has: the usual
+/// cause of a miss is a title meant for a different application.
+unsafe fn pick_window(
+    app: CFTypeRef,
+    who: &str,
+    title: Option<&str>,
+) -> Result<CFType, WindowError> {
     let wins = get_windows(app);
     if let Some(t) = title {
+        let count = wins.len();
         wins.into_iter()
             .find(|w| {
                 copy_attr_string(w.as_CFTypeRef(), "AXTitle")
                     .as_deref()
                     .is_some_and(|s| s.contains(t))
             })
-            .ok_or_else(|| WindowError::NotFound(format!("window '{t}' not found")))
+            .ok_or_else(|| {
+                WindowError::NotFound(format!(
+                    "'{who}' has {count} window{}, none with a title containing '{t}'",
+                    if count == 1 { "" } else { "s" }
+                ))
+            })
     } else if let Some(mw) = copy_attr(app, "AXMainWindow") {
         Ok(mw)
     } else {
         wins.into_iter()
             .next()
-            .ok_or_else(|| WindowError::NotFound("no windows".into()))
-    }
-}
-
-unsafe fn window_info(el: CFTypeRef, index: u32, app: &Option<String>) -> WindowInfo {
-    let bounds = read_bounds(el).map(|b| Rect {
-        x: b.x,
-        y: b.y,
-        w: b.w,
-        h: b.h,
-    });
-    WindowInfo {
-        id: index,
-        app: app.clone(),
-        title: copy_attr_string(el, "AXTitle"),
-        bounds,
-        minimized: copy_attr_bool(el, "AXMinimized").unwrap_or(false),
+            .ok_or_else(|| WindowError::NotFound(format!("'{who}' has no windows")))
     }
 }
 
@@ -1672,27 +2338,76 @@ fn run(cmd: &str, args: &[&str]) -> Result<std::process::Output, WindowError> {
         .map_err(|e| WindowError::Failed(format!("{cmd}: {e}")))
 }
 
+/// How long `launch` keeps retrying an app that is still shutting down.
+const LAUNCH_RETRY_WINDOW: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// Whether `open`'s complaint means "try again in a moment".
+///
+/// An app that was quit a heartbeat ago is still known to LaunchServices for a
+/// short while, and `open -a` answers with error -600 (`procNotFound`) instead
+/// of starting a fresh copy. The same call a second later works, so a caller
+/// that closed an app and reopens it must not be told it cannot be launched.
+/// Every other failure (no such application, a damaged bundle) is permanent
+/// and is returned at once.
+fn launch_failure_is_transient(stderr: &str) -> bool {
+    stderr.contains("error -600") || stderr.contains("procNotFound")
+}
+
+/// `open -a`, retried while the previous instance of the app finishes quitting.
+async fn open_app(app: &str, background: bool) -> Result<(), WindowError> {
+    let args: Vec<&str> = if background {
+        vec!["-g", "-a", app]
+    } else {
+        vec!["-a", app]
+    };
+    let deadline = std::time::Instant::now() + LAUNCH_RETRY_WINDOW;
+    loop {
+        let out = run("open", &args)?;
+        if out.status.success() {
+            return Ok(());
+        }
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if !launch_failure_is_transient(&stderr) || std::time::Instant::now() >= deadline {
+            let why = stderr.trim();
+            return Err(WindowError::NotFound(if why.is_empty() {
+                format!("could not launch '{app}'; check the name with list_apps")
+            } else {
+                format!("could not launch '{app}': {why}")
+            }));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+}
+
 #[async_trait]
 impl WindowBackend for MacosBackend {
+    fn screen_state(&self) -> mcp_types::ScreenState {
+        crate::session::screen_state()
+    }
+
     async fn list_windows(&self, app_name: Option<&str>) -> Result<Vec<WindowInfo>, WindowError> {
         unsafe {
+            let rows = self.window_rows()?;
             // With no app named and no pinned target, answer about the whole
             // machine. Resolving to the frontmost app instead makes the
             // obvious opening question — "what is open?" — return one app's
             // windows, or none at all, with nothing to say it was narrowed.
-            if app_name.is_none() && self.pinned_target().is_none() {
-                return self.every_window();
+            let named = app_name.is_some_and(|a| !a.trim().is_empty());
+            if !named && self.live_pin().is_none() {
+                return Ok(rows.into_iter().map(|r| r.info).collect());
             }
             // Honour the requested app. Resolving `None` here would silently
             // answer about whatever happens to be frontmost, so
             // `list_windows { app: "TextEdit" }` returned the caller's own
-            // terminal — wrong, and wrong without saying so.
-            let app = self.target_app_element(app_name)?;
-            let name = copy_attr_string(app.as_CFTypeRef(), "AXTitle");
-            Ok(get_windows(app.as_CFTypeRef())
-                .iter()
-                .enumerate()
-                .map(|(i, w)| window_info(w.as_CFTypeRef(), i as u32, &name))
+            // terminal — wrong, and wrong without saying so. An app that is
+            // running with no windows is an empty list; one that is not
+            // running is an error.
+            let target = self.peek_target(app_name).map_err(WindowError::NotFound)?;
+            let pid = u32::try_from(target.pid).ok();
+            Ok(rows
+                .into_iter()
+                .map(|r| r.info)
+                .filter(|w| w.pid == pid)
                 .collect())
         }
     }
@@ -1717,12 +2432,13 @@ impl WindowBackend for MacosBackend {
     }
 
     async fn launch(&self, app: &str) -> Result<(), WindowError> {
-        let out = run("open", &["-a", app])?;
-        if out.status.success() {
-            Ok(())
-        } else {
-            Err(WindowError::NotFound(format!("could not launch '{app}'")))
-        }
+        open_app(app, false).await
+    }
+
+    /// `open -g`: launch without bringing the app to the foreground. The app
+    /// can still activate itself once it is running.
+    async fn launch_in_background(&self, app: &str) -> Result<(), WindowError> {
+        open_app(app, true).await
     }
 
     async fn close_app(&self, target: &str) -> Result<(), WindowError> {
@@ -1738,14 +2454,30 @@ impl WindowBackend for MacosBackend {
 
     async fn control_window(
         &self,
-        _app: Option<&str>,
+        app: Option<&str>,
         title: Option<&str>,
         action: WindowAction,
         bounds: Option<Rect>,
     ) -> Result<(), WindowError> {
         unsafe {
-            let app = self.target_app_element(None)?;
-            let win = pick_window(app.as_CFTypeRef(), title)?;
+            // The app the call names, not whichever is in front: this used to
+            // read the frontmost app whatever `app` said, so closing a window
+            // of one application closed a window of another.
+            let (app, who) = self.peek_app(app)?;
+            // Restoring with no title means the window that is minimised. The
+            // main window is the one in view, so un-minimising "it" does
+            // nothing while the window the caller meant stays in the Dock.
+            let minimized = (action == WindowAction::Restore && title.is_none())
+                .then(|| {
+                    get_windows(app.as_CFTypeRef())
+                        .into_iter()
+                        .find(|w| copy_attr_bool(w.as_CFTypeRef(), "AXMinimized") == Some(true))
+                })
+                .flatten();
+            let win = match minimized {
+                Some(w) => w,
+                None => pick_window(app.as_CFTypeRef(), &who.name, title)?,
+            };
             let wref = win.as_CFTypeRef();
             match action {
                 WindowAction::Focus => {
@@ -1774,16 +2506,23 @@ impl WindowBackend for MacosBackend {
         }
     }
 
-    async fn menu_open(&self, _app: Option<&str>, path: &[String]) -> Result<(), WindowError> {
+    /// Focus raises the window and un-minimising brings it back to the front.
+    /// Every other action is an attribute write or a button press on the
+    /// window and leaves the app where it was.
+    fn control_takes_foreground(&self, action: WindowAction) -> bool {
+        matches!(action, WindowAction::Focus | WindowAction::Restore)
+    }
+
+    async fn menu_open(&self, app: Option<&str>, path: &[String]) -> Result<(), WindowError> {
         unsafe {
-            let app = self.target_app_element(None)?;
+            let (app, _) = self.peek_app(app)?;
             navigate_menu(app.as_CFTypeRef(), path, false)
         }
     }
 
-    async fn menu_invoke(&self, _app: Option<&str>, path: &[String]) -> Result<(), WindowError> {
+    async fn menu_invoke(&self, app: Option<&str>, path: &[String]) -> Result<(), WindowError> {
         unsafe {
-            let app = self.target_app_element(None)?;
+            let (app, _) = self.peek_app(app)?;
             navigate_menu(app.as_CFTypeRef(), path, true)
         }
     }
@@ -1794,12 +2533,45 @@ impl WindowBackend for MacosBackend {
             return Ok(None);
         };
         unsafe {
-            // Resolving with an explicit name pins the session target.
-            let elem = self.target_app_element(Some(name))?;
+            let (elem, r) = self.peek_app(Some(name))?;
+            self.set_target(r.pid, &r.name);
             // Bring it forward so keyboard/coordinate input lands there too.
             let _ = set_bool_attr(elem.as_CFTypeRef(), "AXFrontmost", true);
         }
         Ok(self.current_target().map(|(_, n)| n))
+    }
+
+    /// The pin of `focus_app` without its raise: no attribute is written to
+    /// the app, so nothing in front changes.
+    async fn pin_app(&self, app: &str) -> Result<TargetInfo, WindowError> {
+        unsafe {
+            let r = self.peek_target(Some(app)).map_err(WindowError::NotFound)?;
+            self.set_target(r.pid, &r.name);
+            Ok(r.info())
+        }
+    }
+
+    async fn describe_target(&self, app: Option<&str>) -> Result<TargetInfo, WindowError> {
+        unsafe {
+            self.peek_target(app)
+                .map(|r| r.info())
+                .map_err(WindowError::NotFound)
+        }
+    }
+
+    async fn watch_changes(&self, app: Option<&str>) -> Option<mcp_window::ChangeWatch> {
+        // Resolved without pinning, like every read of an app that is not the
+        // one being driven: waiting is not choosing a target.
+        let pid = unsafe { self.peek_target(app) }.ok()?.pid;
+        crate::observe::watch_pid(pid).await
+    }
+
+    async fn pinned(&self) -> Option<TargetInfo> {
+        self.live_pin().map(|t| TargetInfo {
+            app: t.name,
+            pid: u32::try_from(t.pid).ok(),
+            from: TargetSource::Pinned,
+        })
     }
 
     async fn list_dialogs(
@@ -1811,7 +2583,7 @@ impl WindowBackend for MacosBackend {
             let mut out = Vec::new();
             match scope {
                 DialogScope::App => {
-                    let elem = self.target_app_element(app)?;
+                    let (elem, _) = self.peek_app(app)?;
                     collect_app_dialogs(elem.as_CFTypeRef(), &mut out);
                 }
                 DialogScope::System => {
@@ -1844,7 +2616,7 @@ impl WindowBackend for MacosBackend {
         depth: u32,
     ) -> Result<Vec<MenuItemInfo>, WindowError> {
         unsafe {
-            let elem = self.target_app_element(app)?;
+            let (elem, _) = self.peek_app(app)?;
             let container = menu_container(elem.as_CFTypeRef(), path)?;
             let mut out = Vec::new();
             collect_menu(container.as_CFTypeRef(), path, depth.clamp(1, 5), &mut out);
@@ -1857,6 +2629,152 @@ impl WindowBackend for MacosBackend {
     }
 }
 
+// ---- the facts behind `effects` ---------------------------------------------
+
+/// How long one read may wait on an app that is not answering. A probe runs
+/// twice around every input action, so a stuck app must cost a fraction of a
+/// second, not the system default of several.
+const PROBE_TIMEOUT_S: f32 = 0.25;
+
+/// Windows examined for sheets and dialogs. A sheet is on an app's front
+/// windows; a long tail of palettes would only add cost.
+const PROBE_WINDOWS: usize = 12;
+
+/// The kind of overlay a window or a window's child is, if it is one.
+///
+/// Sheets are children of the window they slide from (a save panel is the last
+/// entry of the window's `AXChildren`; `AXSheets` reports nothing for it), and
+/// alerts and dialogs are windows of their own. Floating palettes carry the
+/// `AXSystemFloatingWindow` subrole and are not decisions to make, so they are
+/// not overlays here, unlike in `list_dialogs`.
+unsafe fn overlay_kind(el: CFTypeRef, is_window: bool) -> Option<&'static str> {
+    let role = copy_attr_string(el, "AXRole")?;
+    if role == "AXSheet" {
+        return Some("sheet");
+    }
+    if role == "AXPopover" && !is_window {
+        return Some("popover");
+    }
+    if !is_window {
+        return None;
+    }
+    match copy_attr_string(el, "AXSubrole").as_deref() {
+        Some("AXSystemDialog") => Some("alert"),
+        Some("AXDialog") => Some("dialog"),
+        _ => None,
+    }
+}
+
+impl MacosBackend {
+    /// Read the facts `effects` compares, passively: attribute reads only, no
+    /// action, no raise, and the sticky target is left as it was.
+    ///
+    /// The application read is the one the session is driving: the pinned
+    /// target, else the app of the last snapshot, else the frontmost app.
+    unsafe fn read_facts(&self, describe_new: Option<&[mcp_input::Overlay]>) -> mcp_input::UiFacts {
+        use mcp_input::{Focus, Overlay, UiFacts};
+        let mut facts = UiFacts::default();
+        if AXIsProcessTrusted() == 0 {
+            return facts;
+        }
+        let front = frontmost_pid();
+        facts.frontmost = front.and_then(|pid| app_element(pid)).and_then(|a| {
+            AXUIElementSetMessagingTimeout(a.as_CFTypeRef(), PROBE_TIMEOUT_S);
+            copy_attr_string(a.as_CFTypeRef(), "AXTitle").filter(|n| !n.is_empty())
+        });
+        let pid = {
+            let st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            st.target.as_ref().map(|t| t.pid).or(st.pid)
+        }
+        .or(front);
+        let Some(app) = pid.and_then(|p| app_element(p)) else {
+            return facts;
+        };
+        let app_ref = app.as_CFTypeRef();
+        AXUIElementSetMessagingTimeout(app_ref, PROBE_TIMEOUT_S);
+
+        facts.focus = copy_attr(app_ref, "AXFocusedUIElement").and_then(|f| {
+            let r = f.as_CFTypeRef();
+            Some(Focus {
+                role: mcp_a11y::normalize_role(&copy_attr_string(r, "AXRole")?),
+                name: ["AXTitle", "AXDescription"]
+                    .iter()
+                    .find_map(|a| copy_attr_string(r, a).filter(|s| !s.is_empty())),
+            })
+        });
+
+        // `AXWindows` that cannot be read is not an app without windows.
+        let wins: Option<Vec<CFType>> = copy_attr(app_ref, "AXWindows")
+            .and_then(|v| v.downcast::<CFArray>())
+            .map(|arr| {
+                arr.get_all_values()
+                    .into_iter()
+                    .map(|p| CFType::wrap_under_get_rule(p))
+                    .collect()
+            });
+        let mut overlays: Vec<Overlay> = Vec::new();
+        let mut found: Vec<(&'static str, CFType)> = Vec::new();
+        // Open menus hang off the application, not a window.
+        for child in copy_children(app_ref) {
+            if copy_attr_string(child.as_CFTypeRef(), "AXRole").as_deref() == Some("AXMenu") {
+                found.push(("menu", child));
+            }
+        }
+        let mut titles = Vec::new();
+        if let Some(wins) = &wins {
+            for w in wins.iter().take(PROBE_WINDOWS) {
+                let wr = w.as_CFTypeRef();
+                match overlay_kind(wr, true) {
+                    // Reported as an overlay, not also as a window.
+                    Some(kind) => found.push((kind, w.clone())),
+                    None => titles.push(copy_attr_string(wr, "AXTitle").unwrap_or_default()),
+                }
+                for c in copy_children(wr) {
+                    if let Some(kind) = overlay_kind(c.as_CFTypeRef(), false) {
+                        found.push((kind, c));
+                    }
+                }
+            }
+            // Past the examined windows only titles are read.
+            for w in wins.iter().skip(PROBE_WINDOWS) {
+                titles.push(copy_attr_string(w.as_CFTypeRef(), "AXTitle").unwrap_or_default());
+            }
+            facts.windows = Some(titles);
+        }
+        for (kind, el) in found {
+            let r = el.as_CFTypeRef();
+            let mut o = Overlay {
+                kind: kind.to_string(),
+                title: copy_attr_string(r, "AXTitle").filter(|t| !t.is_empty()),
+                text: None,
+                buttons: Vec::new(),
+            };
+            // The contents are read once, when the overlay first shows.
+            if describe_new
+                .is_some_and(|known| !known.iter().any(|k| k.kind == o.kind && k.title == o.title))
+            {
+                let (buttons, text, _) = dialog_details(r);
+                o.buttons = buttons;
+                o.text = text.into_iter().next();
+            }
+            overlays.push(o);
+        }
+        // Menus and windows are readable or the app is not; a failed window
+        // read means the overlay list is incomplete too.
+        if wins.is_some() {
+            facts.overlays = Some(overlays);
+        }
+        facts
+    }
+}
+
+#[async_trait]
+impl mcp_input::UiProbe for MacosBackend {
+    async fn probe(&self, describe_new: Option<&[mcp_input::Overlay]>) -> mcp_input::UiFacts {
+        unsafe { self.read_facts(describe_new) }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1864,6 +2782,17 @@ mod tests {
     use mcp_types::{CallCtx, CancelToken, ErrorCode, ToolModule};
     use serde_json::json;
     use std::sync::Arc;
+
+    #[test]
+    fn only_a_still_quitting_app_is_worth_retrying() {
+        // The exact text `open -a` printed when run straight after a quit.
+        let quitting = "_LSOpenURLsWithCompletionHandler() failed for the application \
+            /System/Applications/TextEdit.app with error -600.";
+        assert!(launch_failure_is_transient(quitting));
+        let missing = "Unable to find application named 'NoSuchApp'";
+        assert!(!launch_failure_is_transient(missing));
+        assert!(!launch_failure_is_transient(""));
+    }
 
     /// Real backend through the real module. Without the TCC Accessibility grant
     /// this returns PERM_DENIED (or NotFound if no focused app); with it, an ok
@@ -1881,6 +2810,40 @@ mod tests {
                 matches!(code, ErrorCode::PermDenied | ErrorCode::NotFound),
                 "unexpected: {code:?}"
             );
+        }
+    }
+
+    /// The facts behind `effects`, read from whatever is on screen: attribute
+    /// reads only, so it neither raises a window nor changes the session's
+    /// target, and it answers promptly (a probe runs twice around every
+    /// action). Without the Accessibility grant it reads nothing, which is an
+    /// answer too.
+    #[tokio::test]
+    async fn the_facts_behind_effects_are_read_passively_and_quickly() {
+        use mcp_input::UiProbe;
+        let b = MacosBackend::new();
+        let started = std::time::Instant::now();
+        let facts = b.probe(None).await;
+        let again = b.probe(Some(&[])).await;
+        let spent = started.elapsed();
+        assert!(
+            b.current_target().is_none(),
+            "reading set the sticky target"
+        );
+        assert!(
+            spent < std::time::Duration::from_secs(3),
+            "two readings took {spent:?}"
+        );
+        // Two readings of an idle screen agree on what is in front.
+        assert_eq!(facts.frontmost, again.frontmost);
+        // With no frontmost application there is nothing to read the rest
+        // from. That is the case without the grant, and also on a machine
+        // with the grant and no one logged in at a screen: a CI runner
+        // reports Accessibility as trusted and has no frontmost app.
+        if facts.frontmost.is_none() {
+            assert_eq!(facts, mcp_input::UiFacts::default());
+        } else {
+            assert!(permissions().accessibility, "{facts:?}");
         }
     }
 
@@ -2025,6 +2988,51 @@ mod tests {
     }
 
     /// Releasing the pin clears the target so calls track the frontmost app again.
+    /// `foreground = "never"` trusts this answer to refuse a pointer click
+    /// before it is posted, so it must agree with what `perform` returns: it
+    /// returns `Ax` on every path.
+    #[test]
+    fn every_semantic_action_is_an_accessibility_route_on_macos() {
+        let b = MacosBackend::new();
+        for name in [
+            "click",
+            "double_click",
+            "right_click",
+            "focus",
+            "toggle",
+            "check",
+            "uncheck",
+            "expand",
+            "collapse",
+            "select",
+            "scroll_into_view",
+            "show_menu",
+            "increment",
+            "decrement",
+            "pick",
+        ] {
+            let action = SemanticAction::parse(name).expect(name);
+            assert_eq!(b.route_for(action), Route::Ax, "{name}");
+        }
+    }
+
+    #[test]
+    fn only_focus_and_restore_take_the_foreground_in_a_macos_window_action() {
+        let b = MacosBackend::new();
+        for (name, takes) in [
+            ("focus", true),
+            ("restore", true),
+            ("minimize", false),
+            ("maximize", false),
+            ("close", false),
+            ("move", false),
+            ("resize", false),
+        ] {
+            let action = WindowAction::parse(name).expect(name);
+            assert_eq!(b.control_takes_foreground(action), takes, "{name}");
+        }
+    }
+
     #[tokio::test]
     async fn focus_app_none_releases_the_pin() {
         let backend = MacosBackend::new();
@@ -2163,5 +3171,434 @@ mod tests {
             out.status.success(),
             "frontmost pid {pid} is not a live process"
         );
+    }
+}
+
+/// Driving an application that is not frontmost, against the real OS and
+/// real running applications, by passive reads only: a pin is a change to this
+/// process's own state, and everything else reads the window server and the
+/// accessibility tree. None of these may raise a window, change the
+/// frontmost application, move the pointer or type, and each says so by
+/// comparing the desktop before and after. Finder is always running; it may
+/// have no window open, which is an answer and is not opened here.
+///
+/// Where Accessibility is not granted the calls answer `PermissionDenied`
+/// rather than succeed, and the tests accept that answer and nothing else.
+#[cfg(test)]
+mod background_app_tests {
+    use super::*;
+    use mcp_types::{CallCtx, CancelToken, ErrorCode, ToolModule};
+    use serde_json::json;
+    use std::sync::Arc;
+
+    const NO_SUCH_APP: &str = "NoSuchApplication-zzz-4471";
+
+    /// What the person at the machine would notice: which app is in front and
+    /// where the pointer is.
+    fn desk() -> (Option<c_int>, Option<(f64, f64)>) {
+        let pointer = crate::event::pointer_position().ok().flatten();
+        (unsafe { frontmost_pid() }, pointer)
+    }
+
+    fn finder_pid() -> Option<u32> {
+        let out = std::process::Command::new("/usr/bin/pgrep")
+            .args(["-x", "Finder"])
+            .output()
+            .ok()?;
+        String::from_utf8_lossy(&out.stdout)
+            .split_whitespace()
+            .next()?
+            .parse()
+            .ok()
+    }
+
+    fn name_of(pid: Option<c_int>) -> String {
+        unsafe {
+            window_owners_all()
+                .into_iter()
+                .find(|(p, _)| Some(*p) == pid)
+                .map(|(_, n)| n)
+                .unwrap_or_else(|| format!("{pid:?}"))
+        }
+    }
+
+    #[tokio::test]
+    async fn pinning_finder_changes_nothing_the_person_would_see() {
+        let b = MacosBackend::new();
+        let (front, pointer) = desk();
+        let pinned = WindowBackend::pin_app(&b, "Finder").await;
+        let (front_after, pointer_after) = desk();
+        eprintln!(
+            "frontmost before/after: {} / {}; pin: {pinned:?}",
+            name_of(front),
+            name_of(front_after)
+        );
+        assert_eq!(front, front_after, "the frontmost app changed");
+        assert_eq!(pointer, pointer_after, "the pointer moved");
+        let t = pinned.expect("Finder is always running; a pin reads no permission");
+        assert_eq!(t.app, "Finder");
+        assert_eq!(t.from, TargetSource::Named);
+        if let Some(want) = finder_pid() {
+            assert_eq!(t.pid, Some(want), "pinned another process than Finder");
+        }
+        let pinned = WindowBackend::pinned(&b).await.expect("the pin is set");
+        assert_eq!(
+            (pinned.app.as_str(), pinned.from),
+            ("Finder", TargetSource::Pinned)
+        );
+        // Releasing it is as quiet.
+        WindowBackend::focus_app(&b, None).await.unwrap();
+        assert!(WindowBackend::pinned(&b).await.is_none());
+        assert_eq!(desk().0, front);
+    }
+
+    #[tokio::test]
+    async fn with_finder_pinned_every_read_is_finders_and_nothing_moves() {
+        let b = MacosBackend::new();
+        let (front, pointer) = desk();
+        WindowBackend::pin_app(&b, "Finder").await.unwrap();
+        let want = finder_pid();
+
+        // Windows: whatever the pin lists is Finder's, numbered from 0.
+        let ws = WindowBackend::list_windows(&b, None).await.unwrap();
+        eprintln!(
+            "Finder (pid {want:?}) has {} window(s): {:?}",
+            ws.len(),
+            ws.iter()
+                .map(|w| (w.id, &w.title, w.state))
+                .collect::<Vec<_>>()
+        );
+        for (i, w) in ws.iter().enumerate() {
+            assert_eq!(w.app.as_deref(), Some("Finder"));
+            assert_eq!(w.pid, want, "a window of another process in Finder's list");
+            assert_eq!(w.id as usize, i, "ids are Finder's own, in order");
+        }
+
+        // The accessibility tree: Finder's, said to come from the pin. Finder
+        // may have no window; its application element is still readable.
+        let req = SnapshotRequest::default();
+        match A11yBackend::snapshot(&b, &req).await {
+            Ok(raw) => {
+                let t = raw.target.expect("a macOS snapshot says what it read");
+                assert_eq!(raw.app.as_deref(), Some("Finder"));
+                assert_eq!(t.from, "pinned");
+                assert_eq!(t.pid, want);
+            }
+            Err(BackendError::PermissionDenied(_)) => eprintln!("no Accessibility: tree skipped"),
+            Err(e) => panic!("unexpected: {e:?}"),
+        }
+
+        // A window id Finder does not have is an error naming Finder and its
+        // window count, never a window of the frontmost app.
+        let err = unsafe { b.window_for_capture(9_999, None) }
+            .err()
+            .expect("no window 9999");
+        match err {
+            WindowError::NotFound(m) => {
+                assert!(m.contains("'Finder'"), "{m}");
+                assert!(m.contains("window"), "{m}");
+                eprintln!("out-of-range id: {m}");
+            }
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+        // Each id it does have is Finder's and capturable, with whatever
+        // covers it listed, or refused because nothing of it is drawn; it is
+        // never somebody else's window.
+        for w in &ws {
+            match unsafe { b.window_for_capture(w.id, None) } {
+                Ok(CaptureTarget {
+                    target,
+                    info,
+                    covered,
+                    ..
+                }) => {
+                    assert_eq!(info.pid, want);
+                    assert_eq!(target.from, TargetSource::Pinned);
+                    assert_eq!(w.state, WindowState::Onscreen);
+                    assert!(
+                        covered.iter().all(|(owner, _)| owner != "Finder"),
+                        "Finder's own windows are not covering it: {covered:?}"
+                    );
+                    eprintln!(
+                        "Finder window {} would capture, covered by {covered:?}",
+                        w.id
+                    );
+                }
+                Err(WindowError::Failed(m)) => {
+                    eprintln!("Finder window {} refused: {m}", w.id);
+                    assert!(
+                        m.contains("minimised") || m.contains("not on screen"),
+                        "a window is refused only when it is not drawn: {m}"
+                    );
+                }
+                Err(e) => panic!("unexpected: {e:?}"),
+            }
+        }
+
+        assert_eq!(
+            desk(),
+            (front, pointer),
+            "reading Finder disturbed the desktop"
+        );
+    }
+
+    /// A name that matches nothing is an error that names it, from every
+    /// operation, and pins nothing.
+    #[tokio::test]
+    async fn an_app_that_is_not_running_is_an_error_naming_it_never_a_fallback() {
+        let b = MacosBackend::new();
+        let (front, pointer) = desk();
+        let not_found = |what: &str, r: Result<(), WindowError>| match r {
+            Err(WindowError::NotFound(m)) => {
+                assert!(m.contains(NO_SUCH_APP), "{what}: {m}");
+            }
+            // The operations that read the tree check the permission first.
+            Err(WindowError::PermissionDenied(_)) => {}
+            other => panic!("{what}: expected NotFound, got {other:?}"),
+        };
+        not_found(
+            "pin",
+            WindowBackend::pin_app(&b, NO_SUCH_APP).await.map(|_| ()),
+        );
+        not_found(
+            "describe",
+            WindowBackend::describe_target(&b, Some(NO_SUCH_APP))
+                .await
+                .map(|_| ()),
+        );
+        not_found(
+            "list_windows",
+            WindowBackend::list_windows(&b, Some(NO_SUCH_APP))
+                .await
+                .map(|_| ()),
+        );
+        not_found(
+            "control_window",
+            WindowBackend::control_window(
+                &b,
+                Some(NO_SUCH_APP),
+                None,
+                WindowAction::Minimize,
+                None,
+            )
+            .await,
+        );
+        not_found(
+            "menu_list",
+            WindowBackend::menu_list(&b, Some(NO_SUCH_APP), &[], 1)
+                .await
+                .map(|_| ()),
+        );
+        not_found(
+            "list_dialogs",
+            WindowBackend::list_dialogs(&b, Some(NO_SUCH_APP), DialogScope::App)
+                .await
+                .map(|_| ()),
+        );
+        not_found(
+            "menu_invoke",
+            WindowBackend::menu_invoke(&b, Some(NO_SUCH_APP), &["File".into(), "Close".into()])
+                .await,
+        );
+        let cap = unsafe { b.window_for_capture(0, Some(NO_SUCH_APP)) };
+        assert!(matches!(cap, Err(WindowError::NotFound(m)) if m.contains(NO_SUCH_APP)));
+        let req = SnapshotRequest {
+            app: Some(NO_SUCH_APP.into()),
+            ..Default::default()
+        };
+        match A11yBackend::snapshot(&b, &req).await {
+            Err(BackendError::NotFound(m)) => assert!(m.contains(NO_SUCH_APP), "{m}"),
+            Err(BackendError::PermissionDenied(_)) => {}
+            other => panic!("a snapshot of a missing app: {other:?}"),
+        }
+        assert!(
+            b.current_target().is_none(),
+            "a failed lookup pinned something"
+        );
+        assert_eq!(desk(), (front, pointer));
+    }
+
+    /// A control_window naming an app acts on that app. Finder is asked for a
+    /// title nothing has, so the answer is the error and no window is touched.
+    #[tokio::test]
+    async fn control_window_looks_in_the_named_app_and_says_so_when_it_has_no_such_window() {
+        let b = MacosBackend::new();
+        let (front, pointer) = desk();
+        let r = WindowBackend::control_window(
+            &b,
+            Some("Finder"),
+            Some("no-window-has-this-title-9187"),
+            WindowAction::Minimize,
+            None,
+        )
+        .await;
+        match r {
+            Err(WindowError::NotFound(m)) => {
+                assert!(m.contains("'Finder'"), "{m}");
+                eprintln!("{m}");
+            }
+            Err(WindowError::PermissionDenied(_)) => {}
+            other => panic!("expected NotFound naming Finder, got {other:?}"),
+        }
+        assert!(b.current_target().is_none(), "a window call pinned the app");
+        assert_eq!(desk(), (front, pointer));
+    }
+
+    /// `list_windows { app }` is a read: it must not leave that app pinned,
+    /// or a later call that names nothing would silently act on it.
+    #[tokio::test]
+    async fn naming_an_app_in_a_window_call_does_not_pin_it() {
+        let b = MacosBackend::new();
+        let _ = WindowBackend::list_windows(&b, Some("Finder")).await;
+        let _ = WindowBackend::menu_list(&b, Some("Finder"), &[], 1).await;
+        let _ = WindowBackend::list_dialogs(&b, Some("Finder"), DialogScope::App).await;
+        let _ = unsafe { b.window_for_capture(0, Some("Finder")) };
+        assert!(b.current_target().is_none());
+        let t = WindowBackend::describe_target(&b, Some("Finder"))
+            .await
+            .unwrap();
+        assert_eq!(t.from, TargetSource::Named);
+        assert!(b.current_target().is_none());
+    }
+
+    /// With nothing named and nothing pinned the call acts on the frontmost
+    /// app, and says that is what it did.
+    #[tokio::test]
+    async fn with_nothing_pinned_the_frontmost_app_is_the_target_and_is_reported_as_such() {
+        let b = MacosBackend::new();
+        let (front, pointer) = desk();
+        match WindowBackend::describe_target(&b, None).await {
+            Ok(t) => {
+                eprintln!(
+                    "frontmost reported as {t:?}; CG frontmost is {}",
+                    name_of(front)
+                );
+                assert_eq!(t.from, TargetSource::Frontmost);
+                assert!(t.pid.is_some_and(|p| pid_alive(p as c_int)));
+            }
+            Err(WindowError::NotFound(m)) => eprintln!("no frontmost app: {m}"),
+            Err(e) => panic!("unexpected: {e:?}"),
+        }
+        assert!(
+            b.current_target().is_none(),
+            "describing pinned the frontmost app"
+        );
+        assert_eq!(desk(), (front, pointer));
+    }
+
+    /// The same id means the same window whether the list was asked for one
+    /// application or for all of them.
+    #[tokio::test]
+    async fn a_window_id_means_the_same_window_in_the_whole_list_and_in_the_apps_own() {
+        let b = MacosBackend::new();
+        let Ok(all) = WindowBackend::list_windows(&b, None).await else {
+            return;
+        };
+        let mut names: Vec<(u32, String)> = all
+            .iter()
+            .filter_map(|w| Some((w.pid?, w.app.clone()?)))
+            .collect();
+        names.sort();
+        names.dedup();
+        let mut checked = 0;
+        for (pid, name) in &names {
+            // Two processes with one name cannot be told apart by name.
+            if names.iter().filter(|(_, n)| n == name).count() > 1 {
+                continue;
+            }
+            let Ok(own) = WindowBackend::list_windows(&b, Some(name)).await else {
+                continue;
+            };
+            let from_all: Vec<_> = all
+                .iter()
+                .filter(|w| w.pid == Some(*pid))
+                .map(|w| (w.id, w.title.clone(), w.state))
+                .collect();
+            let from_own: Vec<_> = own
+                .iter()
+                .map(|w| (w.id, w.title.clone(), w.state))
+                .collect();
+            assert_eq!(
+                from_all, from_own,
+                "'{name}' (pid {pid}) is numbered two ways"
+            );
+            checked += 1;
+        }
+        eprintln!("{} apps listed, {checked} compared", names.len());
+    }
+
+    /// Waiting on or checking another application is not choosing to drive it.
+    #[tokio::test]
+    async fn a_passive_snapshot_names_an_app_without_pinning_it_or_replacing_the_refs() {
+        let b = MacosBackend::new();
+        let (front, pointer) = desk();
+        let before = b.state.lock().unwrap().paths.len();
+        let req = SnapshotRequest {
+            app: Some("Finder".into()),
+            passive: true,
+            max_depth: Some(2),
+            ..Default::default()
+        };
+        match A11yBackend::snapshot(&b, &req).await {
+            Ok(raw) => {
+                assert_eq!(raw.target.expect("target").from, "named");
+                eprintln!("passive read of Finder: {:?}", raw.app);
+            }
+            Err(BackendError::PermissionDenied(_)) => eprintln!("no Accessibility: skipped"),
+            Err(e) => panic!("unexpected: {e:?}"),
+        }
+        assert!(
+            b.current_target().is_none(),
+            "a passive read pinned the app"
+        );
+        assert_eq!(
+            b.state.lock().unwrap().paths.len(),
+            before,
+            "refs were replaced"
+        );
+        assert!(b.state.lock().unwrap().pid.is_none());
+        assert_eq!(desk(), (front, pointer));
+
+        // A reading for acting on does pin, as get_ui_tree { app } always did.
+        let req = SnapshotRequest {
+            app: Some("Finder".into()),
+            max_depth: Some(2),
+            ..Default::default()
+        };
+        if A11yBackend::snapshot(&b, &req).await.is_ok() {
+            assert_eq!(
+                b.current_target().map(|(_, n)| n).as_deref(),
+                Some("Finder")
+            );
+            assert_eq!(desk(), (front, pointer), "reading Finder raised it");
+        }
+    }
+
+    /// `allowed_apps` through the real backend: an app outside the list cannot
+    /// be listed, pinned or driven by name, and nothing is pinned by trying.
+    #[tokio::test]
+    async fn an_app_outside_allowed_apps_cannot_be_listed_or_pinned_by_name() {
+        let b = Arc::new(MacosBackend::new());
+        let m = mcp_window::WindowModule::new(b.clone(), b.clone(), vec!["TextEdit".into()]);
+        let ctx = CallCtx::new("t", CancelToken::new());
+        for (tool, args) in [
+            ("list_windows", json!({"app":"Finder"})),
+            ("focus_app", json!({"app":"Finder","activate":false})),
+            ("focus_app", json!({"app":"Finder"})),
+            ("menu_list", json!({"app":"Finder"})),
+            ("handle_dialogs", json!({"app":"Finder"})),
+            (
+                "control_window",
+                json!({"app":"Finder","action":"minimize"}),
+            ),
+        ] {
+            let env = m.call(tool, args.clone(), &ctx).await;
+            assert_eq!(
+                env.error.map(|e| e.code),
+                Some(ErrorCode::PolicyDenied),
+                "{tool} {args}"
+            );
+        }
+        assert!(b.current_target().is_none(), "a refused call pinned an app");
     }
 }

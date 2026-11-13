@@ -8,7 +8,7 @@ Tiers gate what an agent may call: `read` and `standard` tools are available ins
 enabled category, while a `dangerous` tool additionally has to be named in
 `policy.enable`. Enabling a category never enables its dangerous tools.
 
-**124 tools across 12 categories.**
+**130 tools across 12 categories.**
 
 | Tool | Category | Tier | Summary |
 |---|---|---|---|
@@ -18,32 +18,38 @@ enabled category, while a `dangerous` tool additionally has to be named in
 | [`get_element`](#get-element) | vision | read | Read one property of an element by ref from the latest snapshot. |
 | [`get_ui_tree`](#get-ui-tree) | vision | read | Observe the UI. |
 | [`list_displays`](#list-displays) | vision | read | List displays (monitors) with geometry, scale, and which is primary. |
+| [`observe`](#observe) | vision | read | Everything needed to act on a desktop window, in one call: the accessibility tree (the same refs as get_ui_tree, usable by ui_action) and, when the tree is sparse for that window, the window's text read off its pixels and joined to the tree. |
 | [`ocr_region`](#ocr-region) | vision | read | Read text off the screen, with a box for each line in screen coordinates. |
 | [`ui_extract`](#ui-extract) | vision | read | Extract structured data (tables, forms, lists, or custom schemas) directly from native accessibility trees into JSON without parsing raw tex… |
 | [`clipboard_read`](#clipboard-read) | input | standard | Read the clipboard. |
 | [`clipboard_write`](#clipboard-write) | input | standard | Write the clipboard. |
+| [`desktop_flow`](#desktop-flow) | input | standard | Keep and replay recorded desktop flows: list, get, save, delete, run (name, secrets). |
+| [`desktop_record`](#desktop-record) | input | dangerous | Watch a person demonstrate a task and turn it into a desktop_flow: start, stop (name saves it) or status. |
 | [`drag_drop`](#drag-drop) | input | standard | Press-move-release drag from one point/element to another. |
+| [`get_selection`](#get-selection) | input | standard | Read the text selected in an element (ref or name), or in the focused element when none is given, without changing it. |
 | [`hover`](#hover) | input | standard | Move the pointer over an element (ref or name) or point (reveals tooltips/hover menus). |
 | [`input_showcase`](#input-showcase) | input | standard | Glide the real mouse pointer along a smooth Bezier curve to each point instead of jumping there, for demos, screencasts and presentations. |
+| [`input_steps`](#input-steps) | input | standard | Run up to 20 input actions in one call, in order, stopping at the first that fails. |
 | [`keyboard_shortcut`](#keyboard-shortcut) | input | standard | Press a key or chord, e.g. |
 | [`keyboard_type`](#keyboard-type) | input | standard | Type Unicode text into the focused window. |
 | [`mouse_action`](#mouse-action) | input | standard | Coordinate pointer action. |
-| [`scroll`](#scroll) | input | standard | Scroll at an element (ref or name) or a point. |
+| [`scroll`](#scroll) | input | standard | Scroll at an element (ref or name) or a point: wheel lines by 'direction', or smooth trackpad-style pixels by 'dx'/'dy' with optional momentum. |
+| [`select_text`](#select-text) | input | standard | Select text in a text field or text area by ref or name, through the accessibility API (no drag, no focus needed), and read the selection back. |
 | [`set_value`](#set-value) | input | standard | Set the value of a text element by ref or name (accessibility SetValue). |
-| [`ui_action`](#ui-action) | input | standard | Perform a semantic action on an element by ref or name (accessibility action, no cursor). |
+| [`ui_action`](#ui-action) | input | standard | Perform a semantic action on an element by ref or name (accessibility action, no cursor, app need not be frontmost). |
 | [`ui_fill_form`](#ui-fill-form) | input | standard | Fill multiple native UI fields (text fields, checkboxes, switches, popups, radios) in one call, and optionally submit and verify postconditions. |
 | [`close_app`](#close-app) | window | standard | Quit an application by name. |
-| [`control_window`](#control-window) | window | standard | Focus/move/resize/minimize/maximize/restore/close a window. |
-| [`focus_app`](#focus-app) | window | standard | Pin this session to an application: bring it forward and make every later get_ui_tree/action target it instead of whatever happens to be frontmost. |
+| [`control_window`](#control-window) | window | standard | Focus/move/resize/minimize/maximize/restore/close a window of 'app' (else the pinned app, else the frontmost) whose title contains 'title' (else its main window). |
+| [`focus_app`](#focus-app) | window | standard | Pin this session to an application so every later get_ui_tree/action targets it instead of whatever happens to be frontmost. |
 | [`handle_dialogs`](#handle-dialogs) | window | read | List open dialogs, sheets, popovers and menus, with their buttons, message text and which button Return/Escape activates. |
 | [`launch`](#launch) | window | standard | Launch or bring forward an application by name (allowlist-gated). |
 | [`list_apps`](#list-apps) | window | read | List the applications that are running, by the name launch, focus_app, list_windows and get_ui_tree expect. |
-| [`list_windows`](#list-windows) | window | read | List open windows: title, position, size, minimised state. |
+| [`list_windows`](#list-windows) | window | read | List open windows: title, position, size and state (onscreen, minimized, or offscreen: another Space or a hidden app). |
 | [`menu_invoke`](#menu-invoke) | window | standard | Open and click a menu item by title path, e.g. |
 | [`menu_list`](#menu-list) | window | read | Enumerate an app's menu bar: titles, enabled state, and the keyboard equivalent of each item. |
 | [`menu_open`](#menu-open) | window | standard | Open a menu-bar menu by title path, e.g. |
 | [`wait_for`](#wait-for) | window | read | Block until the UI settles: text appears, a window appears, text is gone, or an element takes focus. |
-| [`idle_status`](#idle-status) | desktop | read | Seconds since the last human input, whether the screen is locked, and whether someone is plausibly present. |
+| [`idle_status`](#idle-status) | desktop | read | Seconds since the last human input, whether the screen is locked, whether the session can receive synthetic input at all (input_state: ok, locked, off_console or unknown), and whether someone is plausibly present. |
 | [`lock_screen`](#lock-screen) | desktop | standard | Lock the session. |
 | [`media_control`](#media-control) | desktop | standard | Transport control for the running media player. |
 | [`notify_user`](#notify-user) | desktop | standard | Post a desktop notification. |
@@ -163,10 +169,11 @@ Capture a display (or a region) as a PNG image. Large captures are downscaled fo
 
 `capture_window` · read tier
 
-Capture a single window as a PNG image: prefer this over capture_screen when you only care about one app; fewer pixels means proportionally fewer tokens. grid=true labels the image in screen points (the window's own position included), what mouse_action takes.
+Capture a single window as a PNG image: prefer this over capture_screen when you only care about one app; fewer pixels means proportionally fewer tokens. window_id is the window's id in list_windows for 'app' (else the pinned app, else the frontmost one); the result's window names the app it was read against. On macOS a window that is minimized or on another Space is refused (nothing is drawn). Otherwise it is read through ScreenCaptureKit where that works (via: screencapturekit), the window's own pixels even if another app's window covers it; if not, the screen area is grabbed (via: screencapture) and a window covered by another app comes back with a top-level warning and covered_by [{app, fraction}] saying whose pixels are in the image, which are not the window's. Elsewhere a covered window shows what covers it. grid=true labels the image in screen points (the window's own position included), what mouse_action takes.
 
 | Argument | Type | Required | Description |
 |---|---|---|---|
+| `app` | string |  | the application whose window list window_id is from (default: the pinned app, else the frontmost) |
 | `detail` | one of: low, balanced, full |  |  |
 | `force` | boolean |  |  |
 | `grid` | boolean |  | draw a labelled coordinate grid on the image, labelled in screen points (what mouse_action takes, the window's position included); the result gives scale (image px per point), grid_step and origin |
@@ -230,14 +237,33 @@ List displays (monitors) with geometry, scale, and which is primary.
 
 No arguments.
 
+### observe
+
+`observe` · read tier
+
+Everything needed to act on a desktop window, in one call: the accessibility tree (the same refs as get_ui_tree, usable by ui_action) and, when the tree is sparse for that window, the window's text read off its pixels and joined to the tree. Text on an element is attached to its ref; text with no element is a numbered mark (m1, m2...) in reading order with the screen point and box mouse_action takes. Sparse means fewer than 5 actionable elements in the window, or fewer than one per 120000 square points of it, or a childless canvas, web view or group covering a quarter of it. marks_image returns the window's screenshot with the marks numbered on it. Passive: pins, raises and focuses nothing, so it works on a window behind others.
+
+Result: `text` is get_ui_tree's flattened tree and `snapshot_id` its snapshot; `sparse` and `sparsity` give the verdict and the figures (the rule is also in `sparsity.rule`); `ocr` says whether the text was read (`ran`), how (`via`, the capture route) and, if it could not be, why. `attached` lists text found on an element by ref; `same_as_ax` marks text the tree already says. `marks` lists the rest, each with `x`,`y` (the point to pass to mouse_action) and `bounds`, all in screen points. `merge` counts what was left out and why: duplicates, text the tree already has, text on a secure field (withheld, never returned), text in an area another application covers, and entries over `max_elements`. When another application's window covers this one and the text was read off the screen, `warning` and `covered_by` say so as capture_window does; text from the covering windows' areas is left out where the geometry is known and otherwise every mark carries `unreliable: true`. Text is read with the platform recogniser (Apple Vision on macOS, the bundled model on Linux); a future local grounding model would add boxes to the same join. The tree is of the whole application, as get_ui_tree's is; `window_id` chooses which window is read for text and judged for sparsity. Refs from observe replace those of the last get_ui_tree. Output carries text from the application's own interface and is untrusted.
+
+| Argument | Type | Required | Description |
+|---|---|---|---|
+| `app` | string |  | application to observe (default: the pinned one, else the frontmost) |
+| `detail` | one of: low, balanced, full |  | size of the marks_image (default from config) |
+| `marks_image` | boolean |  | also return the window's screenshot with the marks numbered on it (default false) |
+| `max_elements` | integer |  | most text entries (attached plus marks) to return, 1 to 300 (default 60); the rest are counted in merge.omitted |
+| `ocr` | one of: auto, always, never |  | read the window's text: auto (only when the tree is sparse, the default), always, or never |
+| `ocr_level` | one of: fast, accurate |  | recogniser speed: fast (default) or accurate, which reads small text better and can take many seconds |
+| `window_id` | integer |  | window of that application, as list_windows numbers it (default 0, the frontmost) |
+
 ### ocr-region
 
 `ocr_region` · read tier
 
-Read text off the screen, with a box for each line in screen coordinates. The fallback when get_ui_tree comes back sparse: a canvas, a game, a custom-drawn or Electron UI: where the text is visible but not in the accessibility tree. Cheaper than a screenshot for reading, and unlike a screenshot it hands back coordinates you can click. Pass find to get only the lines containing some text, ranked, each with the x,y to click: two small calls (ocr_region find, then mouse_action) instead of a screenshot.
+Read text off the screen, with a box for each line in screen coordinates. The fallback when get_ui_tree comes back sparse: a canvas, a game, a custom-drawn or Electron UI: where the text is visible but not in the accessibility tree. Cheaper than a screenshot for reading, and unlike a screenshot it hands back coordinates you can click. Pass find to get only the lines containing some text, ranked, each with the x,y to click: two small calls (ocr_region find, then mouse_action) instead of a screenshot. With window_id on macOS, a window another app's window covers is read anyway and the result carries warning and covered_by [{app, fraction}]: text in the covered part is that app's, not the window's.
 
 | Argument | Type | Required | Description |
 |---|---|---|---|
+| `app` | string |  | with window_id: the application whose window list the id is from |
 | `display` | integer |  | which display, when no region or window is given |
 | `exact` | boolean |  | with find: only a line that is exactly the text, not one that contains it (default false) |
 | `find` | string |  | return only the lines containing this text (case-insensitive, whitespace-collapsed), best match first, each with x,y (the centre, in screen points, for mouse_action) and bounds, instead of all the text |
@@ -249,7 +275,7 @@ Read text off the screen, with a box for each line in screen coordinates. The fa
 | `region.w` | number |  |  |
 | `region.x` | number |  |  |
 | `region.y` | number |  |  |
-| `window_id` | integer |  | read one window (id from list_windows); results are still in screen coordinates |
+| `window_id` | integer |  | read one window (its id in list_windows, for 'app' else the pinned app, else the frontmost one); results are still in screen coordinates |
 
 ### ui-extract
 
@@ -289,13 +315,42 @@ Write the clipboard. For 'image', 'data' is a base64 PNG; for 'files', it is a n
 | `format` | one of: text, html, image, files |  |  |
 | `secret` | boolean |  | the text is a password or other secret: keep it out of the audit log and never send it to the judge |
 
+### desktop-flow
+
+`desktop_flow` · standard tier
+
+Keep and replay recorded desktop flows: list, get, save, delete, run (name, secrets). Run finds each step's element by role, title and ancestry and performs it through the normal tools, so policy and audit see every step; stops at the first failure.
+
+A flow is a list of steps `{op, locator, text | combo | secret_ref, ...}` kept in `desktop_flows.json` beside the config. `run` takes a snapshot of each step's application without pinning it, finds the element whose role and title match and whose parents agree (exact), or whose title merely contains the recorded one or whose surroundings changed (fuzzy), and performs the step as the ordinary call it stands for: `ui_action` for a click (an accessibility press, so it can run with the app in the background), `keyboard_type` or `set_value` for text, `keyboard_shortcut` for a chord. Only when nothing matches does a click fall back to the recorded point with `mouse_action`, which `foreground = "never"` refuses like any pointer action. Two elements that fit equally well are an error, not a guess. Each step in the result has `matched` (exact, fuzzy or coordinate), `route` (`ax`, `hid` or `pid_event`, as the tool reported) and the ref used; the first failure stops the run with `failed_at` and what to do. Under `never` the steps that would use the keyboard are refused before anything runs. `value set` steps are written by hand with `save` (op `set`); the recorder cannot see a value being set, only keys.
+
+| Argument | Type | Required | Description |
+|---|---|---|---|
+| `action` | one of: list, get, save, delete, run |  | default list |
+| `name` | string |  | the flow |
+| `secrets` | object |  | run: values for the flow's secret_refs, used in memory only |
+| `steps` | array&lt;object&gt; |  | save: the steps, as desktop_flow get shows them |
+
+### desktop-record
+
+`desktop_record` · dangerous tier
+
+Watch a person demonstrate a task and turn it into a desktop_flow: start, stop (name saves it) or status. Keeps what was clicked or typed as what it was (role, title, ancestry), never typed secrets. Only allowed_apps; bounded in time and size. Dangerous tier.
+
+Recording listens to the keyboard and mouse through a listen-only event tap (macOS, `kCGEventTapOptionListenOnly`), which needs the Input Monitoring permission and Accessibility for the app that runs agentctl; without them the call returns PERM_DENIED naming which and records nothing. It never acts. Each click is resolved through accessibility to the element under the pointer (role, title, parents up to the window, and the point as a fallback hint); each run of typing becomes one `type` step on the field that had the focus; chords and non-printing keys become `shortcut` steps; a click on a menu item keeps its menu path. Text typed into a secure field is cleared as it is read and the step holds only a `secret_ref`, supplied as `secrets` when the flow runs. Events whose application is not in `allowed_apps` are counted (`dropped_other_apps`) and not stored; so are events with no readable element (`dropped_unlocated`). A session stops by itself after `max_seconds` (at most 600) or 4000 events, and a marker file in the state directory makes `agentctl doctor` report it while it runs. Dangerous tier: it records a person's real input, so it needs to be named in `policy.enable` and is not available by default. Starting does not arm the human-override watcher, but a recording that starts within its grace period (1.5 s) of an agent input call is still inside it. Linux has no listen-only tap in the remote-desktop portal (it can inject input, not observe it), so it returns UNSUPPORTED_OS there; flows written with `desktop_flow save` replay on both.
+
+| Argument | Type | Required | Description |
+|---|---|---|---|
+| `action` | one of: start, stop, status |  | default status |
+| `max_seconds` | integer |  | start: stop listening after this long (default 120, at most 600) |
+| `name` | string |  | stop: flow name to save |
+
 ### drag-drop
 
 `drag_drop` · standard tier
 
 Press-move-release drag from one point/element to another. The pointer travels in 'steps' intermediate moves so targets that track motion register the drag.
 
-Each end is `from`/`to` as an object (`{ref}`, `{name}` with an optional `role`, or `{x, y}`), or the flat `from_ref`/`from_x`/... spelling. With a ref or name, `x` and `y` are offsets in points from the element's top-left (default its centre); otherwise absolute screen coordinates. Both points are checked against the allowed window bounds. `hold_ms` keeps the button down before the first move, for drag sources (Finder icons, list rows) that wait to tell a drag from a click.
+Each end is `from`/`to` as an object (`{ref}`, `{name}` with an optional `role`, or `{x, y}`), or the flat `from_ref`/`from_x`/... spelling. With a ref or name, `x` and `y` are offsets in points from the element's top-left (default its centre); otherwise absolute screen coordinates. Both points are checked against the allowed window bounds. `path` is up to 200 waypoints `{x, y}` (the same argument as `browser_act drag`) for brush strokes and freehand shapes: the drag presses at `from`, passes through each waypoint in order and releases at the last, so give no `to`. Waypoints are in the frame of `from`: offsets from its top-left when it is a ref or name, else absolute screen points. `steps` moves are spread over the segments by length, at least one landing on every waypoint; every waypoint is checked against the allowed window bounds before anything moves. The result's `waypoints` is the number of path points and `steps` the moves made. `hold_ms` keeps the button down before the first move, for drag sources (Finder icons, list rows) that wait to tell a drag from a click.
 
 | Argument | Type | Required | Description |
 |---|---|---|---|
@@ -311,6 +366,7 @@ Each end is `from`/`to` as an object (`{ref}`, `{name}` with an optional `role`,
 | `from_y` | number |  |  |
 | `hold_ms` | integer |  | hold the button this long before moving, 0-2000 |
 | `modifiers` | array&lt;one of: cmd, shift, opt, alt, ctrl, fn&gt; |  |  |
+| `path` | array&lt;object&gt; |  | up to 200 waypoints to pass through in order, releasing at the last; replaces 'to'. Offsets from the 'from' element's top-left when it is a ref/name, else screen points |
 | `steps` | integer |  | intermediate moves, 2-100 (default 20) |
 | `to` | object |  | where to release: same forms as from |
 | `to.name` | string |  | element name or label, instead of ref; best match wins |
@@ -322,6 +378,22 @@ Each end is `from`/`to` as an object (`{ref}`, `{name}` with an optional `role`,
 | `to_ref` | string |  |  |
 | `to_x` | number |  |  |
 | `to_y` | number |  |  |
+
+### get-selection
+
+`get_selection` · standard tier
+
+Read the text selected in an element (ref or name), or in the focused element when none is given, without changing it.
+
+Target an element by `ref` (`@e12`; `e12` and `12` also work) or by `name`, with an optional `role` to narrow it. A name is matched against the latest snapshot (a fresh one is taken if there is none), ignoring case and extra whitespace: exact name first, then prefix, then substring; the name and the current value both count; controls come before other elements; ties go to document order. The result reports the `ref` it resolved to and, for a name, `matches`: how many elements matched as well as the one used. A name that matches nothing is NOT_FOUND, with up to five elements that share a word with it.
+
+Returns `start`, `end` (character offsets, as in `select_text`), `length`, `text` (cut at 2000 characters, with `truncated`) and `role`; a caret with nothing selected is `length: 0`. Without a target it reads the focused element of the app being driven (macOS only; on Linux give a ref). Password fields are refused.
+
+| Argument | Type | Required | Description |
+|---|---|---|---|
+| `name` | string |  | element name or label, instead of ref; best match wins |
+| `ref` | string |  | element ref @eN |
+| `role` | string |  | narrow a name by role, e.g. button, popup button, text field |
 
 ### hover
 
@@ -356,17 +428,41 @@ Glide the real mouse pointer along a smooth Bezier curve to each point instead o
 | `enabled` | boolean |  | enable or disable smooth gliding |
 | `speed` | one of: cinematic, demo, snappy, instant, off |  | speed preset (cinematic: 350ms, demo: 200ms, snappy: 100ms, instant: 0ms) |
 
+### input-steps
+
+`input_steps` · standard tier
+
+Run up to 20 input actions in one call, in order, stopping at the first that fails. Each step is {tool, args}: the tool's name and the arguments you would give it alone. Every step is checked, allowed and logged exactly as if you had called it yourself.
+
+`steps` is a list of `{tool, args}`, at most 20. The tools that can run in a batch are ui_action, set_value, select_text, ui_fill_form, keyboard_type, keyboard_shortcut, mouse_action, scroll, hover, drag_drop and clipboard_write; anything else, and a step that is not `{tool, args}`, is an INVALID_ARGS error naming the step, before any step runs.
+
+Each step goes through the same gate as a call made on its own: the policy tier, the role's allowed and denied tools, consent, the hard invariants, the kill switch and the audit log (every step is its own entry, and a step flagged `secret` is redacted in it). So a batch can do nothing that the same calls made one at a time could not, and a step the role or `foreground = "never"` refuses ends the batch. Under `never` the whole batch is checked first, so one refused step means no step ran. A synthetic personal-data token cannot be passed in a batch; type it with its own call.
+
+Steps run in order and the first failure stops the batch; the steps after it do not run. The result is {ran, total, failed_at (the 0-based step that failed, absent when all succeeded), elapsed_ms, steps: [{i, tool, ok, ...that step's result, error}]}. The batch has 30 seconds: a step still running then is cancelled and the rest are not run. The kill switch, a human taking the pointer and a client cancel are checked between steps. A key held with keyboard_shortcut down stays held across the batch, and a step that fails releases held keys as it would alone. A step that names an element by `name` resolves it against the snapshot at that moment, so an earlier step that changes the screen can change what the next one finds: use `ref`s from the same get_ui_tree for a run of steps on one screen, and put a step that opens a dialog last in the batch.
+
+| Argument | Type | Required | Description |
+|---|---|---|---|
+| `steps` | array&lt;object&gt; | yes | actions to run in order (max 20) |
+
 ### keyboard-shortcut
 
 `keyboard_shortcut` · standard tier
 
-Press a key or chord, e.g. Return, Escape, cmd+s, Control+A, cmd+shift+z.
+Press a key or chord, e.g. Return, Escape, cmd+s, Control+A, cmd+shift+z. action down holds keys (e.g. shift across several clicks) until action up; held keys auto-release after 30 s.
 
 Modifiers then exactly one key, joined by `+` (or `-` when there is no `+`). Case does not matter: `Control+A`, `ctrl-a` and `CTRL+a` are one chord. Modifiers: cmd/command, ctrl/control, shift, alt/opt/option, fn, super/meta/win; `mod` (also `cmdorctrl`, `primary`) is Command on macOS and Control on Linux, and on Linux `cmd` means Control. Keys: letters, digits, return/enter, tab, space, escape/esc, delete/backspace (erases backwards), forwarddelete/del, insert, home, end, pageup/page_up/pgup, pagedown/page_down/pgdn, up/down/left/right (also ArrowUp...), F1-F20, punctuation as the character or its name (minus, equal, plus, comma, period, slash, backslash, semicolon, quote, grave, leftbracket, rightbracket), and a literal `+` as `plus` or a trailing `cmd++`. More than one key is an error, never a silent drop. The result's `pressed` is the canonical chord that was sent.
 
+`action: "down"` takes the same names but also a lone modifier (`shift`, `cmd+shift`) or one key, and leaves them down across later calls: every click, drag, scroll and chord until the matching `action: "up"` carries the held modifiers, whatever `modifiers` the call itself names. Holding a key already held renews its time limit and presses nothing. At most 6 keys are held at once. A key is released by `up` (with no `combo`, all of them), after 30 s unless renewed (the result's `auto_release_ms`), when any other input call fails (the error says so), when the kill switch trips or a human takes the mouse, and when the server stops. `keyboard_type` ignores held modifiers: the text carries its own case. On macOS a held modifier is applied to the events agentctl posts and is not a physical key press, so it cannot stay latched in the system; other software that polls the keyboard state does not see it. On Linux it is a real key press.
+
+A chord pressed while the app pinned with `focus_app` is in the background is sent to that process (`input` is `pid_event`) and does not bring it forward. Text-editing chords such as `shift+left` arrive; menu key equivalents such as `cmd+a` and `cmd+s` were not delivered to TextEdit this way. A chord has no read-back, so the result's `verified` is `true` only when the focused element visibly changed and `false` otherwise, with a `note`: `false` means not known, not that it failed. `action: "down"` and `up` always use the frontmost app (and `down` brings a pinned app forward); a pid press is refused while keys are held.
+
+The result carries `effects` when the action changed something that was seen (a sheet or window opened, focus moved, ...); see ui_action for what it holds and what its absence means. `effects: false` skips it.
+
 | Argument | Type | Required | Description |
 |---|---|---|---|
-| `combo` | string | yes |  |
+| `action` | one of: press, down, up |  | press (default) taps the chord; down holds the key or modifiers; up releases them (no combo: everything held) |
+| `combo` | string |  |  |
+| `effects` | boolean |  | false: do not report what changed (saves a short wait) |
 | `expect` | object |  | optional: wait for this to become true after the action, and return what changed |
 | `expect.app` | string |  | which application to observe |
 | `expect.element` | string |  | synonym for text |
@@ -381,14 +477,19 @@ Modifiers then exactly one key, joined by `+` (or `-` when there is no `+`). Cas
 
 `keyboard_type` · standard tier
 
-Type Unicode text into the focused window. If a target (ref or name) is given, focus it first and read its value back. Does not press return. Set 'secret' when typing a password so it is kept out of the audit log and never sent to the judge.
+Type Unicode text into the focused window. If a target (ref or name) is given, focus it first and read its value back. Does not press return. When the app pinned with focus_app is not frontmost, the text is sent to that app directly (input "pid_event") without raising it. Set 'secret' when typing a password so it is kept out of the audit log and never sent to the judge.
 
 Target an element by `ref` (`@e12`; `e12` and `12` also work) or by `name`, with an optional `role` to narrow it. A name is matched against the latest snapshot (a fresh one is taken if there is none), ignoring case and extra whitespace: exact name first, then prefix, then substring; the name and the current value both count; controls come before other elements; ties go to document order. The result reports the `ref` it resolved to and, for a name, `matches`: how many elements matched as well as the one used. A name that matches nothing is NOT_FOUND, with up to five elements that share a word with it.
 
 With a target, the element's value is read before and after. The result carries `value_after` (never for a `secret` or a password field) and `changed`; typing into a text field that then shows the same value is an error. Without a target, the keystrokes go wherever focus is and nothing is read back.
 
+When the app pinned with `focus_app` is not the frontmost one (pin it with `activate: false`), the text is sent to that process with per-process key events, so it does not bring the app forward and the frontmost app receives nothing. The result's `input` is `pid_event` and `verified: true` means the app's focused element changed as typed. Some apps drop these events while they are in the background; then the call is an error that says so (or that delivery could not be read back, for a password field or an app with no readable text) and does not retry through the foreground. Use `set_value` for those, or `focus_app` with `activate: true` and type again. Not available on Linux, where keys always go to the focused window. It is refused while keys are held with `keyboard_shortcut` `down`.
+
+The result carries `effects` when the action changed something that was seen (a sheet or window opened, focus moved, ...); see ui_action for what it holds and what its absence means. `effects: false` skips it.
+
 | Argument | Type | Required | Description |
 |---|---|---|---|
+| `effects` | boolean |  | false: do not report what changed (saves a short wait) |
 | `expect` | object |  | optional: wait for this to become true after the action, and return what changed |
 | `expect.app` | string |  | which application to observe |
 | `expect.element` | string |  | synonym for text |
@@ -414,10 +515,13 @@ Target an element by `ref` (`@e12`; `e12` and `12` also work) or by `name`, with
 
 `x` and `y` may be numbers or numeric strings. Every point, absolute or element-relative, is checked against the allowed window bounds when `clamp_input_to_allowed` is on. The result's `at` is the screen point that was used. Set `glide: true` or `speed` to glide the pointer along a Bezier curve for demos.
 
+The result carries `effects` when the action changed something that was seen (a sheet or window opened, focus moved, ...); see ui_action for what it holds and what its absence means. `effects: false` skips it.
+
 | Argument | Type | Required | Description |
 |---|---|---|---|
 | `button` | string |  | left\|right\|middle |
 | `duration_ms` | integer |  | custom gliding duration in milliseconds, 0-2000 |
+| `effects` | boolean |  | false: do not report what changed (saves a short wait) |
 | `expect` | object |  | optional: wait for this to become true after the action, and return what changed |
 | `expect.app` | string |  | which application to observe |
 | `expect.element` | string |  | synonym for text |
@@ -441,22 +545,66 @@ Target an element by `ref` (`@e12`; `e12` and `12` also work) or by `name`, with
 
 `scroll` · standard tier
 
-Scroll at an element (ref or name) or a point. 'modifiers' holds keys down for the wheel, e.g. ["cmd"] or ["ctrl"] to zoom.
+Scroll at an element (ref or name) or a point: wheel lines by 'direction', or smooth trackpad-style pixels by 'dx'/'dy' with optional momentum. 'modifiers' holds keys down for the wheel, e.g. ["cmd"] or ["ctrl"] to zoom.
 
 Target an element by `ref` (`@e12`; `e12` and `12` also work) or by `name`, with an optional `role` to narrow it. A name is matched against the latest snapshot (a fresh one is taken if there is none), ignoring case and extra whitespace: exact name first, then prefix, then substring; the name and the current value both count; controls come before other elements; ties go to document order. The result reports the `ref` it resolved to and, for a name, `matches`: how many elements matched as well as the one used. A name that matches nothing is NOT_FOUND, with up to five elements that share a word with it.
 
 With a target, `x` and `y` are offsets from the element's top-left (default its centre); without one they are absolute screen coordinates. `modifiers` takes the same names as `mouse_action` and `drag_drop` and is held for the whole gesture: `["cmd"]` (macOS) or `["ctrl"]` zooms in most documents, maps and canvases, `["shift"]` scrolls sideways where an app binds it. The result's `modifiers` is what was held.
 
+Give `direction` (with `amount`) for wheel lines, or `dx` and/or `dy` for a smooth trackpad scroll in pixels (positive is right and down). That sends a stream of pixel events with gesture phases (began, changed, ended) over `duration_ms`, and with `momentum: true` the coast of a flick after release. Caps: 10000 px per axis, 3000 ms, momentum at most 3000 px and 60 events; over them is INVALID_ARGS. The deltas sum exactly to the request; the result's `dx`, `dy`, `events` and `momentum_dx` / `momentum_dy` say what was sent. Either form moves the real pointer to the target, so `foreground = "never"` refuses it (use `ui_action scroll_into_view`, or increment / decrement on a scroll bar) and `polite` waits for the person to be idle. Pinch, rotate and swipe have no public system API to synthesise and are not attempted: `gesture` returns UNSUPPORTED_OS naming the app's own command (zoom: `cmd+plus` / `cmd+minus` or ctrl-scroll; rotate: its menu item; swipe: back / forward shortcut, or `ctrl+left` / `ctrl+right` between spaces).
+
 | Argument | Type | Required | Description |
 |---|---|---|---|
 | `amount` | integer |  | wheel lines (default 3); a page is ten lines |
-| `direction` | one of: up, down, left, right, page_up, page_down | yes |  |
+| `direction` | one of: up, down, left, right, page_up, page_down |  |  |
+| `duration_ms` | integer |  | how long the fingers-down part takes with dx/dy (default 250, at most 3000) |
+| `dx` | integer |  | smooth scroll right by this many pixels (negative: left); with dy, used instead of direction and amount |
+| `dy` | integer |  | smooth scroll down by this many pixels (negative: up) |
+| `gesture` | one of: pinch, rotate, swipe |  | always UNSUPPORTED_OS; the error names the working equivalent |
 | `modifiers` | array&lt;one of: cmd, shift, opt, alt, ctrl, fn&gt; |  |  |
+| `momentum` | boolean |  | with dx/dy, keep coasting after release as a flick does (macOS) |
 | `name` | string |  | element name or label, instead of ref; best match wins |
 | `ref` | string |  | element ref @eN |
 | `role` | string |  | narrow a name by role, e.g. button, popup button, text field |
 | `x` | number |  | screen x, or offset from the element's left |
 | `y` | number |  | screen y, or offset from the element's top |
+
+### select-text
+
+`select_text` · standard tier
+
+Select text in a text field or text area by ref or name, through the accessibility API (no drag, no focus needed), and read the selection back. Give one of: all; start and end (character offsets); text (with occurrence); from_text and to_text.
+
+Target an element by `ref` (`@e12`; `e12` and `12` also work) or by `name`, with an optional `role` to narrow it. A name is matched against the latest snapshot (a fresh one is taken if there is none), ignoring case and extra whitespace: exact name first, then prefix, then substring; the name and the current value both count; controls come before other elements; ties go to document order. The result reports the `ref` it resolved to and, for a name, `matches`: how many elements matched as well as the one used. A name that matches nothing is NOT_FOUND, with up to five elements that share a word with it.
+
+Offsets count characters (Unicode scalar values) from 0 with `end` exclusive, on every platform: a combining accent is its own character, and a character outside the Basic Multilingual Plane is one, not two. `text` matches exactly (case and accents count), non-overlapping, and `occurrence` picks the Nth. `from_text`/`to_text` select from the start of the first `from_text` through the end of the first `to_text` that follows it. The element's text is read first and the request is resolved against it.
+
+The result carries `start`, `end`, `length` and `text` as the element reports them after the change (`text` is cut at 2000 characters, with `truncated`), and `input: ax`. If the element reports a different range than was asked for (some editors snap to words or ignore the request), the call fails and says what it reports. macOS sets `AXSelectedTextRange`; an element where that is not settable is an `UNSUPPORTED_OS` error. There is no pointer fallback: dragging to select is not attempted, so use `drag_drop` or shift-click with `mouse_action` for those. Linux uses the AT-SPI Text interface (`set_selection`). Password fields are refused. Which apps honour the selection has not been verified beyond TextEdit.
+
+The result carries `effects` when the action changed something that was seen (a sheet or window opened, focus moved, ...); see ui_action for what it holds and what its absence means. `effects: false` skips it.
+
+| Argument | Type | Required | Description |
+|---|---|---|---|
+| `all` | boolean |  | select everything |
+| `effects` | boolean |  | false: do not report what changed (saves a short wait) |
+| `end` | integer |  | offset after the last character; equal to start places the caret |
+| `expect` | object |  | optional: wait for this to become true after the action, and return what changed |
+| `expect.app` | string |  | which application to observe |
+| `expect.element` | string |  | synonym for text |
+| `expect.focused` | string |  | wait until an element matching this text has focus |
+| `expect.gone` | string |  | wait until this text is no longer present |
+| `expect.judge` | string |  | wait until this plain-language claim about the UI is judged true (needs the judge enabled); the probability is reported |
+| `expect.text` | string |  | wait until this text appears in the UI |
+| `expect.timeout_ms` | integer |  | give up after this long (max 30000) |
+| `expect.window` | string |  | wait until a window with this title exists |
+| `from_text` | string |  | select from the start of this text... |
+| `name` | string |  | element name or label, instead of ref; best match wins |
+| `occurrence` | integer |  | which match of text, from 1 (default 1) |
+| `ref` | string |  | element ref @eN |
+| `role` | string |  | narrow a name by role, e.g. button, popup button, text field |
+| `start` | integer |  | first character offset, from 0 |
+| `text` | string |  | select this text |
+| `to_text` | string |  | ...to the end of the next match of this |
 
 ### set-value
 
@@ -468,8 +616,11 @@ Target an element by `ref` (`@e12`; `e12` and `12` also work) or by `name`, with
 
 The element is read before and after the write. The result carries `value_after` (never for a `secret` or a password field), `changed`, and `reformatted` when the field shows something other than what was written (a number field turning 1000 into 1,000 is fine). A field that keeps its old value and does not show the new text is an error, not an `ok`. `verified: false` means the platform could not read the value back.
 
+The result carries `effects` when the action changed something that was seen (a sheet or window opened, focus moved, ...); see ui_action for what it holds and what its absence means. `effects: false` skips it.
+
 | Argument | Type | Required | Description |
 |---|---|---|---|
+| `effects` | boolean |  | false: do not report what changed (saves a short wait) |
 | `expect` | object |  | optional: wait for this to become true after the action, and return what changed |
 | `expect.app` | string |  | which application to observe |
 | `expect.element` | string |  | synonym for text |
@@ -489,7 +640,7 @@ The element is read before and after the write. The result carries `value_after`
 
 `ui_action` · standard tier
 
-Perform a semantic action on an element by ref or name (accessibility action, no cursor). select with option chooses a popup or combo box entry by its text.
+Perform a semantic action on an element by ref or name (accessibility action, no cursor, app need not be frontmost). select with option chooses a popup or combo box entry by its text. An action the element does not offer is an error naming the ones it does.
 
 Target an element by `ref` (`@e12`; `e12` and `12` also work) or by `name`, with an optional `role` to narrow it. A name is matched against the latest snapshot (a fresh one is taken if there is none), ignoring case and extra whitespace: exact name first, then prefix, then substring; the name and the current value both count; controls come before other elements; ties go to document order. The result reports the `ref` it resolved to and, for a name, `matches`: how many elements matched as well as the one used. A name that matches nothing is NOT_FOUND, with up to five elements that share a word with it.
 
@@ -499,9 +650,16 @@ Target an element by `ref` (`@e12`; `e12` and `12` also work) or by `name`, with
 
 macOS opens a popup button with the accessibility press and presses its menu item; a combo box takes the text. Linux invokes the combo box's menu or list item through AT-SPI.
 
+`show_menu` opens the element's context menu (AXShowMenu) without a right click, `increment` and `decrement` take one step on a slider, stepper or scroll bar and report `value_after` and `changed` (`changed: false` means the control is at its limit or ignored the step), `pick` picks the element in a list or picker (AXPick), and `scroll_to_visible` is accepted for `scroll_into_view`. On macOS these four are checked against the element's own action list first, so an element that lacks one gets an error listing what it does support, never an `ok`. Linux has no context-menu action: `show_menu` looks for a menu or popup action on the element and otherwise says what it has; `increment` and `decrement` move an AT-SPI Value by its minimum increment, clamped to its range.
+
+Every result carries `input`: `ax` when the accessibility API acted (no pointer, the app can stay in the background) `pid_event` for keys sent to one background process (`keyboard_type`, `keyboard_shortcut`), or `hid` when synthetic system input was needed (the real cursor moved). `right_click` and `double_click` are an accessibility press on macOS, which has no distinct double or secondary press; on Linux `right_click` clicks at the element's centre, so it is `hid`. `input` is absent when nothing needed doing (checking a checked box).
+
+`effects` is added to the result of an action when something it changed was seen: `app` (the frontmost application changed), `focus` ({role, name} of the newly focused element), `appeared` and `disappeared` (titles of the target application's windows, at most 5 each), `retitled` ({from, to} when one window was renamed), `overlay` ({kind: sheet|dialog|alert|popover|menu, title, text, buttons} of one that opened) and `overlay_closed`, and `value` or `checked` of the element a `ui_action` pressed by `ref`. It is read from a small fixed set of facts before and after the action, about 120 ms apart, not from a new snapshot, and without raising a window or moving focus, so it works under `foreground = "never"`. A fact the platform cannot read is left out, never guessed. No `effects` means nothing was seen to change among those facts, which is not proof that nothing did: an app may react later, and a change inside a window's own contents is not among them. Linux reads the window list, dialogs and the frontmost application only. `effects: false` skips the reads and the wait, and `expect` replaces it with its own delta.
+
 | Argument | Type | Required | Description |
 |---|---|---|---|
-| `action` | one of: click, double_click, right_click, focus, toggle, check, uncheck, expand, collapse, select, scroll_into_view | yes |  |
+| `action` | one of: click, double_click, right_click, focus, toggle, check, uncheck, expand, collapse, select, scroll_into_view, show_menu, increment, decrement, pick | yes |  |
+| `effects` | boolean |  | false: do not report what changed (saves a short wait) |
 | `expect` | object |  | optional: wait for this to become true after the action, and return what changed |
 | `expect.app` | string |  | which application to observe |
 | `expect.element` | string |  | synonym for text |
@@ -526,8 +684,11 @@ Target an element by `ref` (`@e12`; `e12` and `12` also work) or by `name`, with
 
 Fields are applied in order and the call stops at the first failure, reporting `filled` and the `results` so far. Each result carries what that field's tool would: `value_after`, `selected`, `checked` and `changed`. A field named by `name` resolves with the same ranking as `ui_action`, so two fields with similar labels are told apart by exactness and then document order.
 
+The result carries `effects` when the action changed something that was seen (a sheet or window opened, focus moved, ...); see ui_action for what it holds and what its absence means. `effects: false` skips it.
+
 | Argument | Type | Required | Description |
 |---|---|---|---|
+| `effects` | boolean |  | false: do not report what changed (saves a short wait) |
 | `expect` | object |  | optional: wait for this to become true after the action, and return what changed |
 | `expect.app` | string |  | which application to observe |
 | `expect.element` | string |  | synonym for text |
@@ -560,7 +721,7 @@ Quit an application by name.
 
 `control_window` · standard tier
 
-Focus/move/resize/minimize/maximize/restore/close a window.
+Focus/move/resize/minimize/maximize/restore/close a window of 'app' (else the pinned app, else the frontmost) whose title contains 'title' (else its main window). The result's target says which app it acted on.
 
 | Argument | Type | Required | Description |
 |---|---|---|---|
@@ -577,11 +738,12 @@ Focus/move/resize/minimize/maximize/restore/close a window.
 
 `focus_app` · standard tier
 
-Pin this session to an application: bring it forward and make every later get_ui_tree/action target it instead of whatever happens to be frontmost. Call once before driving an app. Omit 'app' to release the pin.
+Pin this session to an application so every later get_ui_tree/action targets it instead of whatever happens to be frontmost. By default it also brings the app forward; activate=false pins it without raising it or touching its windows, to drive an app that stays in the background (the only form foreground="never" allows). Omit 'app' to release the pin.
 
 | Argument | Type | Required | Description |
 |---|---|---|---|
-| `app` | string |  |  |
+| `activate` | boolean |  | false: pin without bringing the app forward (default true) |
+| `app` | string |  | application name, as list_apps reports it |
 
 ### handle-dialogs
 
@@ -617,7 +779,7 @@ No arguments.
 
 `list_windows` · read tier
 
-List open windows: title, position, size, minimised state. With no 'app', lists every application's windows: start here to see what is open. With 'app', lists just that one. After focus_app has pinned an application, omitting 'app' means the pinned one. Desktop furniture (the Dock, menu bar, overlays) is left out.
+List open windows: title, position, size and state (onscreen, minimized, or offscreen: another Space or a hidden app). With no 'app', lists every application's windows: start here to see what is open. With 'app', lists just that one, running or not frontmost. After focus_app has pinned an application, omitting 'app' means the pinned one. Desktop furniture (the Dock, menu bar, overlays) is left out. A window's id is its place in its own application's list: pass it with that app to capture_window or ocr_region. The result's target names the application a list is of.
 
 | Argument | Type | Required | Description |
 |---|---|---|---|
@@ -661,7 +823,7 @@ Open a menu-bar menu by title path, e.g. ["File"].
 
 `wait_for` · read tier
 
-Block until the UI settles: text appears, a window appears, text is gone, or an element takes focus. Synthetic input is asynchronous, so observing straight after acting reads the previous state: wait first. Several conditions must all hold at once.
+Block until the UI settles: text appears, a window appears, text is gone, or an element takes focus. Synthetic input is asynchronous, so observing straight after acting reads the previous state: wait first. Several conditions must all hold at once. 'app' watches that application without pinning it. Where the platform announces UI changes (macOS) it re-checks when the app reports one, with a 500 ms safety re-check; the result's 'woke_by' is 'immediate' (already true), 'event' or 'poll' (found by the timer, which is also what happens when the app cannot be observed), with 'waited_ms'.
 
 | Argument | Type | Required | Description |
 |---|---|---|---|
@@ -680,7 +842,7 @@ Block until the UI settles: text appears, a window appears, text is gone, or an 
 
 `idle_status` · read tier
 
-Seconds since the last human input, whether the screen is locked, and whether someone is plausibly present. Check before anything that would interrupt.
+Seconds since the last human input, whether the screen is locked, whether the session can receive synthetic input at all (input_state: ok, locked, off_console or unknown), and whether someone is plausibly present. Check before anything that would interrupt. While the screen is locked, key and pointer tools are refused, because the system would discard the events.
 
 No arguments.
 
@@ -766,7 +928,7 @@ Read or change a desktop setting. Settings the platform does not expose return U
 
 `browser_act` · standard tier
 
-Act on a DOM node. Target 'ref' (from browser_snapshot/query) or 'query' (CSS, visible text, XPath or role=...; optional by, within, text, index). x, y act at a point (offsets in the target, canvas bitmap px, or viewport px): hit says what is there. type replaces the field's content; press takes a key or combo (ctrl+a). effects says what changed (url, new_tab, dialog, appeared, disappeared, focus). A click returns before navigation: use wait_after='settle'. steps=[{action, ...}] runs up to 20 acts in one call.
+Act on a DOM node. Target 'ref' (from browser_snapshot/query) or 'query' (CSS, visible text, XPath or role=...; optional by, within, text, index). x, y act at a point (offsets in the target, canvas bitmap px, or viewport px): hit says what is there. type replaces the field's content; press takes a key or combo (ctrl+a). effects says what changed (url, new_tab, dialog, appeared, disappeared, focus, overlay). A click returns before navigation: use wait_after='settle'. steps=[{action, ...}] runs up to 20 acts in one call.
 
 `press` takes a key or a combo in `value`: a named key (Enter, Escape, Tab, Arrow keys, Home, End, PageUp, PageDown, Backspace, Delete, Insert, Space, F1-F12), a character, or modifiers (ctrl, alt, shift, meta/cmd) joined by +, as in ctrl+a or Shift+ArrowDown. It is a real key event to the target, or to the focused node or page with no target; Chrome only. ctrl or cmd with a, c, x, v, z or y edits as a person's shortcut does, also on macOS.
 
@@ -774,7 +936,7 @@ Pointer actions are real input (Chrome only): double_click, triple_click (select
 
 Every action given x and y returns `hit`: the element under that point (tag, id, short text or name, and canvas). A point outside the viewport is an error naming the viewport size, and an input event the browser does not accept makes the call fail rather than report ok.
 
-Each result carries `effects` with only what the action changed, so the next call needs no snapshot to learn it: `url` and `title` when they changed, `new_tab` ({target_id, url}) for a tab or popup it opened, `dialog` ({type, message, answered}) for an alert, confirm or prompt it raised, `appeared` and `disappeared` (up to 5 each, such as 'dialog "Session expired" ref=...': dialogs, menus, listboxes, toasts, overlays and interactive elements that became visible or went away) and `focus` for the newly focused element. A navigation reports url and title only. Chrome only; effects are read about 120 ms after the action unless wait_after is settle.
+Each result carries `effects` with only what the action changed, so the next call needs no snapshot to learn it: `url` and `title` when they changed, `new_tab` ({target_id, url}) for a tab or popup it opened, `dialog` ({type, message, answered}) for an alert, confirm or prompt it raised, `appeared` and `disappeared` (up to 5 each, such as 'dialog "Session expired" ref=...': dialogs, menus, listboxes, toasts, overlays and interactive elements that became visible or went away), `focus` for the newly focused element, and `overlay` ({text, ref, covers}) when a dialog or layer now sits over controls that were clickable (covers counts them), so a click on the page behind it will not land. A navigation reports url and title only. Chrome only; effects are read about 120 ms after the action unless wait_after is settle.
 
 Spellings such as key, dblclick, triple-click, drag_and_drop, move, mousedown are accepted.
 
@@ -924,6 +1086,8 @@ Optionally auto-restores a saved profile. The browser's active tab is brought to
 
 `launch.background_throttling`: a visible (headless=false) browser is started with flags that stop Chrome throttling timers, rendering and screen recording when its window is behind another or covered. Set true to leave Chrome's normal throttling on. Default false. `profile` (top level or under `launch`) is the saved profile name to auto-restore upon connecting.
 
+Under the operator's `foreground = "never"` (or `"polite"`, which this engine treats the same way) a visible browser is not brought forward: the page is not raised on connect ('foregrounded' is false) and focus emulation keeps it believing it has focus. Launching a visible Chromium or Safari is refused with POLICY_DENIED because the OS activates a newly started app: use `launch.headless: true`, or attach to a Chromium that is already running. Headless launches are unaffected.
+
 | Argument | Type | Required | Description |
 |---|---|---|---|
 | `attach` | object |  |  |
@@ -1015,7 +1179,7 @@ Offloads extraction parsing from the LLM. The schema maps field names to rules {
 
 Fill several form fields (input, select, checkbox, radio) in one call and optionally submit.
 
-Eliminates round-trips for registration or checkout forms. `fields` is an array of [{ref or selector, by, value, type, secret}]; `submit` is an optional submit trigger: {ref or selector}.
+Eliminates round-trips for registration or checkout forms. `fields` is an array of [{ref or selector, by, value, type, secret}]; `submit` is an optional submit trigger: {ref or selector}. `submitted` is false, with `submit_blocked`, when the trigger was disabled or covered; `effects.overlay` names a dialog now over the page.
 
 | Argument | Type | Required | Description |
 |---|---|---|---|
@@ -1211,6 +1375,8 @@ A node carries only what is set: ref, tag, role, name, value (what a text field 
 `browser_tabs` · standard tier
 
 List, open (url), activate or close (target_id) tabs of a connected browser.
+
+`open` creates the tab and, normally, brings it to the front. Under the operator's `foreground = "never"` (or `"polite"`) it is created in the background and stays behind; every browser tool takes the `target_id` it returns. `activate` raises the tab's window, so under those settings it is refused with POLICY_DENIED for a visible browser (pass `target_id` to the other tools instead) and allowed for a headless one, which has no window.
 
 | Argument | Type | Required | Description |
 |---|---|---|---|

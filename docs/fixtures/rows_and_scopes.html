@@ -1,0 +1,45 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Rows and scopes</title>
+<!-- Fixture for the text-match ranking and `within` live tests
+     (crates/mcp-browser/tests/locator_rank_scope_live.rs). The instruction
+     sentence names the sender before the inbox does, as the MiniWoB++
+     email-inbox task does; the rows are plain divs with a pointer cursor and a
+     script click handler, with no role, href or onclick attribute. -->
+<style>
+  .row { cursor: pointer; border-bottom: 1px solid #ccc; padding: 2px 6px; }
+  .who { font-weight: bold; }
+  .card { border: 1px solid #999; margin: 4px; padding: 4px; }
+</style>
+<body>
+<div id="query">Open the email by <b id="p-gilli">Gilli</b> and reply.</div>
+<div id="inbox">
+  <div class="row" id="row-gilli"><span class="who">Gilli</span> <span class="subj">Lunch</span></div>
+  <div class="row" id="row-marge"><span class="who">Marge</span> <span class="subj">Gilli's party</span></div>
+</div>
+
+<p id="tie-a">Solo mention</p>
+<p id="tie-b">Solo mention again</p>
+
+<p id="docs-prose">See Docs for details.</p>
+<a href="#docs" id="docs-link">Docs</a>
+
+<p id="vis-prose">Hidden</p>
+<div style="display:none"><div class="row" id="row-hidden">Hidden</div></div>
+
+<p id="exact-prose">Exact</p>
+<div class="row" id="row-partial">Exact thing</div>
+
+<div class="card" id="card1"><span class="name">Ann</span> <button class="act" id="act1">Open</button></div>
+<div class="card" id="card2"><span class="name">Zed</span> <button class="act" id="act2">Open</button> <span id="only2">second only</span></div>
+<div class="card" id="card3"><span class="name">Bob</span> <button class="act" id="act3">Open</button></div>
+
+<script>
+window.L = [];
+document.addEventListener('click', function(e){
+  var t = e.target, r = t.closest('.row, a, button');
+  window.L.push((r && r.id) || t.id || t.tagName);
+}, true);
+document.querySelectorAll('.row').forEach(function(r){ r.addEventListener('click', function(){}); });
+</script>
+</body>

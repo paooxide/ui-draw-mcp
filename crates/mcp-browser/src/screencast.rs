@@ -190,6 +190,7 @@ pub fn png_b64_size(b64: &str) -> Option<(u32, u32)> {
 fn err_text(e: &BrowserError) -> String {
     match e {
         BrowserError::PermissionDenied(m)
+        | BrowserError::Refused(m)
         | BrowserError::NotFound(m)
         | BrowserError::Unsupported(m)
         | BrowserError::Timeout(m)
@@ -320,7 +321,8 @@ async fn open_session(
     host: &str,
     port: u16,
     target: &str,
-    first: bool,
+    to_front: bool,
+    emulate_focus: bool,
 ) -> Result<CdpConn, BrowserError> {
     let list = http_json(host, port, "GET", "/json/list").await?;
     let ws = list
@@ -333,15 +335,19 @@ async fn open_session(
         .to_string();
     let mut c = CdpConn::connect(&ws).await?;
     c.call("Page.enable", json!({})).await?;
-    if first {
+    if to_front {
         c.call("Page.bringToFront", json!({})).await.ok();
     }
-    c.call(
-        "Emulation.setFocusEmulationEnabled",
-        json!({ "enabled": true }),
-    )
-    .await
-    .ok();
+    // Skipped where the backend keeps a session of its own for it: Chrome
+    // ends emulation for the page when any session that set it goes away.
+    if emulate_focus {
+        c.call(
+            "Emulation.setFocusEmulationEnabled",
+            json!({ "enabled": true }),
+        )
+        .await
+        .ok();
+    }
     Ok(c)
 }
 
@@ -380,6 +386,7 @@ struct Capture {
     opts: ScreencastOpts,
     started: Instant,
     shared: Arc<Mutex<Shared>>,
+    emulate_focus: bool,
 }
 
 async fn capture_loop(cap: Capture, first: CdpConn, mut stop: watch::Receiver<bool>) {
@@ -397,7 +404,7 @@ async fn capture_loop(cap: Capture, first: CdpConn, mut stop: watch::Receiver<bo
             break ("max_seconds", None);
         }
         if conn.is_none() {
-            match open_session(&cap.host, cap.port, &cap.target, false).await {
+            match open_session(&cap.host, cap.port, &cap.target, false, cap.emulate_focus).await {
                 Ok(c) => conn = Some(c),
                 Err(BrowserError::NotFound(_)) => break ("target_closed", None),
                 Err(e) => {
@@ -459,10 +466,12 @@ impl ScreencastHub {
         target: &str,
         media: &Path,
         opts: ScreencastOpts,
+        to_front: bool,
+        emulate_focus: bool,
     ) -> Result<Value, BrowserError> {
         self.check_free(target)?;
         let (browser_id, host, port) = browser;
-        let first = open_session(host, port, target, true).await?;
+        let first = open_session(host, port, target, to_front, emulate_focus).await?;
         let id = next_media_name();
         let dir = create_private_dirs(media, &["screencasts", &id, "frames"])?
             .parent()
@@ -479,6 +488,7 @@ impl ScreencastHub {
             opts,
             started,
             shared: shared.clone(),
+            emulate_focus,
         };
         let task = tokio::spawn(capture_loop(cap, first, stop_rx));
         let mut recs = lock(&self.recs);

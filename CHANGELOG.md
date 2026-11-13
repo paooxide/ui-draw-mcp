@@ -6,6 +6,534 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **`desktop_record` and `desktop_flow`: record a human demonstration of a desktop task and replay it through the
+  gate.** The desktop twin of `browser_record` / `browser_flow`. `desktop_record` (`start`, `stop` with a `name`
+  to save, `status`) listens to a person's real keyboard and mouse and keeps *what was touched*, not where:
+  for a click, the role, title and parents (up to the window) of the element under the pointer, the point only
+  as a fallback hint, and the menu path for a menu item; a run of typing becomes one `type` step on the field
+  that had the focus (Backspace edits the run); chords and non-printing keys become `shortcut` steps. Text typed
+  into a secure field is cleared as it is read and the step holds a `secret_ref`, supplied as `secrets` at replay,
+  as the browser recorder does. Recording is a dangerous-tier tool (the one tool that reads a person's input, so
+  it must be named in `policy.enable`), an explicit bounded session (at most 600 s, 4000 events, 200 steps), keeps
+  events only for `allowed_apps` and counts the others (`dropped_other_apps`) without storing them, and writes a
+  marker file that makes `agentctl doctor` print `RECORDING ACTIVE` while it runs. On macOS it is a listen-only
+  `CGEventTap` (Input Monitoring plus Accessibility); without them the call is `PERM_DENIED` naming which, and
+  nothing is recorded. On Linux it is `UNSUPPORTED_OS`: the remote-desktop portal can inject input but cannot
+  listen to it. `desktop_flow` (`list`, `get`, `save`, `delete`, `run`) keeps flows in `desktop_flows.json` beside
+  the browser's. `run` takes a snapshot of each step's app without pinning it, finds the element again by role,
+  title and ancestry (exact; fuzzy when the title only contains the recorded one or the surroundings changed;
+  the recorded point only when nothing matches; two equally good candidates are an error, never a guess), and
+  performs the step as the ordinary call it stands for (`ui_action`, `keyboard_type`, `set_value`,
+  `keyboard_shortcut`, `mouse_action`) through the same relay `input_steps` uses, so tier, role, consent,
+  foreground mode and audit see every step as its own call. Each step reports its `route` (`ax`, `hid`,
+  `pid_event`) and `matched`; the first failure stops the run with `failed_at`. A click on a text field replays as
+  `focus` (a text area offers no press), so it can run in the background; under `foreground = "never"` a flow
+  whose steps would use the keyboard is refused before the first runs, and the coordinate fallback is refused
+  like any pointer action. The human-override watcher is untouched: it samples the pointer only while the server is
+  driving, and `desktop_record` does not mark the server as driving. Measured on macOS: a click in a TextEdit
+  scratch document and a typed word recorded as a `textarea` click (exact point kept as a hint) plus a `type` step
+  on the `textarea`, and replayed into a fresh document (matched, route reported, text arrived). `value set` steps
+  are written by hand with `save` (op `set`): the recorder sees keys, not values.
+- **`observe`: a window's tree and, where the tree is thin, its text, in one call.** An agent facing an app it
+  cannot read used to chain `get_ui_tree`, `capture_window` and `ocr_region` and then work out which pixel to
+  click. `observe` returns the accessibility snapshot with `get_ui_tree`'s own refs (they resolve in
+  `ui_action`) and, when the tree is *sparse* for the chosen window, also the window's text read off its pixels
+  and joined to the tree: text that sits on an element is attached to its ref, text that sits on nothing
+  becomes a numbered mark (`m1`, `m2`..., in reading order) with the screen point and box `mouse_action` takes.
+  Sparse is a pure, tested rule stated in the tool description and echoed in every result: fewer than 5
+  actionable elements in the window, or fewer than one per 120000 square points of its area, or a childless
+  canvas, web view, group, scroll area or image covering a quarter of it. `ocr` (`auto`, `always`, `never`)
+  overrides it, `max_elements` caps the entries (the rest are counted), and `marks_image: true` returns the
+  window's screenshot with the numbers drawn on it, sized from the same `[vision]` detail tiers as
+  `capture_window`. It is passive: the app is read without pinning it (a new `without_pin` snapshot mode
+  installs the refs but leaves the session's pinned app alone), nothing is raised, focused or clicked, and it
+  works on a window behind others. The capture's `via` and any covered-window `warning` / `covered_by` are
+  carried through; on macOS the covering windows' rectangles are now kept with the cover report, and text
+  inside them is left out, where a platform only knows that something covers the window every mark is flagged
+  `unreliable`. Text on a secure field is withheld and counted, never returned. A named `app` is held to
+  `allowed_apps` by the name given and by the app it resolves to, and the output is marked untrusted. The
+  join is a source list (`ocr` today), the place a local grounding model would add boxes. Text is read in
+  the recogniser's fast mode unless `ocr_level: "accurate"` is asked for: on the development Mac the accurate
+  mode measured 25 to 52 s wall time per window, mostly waiting on the system, against 0.1 s for fast. Lives
+  in `mcp-window` (the crate that already composes the tree with other reads), the merge and the numbered
+  drawing in `mcp-vision`. Tested live against Finder (nothing pinned, raised or moved), a TextEdit scratch
+  document (the typed word attached to its text area, auto mode reading text exactly when the tree is sparse)
+  and a TextEdit window behind Finder under `foreground = "never"` (reported covered by Finder, 86%).
+- **`wait_for` is woken by the app's own change notifications on macOS.** It registers an `AXObserver` on the
+  target app (value, focus, window, title, selection, layout and menu notifications) on a thread of its own and
+  re-checks the condition when one arrives, instead of every 150 ms; a 500 ms safety re-check stays because
+  many apps post some changes unreliably or not at all. The result says what noticed: `woke_by` is `immediate`
+  (true at the first look), `event`, or `poll` (found by the timer, which is also what an app that refuses
+  observation, or any platform without events such as Linux, gets, at the old 150 ms). `waited_ms` is
+  unchanged and a timeout has the same shape as before. The observer, its run-loop source, its callback
+  context and its thread are torn down when the wait ends by success, timeout, cancellation or the call being
+  dropped, and waiting still does not pin or raise the app. Measured against TextEdit (text written through
+  accessibility 300 ms into a wait, median of 7): the wait returned 187 ms after the 300 ms mark by event,
+  against 382 ms with a 150 ms timer re-reading the tree; the figure includes the time `set_value` itself
+  takes to land the write, which is the same in both. `expect` clauses on input tools use the same wait.
+- **`scroll` with `dx` / `dy`: trackpad-style smooth scrolling with gesture phases and momentum.** Pixel deltas
+  (positive is right and down) sent as a stream of events over `duration_ms` (default 250), began, changed,
+  ended, as a trackpad produces them, which apps that smooth or hand off a scroll key off; the deltas sum
+  exactly to the request. `momentum: true` adds the coast of a flick after release (macOS, using the public
+  `kCGScrollWheelEventScrollPhase` and `kCGScrollWheelEventMomentumPhase` fields; Linux sends the portal's
+  smooth axis with its `finish` flag and lets the compositor coast, and the result says momentum was not
+  sent). Capped at 10000 px per axis, 3000 ms, and momentum at 3000 px and 60 events; a cancelled or
+  interrupted gesture still posts its closing phase. It uses the real pointer like any `scroll`, so
+  `never` refuses it and `polite` borrows it. Measured in TextEdit: a 600 px drag moved the document 17.4%,
+  the same drag with momentum 20.0%. Pinch, rotate and swipe are not attempted (`scroll` `gesture`
+  returns `UNSUPPORTED_OS`): macOS has no public API to synthesise them, and the error names the working
+  route (cmd+plus / cmd+minus or ctrl-scroll, the app's rotate command, back / forward shortcuts, ctrl+arrow
+  between spaces).
+- **`foreground = "polite"`: borrow the pointer and keyboard when you are idle, and give them back.** A third
+  setting between `allow` and `never`, for actions that genuinely need the real pointer, keyboard or a raised
+  app (`mouse_action`, `scroll`, `hover`, `drag_drop`, `keyboard_type` and `keyboard_shortcut` when no pinned
+  background app takes them by process, `ui_action show_menu`, `menu_open`, `menu_invoke`, `control_window
+  restore`, `focus_app` and `control_window focus`). Such a call first waits until you have been idle for
+  `input.polite_idle_ms` (default 1500; the OS idle clock, with agentctl's own input not counted as you:
+  a synthetic pointer move was measured to reset it exactly as a real one does) for at most
+  `input.polite_max_wait_ms` (default 15000), then fails with a retryable `TIMEOUT` ("the user is active")
+  having done nothing. Otherwise it records the frontmost app and the pointer, acts, and puts both back, on
+  error paths and a dropped call too; the result's `polite` says what was returned (`returned.app`,
+  `returned.pointer`) and `waited_ms`. An `input_steps` batch borrows once and restores once. If you move
+  the pointer mid-action, the action is abandoned with buttons and keys released and fails with the same
+  retryable error; the app is put back but the pointer is left in your hand. The human-override watcher trips
+  the kill switch in this mode exactly as under `allow` (taking the pointer is a stop request in every
+  mode), and the STOP file stops everything in every mode. `AGENTCTL_FOREGROUND` can only tighten (`never` over
+  `polite` over `allow`): `polite` from the environment applies over a file's `allow`, and neither `allow`
+  nor `polite` loosens a stricter file. Not supported, and refused with the reason: `keyboard_shortcut`
+  `action: "down"` (a held key outlives the call, so it cannot be given back), and any call that needs the
+  desktop on a platform with no idle clock (Linux). A polite call costs about half a second more, spent
+  watching for an app that is slow to come forward. `focus_app` and `control_window focus` raise the app only
+  for the length of the call (`focus_app` still pins it), and `launch` starts apps without activating them.
+  `agentctl doctor` reports the mode and its timings. Courtesy, not containment: see `docs/threat-model.md`.
+  Measured on macOS with Finder in front, the pointer parked at a known spot and a TextEdit scratch document:
+  a click-and-type batch landed its text and afterwards Finder was frontmost and the pointer 0.0 points from
+  where it was; `focus_app` raised TextEdit and handed the front back.
+
+- **Keys reach a pinned background app by process, without raising it (`input: "pid_event"`).** When the app
+  pinned with `focus_app` is not frontmost, `keyboard_type` and `keyboard_shortcut` (press) post their key
+  events to that process (`CGEventPostToPid`) instead of bringing it forward and typing into the foreground;
+  with the pinned app in front, or nothing pinned, they are `hid` as before. Per-process delivery is
+  unreliable in some apps, so it is never taken on trust: typed text is read back from the app's focused
+  element (or the element a `ref` named) and the call is an error when it did not change, or cannot be read
+  (a password field, an app with no readable text), naming `set_value` and `focus_app activate: true` as the
+  ways forward; it does not fall back to `hid`, which would take the foreground. A chord has no read-back,
+  so its result says `verified: true` only when the focused element visibly changed and `verified: false`
+  with a note otherwise. Measured on TextEdit behind Finder: typed text and text-system chords
+  (`shift+left`) arrived and the topmost window, the active app, Finder's focused element and the pointer
+  were unchanged; the menu key equivalent `cmd+a` was not delivered and the result said so. The
+  destructive-command screen applies to the pinned target, as it does to the frontmost app on `hid`. Held
+  keys (`action: "down"`) stay on the frontmost app, and a pid press is refused, saying why, while keys are
+  held. `foreground = "never"` allows the route, since the measurement showed it neither moves the pointer
+  nor changes the frontmost app, and still refuses keys that would go to the frontmost app. Not available
+  on Linux: the RemoteDesktop portal has no per-process delivery, so keys there go to the focused window as
+  before.
+
+- **`input_steps` runs up to 20 desktop input actions in one call.** An agent filling a dialog spent a model
+  turn on every click and keystroke; `browser_act` `steps` removed that for the browser and the desktop had
+  nothing like it. A step is `{tool, args}`, the tool being `ui_action`, `set_value`, `select_text`,
+  `ui_fill_form`, `keyboard_type`, `keyboard_shortcut`, `mouse_action`, `scroll`, `hover`, `drag_drop` or
+  `clipboard_write`; anything else (`exec`, a browser tool, `input_steps` itself, the two read tools) is an
+  `INVALID_ARGS` error naming the step, and so is a malformed step, before any step runs. Steps run in order
+  and the first failure ends the batch with `failed_at`; the result is `{ran, total, failed_at, elapsed_ms,
+  steps: [{i, tool, ok, ...that step's result, error}]}`. It is not a way around a check: each step is handed
+  back to the server's own `dispatch_call` (through a second `Server` over the same input engine, policy and
+  audit log), so the policy tier, the role's allowed and denied tools, consent, the hard invariants, the
+  kill switch apply to every step as they do to a call made alone, and every step has
+  its own audit entry (a `secret: true` step is redacted there). Under `foreground = "never"` the whole batch
+  is checked first, so one refused step means no step ran. The kill switch, a human taking the pointer and a
+  client cancel are checked between steps; the batch has 30 seconds, and a step still running at the end is
+  cancelled. A synthetic personal-data token cannot be passed in a batch (the batch is not a token sink); type
+  it with its own call. Held keys follow the existing rule per step. Limits: a step that names an element by
+  `name` resolves it against the snapshot as it is at that moment, so after a step that changes the screen
+  use a `ref` or end the batch there. A batch on a server nobody wired (`bind_input_steps`) is refused, not
+  run unchecked. Unverified: the live TextEdit test (`textedit_input_steps_edit_a_scratch_document_in_one_call`)
+  is written but has not been run, and nothing here has run on Linux.
+
+- **Desktop actions report `effects`, what they changed, in the same call.** `ui_action`, `set_value`,
+  `keyboard_type`, `keyboard_shortcut` (press), `mouse_action` clicks, `select_text`, `ui_fill_form` and each
+  step of `input_steps` add `effects` to their result when something changed, with only the fields that did:
+  `app` (the frontmost application), `focus` (`{role, name}`), `appeared` and `disappeared` (titles of the
+  target application's windows, at most 5 each), `retitled` (`{from, to}`), `overlay` (`{kind, title, text,
+  buttons}` of a sheet, dialog, alert, popover or menu that opened; the desktop twin of the browser's
+  `effects.overlay`) and `overlay_closed`, and `value` or `checked` of the element a `ui_action` pressed by
+  `ref`. Before, the agent called `get_ui_tree` after each action to find out. It is not a snapshot diff: a
+  fixed set of attribute reads before and after (about 1 to 4 ms each once an app has been read, 15 to 150 ms the
+  first time; measured on macOS with the accessibility API only), a 120 ms settle between them, and a pure
+  comparison. Reading raises no window and moves no focus, so it works under `foreground = "never"`. A fact
+  that could not be read is left out, never guessed, and a fact missing from either reading is not compared.
+  Nothing is emitted when nothing changed, so a missing `effects` means nothing was seen to change among
+  those facts, which is not proof that nothing did: an app may react after the wait, and a change inside a
+  window's contents is not among them. Text is clipped (names 60 characters, a value 80). `effects: false`
+  skips the reads and the wait, and a call with `expect` keeps its own delta. Limits: a sheet is found only as
+  a direct child of a window (where a TextEdit save panel sits), an app that exposes no accessibility windows
+  (Chrome until its accessibility is on) reports none, and a `ui_action` named by `name` has no `value` or
+  `checked`. On Linux the window list, dialogs and frontmost application are read from AT-SPI and `focus` is
+  not; that code type-checks but has not been run. The live test
+  (`effects_report_the_save_sheet_a_shortcut_opens_and_closes`) is written and has not been run.
+
+- **`foreground = "never"` (`[input]` table, or `AGENTCTL_FOREGROUND=never`) refuses every tool that would
+  take your pointer, keyboard or foreground.** The default, `"allow"`, changes nothing. With `never`,
+  `mouse_action`, `scroll`, `hover`, `drag_drop`, `keyboard_type`, `keyboard_shortcut` (press or hold) and
+  `input_showcase` are refused with `POLICY_DENIED` before anything runs, as are `ui_action` `focus`,
+  `show_menu` and `select` with an `option`, a `ui_fill_form` containing any of those, `menu_open`,
+  `menu_invoke`, `focus_app` with an app, and `control_window` `focus` and `restore`. Each refusal says what
+  was refused, that `foreground = "never"` is why, and the tool that does the job in the background where one
+  exists (`ui_action click` for a click on a ref, `set_value` for typing into a field, `scroll_into_view` or
+  `increment` for scrolling; `drag_drop` and `hover` have none). `set_value`, `select_text`, `get_selection`,
+  the other `ui_action` actions, the clipboard and the window and menu reads keep working and never call the
+  step that raises an app. `launch` runs `open -g` on macOS and is refused on Linux, which has no way to
+  start an app without activating it. The check is made twice: in each tool, first, so a refused call has not
+  taken a snapshot or raised a consent dialog; and in a wrapper around the platform backend, so a tool added
+  later still posts nothing. Only the config file or the environment sets it; the environment can add `never`
+  but not remove it, an unknown value is a startup error, and no role, access profile or tool argument
+  changes it. `agentctl doctor` reports the mode. `ui_action` `show_menu` and `select` with an option, `menu_open`, `menu_invoke`
+  and `control_window restore` are refused; each was measured against TextEdit with Finder in front and
+  brought the app forward, left a menu on screen, or put the restored window above Finder's.
+  `ui_action focus` is allowed on macOS, where three runs left the frontmost app alone (it stays refused on
+  Linux, which was not measured). What `never` does not cover: an app raising itself in answer to an
+  accessibility action, a launched app taking focus anyway, a headed browser driven by `browser_*` tools
+  (the engine brings tabs forward), and anything run through `exec` or `pty_*`. See `docs/threat-model.md`.
+- **`capture_window` on macOS reads the window itself through ScreenCaptureKit, so a window with other windows
+  on top of it comes back as itself.** It used to run `screencapture -R` on the window's rectangle, which
+  photographs whatever is on screen there, and spawned a process and wrote a temp PNG each time. It now asks
+  ScreenCaptureKit (`SCContentFilter(desktopIndependentWindow:)` + `SCScreenshotManager.captureImage`) for
+  that one window, found by the window server's id (`CGWindowID`) of the window the `app` and `window_id`
+  resolved to (and checked against the owning process), never by frame or by the frontmost app, and encodes
+  the PNG in memory. The result has the same shape and coordinate meaning as before (`width`/`height` are
+  pixels after the `max_edge` downscale, `downscaled_from` is the native pixel size, `coordinate_mapping` is
+  the window's rectangle in points), so `grid`, `ocr_region` coordinates and click mapping are unchanged.
+  Every capture result now carries `via`: `screencapturekit`, `screencapture` or (Linux) `xdg-desktop-portal`,
+  set from the path that ran. The covered-window `warning` and `covered_by` are given only when the image
+  came from the screen (`via: "screencapture"`); a `screencapturekit` image is the window's own pixels and
+  carries none. `ocr_region` always reads the screen, so it always carries them. Limits: the ScreenCaptureKit
+  path needs macOS 14 (`SCScreenshotManager`) and Screen Recording; without the permission it returns
+  `PERM_DENIED` (no fallback, the old path fails the same way). Where ScreenCaptureKit is missing (macOS 12.3
+  to 13), times out (10 s), cannot find the window or cannot start a stream for it (error -3811, seen on
+  some windows that are on screen), it falls back to `screencapture` and says so in `via`. A window that
+  renders no pixels is an error, never a blank image. `capture_screen` and `ocr_region` still use
+  `screencapture`. The binary now links ScreenCaptureKit, so it needs macOS 12.3 or later to start. Verified
+  on the development Mac (macOS 27, display awake): ScreenCaptureKit returned real images at the window's
+  size times the display scale for Finder, Notes, System Settings and Activity Monitor windows that were
+  covered 99 to 100% by other windows, and for some Terminal windows; a Finder capture showed Finder's
+  content with none of what covered it. It could not start a stream (-3811) for other Terminal windows and a
+  Chrome window, which fell back to `screencapture`; why those windows differ is not known. Not verified:
+  ScreenCaptureKit on macOS 14 or earlier, and Screen Recording being refused. Adds `objc2-screen-capture-kit`,
+  `objc2-core-graphics`, `objc2-image-io` and `objc2-io-surface` (each `Zlib OR Apache-2.0 OR MIT`) on macOS
+  only.
+
+- **`browser_act` and `browser_fill_form` say when an action left a dialog or layer in the way.** In a recorded
+  MiniWoB++ `login-user-popup` run, focusing the username raised a popup (OK / Cancel) over the form and
+  disabled it; `browser_fill_form` still returned `submitted: true`, and the model answered DONE on a form
+  that was never submitted. `effects.overlay` (`{text, ref, covers}`) now appears on an act, on each of its
+  `steps` and on a fill when a dialog or positioned layer is on top of controls that were clickable before the
+  action and were not under it (`covers` counts up to 40 of them, left out when 0), when a modal dialog opened
+  (`<dialog>` shown with `showModal()`, or `aria-modal`), or when a new layer fills a quarter of the viewport.
+  A toast or menu beside the controls is not reported, and nothing is added when there is nothing to say. On
+  `browser_fill_form` it is the only effect reported.
+
+- **`ui_action` gains `show_menu`, `increment`, `decrement` and `pick`; `scroll_to_visible` is accepted for
+  `scroll_into_view`.** They act through the accessibility API on the element itself (AXShowMenu, AXIncrement,
+  AXDecrement, AXPick), so they need neither the pointer nor the app in front. On macOS the element's own
+  action list is read first, and one that lacks the action is an `UNSUPPORTED_OS` error naming what it does
+  offer (`'Volume' does not offer AXPick; it offers AXPress (click), AXIncrement (increment)`), never an `ok`.
+  `increment` and `decrement` read the value before and after and report `value_after` and `changed`
+  (`changed: false` is a control at its limit or one that ignored the step; `verified: false` is a control
+  whose value cannot be read). `show_menu` and `pick` have no read-back. On Linux `increment`/`decrement` move
+  an AT-SPI Value by its minimum increment, clamped to its range; `show_menu` and `pick` look for an action of
+  that name on the element (`menu`, `popup`, `pick`...) and otherwise name the actions it has. Before, a
+  context menu needed a right click with the real pointer, and a slider needed a drag. `double_click` and
+  `right_click` remain an accessibility press on macOS, which has no distinct press for either.
+- **Every input result says which route acted: `input` is `ax` or `hid`.** `ax` is the accessibility API, with
+  no pointer movement and the app free to stay in the background; `hid` is synthetic system input that moves
+  the real cursor or types into the frontmost app. It is reported by `ui_action`, `set_value`,
+  `ui_fill_form` (per field), `mouse_action`, `scroll`, `hover`, `drag_drop`, `keyboard_type` and
+  `keyboard_shortcut` (a press), taken from the code path that ran rather than from the request: the backend
+  returns the route of `ui_action`. `keyboard_type` on a ref focuses it through the accessibility API but
+  types with system key events, so it is `hid`. On Linux `right_click` clicks at the element's centre through
+  the portal and is `hid`. The field is absent when nothing needed doing (checking a checked box), and on
+  `keyboard_shortcut` `down` and `up`. Before, a result could not tell an agent whether the user's cursor had
+  just been taken.
+- **`select_text` and `get_selection`.** `select_text` selects text in a text field or text area by `ref` or
+  `name`: `all`, `start` and `end` (character offsets, `end` exclusive; equal places the caret), `text` (the
+  `occurrence`-th match, from 1), or `from_text` and `to_text` (through the end of the first `to_text` after
+  the first `from_text`). The element's text is read first and the request resolved against it. Matching is
+  exact, case and accents included, and non-overlapping. On macOS it sets `AXSelectedTextRange`, converting
+  characters to UTF-16 units (a character outside the Basic Multilingual Plane is two, a combining accent is
+  one of its own), then reads back the range and `AXSelectedText`; an element that reports a different range
+  than was asked for fails the call and says what it reports. An element whose selection is not settable is an
+  `UNSUPPORTED_OS` error, and there is no pointer fallback: it never drags to select. On Linux it uses the AT-SPI
+  Text interface (`set_selection`, `add_selection`; a caret through `set_caret_offset`). `get_selection` reads
+  the selection of a ref or name, or of the focused element of the driven app when none is given (macOS only;
+  on Linux give a ref), without changing it. Both report `start`, `end`, `length`, `text` (cut at 2000
+  characters, with `truncated`), `role` and `input: ax`, refuse password fields, and are standard tier like
+  `set_value`. Before, selecting a span meant a pointer drag or shift-arrow chords with no way to confirm
+  the result. A live test against TextEdit exists (gated behind `AGENTCTL_LIVE_GUI=1`); which other
+  apps honour a set selection is not verified. The Linux code type-checks but has not been run.
+- **`drag_drop` takes `path`.** Up to 200 waypoints `{x, y}` (the argument and limit of `browser_act drag`) that
+  the drag passes through in order, releasing at the last, with the moves (`steps`, 2 to 100, default 20) spread
+  over the segments by length and at least one landing on every waypoint. Give no `to` with a path. Waypoints
+  are in the frame of `from`: offsets from the element's top-left when it is a ref or name, else absolute screen
+  points. Every waypoint is checked against the allowed window bounds as the endpoints are, and one outside
+  denies the whole drag before the button goes down. Before, a desktop drag was a straight line, so a brush
+  stroke, a lasso or a curved slider path could not be drawn. The result reports `waypoints`. The path maths
+  now lives in `mcp-types` and is shared with the browser engine.
+- **`keyboard_shortcut` takes `action`: `press` (default), `down` or `up`.** `down` holds a lone modifier
+  (`shift`, `cmd+shift`) or one key, in the same key names `press` takes, and keeps it down across later calls:
+  every click, drag, scroll and chord until `up` carries the held modifiers, whatever `modifiers` the call
+  names. `up` releases the named keys, or everything held when no `combo` is given. Before, Shift could only
+  be held inside a single `modifiers` argument, so a multi-step selection or a press-and-hold was impossible.
+  At most 6 keys are held at once; holding one already held renews its time limit. An unknown key is
+  `INVALID_ARGS` before anything is pressed. A key is released by `up`; automatically after 30 seconds unless
+  renewed (the result's `auto_release_ms`); when any other input call fails (the error says which keys were
+  released); when the STOP file appears or a human takes the mouse, although every later call is refused by
+  then; and when the server stops. On macOS a held modifier is stamped on the flags of the events agentctl
+  posts, not pressed as a key, so it cannot stay latched in the system if the process dies; software that
+  reads the keyboard state rather than event flags does not see it, and `keyboard_type` ignores it. A held
+  ordinary key is a real key-down. On Linux every held key is a real press through the portal. A crash or
+  `SIGKILL` cannot run the release, which on Linux can leave a held key down.
+
+- **`focus_app` with `activate: false` pins an app without raising it, and every window id says which app it
+  belongs to.** Driving an app that stays in the background had one door: `get_ui_tree` with `app` pinned it
+  as a side effect, and `focus_app`, the tool named for pinning, always raised it, so under
+  `foreground = "never"` there was no refused-or-working way to say "this is the app". `focus_app {app,
+  activate: false}` sets the same pin and writes nothing to the app (no `AXFrontmost`, no window touched); its
+  result is `{target, pid, activated: false}`. Under `never` that form is allowed and the raising form
+  (`activate` absent, `true`, or anything that is not the boolean `false`) is refused with a suggestion
+  naming it. `list_windows` with `app` lists a named app whether or not it is frontmost, and each window now
+  carries `pid` and a `state`: `onscreen`, `minimized`, or `offscreen` (another Space, or the app is hidden;
+  the window server lists these, the accessibility tree of the app does not). `capture_window` and
+  `ocr_region` take `app` with `window_id` (the app whose list the id is from; default the pinned app, else
+  the frontmost), and their results carry `window: {app, pid, title, from}`. `list_windows`, `get_ui_tree`,
+  `find_elements`, `ui_extract`, `control_window`, `menu_open`, `menu_invoke`, `menu_list` and
+  `handle_dialogs` results name the application they used and why (`target`/`from` is `named`, `pinned` or
+  `frontmost`, so a call that named no app shows whether it got the pin or whatever was in front);
+  `ui_action`, `set_value`, `select_text` and `get_selection` by ref say the `app` the ref belongs to. A
+  `list_windows` with no app and nothing pinned says `scope: "all_apps"`. An app name that matches no running
+  application, and a `window_id` the app does not have, are errors that name the app (and, for the id, how
+  many windows it has); none falls back to another app. `capture_window` and `ocr_region` on macOS read
+  the screen area, so a window that is minimised or off screen is an error (nothing of it is drawn), and one
+  that other applications' windows cover by 5% or more of its area (read from the window server) is still
+  captured, with a top-level `warning` and `covered_by: [{app, fraction}]` (largest first, fractions of the
+  window's area, capped at 1) saying whose pixels are in the image in place of the window's own. An agent
+  that sees `warning` should not read those parts as the window's content; on Linux a covered window
+  cannot be told and shows what covers it.
+  Unverified: the live test (`a_background_app_is_pinned_listed_and_read_by_window_id_without_taking_the_foreground`)
+  is written and has not been run; nothing here has run on Linux, which type-checks only; no capture was
+  taken, so the `screencapture` half of a window read, and a window on another Space (none was open when
+  this was written), are untested.
+
+- **A locked screen is reported, not acted on.** While the lock screen is up (or another user's session has the
+  console after fast user switching) macOS discards the key and pointer events a program posts, and the post
+  itself still succeeds, so the `hid` route reported an action as done that never arrived. Two live tests showed
+  it: typed text never appeared and the HID idle clock did not move. Every call that would post key or pointer
+  events now checks the session first (`CGSessionCopyCurrentDictionary`: `CGSSessionScreenIsLocked`,
+  `kCGSSessionOnConsoleKey`, a local lookup) and fails before anything runs with `ACTION_FAILED` ("the screen is
+  locked ... nothing was done", suggestion beginning `retryable:`). That covers `mouse_action`, `hover`, `scroll`,
+  `drag_drop`, `keyboard_type`, `keyboard_shortcut` (a key release is let through), an `input_steps` batch
+  containing any of them (refused whole, so no earlier step half-runs), the per-process `pid_event` route, and
+  the window calls that raise an app (`focus_app`, `menu_open`, ...). Under `foreground = "polite"` it refuses at
+  once instead of waiting for idle and then posting into the void. The same check sits at the input backend
+  boundary, so a path the tool layer did not foresee fails too. Measured with the screen locked: `list_windows`
+  and `menu_list` still answer, `get_ui_tree` and `observe` return `ok` with only the application root
+  (flagged `partial`, with a hint that blames slowness), `capture_screen` fails ("no displays"), and
+  `capture_window` and `ocr_region` fail (ScreenCaptureKit -3811, then `screencapture` "could not create image
+  from rect"); the accessibility actions `ui_action` / `set_value` are not refused but were not exercised while
+  locked. A display that is only asleep with the screen unlocked is not treated as blocking: whether a posted
+  event wakes it is not documented and could not be measured. `agentctl doctor` prints a `screen:` line
+  (ok, LOCKED, OFF CONSOLE or unknown), `idle_status` gains `screen_locked` and `input_state`, and the GUI
+  live suites now skip, saying why, when the screen is locked. On Linux the input engine has no cheap reader
+  (logind is on the system bus the input backend does not hold), so it reports unknown and does not block;
+  `idle_status` and `doctor` read logind's `LockedHint` alongside GNOME's screen saver.
+
+- **`foreground = "never"` and `"polite"` now cover the browser engine.** Before, a visible (headed) Chrome was
+  outside the setting: the engine sent `Page.bringToFront` on every connect, `browser_tabs open` went through
+  `/json/new` (which activates the tab it makes), and a visible launch started a window. Inventory of what can raise
+  a window or take focus: `Page.bringToFront` on connect and when a screencast starts; `/json/new` and
+  `/json/activate` in `browser_tabs`; `Target.createTarget` for a branch's context; starting Chromium, and
+  Safari through safaridriver. Under `never` (and under `polite`, which applies the same rule because the browser
+  engine cannot borrow and return the desktop) the page is not brought forward (`foregrounded` is false), tabs
+  and branch tabs are created with `background: true`, `browser_tabs activate` is refused for a visible browser,
+  and a visible Chromium or Safari launch is refused, all `POLICY_DENIED` naming `launch.headless: true` and
+  attaching to a running Chrome; headless is unaffected. Focus-dependent pages keep working because one idle
+  DevTools session per tab holds `Emulation.setFocusEmulationEnabled` while the browser is connected (a session
+  per call is not enough: Chrome ends the emulation when any session that set it closes, so the page saw a blur
+  after every call). `allow` is unchanged. Verified against a real headless Chrome by reading the commands off the
+  wire and with a focus fixture (`docs/fixtures/focus_probe.html`). **Measured:** a visible Chrome (throwaway
+  profile, attach mode) driven under `never` on macOS left Finder frontmost throughout
+  (`live_browser_headed_never.rs`, 3 of 3 runs on an unlocked screen). **Not measured:** Safari, Linux, and
+  attaching to the Chrome window a person uses every day (its window order). A background tab in a visible browser may be hidden to the page and throttled.
+
+- **`--access <level>` and `AGENTCTL_ACCESS`: choose the permission level when starting the server.** `ask`,
+  `auto` or `bypass`, as `policy.access` in the config file. The strictness order is `ask` < `auto` < `bypass`
+  (`ask` is the most restrictive). When the config file sets `access`, the flag or variable may only move it
+  toward `ask`: asking for a looser level is a startup error that names both values, not a silent ignore.
+  When the file sets nothing, the flag sets the level. The variable does not: every level turns on more than
+  the default, and an inherited variable is too easy to leave set by accident, so `AGENTCTL_ACCESS` on its own
+  is a startup error naming the file and the flag. An unknown value is a startup error. When both the flag and
+  the variable are given, the flag stands.
+- **`policy.dry_run = true` and `--dry-run`: rehearse at any level.** Reads run, and anything that would change
+  something reports what it would have done and does not do it, under `ask`, `auto` and `bypass` alike. Dry run
+  can only make a session do less. `mode = "dry_run"` keeps working as the older spelling, and is no longer
+  lost when `access` is set (it used to be overwritten).
+- **`agentctl doctor` prints the policy in three lines**, `access:` (the level, what it means and whether it came
+  from the config file, the `--access` flag or `AGENTCTL_ACCESS`), `scope:` (categories, apps, filesystem
+  roots, commands, hosts, browser origins) and `stops:` (kill switch path, human override, `foreground`), plus
+  `dry run: on` when it is. It also lists, under `ignored keys:`, every config key nothing reads with the
+  nearest key it knows (`policy.catgories (did you mean policy.categories?)`), and under `config warnings:`
+  every older spelling and no-op setting found at load. The same warnings are logged at startup.
+- **`config.example.toml` is reorganised around three ideas**: `access` (the one permission choice), scope (what
+  it may touch) and safety stops, with a "Start here" block of a few lines and everything else under Scope,
+  Safety stops and Advanced. Every setting the loader reads is documented in it, and a test now keeps it so.
+
+### Changed
+
+- **The pure-Rust OCR engine is `ocrs` 0.14 on `rten` 0.28** (was 0.13 on 0.26). The two ONNX model files are
+  the same ones as before and pinned by the same SHA-256, so cached models stay valid and nothing is
+  downloaded again; `AGENTCTL_OCR_MODELS` and `AGENTCTL_OCR_MODELS_UNVERIFIED` behave as before. Recognised text
+  was identical on six rendered test pages and recognition time within 3 %. The update also drops three
+  dependencies (`flatbuffers`, `anyhow`, `bitflags` 1.x).
+- **Window, menu, dialog and capture calls that name an `app` act on it without pinning it.** `list_windows`,
+  `menu_list`, `handle_dialogs` and the rest resolved `app` through the call that pins, so reading one app's
+  menu silently changed which app a later call with no `app` acted on. Only `focus_app` and the
+  `get_ui_tree` family (`get_ui_tree`, `find_elements`, `ui_extract`) pin now. `wait_for` with `app` watches
+  it without pinning it (see Fixed). A flow that named an app in `list_windows` or `menu_list` and then
+  called `get_ui_tree` with no `app` expecting it now reads the pinned or frontmost app, and the result's
+  `target` says so.
+- **A `window_id` is the window's place in its own application's list, the same in `list_windows` with or
+  without `app`.** `list_windows { app }` numbered windows by the app's accessibility order and `list_windows`
+  with no app by the window server's, so one window had two ids, and `capture_window` read either against the
+  frontmost app's accessibility windows. Both lists now come from the window server (the same windows and
+  numbering whether or not Accessibility is granted; titles it redacts are filled from the app when
+  Accessibility is granted). For an app whose windows the two orders agree on, ids are unchanged; where they
+  differed, `list_windows { app }` ids now match the no-app list. Windows under 120x80 points and untitled
+  surfaces (when titles are readable) are not listed, as they were not in the no-app list. `minimized` is
+  true only for a window the app reports minimised.
+- **`allowed_apps` applies to every window tool that names an app.** It gated `launch` and `focus_app`. It now
+  also gates `list_windows`, `control_window`, `menu_open`, `menu_invoke`, `menu_list`, `handle_dialogs`,
+  `wait_for`, `capture_window` and `ocr_region` when they name an `app`, by the name given and by the
+  application it resolves to. It still does not gate `get_ui_tree`, `find_elements` or `ui_extract` with
+  `app`, which read an app the list does not cover; that is unchanged and recorded in
+  `docs/threat-model.md`.
+
+- **With `access` set, `categories` now narrows it instead of being discarded.** Before, writing
+  `categories = ["vision"]` beside `access = "auto"` was silently ignored and every category was on. Now only
+  the categories you list are on (an empty list turns all of them off); leave `categories` out and the level
+  turns every category on, as before. This can only make a session do less, but if you have a stale
+  `categories` line beside `access`, that line now takes effect: remove it, or list what you want. A tool in a
+  category that is not listed is neither advertised in `tools/list` nor callable. Configs without `access` are
+  unchanged byte for byte.
+- **Under `access`, a config that also carries `mode` or `enable` now says so.** Both were always ignored once
+  `access` was set, with no word. Each is now named in a startup warning (`mode = "dry_run"` is not a conflict;
+  it is the older spelling of `dry_run`). Without `access` they work exactly as before and warn about nothing.
+- **When two spellings of one setting disagree, startup stops.** `policy.demo` and `input.demo`,
+  `policy.role` and `policy.default_role`, `[invariants]` and `[policy.invariants]` and the other aliases
+  listed below were read into a hash map, so which one won was arbitrary and could change between runs. Two
+  spellings with the same value are fine (and warn); two with different values are now a startup error naming
+  both.
+- **`agentctl --role serve`, and any flag that takes a value, no longer swallows a command name.** `--role`,
+  `--demo-speed` and `--access` take the next argument or `--flag=value`; a missing value, or a command name
+  where the value should be, is a usage error (`--role=serve` if a role really is called that).
+
+### Deprecated
+
+Each of these still works exactly as before, loads with a startup warning that names what to use, and appears
+under `config warnings:` in `agentctl doctor`. Nothing here is more permissive than it was.
+
+- **Older spellings of one setting** (use the first): `policy.demo` (was `input.demo`, `demo.enabled`),
+  `policy.demo_speed` (was `input.demo_speed`, `demo.speed`), `policy.role` (was `policy.default_role`),
+  `[invariants]` (was `[policy.invariants]`), and in a custom role `require_consent_for` (was
+  `require_consent_for_tiers`, `require_consent_tiers`, `require_consent_for_tools`, `require_consent_tools`).
+- **The roles `operator`, `admin`, `auditor`, `tester` and `superadmin`** are no longer documented and still
+  resolve to the same profiles. `operator` is `access = "ask"`; `admin` and `superadmin` grant nothing, so drop
+  the role; `auditor` is `readonly`; `tester` is `qa`. The documented presets are `readonly`, `qa`, `browser`
+  and `browser-core`. Custom `[roles.<name>]` tables are unchanged and now live in the advanced part of the docs.
+- **`policy.mode` and `policy.enable`** are the older way to say what `access` says. They keep working when
+  `access` is not set; prefer `access`.
+
+### Removed
+
+- **`max_denials` (`policy.max_denials` and `roles.<name>.max_denials`) never did anything, and the denial
+  budget behind it is gone.** The documentation said a session would be aborted after that many denied calls.
+  Nothing ever acted on the count: the call that recorded each denial ignored the answer, so no session was
+  ever aborted. The counter, its plumbing and the `Policy::record_denial` and `denial_count` methods are
+  removed. A config file that still sets the key loads, with a warning that it has no effect and never had;
+  remove the line. Denials are still audited (`decision: "deny"`), and the audit log's schema is unchanged.
+
+### Fixed
+
+- **`idle_status` never reported a locked screen on macOS.** It looked for `CGSSessionScreenIsLocked` with
+  `ioreg -k`, which matches nothing (the key lives inside `IOConsoleUsers`), so `locked` was always `false`,
+  including while the screen was locked. It now reads the session dictionary.
+
+- **macOS: `launch` right after `close_app` failed with "could not launch".** The closed app was still known to
+  LaunchServices for a moment and `open -a` answered error -600, so an agent that closed TextEdit and opened it
+  again was told it could not be started. `launch` (and the background launch used under
+  `foreground = "never"`) now retries that one error for up to 8 seconds, and any other failure carries
+  `open`'s own message instead of a bare "could not launch".
+- **macOS: a minimised window was listed as `onscreen`.** The window server leaves out the on-screen key for a
+  window that is not drawn, and its absence was read as "on screen", so `minimized` was always false.
+  `control_window restore` with no `title` now un-minimises a minimised window; it used to act on the main
+  window, which is the one in view, and did nothing.
+- **macOS: `ui_action` on an element that lacks the action said only "unsupported on this element".** Some
+  apps answer a missing action with the attribute-unsupported code instead of the action one, and that path
+  skipped the message that names what the element does offer. Both now say, for example, that TextEdit's text
+  area does not offer AXScrollToVisible and offers only AXShowMenu. A disabled popup says what to do next.
+
+- **`control_window`, `menu_open` and `menu_invoke` acted on the frontmost app whatever `app` said.** The
+  argument was accepted and discarded (`_app`), so `control_window { app: "TextEdit", action: "close" }` closed
+  a window of the app in front, and `menu_invoke { app, path }` pressed a menu item in it. They now act on the
+  named app, or the pinned one, or the frontmost, and the result's `target` says which. A title that matches
+  none of the app's windows is an error naming the app and how many windows it has.
+- **`capture_window` and `ocr_region` with a `window_id` read the frontmost app's accessibility windows, never
+  the app the id came from.** With TextEdit pinned behind Terminal, `window_id: 0` was Terminal's first
+  window, and the capture was of Terminal. They also photographed whatever was on screen at the window's
+  coordinates, so a window covered by another app's came back as that app's pixels. See Added for the id and
+  the covered-window warning. Seen on the development Mac: Finder's only window listed as `onscreen` and covered 100% by
+  Terminal, which a capture would have returned as Finder's.
+- **`wait_for` with `app` pinned that app and replaced the elements `@eN` refs pointed at.** Its polls took
+  ordinary snapshots, so `wait_for { app: "Finder", ... }` between `get_ui_tree` of TextEdit and `ui_action
+  @e5` left `@e5` resolving in Finder's tree, where an element with the same role and name would be acted on.
+  The polls are now passive reads: nothing is pinned and the last walk's refs are kept. An `expect` clause is
+  not passive (it installs what it last saw), so it is unchanged.
+- **An app whose windows were all minimised or on another Space could not be named unless its process name
+  matched exactly.** Name resolution looked only at on-screen window owners, then `pgrep -x`. It now also
+  looks at off-screen owners, exact before substring.
+- **Linux: a `window_id` from one app's list could resolve to a window of another app.** Ids indexed the last
+  `list_windows` result, and an id past the end re-listed every app and returned that list's entry. Ids are
+  now each window's place in its own app's list and are read against the app named, else the pinned one, else
+  the active one, with an error naming the app and its window count past the end. Naming an app in a window
+  or menu call also pinned it there, as on macOS, and no longer does. Type-checks only; not run.
+- **`browser_fill_form` no longer reports `submitted: true` for a submit that did not happen.** It clicked the
+  submit control with a script `click()`, which a disabled control ignores and a person could not make on a
+  control under a dialog. It now looks first: a disabled control, or one with a dialog or positioned layer
+  over its centre, is not clicked, and the result is `submitted: false` with `submit_blocked` (`disabled`, or
+  `covered by "<text of the layer>"`). The fields are still filled and the call still succeeds.
+- **A plain-word query clicked the instruction sentence instead of the inbox row.** On MiniWoB++ `email-inbox`,
+  `browser_act` `click query:"Gilli"` (no `by`) matched the sender's name twice, in the task's instruction and
+  in the row, and clicked the instruction. A text match counted as clickable only when it was, or sat inside,
+  a link, button, input, role or `onclick`; the row is a `div` with a pointer cursor and a script handler, so
+  both matches tied and document order picked the sentence. Matches now rank control, then text a pointer
+  cursor or a `tabindex` marks as clickable (the cursor is inherited, so the words inside a row show it), then
+  prose. Exact before partial and visible before hidden still come first, `index` walks the same order, and
+  `matches` is the same count.
+- **`within` searched only the first element its selector matched.** `within:".email-thread"` (one match per
+  row) answered NOT_FOUND for text that was in the second row. `within`, as a CSS selector or an XPath, now
+  scopes the search to every element it matches, in document order, for `css`, `xpath`, `text`, `role` and the
+  no-`by` fallback; `index` and `matches` count across all of them. A `within` that matches nothing is still
+  an error and never widens the search.
+
+### Security
+
+- **tokio 1.54.1**, for RUSTSEC-2026-0386 (`AsyncFd::new` and related constructors violate I/O safety), and
+  async-executor 1.14.1 in place of the yanked 1.14.0. The "unmaintained" notices for `zvariant`,
+  `zvariant_derive` and `zbus_names` (folded into the zbus repository, not vulnerable, Linux only) are ignored
+  by id in `deny.toml` until zbus, ashpd and atspi release against the merged crate.
+- **sha2 0.11** for the audit log's hash chain and the OCR model pins (digests are unchanged), with libc,
+  serde_json and wl-clipboard-rs patch updates.
+
 ## [0.3.0] - 2026-10-10
 
 ### Added

@@ -10,11 +10,14 @@ use std::process::Command;
 
 use async_trait::async_trait;
 use mcp_policy::applescript_escape;
+use mcp_types::ScreenState;
 use serde_json::{json, Value};
 
 use crate::backend::{DesktopBackend, DesktopError, IdleStatus, MediaAction, PowerAction};
 
-pub struct MacosDesktop;
+pub struct MacosDesktop {
+    screen: fn() -> ScreenState,
+}
 
 impl Default for MacosDesktop {
     fn default() -> Self {
@@ -24,7 +27,18 @@ impl Default for MacosDesktop {
 
 impl MacosDesktop {
     pub fn new() -> Self {
-        MacosDesktop
+        MacosDesktop {
+            screen: || ScreenState::Unknown,
+        }
+    }
+
+    /// Where the session's lock state comes from. The composition root passes
+    /// the macOS backend's reader, so this engine and the input engine
+    /// answer from one place; without it the state is reported as unknown
+    /// rather than guessed.
+    pub fn with_screen(mut self, screen: fn() -> ScreenState) -> Self {
+        self.screen = screen;
+        self
     }
 }
 
@@ -73,15 +87,6 @@ fn hid_idle_seconds() -> Result<u64, DesktopError> {
     Ok((ns / 1_000_000_000) as u64)
 }
 
-fn screen_locked() -> bool {
-    run(
-        "/usr/sbin/ioreg",
-        &["-n", "Root", "-d", "1", "-k", "CGSSessionScreenIsLocked"],
-    )
-    .map(|t| t.contains("CGSSessionScreenIsLocked\" = Yes"))
-    .unwrap_or(false)
-}
-
 #[async_trait]
 impl DesktopBackend for MacosDesktop {
     async fn lock_screen(&self) -> Result<(), DesktopError> {
@@ -116,13 +121,16 @@ impl DesktopBackend for MacosDesktop {
 
     async fn idle_status(&self) -> Result<IdleStatus, DesktopError> {
         let idle_seconds = hid_idle_seconds()?;
-        let locked = screen_locked();
+        let state = (self.screen)();
+        let locked = state == ScreenState::Locked;
         Ok(IdleStatus {
             idle_seconds,
             locked,
-            // "Present" is a judgement, not a sensor reading: recent input and an
-            // unlocked screen is the best signal the OS actually offers.
-            user_present: !locked && idle_seconds < 300,
+            screen_locked: locked,
+            input_state: state.label(),
+            // "Present" is a judgement, not a sensor reading: recent input and a
+            // session that can take it is the best signal the OS actually offers.
+            user_present: !state.blocks_input() && idle_seconds < 300,
         })
     }
 
@@ -279,7 +287,7 @@ mod tests {
     /// a plausible number rather than an error.
     #[tokio::test]
     async fn idle_status_reads_the_real_session() {
-        let d = MacosDesktop::new();
+        let d = MacosDesktop::new().with_screen(mcp_macos::screen_state);
         let s = d
             .idle_status()
             .await
@@ -289,7 +297,12 @@ mod tests {
             "implausible idle time {}",
             s.idle_seconds
         );
-        assert_eq!(s.user_present, !s.locked && s.idle_seconds < 300);
+        assert_eq!(s.locked, s.screen_locked);
+        assert_eq!(s.screen_locked, s.input_state == "locked");
+        assert_eq!(
+            s.user_present,
+            matches!(s.input_state, "ok" | "unknown") && s.idle_seconds < 300
+        );
     }
 
     #[tokio::test]

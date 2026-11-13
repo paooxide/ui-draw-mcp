@@ -150,6 +150,11 @@ pub async fn pid_of(conn: &AccessibilityConnection, obj: &ObjectRefOwned) -> Opt
 pub struct WindowRef {
     pub obj: ObjectRefOwned,
     pub app_name: String,
+    /// The process behind the application, when the bus says.
+    pub pid: Option<u32>,
+    /// Position in its application's window list: the `window_id` that
+    /// `list_windows` reports, whichever way the list was asked for.
+    pub index: u32,
     pub title: String,
     pub states: StateSet,
     pub bounds: Option<Bounds>,
@@ -165,7 +170,8 @@ pub async fn windows_of(
         .get_children()
         .await
         .map_err(|e| format!("windows of '{}': {e}", app.name))?;
-    let mut out = Vec::new();
+    let pid = pid_of(conn, &app.obj).await;
+    let mut out: Vec<WindowRef> = Vec::new();
     for obj in children.into_iter().take(MAX_CHILDREN) {
         let Ok(p) = proxy_for(conn, &obj).await else {
             continue;
@@ -181,6 +187,8 @@ pub async fn windows_of(
         out.push(WindowRef {
             obj,
             app_name: app.name.clone(),
+            pid,
+            index: out.len() as u32,
             title,
             states,
             bounds,
@@ -189,7 +197,9 @@ pub async fn windows_of(
     Ok(out)
 }
 
-/// Every window on the bus, active one first, system UI excluded.
+/// Every window on the bus, active one first, system UI excluded. Each keeps
+/// the `index` it has in its own application's list, so sorting the active one
+/// to the front does not renumber anything.
 pub async fn all_windows(conn: &AccessibilityConnection) -> Result<Vec<WindowRef>, String> {
     let apps = applications(conn).await?;
     let mut out = Vec::new();

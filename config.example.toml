@@ -6,51 +6,93 @@
 # listed here, those engines refuse everything rather than falling open. A file
 # that exists but fails to parse aborts startup: silently reverting to defaults
 # could *widen* a policy stricter than the built-in one.
+#
+# The policy is three ideas, and this file is arranged around them:
+#
+#   1. access        the one permission choice, one of three levels:
+#        ask         act freely; dangerous tools and high-impact actions ask a human
+#        auto        unattended; nothing prompts; clearly destructive actions are refused
+#        bypass      everything runs; only the kill switch, human override and hard invariants remain
+#   2. scope         what it may touch: categories, allowed_apps, fs.roots,
+#                    terminal.allowed_commands, network.allowed_hosts,
+#                    browser.allowed_origins and the other lists.
+#   3. safety stops  kill switch, human override, foreground and the hard
+#                    invariants. On at every level, `bypass` included.
+#
+# Sections below: Start here, then [policy] (access, scope, stops, advanced and
+# older spellings, in that order: a TOML table can appear only once, so it is
+# written in one piece), then the rest of Scope, Safety stops and Advanced.
+# `agentctl doctor` prints the access, scope and stops in effect, and lists
+# keys it ignored, with the nearest key it knows.
+
+# ---- Start here --------------------------------------------------------------
+# Most setups need only these lines. Uncomment the ones you want in the live
+# tables below, or copy them to the top of a file of your own:
+#
+#   [policy]
+#   access = "ask"
+#   categories = ["vision", "input", "window", "browser", "system"]
+#   allowed_apps = ["TextEdit", "Finder"]
+#   [input]
+#   foreground = "allow"
+#   (then the scope lists you need: fs.roots, terminal.allowed_commands, ...)
 
 [policy]
-# The quick way: one permission profile instead of listing categories and
-# dangerous tools by hand. Uncomment ONE, and the two settings below it
-# (categories, enable) are ignored.
-#   access = "ask"     every capability on; read and act freely, but a
-#                      dangerous tool or a destructive action asks you (dialog).
-#   access = "auto"    every capability on; nothing prompts, but a clearly
-#                      destructive action is refused rather than done blind.
+# ==== 1. ACCESS: the one permission choice ====================================
+# Uncomment ONE. Without it, `categories` below decides what is on and the older
+# `enable` and `mode` (see "Older spellings") decide how risk is handled.
+#   access = "ask"     every capability on; act freely, but dangerous tools and
+#                      high-impact actions ask you (a dialog out of band from the agent).
+#   access = "auto"    every capability on; unattended: nothing prompts, but a
+#                      clearly destructive action is refused rather than done blind.
 #   access = "bypass"  every capability on; nothing prompts; the destructive
-#                      gate is off. Only the kill switch and reaching for the
-#                      mouse can stop it. Your explicit "I take responsibility".
+#                      gate is off. Only the kill switch, reaching for the mouse
+#                      and the hard invariants stop it. Your explicit "I take
+#                      responsibility"; never a default.
+#
+# The same choice can be made when starting the server: `agentctl --access auto`.
+# When this file sets access, the flag or AGENTCTL_ACCESS can only move it toward
+# ask (never toward bypass), and loosening is a startup error, not a silent
+# ignore. When it does not, the flag sets it; AGENTCTL_ACCESS on its own is
+# refused, because a variable is too easy to inherit by accident.
 # access = "ask"
 
-# The granular way (used only when `access` is not set). Only these categories
-# are advertised and callable.
+# Rehearse at any level: reads run, anything that would change something only
+# reports what it *would* have done (including whether it would have asked you)
+# and does not do it. The gate still refuses what it would normally refuse, so
+# this is how you find out what an agent's prompt will actually try, against the
+# real config and the real tool list, with nothing at risk. Dry run can only
+# make a session do less. `agentctl --dry-run` does the same for one run.
+# dry_run = true
+
+# ==== 2. SCOPE: what it may touch =============================================
+# The capability categories that are advertised and callable. With `access`
+# set, a list here NARROWS it (only these are on); leave it out and the level
+# turns them all on. Without `access`, this list is what is on.
 #   vision input window browser system terminal filesystem network credentials
 #   memory desktop packages
+# Enabling a category never enables a dangerous tool by itself: that takes an
+# `access` level (or, without one, the older `enable` below).
 categories = ["vision", "input", "window", "browser", "system"]
 
-# Dangerous-tier tools must be named here to be callable at all. This is the
-# operator's pre-approval; in interactive mode a human is *also* asked per call.
-enable = []
+# GUI apps the agent may launch or drive, and the only apps a `desktop_record`
+# session keeps events for.
+allowed_apps = ["TextEdit", "Finder"]
+# The other scope lists are in the tables below: [fs] roots, [terminal]
+# allowed_commands, [network] allowed_hosts, [browser] allowed_origins,
+# [credentials] allowed_services, [packages] allowed_sources.
 
-# interactive = ask a human (a native dialog on macOS, zenity on Linux) before risky actions.
-# autonomous  = nobody to ask, so anything needing consent is denied.
-# dry_run     = rehearsal. Read-tier tools run for real; anything that would
-#               change something reports what it *would* have done, including
-#               whether it would have asked you, and does not do it. The gate
-#               still refuses what it would normally refuse, so this is how you
-#               find out what an agent's prompt will actually try, against the
-#               real config and the real tool list, with nothing at risk.
-mode = "interactive"
+# ==== 3. SAFETY STOPS (the [policy] ones; the rest are [input] and [invariants]) ==
+# Creating this file stops everything, whatever the level. Default
+# ~/.agentctl/STOP.
+# kill_switch_file = "/Users/you/.agentctl/STOP"
 
 # Cap on how often one session may interrupt a human. Past this, further
 # requests are denied without prompting: unlimited dialogs train people to
 # click Allow (consent fatigue).
 max_consent_prompts = 20
 
-# Session aborts after this many denials (anti-spin).
-max_denials = 5
-
-# GUI apps the agent may launch or drive.
-allowed_apps = ["TextEdit", "Finder"]
-
+# ==== ADVANCED ================================================================
 # PII/PHI tokenizer. When on, tool results reach the model with names you
 # registered, SSNs, Luhn-valid card numbers, emails, phone numbers, MRNs, IPv4
 # addresses and API keys replaced by tokens such as <SSN_1>. The plaintext is
@@ -64,12 +106,14 @@ allowed_apps = ["TextEdit", "Finder"]
 # overrides this.
 anonymize = false
 
-# Audit log signing. Every tool call is appended to ~/.agentctl/audit as a
-# SHA-256 hash chain signed with Ed25519. Unset, each session signs with a
-# throwaway key and records that key in the log, so `agentctl audit verify`
-# can only say the log is self-consistent: anyone able to rewrite the file can
-# re-sign it. Create a key once with `agentctl audit keygen`, point this at it
-# (the file must be mode 0600), and verify with --pubkey <the printed key>.
+# Audit log directory (default ~/.agentctl/audit) and signing. Every tool call
+# is appended there as a SHA-256 hash chain signed with Ed25519. Unset, each
+# session signs with a throwaway key and records that key in the log, so
+# `agentctl audit verify` can only say the log is self-consistent: anyone able
+# to rewrite the file can re-sign it. Create a key once with `agentctl audit
+# keygen`, point this at it (the file must be mode 0600), and verify with
+# --pubkey <the printed key>.
+# audit_dir = "/Users/you/.agentctl/audit"
 # audit_signing_key = "/Users/you/.agentctl/audit_signing.key"
 
 # Demo mode, for screencasts. The pointer glides along an eased curve instead
@@ -84,60 +128,51 @@ demo = false
 # Anything else here, or in AGENTCTL_DEMO_SPEED, is a startup error.
 demo_speed = "demo"
 
-# Role profiles narrow what a session may call; they never widen it. Built in:
-# readonly (read tier only), qa (browser, vision, window, system, input; no
-# browser_eval), browser (browser tools only, for web QA and demos),
-# browser-core (the 12 browser tools a page task needs, for the smallest tool
-# list), operator (dangerous tools always ask), admin (no extra limits). Roles also filter the
-# advertised tool list, so `role = "browser"` is how to show only browser tools
-# when `access` is set (access turns every category on).
-# Pick one for this server, or define your own below.
+# A role is an optional preset that narrows what a session may call; it never
+# widens it, and it also filters the advertised tool list. Built in:
+#   readonly      read tier only
+#   qa            browser, vision, window, system, input; no browser_eval
+#   browser       browser tools only, for web QA and demos
+#   browser-core  the 12 browser tools a page task needs, for the smallest tool list
+# Pick one for this server with `role`, `--role` or AGENTCTL_ROLE. To define
+# your own, see "Custom roles" at the end of this file.
 # role = "qa"
 
-# Paths and domains refused in any tool's arguments before the gate, whatever
-# `access` says. This is a check on argument text: it sees "/etc/shadow" inside
-# a command and resolves symlinks, but not a relative path, a shell glob or
-# what a host name resolves to. The filesystem jail, the command allowlist and
-# the SSRF guard remain the real limits. Defaults cover /etc/shadow,
-# /etc/sudoers, /etc/pam.d, /System and master.passwd.
-# [invariants]
-# protected_paths = ["/etc/shadow", "/etc/sudoers", "/Users/you/.ssh"]
-# denied_domains = ["pastebin.com", "transfer.sh"]
-
-# A custom role, selected with role = "support" above.
-# [roles.support]
-# description = "Reads and browses; may not touch the terminal or files"
-# allowed_categories = ["browser", "vision", "window", "system"]
-# denied_tools = ["browser_eval", "browser_cookies"]
-# require_consent_for = ["standard"]   # tiers or tool names
-# max_denials = 3                      # can only tighten policy.max_denials
-
-[input]
-# Stop when a human takes over the mouse.
+# ==== OLDER SPELLINGS =========================================================
+# These still work exactly as before when `access` is NOT set, and are ignored
+# (with a startup warning naming them) when it is. Prefer `access`.
 #
-# Reaching for the mouse is the reflex people already have for interrupting
-# something; this makes that gesture stop the agent, without needing to
-# remember a key combination or find the STOP file. While agentctl is driving,
-# it compares where the pointer *is* against where it *put* it; a sustained
-# divergence trips the kill switch, cancels any drag in progress, and posts a
-# notification saying how to resume.
+# enable: dangerous-tier tools named here are callable (each also asks you when
+# the mode is interactive). `desktop_record` is one of them. It listens to your
+# real keyboard and mouse (macOS: a listen-only event tap, needing Input
+# Monitoring and Accessibility for the app that runs agentctl) to turn a
+# demonstration into a replayable `desktop_flow`, so add it only on a machine
+# where you want that. It keeps events only for the apps in `allowed_apps`,
+# counts and discards the rest, never keeps text typed into secure fields,
+# stops by itself after at most 10 minutes, and `agentctl doctor` shows
+# "RECORDING ACTIVE" while it runs.
+#   enable = ["desktop_record"]
+# enable = []
 #
-# Keyboard has no equivalent signal and is deliberately not covered: detecting
-# human typing would mean watching every keystroke on the machine.
-human_override = "true"
-# How far the pointer must be from anywhere agentctl put it, in points. Small
-# values trip on ordinary coordinate jitter.
-human_override_px = 12
-# How long after an action agentctl still counts as driving, so a divergence
-# between two calls is not missed.
-human_override_grace_ms = 1500
-# Apps whose typed input is screened for destructive shell commands.
-# Editors are included by default because their *integrated terminals* run the
-# same shell: the accessibility API cannot tell an editor pane from a terminal
-# pane, so the whole app is screened. Over-triggering on a source file that
-# merely contains "rm -rf" is the safe direction to be wrong in: it asks, it
-# does not refuse. Setting this replaces the default list.
-# terminal_apps = ["Terminal", "iTerm", "Code", "Zed", "Cursor"]
+# mode: "interactive" asks a human before risky actions (a native dialog on
+# macOS, zenity on Linux); "autonomous" has nobody to ask, so anything needing
+# consent is denied; "dry_run" is the older spelling of `dry_run = true`.
+# mode = "interactive"
+#
+# Spelled more than one way for years, one spelling each now (the others load
+# with a warning, and two that disagree stop startup): policy.demo (was
+# input.demo, demo.enabled), policy.demo_speed (was input.demo_speed,
+# demo.speed), policy.role (was policy.default_role), [invariants] (was
+# [policy.invariants]).
+#
+# max_denials (here and per role) is accepted and does nothing. It was
+# documented as ending a session after that many denied calls; nothing ever
+# counted against it. Remove it.
+# max_denials = 5
+
+# ---- Scope: the rest of the lists -------------------------------------------
+# An empty list below means the engine refuses everything, except
+# browser.allowed_origins, where empty means any public origin.
 
 [fs]
 # Directories the filesystem engine may touch. Paths are fully resolved and
@@ -187,12 +222,6 @@ denylist = []
 # A protected set (this agent, the package manager, security tooling) can never
 # be uninstalled and is deliberately not configurable.
 
-[memory]
-# Where recorded sequences live, and how many are kept. Off unless the `memory`
-# category is enabled.
-# store = "~/.agentctl/memory.json"
-max_recipes = 500
-
 [browser]
 # Origins `browser_navigate` may go to, as `scheme://host[:port][/path-prefix]`.
 # Matching is on the parsed origin, so "https://ok.example" does not admit
@@ -206,6 +235,102 @@ allowed_origins = []
 # server. It does not bypass `allowed_origins`.
 allow_private = false
 
+# ---- Safety stops ------------------------------------------------------------
+# On at every access level. The kill switch (`kill_switch_file` above) and the
+# human override stop in-flight work; `foreground` keeps the agent off your
+# pointer, keyboard and frontmost app; the hard invariants refuse protected
+# paths and denied domains before anything else runs.
+
+[input]
+# Stop when a human takes over the mouse.
+#
+# Reaching for the mouse is the reflex people already have for interrupting
+# something; this makes that gesture stop the agent, without needing to
+# remember a key combination or find the STOP file. While agentctl is driving,
+# it compares where the pointer *is* against where it *put* it; a sustained
+# divergence trips the kill switch, cancels any drag in progress, and posts a
+# notification saying how to resume.
+#
+# Keyboard has no equivalent signal and is deliberately not covered: detecting
+# human typing would mean watching every keystroke on the machine.
+human_override = "true"
+# How far the pointer must be from anywhere agentctl put it, in points. Small
+# values trip on ordinary coordinate jitter.
+human_override_px = 12
+# How long after an action agentctl still counts as driving, so a divergence
+# between two calls is not missed.
+human_override_grace_ms = 1500
+# Whether tools may take your pointer, keyboard or foreground.
+#   "allow"  (default) every tool may move the pointer, type and bring apps forward.
+#   "polite" an action that needs the real pointer, keyboard or foreground waits
+#            until you have been idle for polite_idle_ms (up to polite_max_wait_ms,
+#            then it fails with a retryable error and does nothing), borrows
+#            them, and puts the frontmost app and the pointer back. If you
+#            move the mouse mid-action the action is abandoned and the kill
+#            switch trips, exactly as under "allow" (delete the STOP file to
+#            resume). Courtesy, not containment: see docs/threat-model.md.
+#            Stricter than "allow", looser than "never".
+#   "never"  no tool moves the real pointer, posts synthetic key or scroll events,
+#            holds a key, or brings an app or window to the front. Each one is
+#            refused before it runs, with the background-safe alternative if
+#            there is one (ui_action and set_value act through accessibility
+#            without moving anything). `launch` starts apps without activating
+#            them (macOS) or is refused (Linux). This is for letting an agent
+#            work while you use the machine.
+#
+# Browser tools (CDP): with "never" or "polite" a visible Chrome is not
+# brought forward. The page is not raised on connect, tabs open in the
+# background, and focus emulation keeps pages believing they have focus.
+# `browser_tabs activate` and launching a visible Chromium or Safari are refused
+# (use `launch.headless: true`, or attach to a Chrome that is already running);
+# headless is unaffected. "polite" applies the same rule: the browser engine
+# cannot borrow and return the desktop. Verified in headless. A visible Chrome
+# was measured on macOS in attach mode: with Finder frontmost it stayed behind
+# while being driven under "never". Not measured: Safari, Linux, and attaching
+# to the Chrome window you use every day (its window order).
+#
+# It does not stop an app from raising itself in response to an accessibility
+# action, and does not limit what `exec` can run. See docs/threat-model.md.
+#
+# Only this file or AGENTCTL_FOREGROUND can set it: no tool, role or access
+# level can. The environment can only make it stricter (allow -> polite ->
+# never), never looser. Any other value is a startup error. `agentctl doctor`
+# shows the mode in effect.
+foreground = "allow"
+# With "polite": how long you must have been idle, and the longest a call waits
+# for that, in milliseconds.
+# polite_idle_ms = 1500
+# polite_max_wait_ms = 15000
+# Apps whose typed input is screened for destructive shell commands.
+# Editors are included by default because their *integrated terminals* run the
+# same shell: the accessibility API cannot tell an editor pane from a terminal
+# pane, so the whole app is screened. Over-triggering on a source file that
+# merely contains "rm -rf" is the safe direction to be wrong in: it asks, it
+# does not refuse. Setting this replaces the default list.
+# terminal_apps = ["Terminal", "iTerm", "Code", "Zed", "Cursor"]
+
+
+# Paths and domains refused in any tool's arguments before the gate, whatever
+# `access` says. This is a check on argument text: it sees "/etc/shadow" inside
+# a command and resolves symlinks, but not a relative path, a shell glob or
+# what a host name resolves to. The filesystem jail, the command allowlist and
+# the SSRF guard remain the real limits. Defaults cover /etc/shadow,
+# /etc/sudoers, /etc/pam.d, /System and master.passwd.
+# [invariants]
+# protected_paths = ["/etc/shadow", "/etc/sudoers", "/Users/you/.ssh"]
+# denied_domains = ["pastebin.com", "transfer.sh"]
+
+# ---- Advanced ----------------------------------------------------------------
+# Tuning and optional features: memory, screen capture, the judge, the HTTP
+# transport, custom roles. (Audit signing, the PII tokenizer, demo mode and
+# role presets are in [policy] above.)
+
+[memory]
+# Where recorded sequences live, and how many are kept. Off unless the `memory`
+# category is enabled.
+# store = "~/.agentctl/memory.json"
+max_recipes = 500
+
 [vision]
 # Screen-capture cost/legibility trade-offs. These are not security controls:
 # they decide how much of your image budget a capture spends. Image cost tracks
@@ -216,6 +341,7 @@ allow_private = false
 detail_low_px = 768         # layout/state checks: "did the dialog appear?"
 detail_balanced_px = 1024   # most interactions
 detail_full_px = 1568       # small text stays legible
+# `observe` with `marks_image: true` sizes its numbered screenshot from these same tiers.
 
 # The tier used when a call names neither `detail` nor `max_edge`. Lower this to
 # make every capture cheaper without touching a single call site.
@@ -300,3 +426,14 @@ token = ""
 # Origin header at all. Only set this if you are deliberately fronting the
 # server with a local web UI.
 allowed_origins = []
+
+# Custom roles. A role is a narrowing preset; define your own and select it
+# with `role = "support"` in [policy]. Most setups never need one.
+# [roles.support]
+# description = "Reads and browses; may not touch the terminal or files"
+# allowed_categories = ["browser", "vision", "window", "system"]
+# denied_categories = ["terminal"]
+# allowed_tiers = ["read", "standard"]
+# allowed_tools = ["browser_navigate", "browser_snapshot"]
+# denied_tools = ["browser_eval", "browser_cookies"]
+# require_consent_for = ["standard"]   # tiers or tool names

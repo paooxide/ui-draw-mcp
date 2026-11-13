@@ -10,9 +10,10 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use atspi::{AccessibilityConnection, ObjectRefOwned};
 use mcp_a11y::{A11yBackend, BackendError, RawSnapshot, SnapshotRequest};
+use mcp_window::TargetSource;
 use tokio::sync::OnceCell;
 
-use crate::a11y::{self, AppInfo, NodeRef, WindowRef};
+use crate::a11y::{self, AppInfo, NodeRef};
 use crate::portal::Portal;
 
 /// The application this session is driving.
@@ -25,13 +26,18 @@ pub struct AppTarget {
 #[derive(Default)]
 pub struct State {
     pub paths: HashMap<u64, NodeRef>,
-    /// Set by an explicit `app` argument and then followed: later calls stay
-    /// on it instead of tracking whatever happens to be frontmost.
+    /// Set by `focus_app`, or by a `get_ui_tree`-family call that names an
+    /// `app` (or names none and finds nothing pinned), and then followed:
+    /// later calls stay on it instead of tracking whatever happens to be
+    /// frontmost. Window, menu and capture calls that name an app do not
+    /// change it.
     pub target: Option<AppTarget>,
-    /// Windows as of the last `list_windows`, by the id it reported.
-    pub windows: Vec<WindowRef>,
     /// Pointer positions this backend set, newest last.
     pub pointer_sets: Vec<mcp_input::SetPoint>,
+    /// Modifiers held down by `key_down`. A pointer action or chord that
+    /// names one of them must neither press it again nor let go of it when it
+    /// finishes, or `shift` held across clicks would end at the first click.
+    pub held_mods: Vec<crate::keys::Modifier>,
 }
 
 /// Applications whose text is a scrollback: keep value tails, not heads.
@@ -131,32 +137,50 @@ impl LinuxBackend {
         self.lock().target.as_ref().map(|t| t.name.clone())
     }
 
-    /// Resolve which app to drive, and remember it. An explicit name wins and
-    /// becomes the sticky target; otherwise the sticky target while it is
-    /// still on the bus; otherwise the app with the active window.
-    pub(crate) async fn resolve_target(&self, app: Option<&str>) -> Result<AppInfo, String> {
+    /// Which app a call acts on and why that one, with nothing pinned or
+    /// changed. A name given to the call wins; otherwise the pinned app while
+    /// it is on the bus; otherwise the app with the active window. A name that
+    /// matches no running app is an error, never another app.
+    pub(crate) async fn peek_target(
+        &self,
+        app: Option<&str>,
+    ) -> Result<(AppInfo, TargetSource), String> {
         let conn = self.conn().await?;
-        if let Some(name) = app.map(str::trim).filter(|s| !s.is_empty()) {
-            let found = a11y::app_by_name(&conn, name)
-                .await?
-                .ok_or_else(|| format!("no running application matching '{name}'"))?;
-            self.set_target(&found);
-            return Ok(found);
-        }
-        let sticky = self.lock().target.clone();
-        if let Some(t) = sticky {
-            let apps = a11y::applications(&conn).await?;
-            if let Some(a) = apps.iter().find(|a| a.obj == t.obj) {
-                return Ok(a.clone());
+        let pinned = self.pinned_target().await;
+        match mcp_window::target_source(app, pinned.is_some()) {
+            TargetSource::Named => {
+                let name = app.unwrap_or_default().trim();
+                let found = a11y::app_by_name(&conn, name)
+                    .await?
+                    .ok_or_else(|| format!("no running application matching '{name}'"))?;
+                Ok((found, TargetSource::Named))
             }
-            // Target went away: drop it and fall through.
-            self.lock().target = None;
+            TargetSource::Pinned => pinned
+                .map(|a| (a, TargetSource::Pinned))
+                .ok_or_else(|| "the pinned application is no longer running".to_string()),
+            TargetSource::Frontmost => {
+                let active = a11y::active_app(&conn)
+                    .await?
+                    .ok_or("no application has an active window")?;
+                Ok((active, TargetSource::Frontmost))
+            }
         }
-        let active = a11y::active_app(&conn)
-            .await?
-            .ok_or("no application has an active window")?;
-        self.set_target(&active);
-        Ok(active)
+    }
+
+    /// Resolve which app to drive, and remember it. An explicit name wins and
+    /// becomes the pinned target; otherwise the pinned target while it is
+    /// still on the bus; otherwise the app with the active window, which then
+    /// becomes the pin. For perception and the actions on its refs; window,
+    /// menu and capture calls use [`Self::peek_target`] and pin nothing.
+    pub(crate) async fn resolve_target(
+        &self,
+        app: Option<&str>,
+    ) -> Result<(AppInfo, TargetSource), String> {
+        let (found, from) = self.peek_target(app).await?;
+        if from != TargetSource::Pinned {
+            self.set_target(&found);
+        }
+        Ok((found, from))
     }
 
     /// The pinned target if it is still on the bus.
@@ -180,10 +204,14 @@ impl LinuxBackend {
 impl A11yBackend for LinuxBackend {
     async fn snapshot(&self, req: &SnapshotRequest) -> Result<RawSnapshot, BackendError> {
         let conn = self.conn().await.map_err(BackendError::PermissionDenied)?;
-        let app = self
-            .resolve_target(req.app.as_deref())
-            .await
-            .map_err(BackendError::NotFound)?;
+        // A passive read (a wait, a check) names the app it reads without
+        // becoming it, and keeps the refs of the last walk.
+        let (app, from) = if req.passive || req.without_pin {
+            self.peek_target(req.app.as_deref()).await
+        } else {
+            self.resolve_target(req.app.as_deref()).await
+        }
+        .map_err(BackendError::NotFound)?;
         let root = match &req.root_ref {
             Some(r) => {
                 let id: u64 = r
@@ -225,17 +253,22 @@ impl A11yBackend for LinuxBackend {
                     .map(|w| w.title.clone())
             })
             .filter(|t| !t.is_empty());
-        {
+        if !req.passive {
             let mut st = self.lock();
             st.paths = walked.paths;
         }
         let terminal = is_terminal(&app.name) || walked.root.subrole.as_deref() == Some("terminal");
+        let pid = a11y::pid_of(&conn, &app.obj).await;
         Ok(RawSnapshot {
             root: walked.root,
             app: Some(app.name),
             window,
             terminal_app: terminal,
             partial: walked.partial,
+            target: Some(mcp_a11y::SnapshotTarget {
+                pid,
+                from: from.as_str(),
+            }),
         })
     }
 

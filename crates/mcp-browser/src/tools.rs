@@ -195,6 +195,7 @@ fn require<'a>(args: &'a Value, key: &str, tool: &str) -> Result<&'a str, Envelo
 fn browser_err(tool: &str, e: BrowserError) -> Envelope {
     let (code, msg) = match e {
         BrowserError::PermissionDenied(m) => (ErrorCode::PermDenied, m),
+        BrowserError::Refused(m) => (ErrorCode::PolicyDenied, m),
         BrowserError::NotFound(m) => (ErrorCode::NotFound, m),
         BrowserError::Unsupported(m) => (ErrorCode::UnsupportedOs, m),
         BrowserError::Timeout(m) => (ErrorCode::Timeout, m),
@@ -1728,13 +1729,26 @@ impl BrowserModule {
             );
         }
         let submit = args.get("submit");
-        result_with_selector_hint(
-            tool,
+        // Focusing a field can raise a dialog over the form (a session popup),
+        // so a fill that says ok is not a form that can be used.
+        let probe = self.backend.act_probe(target, "fill_form").await;
+        let mut res = self
+            .backend
+            .fill_form(target, &Value::Array(fields.clone()), submit)
+            .await;
+        if let (Ok(out), Some(probe)) = (res.as_mut(), probe) {
+            // Only the overlay: the rest of `effects` would be paid for on
+            // every fill, and the fields it names are the caller's own.
+            let submitted = out.get("submitted").and_then(Value::as_bool) == Some(true);
+            let mut fx = json!({});
             self.backend
-                .fill_form(target, &Value::Array(fields.clone()), submit)
-                .await,
-            &fill_css_selectors(args),
-        )
+                .act_effects(target, probe, !submitted, &mut fx)
+                .await;
+            if let Some(o) = fx.pointer("/effects/overlay") {
+                out["effects"] = json!({ "overlay": o });
+            }
+        }
+        result_with_selector_hint(tool, res, &fill_css_selectors(args))
     }
 
     async fn extract(&self, args: &Value) -> Envelope {
@@ -3474,6 +3488,7 @@ fn flow_err(tool: &str, e: crate::flow::FlowError) -> Envelope {
 fn browser_err_msg(e: &BrowserError) -> String {
     match e {
         BrowserError::PermissionDenied(m)
+        | BrowserError::Refused(m)
         | BrowserError::NotFound(m)
         | BrowserError::Unsupported(m)
         | BrowserError::Timeout(m)
@@ -3528,7 +3543,12 @@ impl ToolModule for BrowserModule {
                  `launch.background_throttling`: a visible (headless=false) browser is started with flags that stop Chrome \
                  throttling timers, rendering and screen recording when its window is behind another or covered. Set true \
                  to leave Chrome's normal throttling on. Default false. `profile` (top level or under `launch`) is the \
-                 saved profile name to auto-restore upon connecting.",
+                 saved profile name to auto-restore upon connecting.\n\n\
+                 Under the operator's `foreground = \"never\"` (or `\"polite\"`, which this engine treats the same way) \
+                 a visible browser is not brought forward: the page is not raised on connect ('foregrounded' is false) and \
+                 focus emulation keeps it believing it has focus. Launching a visible Chromium or Safari is refused with \
+                 POLICY_DENIED because the OS activates a newly started app: use `launch.headless: true`, or attach to \
+                 a Chromium that is already running. Headless launches are unaffected.",
             ).untrusted_output(),
             ToolDescriptor::new(
                 "browser_disconnect",
@@ -3560,6 +3580,12 @@ impl ToolModule for BrowserModule {
                     }),
                     json!(["browser_id", "action"]),
                 ),
+            ).details(
+                "`open` creates the tab and, normally, brings it to the front. Under the operator's `foreground = \"never\"` \
+                 (or `\"polite\"`) it is created in the background and stays behind; every browser tool takes the \
+                 `target_id` it returns. `activate` raises the tab's window, so under those settings it is refused with \
+                 POLICY_DENIED for a visible browser (pass `target_id` to the other tools instead) and allowed for a \
+                 headless one, which has no window.",
             ).untrusted_output(),
             ToolDescriptor::new(
                 "browser_navigate",
@@ -3644,7 +3670,7 @@ impl ToolModule for BrowserModule {
                 "browser_act",
                 Category::Browser,
                 Tier::Standard,
-                "Act on a DOM node. Target 'ref' (from browser_snapshot/query) or 'query' (CSS, visible text, XPath or role=...; optional by, within, text, index). x, y act at a point (offsets in the target, canvas bitmap px, or viewport px): hit says what is there. type replaces the field's content; press takes a key or combo (ctrl+a). effects says what changed (url, new_tab, dialog, appeared, disappeared, focus). A click returns before navigation: use wait_after='settle'. steps=[{action, ...}] runs up to 20 acts in one call.",
+                "Act on a DOM node. Target 'ref' (from browser_snapshot/query) or 'query' (CSS, visible text, XPath or role=...; optional by, within, text, index). x, y act at a point (offsets in the target, canvas bitmap px, or viewport px): hit says what is there. type replaces the field's content; press takes a key or combo (ctrl+a). effects says what changed (url, new_tab, dialog, appeared, disappeared, focus, overlay). A click returns before navigation: use wait_after='settle'. steps=[{action, ...}] runs up to 20 acts in one call.",
                 obj(
                     json!({
                         "target_id": { "type": "string", "description": "tab id (default: active tab)" },
@@ -3724,8 +3750,9 @@ impl ToolModule for BrowserModule {
                  learn it: `url` and `title` when they changed, `new_tab` ({target_id, url}) for a tab or popup it \
                  opened, `dialog` ({type, message, answered}) for an alert, confirm or prompt it raised, `appeared` and \
                  `disappeared` (up to 5 each, such as 'dialog \"Session expired\" ref=...': dialogs, menus, listboxes, \
-                 toasts, overlays and interactive elements that became visible or went away) and `focus` for the newly \
-                 focused element. A navigation reports url and title only. Chrome only; effects are read about 120 ms \
+                 toasts, overlays and interactive elements that became visible or went away), `focus` for the newly \
+                 focused element, and `overlay` ({text, ref, covers}) when a dialog or layer now sits over controls that \
+                 were clickable (covers counts them), so a click on the page behind it will not land. A navigation reports url and title only. Chrome only; effects are read about 120 ms \
                  after the action unless wait_after is settle.\n\n\
                  Spellings such as key, dblclick, triple-click, drag_and_drop, move, mousedown are accepted.\n\n\
                  Batches: `steps` is a list of acts (each with its own action, ref or query, value, and so on; target_id \
@@ -3829,7 +3856,8 @@ impl ToolModule for BrowserModule {
                 ),
             ).details(
                 "Eliminates round-trips for registration or checkout forms. `fields` is an array of \
-                 [{ref or selector, by, value, type, secret}]; `submit` is an optional submit trigger: {ref or selector}.",
+                 [{ref or selector, by, value, type, secret}]; `submit` is an optional submit trigger: {ref or selector}. \
+                 `submitted` is false, with `submit_blocked`, when the trigger was disabled or covered; `effects.overlay` names a dialog now over the page.",
             ),
             ToolDescriptor::new(
                 "browser_extract",

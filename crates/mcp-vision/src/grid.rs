@@ -104,7 +104,7 @@ pub fn draw_grid(png_bytes: &[u8], spec: &GridSpec) -> Result<Vec<u8>, String> {
     encode_rgba(&px, w, h)
 }
 
-fn decode_rgba(bytes: &[u8]) -> Result<(u32, u32, Vec<u8>), String> {
+pub(crate) fn decode_rgba(bytes: &[u8]) -> Result<(u32, u32, Vec<u8>), String> {
     let mut dec = png::Decoder::new(Cursor::new(bytes));
     dec.set_transformations(png::Transformations::normalize_to_color8());
     let mut reader = dec.read_info().map_err(|e| format!("not a PNG: {e}"))?;
@@ -133,7 +133,7 @@ fn decode_rgba(bytes: &[u8]) -> Result<(u32, u32, Vec<u8>), String> {
     Ok((w, h, rgba))
 }
 
-fn encode_rgba(px: &[u8], w: u32, h: u32) -> Result<Vec<u8>, String> {
+pub(crate) fn encode_rgba(px: &[u8], w: u32, h: u32) -> Result<Vec<u8>, String> {
     let mut out = Vec::new();
     {
         let mut enc = png::Encoder::new(&mut out, w, h);
@@ -159,22 +159,22 @@ const BOX_ALPHA: f32 = 0.8;
 const CROSSING_LABEL_MIN_CELL: f64 = 64.0;
 
 /// A rectangle in image pixels.
-struct Rect {
-    x: i64,
-    y: i64,
-    w: i64,
-    h: i64,
+pub(crate) struct Rect {
+    pub(crate) x: i64,
+    pub(crate) y: i64,
+    pub(crate) w: i64,
+    pub(crate) h: i64,
 }
 
 /// The pixel buffer being drawn on.
-struct Canvas<'a> {
-    px: &'a mut [u8],
-    w: u32,
-    h: u32,
+pub(crate) struct Canvas<'a> {
+    pub(crate) px: &'a mut [u8],
+    pub(crate) w: u32,
+    pub(crate) h: u32,
 }
 
 impl Canvas<'_> {
-    fn blend(&mut self, x: i64, y: i64, rgb: [u8; 3], alpha: f32) {
+    pub(crate) fn blend(&mut self, x: i64, y: i64, rgb: [u8; 3], alpha: f32) {
         if x < 0 || y < 0 || x >= self.w as i64 || y >= self.h as i64 {
             return;
         }
@@ -186,7 +186,7 @@ impl Canvas<'_> {
         self.px[i + 3] = 255;
     }
 
-    fn fill(&mut self, r: &Rect, rgb: [u8; 3], alpha: f32) {
+    pub(crate) fn fill(&mut self, r: &Rect, rgb: [u8; 3], alpha: f32) {
         for y in r.y..r.y + r.h {
             for x in r.x..r.x + r.w {
                 self.blend(x, y, rgb, alpha);
@@ -197,10 +197,23 @@ impl Canvas<'_> {
     /// Draw `text` in a filled box whose top-left corner is `(x, y)`, pulled
     /// back inside the image when it would overhang the right or bottom edge.
     fn label(&mut self, x: i64, y: i64, text: &str, ts: i64) {
+        self.label_on(x, y, text, ts, [0, 0, 0], BOX_ALPHA);
+    }
+
+    /// As [`Canvas::label`], on a box of the given colour and opacity.
+    pub(crate) fn label_on(
+        &mut self,
+        x: i64,
+        y: i64,
+        text: &str,
+        ts: i64,
+        bg: [u8; 3],
+        bg_alpha: f32,
+    ) {
         let (bw, bh) = label_size(text, ts);
         let x = x.min(self.w as i64 - bw).max(0);
         let y = y.min(self.h as i64 - bh).max(0);
-        self.fill(&Rect { x, y, w: bw, h: bh }, [0, 0, 0], BOX_ALPHA);
+        self.fill(&Rect { x, y, w: bw, h: bh }, bg, bg_alpha);
         for (i, c) in text.chars().enumerate() {
             let gx = x + (1 + i as i64 * 6) * ts;
             let gy = y + ts;
@@ -235,6 +248,8 @@ fn glyph(c: char) -> [u8; 7] {
         '7' => [0x1F, 0x01, 0x02, 0x04, 0x08, 0x08, 0x08],
         '8' => [0x0E, 0x11, 0x11, 0x0E, 0x11, 0x11, 0x0E],
         '9' => [0x0E, 0x11, 0x11, 0x0F, 0x01, 0x02, 0x0C],
+        // The mark prefix of `observe`'s numbered labels (m1, m2...).
+        'm' => [0, 0, 0x1A, 0x15, 0x15, 0x15, 0x15],
         ',' => [0, 0, 0, 0, 0x04, 0x04, 0x08],
         '-' => [0, 0, 0, 0x1F, 0, 0, 0],
         _ => [0; 7],
@@ -242,7 +257,7 @@ fn glyph(c: char) -> [u8; 7] {
 }
 
 /// Size of a label box in pixels for `text` at text scale `ts`.
-fn label_size(text: &str, ts: i64) -> (i64, i64) {
+pub(crate) fn label_size(text: &str, ts: i64) -> (i64, i64) {
     let n = text.chars().count() as i64;
     ((n * 6 - 1 + 2) * ts, (7 + 2) * ts)
 }

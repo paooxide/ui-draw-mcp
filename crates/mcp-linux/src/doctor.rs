@@ -145,6 +145,36 @@ pub async fn doctor(state_dir: &Path) -> Doctor {
         }
     }
 
+    // A locked session discards synthetic input. logind's LockedHint is the
+    // one source every systemd session offers; where it is silent the state
+    // is unknown, which is reported as such and never blocks a call.
+    let hint = async {
+        let conn = zbus::Connection::system().await.ok()?;
+        zbus::Proxy::new(
+            &conn,
+            "org.freedesktop.login1",
+            "/org/freedesktop/login1/session/auto",
+            "org.freedesktop.login1.Session",
+        )
+        .await
+        .ok()?
+        .get_property::<bool>("LockedHint")
+        .await
+        .ok()
+    }
+    .await;
+    let state = mcp_types::ScreenState::from_lock_hints(&[hint]);
+    d.checks.push(Check {
+        name: "screen",
+        ok: !state.blocks_input(),
+        detail: match state {
+            mcp_types::ScreenState::Locked => "locked: key and pointer tools are refused".into(),
+            mcp_types::ScreenState::Ready => "unlocked".into(),
+            _ => "unknown (logind does not report a lock hint here); input is not blocked".into(),
+        },
+        fix: "unlock the screen, or ask the person to",
+    });
+
     let token = state_dir.join("portal-restore-token");
     d.checks.push(Check {
         name: "input approval",

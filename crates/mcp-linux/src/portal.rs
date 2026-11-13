@@ -19,8 +19,8 @@ use std::time::{Duration, Instant};
 
 use ashpd::desktop::remote_desktop::{
     Axis, DeviceType, KeyState, NotifyKeyboardKeysymOptions, NotifyPointerAxisDiscreteOptions,
-    NotifyPointerButtonOptions, NotifyPointerMotionAbsoluteOptions, RemoteDesktop,
-    SelectDevicesOptions, StartOptions,
+    NotifyPointerAxisOptions, NotifyPointerButtonOptions, NotifyPointerMotionAbsoluteOptions,
+    RemoteDesktop, SelectDevicesOptions, StartOptions,
 };
 use ashpd::desktop::screencast::{CursorMode, Screencast, SelectSourcesOptions, SourceType};
 use ashpd::desktop::{CreateSessionOptions, PersistMode, Session};
@@ -440,6 +440,25 @@ impl Portal {
             async move {
                 p.notify_pointer_button(s, code, state, NotifyPointerButtonOptions::default())
                     .await
+            }
+            .boxed()
+        })
+        .await
+    }
+
+    /// Smooth scrolling: `dx`, `dy` in the portal's pixel-like units, with
+    /// `finish` set on the last event of a gesture so the compositor can start
+    /// its own kinetic scroll.
+    pub async fn axis_smooth(&self, dx: f64, dy: f64, finish: bool) -> Result<(), InputError> {
+        self.with(move |p, s, _| {
+            async move {
+                p.notify_pointer_axis(
+                    s,
+                    dx,
+                    dy,
+                    NotifyPointerAxisOptions::default().set_finish(finish),
+                )
+                .await
             }
             .boxed()
         })

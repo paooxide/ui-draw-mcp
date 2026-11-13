@@ -45,6 +45,7 @@ Cheapest first:
 | The shape of a busy app | `get_ui_tree` with `skeleton: true` | then `root: "@eN"` to drill into one container |
 | What changed since last time | `get_ui_tree` with `since: <snapshot_id>` | costs only the delta |
 | A page in the browser | `browser_snapshot` | then `diff: true` on later calls |
+| A desktop window, tree and text in one call | `observe` | the tree with refs, plus, when the tree is sparse, the window's text as attached text or numbered marks (`m1`...) to click with `mouse_action`; passive |
 | A desktop canvas, game or app with no tree | `ocr_region` | returns a clickable box per line of text |
 | Text drawn in a web page (canvas, image UI) | `browser_screenshot` with `find: "text"` | ranked matches with viewport x,y for `browser_act`; `ocr: true` lists every line; no image unless `image: true` |
 | Pixels, as a last resort | `capture_screen` / `browser_screenshot` | image tokens are expensive |
@@ -55,14 +56,32 @@ ones.
 ## Desktop apps
 
 1. `launch` (or `focus_app`) the application. `focus_app` pins the session to it, so later observations
-   and actions target it rather than whatever happens to be in front.
+   and actions target it rather than whatever happens to be in front. To work on an app that stays in the
+   background, pin it with `focus_app` and `activate: false`: that raises nothing, and it is the only form
+   accepted when the operator has set `foreground = "never"`. `list_windows` with `app` lists that app's
+   windows, and a `window_id` means a window of one app, so pass the same `app` with it to `capture_window`
+   or `ocr_region`. Results name the `app` and `pid` they used (`target` says whether it was named, pinned
+   or the frontmost app): check it is the one you meant. A window that is minimised, on another Space or
+   covered by another app's window cannot be captured on macOS and says so; read it with `get_ui_tree`.
 2. `find_elements` for the control, or `get_ui_tree` with `skeleton: true` if you need the layout.
 3. Act semantically: `ui_action` (click, check, select with `option`, expand...) on a `ref`, `set_value`
-   for text fields, `ui_fill_form` for several fields at once, `menu_invoke` for menu commands. These
-   work without moving the cursor and, on Linux, on windows that are not focused.
+   for text fields, `select_text` to select text, `ui_fill_form` for several fields at once,
+   `menu_invoke` for menu commands. These work without moving the cursor and, on Linux, on windows that
+   are not focused. Each input result's `input` says which route acted: `ax` (accessibility, background-
+   safe), `pid_event` (keys sent to a pinned background app without raising it; check `verified`) or `hid`
+   (synthetic input, moved the real cursor or needs the app in front).
 4. Verify in the same call with `expect` (`text`, `gone`, `window`, `focused`) instead of a separate
    observation. Without `expect`, call `wait_for` before observing: input is asynchronous, and observing
-   straight after acting reads the previous state.
+   straight after acting reads the previous state. An action's result also carries `effects` when it
+   saw something change (a sheet or dialog opened, a window appeared or was renamed, focus or the front
+   app moved, a pressed control's value changed): read it before taking another `get_ui_tree`. No
+   `effects` means nothing was seen to change, not that nothing did.
+   Several actions that need no look in between (fill these fields, then press Save) go in one
+   `input_steps` call; it stops at the first failure, every step is checked and logged as if called alone,
+   and a step that opens a dialog belongs last, since the next step's `name` would be resolved too early.
+   To repeat a task a person has shown, `desktop_flow` lists, gets and runs flows they recorded with
+   `desktop_record` (which the operator must enable); `run` re-finds each element and goes through the same
+   checks as the tools it calls, and stops at the first step that fails.
 5. Use `keyboard_type`, `keyboard_shortcut` and coordinate `mouse_action` only when there is no
    semantic route. They go to the frontmost window, so confirm focus first. For a drag, `drag_drop` is one
    call; `mouse_action` `down`, `move`, `up` composes one with pauses or a second button. `scroll` with

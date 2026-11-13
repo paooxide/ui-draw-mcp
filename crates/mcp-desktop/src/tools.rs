@@ -223,8 +223,11 @@ impl ToolModule for DesktopModule {
                 "idle_status",
                 Category::Desktop,
                 Tier::Read,
-                "Seconds since the last human input, whether the screen is locked, and whether \
-                 someone is plausibly present. Check before anything that would interrupt.",
+                "Seconds since the last human input, whether the screen is locked, whether the \
+                 session can receive synthetic input at all (input_state: ok, locked, \
+                 off_console or unknown), and whether someone is plausibly present. Check \
+                 before anything that would interrupt. While the screen is locked, key and \
+                 pointer tools are refused, because the system would discard the events.",
                 json!({"type":"object","properties":{},"required":[]}),
             ),
             ToolDescriptor::new(
