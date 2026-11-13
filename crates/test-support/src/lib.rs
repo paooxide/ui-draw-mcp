@@ -202,7 +202,6 @@ pub fn test_policy(categories: &[Category]) -> PolicyConfig {
     PolicyConfig {
         categories: categories.to_vec(),
         mode: Mode::Autonomous,
-        max_denials: usize::MAX,
         kill_switch_file: dir.join("STOP"),
         audit_dir: dir.join("audit"),
         ..PolicyConfig::default()

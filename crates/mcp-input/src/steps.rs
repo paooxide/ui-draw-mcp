@@ -6,7 +6,7 @@
 //! The hard part is not running the steps, it is not giving anything up by
 //! running them together. `Server::dispatch_call` is the only place that
 //! applies the policy tier, the role's allow and deny lists, consent, the
-//! hard invariants, the denial budget, the kill switch and the audit record,
+//! hard invariants, the kill switch and the audit record,
 //! and it does so for the tool *named in the call*. A batch tool that ran its
 //! inner steps by calling the module directly would be checked once, as the
 //! batch, and a role that denies `keyboard_type` but not `input_steps` would
@@ -144,7 +144,7 @@ pub fn parse_steps(
 ///
 /// Implemented by the composition root over a server that shares this
 /// session's policy, so a step meets the checks a call made on its own would:
-/// tier, role, consent, invariants, kill switch, denial budget and an audit
+/// tier, role, consent, invariants, kill switch and an audit
 /// record of its own.
 #[async_trait]
 pub trait StepDispatch: Send + Sync {

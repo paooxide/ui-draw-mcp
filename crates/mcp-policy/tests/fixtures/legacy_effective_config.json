@@ -1,0 +1,836 @@
+{
+  "autonomous_with_scope_lists": {
+    "effective": {
+      "browser": {
+        "allow_private": false,
+        "allowed_origins": []
+      },
+      "credentials": {
+        "allowed_services": []
+      },
+      "demo": {
+        "enabled": false,
+        "speed": "demo"
+      },
+      "fs": {
+        "roots": [
+          "/tmp/work"
+        ]
+      },
+      "http": {
+        "allowed_origins": [],
+        "enabled": false,
+        "token": "(generated per session)"
+      },
+      "input": {
+        "foreground": "allow",
+        "human_override": true,
+        "human_override_grace_ms": 1500,
+        "human_override_px": 12,
+        "polite_idle_ms": 1500,
+        "polite_max_wait_ms": 15000,
+        "terminal_apps": [
+          "Terminal",
+          "iTerm",
+          "Warp",
+          "Alacritty",
+          "kitty",
+          "Ghostty",
+          "WezTerm",
+          "Hyper",
+          "Tabby",
+          "Code",
+          "Visual Studio Code",
+          "VSCodium",
+          "Cursor",
+          "Windsurf",
+          "Zed",
+          "Sublime Text",
+          "JetBrains",
+          "IntelliJ",
+          "PyCharm",
+          "WebStorm",
+          "RustRover",
+          "Xcode",
+          "Nova",
+          "Emacs"
+        ]
+      },
+      "judge": {
+        "base_url": "https://api.typesafe.ai",
+        "enabled": false,
+        "max_state_bytes": 48000,
+        "model": "jev-latest",
+        "threshold": 0.7,
+        "timeout_ms": 4000
+      },
+      "memory": {
+        "max_recipes": 500,
+        "store": "<AGENTCTL_DIR>/memory.json"
+      },
+      "network": {
+        "allow_private": false,
+        "allowed_hosts": [
+          ".example.com"
+        ]
+      },
+      "packages": {
+        "allow_arbitrary_source": false,
+        "allowed_sources": [],
+        "allowlist": [],
+        "denylist": []
+      },
+      "policy": {
+        "access": null,
+        "allowed_apps": [
+          "Terminal",
+          "Finder",
+          "TextEdit"
+        ],
+        "anonymize": false,
+        "audit_dir": "<AGENTCTL_DIR>/audit",
+        "audit_signing_key": null,
+        "categories": [
+          "vision",
+          "terminal",
+          "filesystem",
+          "network"
+        ],
+        "enable": [
+          "power_control"
+        ],
+        "kill_switch_file": "<AGENTCTL_DIR>/STOP",
+        "max_consent_prompts": 20,
+        "max_denials": 5,
+        "mode": "autonomous"
+      },
+      "terminal": {
+        "allow_shell": false,
+        "allowed_commands": [
+          "git",
+          "ls"
+        ],
+        "allowed_shells": [
+          "/bin/zsh",
+          "/bin/bash",
+          "/bin/sh"
+        ],
+        "max_pty_buffer": 262144,
+        "max_pty_sessions": 4
+      }
+    },
+    "extra": {
+      "active_role": null,
+      "invariants": {
+        "denied_domains": [],
+        "protected_paths": [
+          "/etc/shadow",
+          "/etc/sudoers",
+          "/etc/pam.d",
+          "/System",
+          "/private/etc/master.passwd",
+          "/etc/master.passwd"
+        ]
+      },
+      "role_profile": null,
+      "roles": {}
+    }
+  },
+  "dry_run_rehearsal": {
+    "effective": {
+      "browser": {
+        "allow_private": false,
+        "allowed_origins": []
+      },
+      "credentials": {
+        "allowed_services": []
+      },
+      "demo": {
+        "enabled": false,
+        "speed": "demo"
+      },
+      "fs": {
+        "roots": []
+      },
+      "http": {
+        "allowed_origins": [],
+        "enabled": false,
+        "token": "(generated per session)"
+      },
+      "input": {
+        "foreground": "allow",
+        "human_override": true,
+        "human_override_grace_ms": 1500,
+        "human_override_px": 12,
+        "polite_idle_ms": 1500,
+        "polite_max_wait_ms": 15000,
+        "terminal_apps": [
+          "Terminal",
+          "iTerm",
+          "Warp",
+          "Alacritty",
+          "kitty",
+          "Ghostty",
+          "WezTerm",
+          "Hyper",
+          "Tabby",
+          "Code",
+          "Visual Studio Code",
+          "VSCodium",
+          "Cursor",
+          "Windsurf",
+          "Zed",
+          "Sublime Text",
+          "JetBrains",
+          "IntelliJ",
+          "PyCharm",
+          "WebStorm",
+          "RustRover",
+          "Xcode",
+          "Nova",
+          "Emacs"
+        ]
+      },
+      "judge": {
+        "base_url": "https://api.typesafe.ai",
+        "enabled": false,
+        "max_state_bytes": 48000,
+        "model": "jev-latest",
+        "threshold": 0.7,
+        "timeout_ms": 4000
+      },
+      "memory": {
+        "max_recipes": 500,
+        "store": "<AGENTCTL_DIR>/memory.json"
+      },
+      "network": {
+        "allow_private": false,
+        "allowed_hosts": []
+      },
+      "packages": {
+        "allow_arbitrary_source": false,
+        "allowed_sources": [],
+        "allowlist": [],
+        "denylist": []
+      },
+      "policy": {
+        "access": null,
+        "allowed_apps": [
+          "Terminal",
+          "Finder",
+          "TextEdit"
+        ],
+        "anonymize": false,
+        "audit_dir": "<AGENTCTL_DIR>/audit",
+        "audit_signing_key": null,
+        "categories": [
+          "vision",
+          "browser"
+        ],
+        "enable": [
+          "browser_eval",
+          "browser_cookies"
+        ],
+        "kill_switch_file": "<AGENTCTL_DIR>/STOP",
+        "max_consent_prompts": 20,
+        "max_denials": 5,
+        "mode": "dry_run"
+      },
+      "terminal": {
+        "allow_shell": false,
+        "allowed_commands": [],
+        "allowed_shells": [
+          "/bin/zsh",
+          "/bin/bash",
+          "/bin/sh"
+        ],
+        "max_pty_buffer": 262144,
+        "max_pty_sessions": 4
+      }
+    },
+    "extra": {
+      "active_role": null,
+      "invariants": {
+        "denied_domains": [],
+        "protected_paths": [
+          "/etc/shadow",
+          "/etc/sudoers",
+          "/etc/pam.d",
+          "/System",
+          "/private/etc/master.passwd",
+          "/etc/master.passwd"
+        ]
+      },
+      "role_profile": null,
+      "roles": {}
+    }
+  },
+  "empty": {
+    "effective": {
+      "browser": {
+        "allow_private": false,
+        "allowed_origins": []
+      },
+      "credentials": {
+        "allowed_services": []
+      },
+      "demo": {
+        "enabled": false,
+        "speed": "demo"
+      },
+      "fs": {
+        "roots": []
+      },
+      "http": {
+        "allowed_origins": [],
+        "enabled": false,
+        "token": "(generated per session)"
+      },
+      "input": {
+        "foreground": "allow",
+        "human_override": true,
+        "human_override_grace_ms": 1500,
+        "human_override_px": 12,
+        "polite_idle_ms": 1500,
+        "polite_max_wait_ms": 15000,
+        "terminal_apps": [
+          "Terminal",
+          "iTerm",
+          "Warp",
+          "Alacritty",
+          "kitty",
+          "Ghostty",
+          "WezTerm",
+          "Hyper",
+          "Tabby",
+          "Code",
+          "Visual Studio Code",
+          "VSCodium",
+          "Cursor",
+          "Windsurf",
+          "Zed",
+          "Sublime Text",
+          "JetBrains",
+          "IntelliJ",
+          "PyCharm",
+          "WebStorm",
+          "RustRover",
+          "Xcode",
+          "Nova",
+          "Emacs"
+        ]
+      },
+      "judge": {
+        "base_url": "https://api.typesafe.ai",
+        "enabled": false,
+        "max_state_bytes": 48000,
+        "model": "jev-latest",
+        "threshold": 0.7,
+        "timeout_ms": 4000
+      },
+      "memory": {
+        "max_recipes": 500,
+        "store": "<AGENTCTL_DIR>/memory.json"
+      },
+      "network": {
+        "allow_private": false,
+        "allowed_hosts": []
+      },
+      "packages": {
+        "allow_arbitrary_source": false,
+        "allowed_sources": [],
+        "allowlist": [],
+        "denylist": []
+      },
+      "policy": {
+        "access": null,
+        "allowed_apps": [
+          "Terminal",
+          "Finder",
+          "TextEdit"
+        ],
+        "anonymize": false,
+        "audit_dir": "<AGENTCTL_DIR>/audit",
+        "audit_signing_key": null,
+        "categories": [
+          "vision",
+          "input",
+          "window"
+        ],
+        "enable": [],
+        "kill_switch_file": "<AGENTCTL_DIR>/STOP",
+        "max_consent_prompts": 20,
+        "max_denials": 5,
+        "mode": "interactive"
+      },
+      "terminal": {
+        "allow_shell": false,
+        "allowed_commands": [],
+        "allowed_shells": [
+          "/bin/zsh",
+          "/bin/bash",
+          "/bin/sh"
+        ],
+        "max_pty_buffer": 262144,
+        "max_pty_sessions": 4
+      }
+    },
+    "extra": {
+      "active_role": null,
+      "invariants": {
+        "denied_domains": [],
+        "protected_paths": [
+          "/etc/shadow",
+          "/etc/sudoers",
+          "/etc/pam.d",
+          "/System",
+          "/private/etc/master.passwd",
+          "/etc/master.passwd"
+        ]
+      },
+      "role_profile": null,
+      "roles": {}
+    }
+  },
+  "kitchen_sink": {
+    "effective": {
+      "browser": {
+        "allow_private": true,
+        "allowed_origins": [
+          "https://ok.example"
+        ]
+      },
+      "credentials": {
+        "allowed_services": []
+      },
+      "demo": {
+        "enabled": true,
+        "speed": "cinematic"
+      },
+      "fs": {
+        "roots": []
+      },
+      "http": {
+        "allowed_origins": [],
+        "enabled": true,
+        "token": "‹redacted:len=12›"
+      },
+      "input": {
+        "foreground": "polite",
+        "human_override": false,
+        "human_override_grace_ms": 1500,
+        "human_override_px": 12,
+        "polite_idle_ms": 900,
+        "polite_max_wait_ms": 15000,
+        "terminal_apps": [
+          "Terminal",
+          "iTerm",
+          "Warp",
+          "Alacritty",
+          "kitty",
+          "Ghostty",
+          "WezTerm",
+          "Hyper",
+          "Tabby",
+          "Code",
+          "Visual Studio Code",
+          "VSCodium",
+          "Cursor",
+          "Windsurf",
+          "Zed",
+          "Sublime Text",
+          "JetBrains",
+          "IntelliJ",
+          "PyCharm",
+          "WebStorm",
+          "RustRover",
+          "Xcode",
+          "Nova",
+          "Emacs"
+        ]
+      },
+      "judge": {
+        "base_url": "https://api.typesafe.ai",
+        "enabled": false,
+        "max_state_bytes": 48000,
+        "model": "jev-latest",
+        "threshold": 0.6,
+        "timeout_ms": 4000
+      },
+      "memory": {
+        "max_recipes": 12,
+        "store": "<AGENTCTL_DIR>/memory.json"
+      },
+      "network": {
+        "allow_private": false,
+        "allowed_hosts": []
+      },
+      "packages": {
+        "allow_arbitrary_source": false,
+        "allowed_sources": [
+          "brew"
+        ],
+        "allowlist": [
+          "jq"
+        ],
+        "denylist": []
+      },
+      "policy": {
+        "access": null,
+        "allowed_apps": [
+          "Terminal",
+          "Finder",
+          "TextEdit"
+        ],
+        "anonymize": false,
+        "audit_dir": "/tmp/audit",
+        "audit_signing_key": null,
+        "categories": [
+          "vision",
+          "input",
+          "window",
+          "browser",
+          "system",
+          "desktop"
+        ],
+        "enable": [],
+        "kill_switch_file": "/tmp/STOP",
+        "max_consent_prompts": 20,
+        "max_denials": 5,
+        "mode": "autonomous"
+      },
+      "terminal": {
+        "allow_shell": false,
+        "allowed_commands": [],
+        "allowed_shells": [
+          "/bin/zsh",
+          "/bin/bash",
+          "/bin/sh"
+        ],
+        "max_pty_buffer": 262144,
+        "max_pty_sessions": 4
+      }
+    },
+    "extra": {
+      "active_role": "readonly",
+      "invariants": {
+        "denied_domains": [
+          "evil.example"
+        ],
+        "protected_paths": [
+          "/etc/shadow",
+          "/etc/sudoers",
+          "/etc/pam.d",
+          "/System",
+          "/private/etc/master.passwd",
+          "/etc/master.passwd"
+        ]
+      },
+      "role_profile": {
+        "allowed_tiers": [
+          "read"
+        ],
+        "denied_categories": [
+          "terminal",
+          "credentials",
+          "memory"
+        ],
+        "denied_tools": [
+          "browser_act",
+          "browser_fill_form",
+          "browser_upload",
+          "browser_eval",
+          "ui_action",
+          "ui_fill_form",
+          "keyboard_type",
+          "keyboard_shortcut",
+          "mouse_action",
+          "drag_drop",
+          "set_value"
+        ],
+        "description": "Read-only inspection and monitoring (no state mutation or OS execution)",
+        "max_denials": 5,
+        "name": "readonly"
+      },
+      "roles": {}
+    }
+  },
+  "older_spellings": {
+    "effective": {
+      "browser": {
+        "allow_private": false,
+        "allowed_origins": []
+      },
+      "credentials": {
+        "allowed_services": []
+      },
+      "demo": {
+        "enabled": true,
+        "speed": "snappy"
+      },
+      "fs": {
+        "roots": []
+      },
+      "http": {
+        "allowed_origins": [],
+        "enabled": false,
+        "token": "(generated per session)"
+      },
+      "input": {
+        "foreground": "allow",
+        "human_override": true,
+        "human_override_grace_ms": 1500,
+        "human_override_px": 12,
+        "polite_idle_ms": 1500,
+        "polite_max_wait_ms": 15000,
+        "terminal_apps": [
+          "Terminal",
+          "iTerm",
+          "Warp",
+          "Alacritty",
+          "kitty",
+          "Ghostty",
+          "WezTerm",
+          "Hyper",
+          "Tabby",
+          "Code",
+          "Visual Studio Code",
+          "VSCodium",
+          "Cursor",
+          "Windsurf",
+          "Zed",
+          "Sublime Text",
+          "JetBrains",
+          "IntelliJ",
+          "PyCharm",
+          "WebStorm",
+          "RustRover",
+          "Xcode",
+          "Nova",
+          "Emacs"
+        ]
+      },
+      "judge": {
+        "base_url": "https://api.typesafe.ai",
+        "enabled": false,
+        "max_state_bytes": 48000,
+        "model": "jev-latest",
+        "threshold": 0.7,
+        "timeout_ms": 4000
+      },
+      "memory": {
+        "max_recipes": 500,
+        "store": "<AGENTCTL_DIR>/memory.json"
+      },
+      "network": {
+        "allow_private": false,
+        "allowed_hosts": []
+      },
+      "packages": {
+        "allow_arbitrary_source": false,
+        "allowed_sources": [],
+        "allowlist": [],
+        "denylist": []
+      },
+      "policy": {
+        "access": null,
+        "allowed_apps": [
+          "Terminal",
+          "Finder",
+          "TextEdit"
+        ],
+        "anonymize": false,
+        "audit_dir": "<AGENTCTL_DIR>/audit",
+        "audit_signing_key": null,
+        "categories": [
+          "vision",
+          "browser"
+        ],
+        "enable": [],
+        "kill_switch_file": "<AGENTCTL_DIR>/STOP",
+        "max_consent_prompts": 20,
+        "max_denials": 4,
+        "mode": "interactive"
+      },
+      "terminal": {
+        "allow_shell": false,
+        "allowed_commands": [],
+        "allowed_shells": [
+          "/bin/zsh",
+          "/bin/bash",
+          "/bin/sh"
+        ],
+        "max_pty_buffer": 262144,
+        "max_pty_sessions": 4
+      }
+    },
+    "extra": {
+      "active_role": "operator",
+      "invariants": {
+        "denied_domains": [
+          "pastebin.com"
+        ],
+        "protected_paths": [
+          "/etc/shadow",
+          "/Users/x/.ssh"
+        ]
+      },
+      "role_profile": {
+        "description": "Standard human-in-the-loop operator (dangerous actions require consent)",
+        "name": "operator",
+        "require_consent_for_tiers": [
+          "dangerous"
+        ]
+      },
+      "roles": {
+        "custom": {
+          "allowed_categories": [
+            "browser"
+          ],
+          "denied_tools": [
+            "browser_eval"
+          ],
+          "description": "mine",
+          "max_denials": 2,
+          "name": "custom",
+          "require_consent_for_tiers": [
+            "standard"
+          ],
+          "require_consent_for_tools": [
+            "browser_cookies"
+          ]
+        }
+      }
+    }
+  },
+  "typical_interactive": {
+    "effective": {
+      "browser": {
+        "allow_private": false,
+        "allowed_origins": []
+      },
+      "credentials": {
+        "allowed_services": []
+      },
+      "demo": {
+        "enabled": false,
+        "speed": "demo"
+      },
+      "fs": {
+        "roots": []
+      },
+      "http": {
+        "allowed_origins": [],
+        "enabled": false,
+        "token": "(generated per session)"
+      },
+      "input": {
+        "foreground": "allow",
+        "human_override": true,
+        "human_override_grace_ms": 1500,
+        "human_override_px": 12,
+        "polite_idle_ms": 1500,
+        "polite_max_wait_ms": 15000,
+        "terminal_apps": [
+          "Terminal",
+          "iTerm",
+          "Warp",
+          "Alacritty",
+          "kitty",
+          "Ghostty",
+          "WezTerm",
+          "Hyper",
+          "Tabby",
+          "Code",
+          "Visual Studio Code",
+          "VSCodium",
+          "Cursor",
+          "Windsurf",
+          "Zed",
+          "Sublime Text",
+          "JetBrains",
+          "IntelliJ",
+          "PyCharm",
+          "WebStorm",
+          "RustRover",
+          "Xcode",
+          "Nova",
+          "Emacs"
+        ]
+      },
+      "judge": {
+        "base_url": "https://api.typesafe.ai",
+        "enabled": false,
+        "max_state_bytes": 48000,
+        "model": "jev-latest",
+        "threshold": 0.7,
+        "timeout_ms": 4000
+      },
+      "memory": {
+        "max_recipes": 500,
+        "store": "<AGENTCTL_DIR>/memory.json"
+      },
+      "network": {
+        "allow_private": false,
+        "allowed_hosts": []
+      },
+      "packages": {
+        "allow_arbitrary_source": false,
+        "allowed_sources": [],
+        "allowlist": [],
+        "denylist": []
+      },
+      "policy": {
+        "access": null,
+        "allowed_apps": [
+          "TextEdit",
+          "Finder"
+        ],
+        "anonymize": true,
+        "audit_dir": "<AGENTCTL_DIR>/audit",
+        "audit_signing_key": null,
+        "categories": [
+          "vision",
+          "input",
+          "window",
+          "browser",
+          "system"
+        ],
+        "enable": [
+          "browser_eval"
+        ],
+        "kill_switch_file": "<AGENTCTL_DIR>/STOP",
+        "max_consent_prompts": 7,
+        "max_denials": 3,
+        "mode": "interactive"
+      },
+      "terminal": {
+        "allow_shell": false,
+        "allowed_commands": [],
+        "allowed_shells": [
+          "/bin/zsh",
+          "/bin/bash",
+          "/bin/sh"
+        ],
+        "max_pty_buffer": 262144,
+        "max_pty_sessions": 4
+      }
+    },
+    "extra": {
+      "active_role": null,
+      "invariants": {
+        "denied_domains": [],
+        "protected_paths": [
+          "/etc/shadow",
+          "/etc/sudoers",
+          "/etc/pam.d",
+          "/System",
+          "/private/etc/master.passwd",
+          "/etc/master.passwd"
+        ]
+      },
+      "role_profile": null,
+      "roles": {}
+    }
+  }
+}

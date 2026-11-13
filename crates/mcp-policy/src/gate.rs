@@ -1,15 +1,12 @@
 use mcp_types::{Category, Envelope, ErrorCode, Tier, ToolDescriptor};
 use serde_json::Value;
 
-use crate::{
-    AuditRecord, AuditSink, Decision, DenialBudget, KillSwitch, Mode, PolicyConfig, Redactor,
-};
+use crate::{AuditRecord, AuditSink, Decision, KillSwitch, Mode, PolicyConfig, Redactor};
 
-/// The policy kernel: ties config, denial budget, kill switch, audit sink, and
-/// redactor into the single object `mcp-core::dispatch` consults.
+/// The policy kernel: ties config, kill switch, audit sink, and redactor into
+/// the single object `mcp-core::dispatch` consults.
 pub struct Policy {
     config: PolicyConfig,
-    budget: DenialBudget,
     kill: KillSwitch,
     audit: AuditSink,
     redactor: Redactor,
@@ -19,30 +16,14 @@ pub struct Policy {
     anonymizer: std::sync::Mutex<crate::SessionAnonymizer>,
 }
 
-/// The stricter of two denial budgets, where 0 means no limit.
-fn tighter_budget(a: usize, b: usize) -> usize {
-    match (a, b) {
-        (0, x) | (x, 0) => x,
-        (x, y) => x.min(y),
-    }
-}
-
 impl Policy {
     pub fn new(config: PolicyConfig, audit: AuditSink, redactor: Redactor) -> Self {
-        // A role may tighten the operator's denial budget, never loosen or
-        // disable it (0 means no limit).
-        let effective_max_denials = match config.active_role_profile().and_then(|r| r.max_denials) {
-            Some(role) => tighter_budget(config.max_denials, role),
-            None => config.max_denials,
-        };
-        let budget = DenialBudget::new(effective_max_denials);
         let config_max_prompts = config.max_consent_prompts;
         let kill = KillSwitch::new(config.kill_switch_file.clone());
         let prompts = crate::PromptBudget::new(config_max_prompts);
         let anonymize_enabled = config.anonymize;
         Policy {
             config,
-            budget,
             kill,
             audit,
             redactor,
@@ -258,15 +239,6 @@ impl Policy {
 
     pub fn is_dry_run(&self) -> bool {
         matches!(self.config.mode, Mode::DryRun)
-    }
-
-    /// Record a denial against the anti-spin budget; returns `true` if exhausted.
-    pub fn record_denial(&self) -> bool {
-        self.budget.record()
-    }
-
-    pub fn denial_count(&self) -> usize {
-        self.budget.count()
     }
 
     /// Mark a result as carrying content from outside the trust boundary.

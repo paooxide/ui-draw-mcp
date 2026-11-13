@@ -121,7 +121,6 @@ mcp-policy/src/
   allowlist.rs     # apps, fs_roots/deny, http hosts (SSRF), browser origins
   destructive.rs   # typed/clipboard/pty/exec-argv denylist (configurable regex)
   consent.rs       # channel trait (stdin baseline; notification/TUI pluggable)
-  budget.rs        # denial budget (atomic)
   killswitch.rs    # STOP-file poll + optional hotkey; cancellation token source
   audit.rs         # append-only JSONL sink, rotation, pre/post records
   redact.rs        # central secret redactor + secret-field registry
@@ -227,7 +226,6 @@ so an engine cannot re-decide or skip it.
   - **Session registries** (browser targets; pty later): `DashMap`/`Mutex<HashMap>` keyed by id; create/close
     are atomic; every use re-looks-up the id (no cached handle) so a concurrent close yields `NOT_FOUND`, never
     a use-after-free.
-  - **Denial budget**: `AtomicUsize`; incremented on each deny; compared under a single fetch to avoid TOCTOU.
   - **Audit sink**: single writer task behind an `mpsc` channel; callers send records, the task serializes
     writes → no interleaving/corruption under concurrency, total order preserved.
   - **Kill switch**: one `CancellationToken`; a poller task trips it; all in-flight tasks observe it via
@@ -237,7 +235,7 @@ so an engine cannot re-decide or skip it.
 - **Cancellation safety:** engines must be cancellation-safe: a dropped future must not leave a spawned child
   process, an open AX observer, or a half-written file. Each engine documents its cleanup (Drop guards).
 - **Backpressure / DoS bounds:** per-call timeout, output/screenshot/tree size caps, max concurrent
-  sessions, denial budget, and (http transport later) request rate limits.
+  sessions, and (http transport later) request rate limits.
 
 Concurrency is validated with `loom` (lock-based state) and `tokio` cancellation tests (see test-plan §2).
 
@@ -261,7 +259,7 @@ OWASP Top 10 for LLM Applications apply. Mapping of concern → guidance → con
 | Error handling | ASVS V7 · **LLM02** | fail-closed; stable `ErrorCode`; `INTERNAL` never leaks internals to the agent | `core/error.rs`, `mcp-types/envelope.rs` |
 | Secure defaults / misconfig | **A05** · ASVS V14 | minimal default categories (`vision,input,window`); dangerous off; stdout is protocol-only; secrets never in stdout | `agentctl/{config,wire}.rs` |
 | Supply chain | **A06/A08** · SLSA | pinned deps; `cargo deny` (licenses/advisories) + `cargo audit` in CI; VERIFY each crate | CI (X-B2), `deny.toml` |
-| Resource exhaustion / DoS | A04 Insecure Design · **LLM04** | timeouts, size caps, max sessions, denial budget, kill switch | `mcp-policy/*`, `core/dispatch.rs` |
+| Resource exhaustion / DoS | A04 Insecure Design · **LLM04** | timeouts, size caps, max sessions, kill switch | `mcp-policy/*`, `core/dispatch.rs` |
 | Human-in-the-loop for high impact | **LLM08 Excessive Agency** | interactive consent on `NeedConsent`; agent cannot self-answer; per-call reason | `mcp-policy/consent.rs` |
 | Authentication (remote transport) | A07 · ASVS V2/V13 | stdio has no network surface; http transport (later) requires bearer/mTLS, off by default | `core/transport/*` (P10) |
 

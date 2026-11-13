@@ -17,22 +17,11 @@ async fn main() -> std::io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let force_http = args.iter().any(|a| a == "--http");
 
-    let mut cmd = None;
-    let mut i = 1;
-    while i < args.len() {
-        let a = &args[i];
-        if a == "--role" || a == "--demo-speed" {
-            i += 2;
-            continue;
-        }
-        if a.starts_with("--") || a == "-h" {
-            i += 1;
-            continue;
-        }
-        cmd = Some(a.as_str());
-        break;
-    }
-    let cmd = cmd.unwrap_or_else(|| {
+    let cli = parse_cli(&args).unwrap_or_else(|e| {
+        eprintln!("agentctl: {e}");
+        std::process::exit(2);
+    });
+    let cmd = cli.command.as_deref().unwrap_or_else(|| {
         if args.iter().any(|a| a == "--help" || a == "-h") {
             "help"
         } else if args.iter().any(|a| a == "--version" || a == "-V") {
@@ -106,41 +95,136 @@ fn init_tracing() {
         .ok();
 }
 
+/// Every command name, so that a flag which takes a value cannot swallow one.
+const COMMANDS: &[&str] = &[
+    "serve",
+    "version",
+    "doctor",
+    "tools",
+    "bridge",
+    "test",
+    "record",
+    "transcript",
+    "audit",
+    "config",
+    "help",
+];
+
+/// What the command line says, parsed without reading the environment or the
+/// config, so the rules are testable as a function.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Cli {
+    /// The first argument that is not a flag or a flag's value.
+    command: Option<String>,
+    role: Option<String>,
+    /// As typed; checked by [`demo_speed_from_args`].
+    demo_speed: Option<String>,
+    access: Option<mcp_policy::Access>,
+    anonymize: Option<bool>,
+    demo: Option<bool>,
+    dry_run: bool,
+}
+
+/// What a flag that takes a value expects, for the error that says it is missing.
+fn value_hint(flag: &str) -> String {
+    match flag {
+        "--role" => "a role name, e.g. --role readonly".to_string(),
+        "--access" => "ask, auto or bypass".to_string(),
+        _ => format!("one of: {}", mcp_policy::DEMO_SPEEDS.join(", ")),
+    }
+}
+
+/// Parse the flags agentctl itself reads (`--role`, `--demo-speed`,
+/// `--access` take a value; the rest are switches) and find the command.
+///
+/// A flag that takes a value takes the next argument, or `--flag=value`. It
+/// never takes a flag or a command name: `agentctl --role serve` used to make
+/// `serve` the role and run the default command, and a missing value used to be
+/// skipped over. Both are errors now. Later flags win, as they always did.
+fn parse_cli(args: &[String]) -> Result<Cli, String> {
+    const VALUE_FLAGS: [&str; 3] = ["--role", "--demo-speed", "--access"];
+    let mut cli = Cli::default();
+    let mut i = 1;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        let (flag, inline) = match arg.split_once('=') {
+            Some((f, v)) if VALUE_FLAGS.contains(&f) => (f, Some(v)),
+            _ => (arg, None),
+        };
+        if VALUE_FLAGS.contains(&flag) {
+            let value = match inline {
+                Some(v) => v,
+                None => match args.get(i + 1).map(String::as_str) {
+                    Some(next) if COMMANDS.contains(&next) => {
+                        return Err(format!(
+                            "{flag} needs a value, but the next argument is the command \
+                             '{next}'; write {flag}={next} if that is really the value"
+                        ));
+                    }
+                    Some(next) if !next.starts_with('-') => {
+                        i += 1;
+                        next
+                    }
+                    _ => return Err(format!("{flag} needs a value: {}", value_hint(flag))),
+                },
+            };
+            if value.trim().is_empty() {
+                return Err(format!("{flag} needs a value: {}", value_hint(flag)));
+            }
+            match flag {
+                "--role" => cli.role = Some(value.to_string()),
+                "--demo-speed" => cli.demo_speed = Some(value.to_string()),
+                _ => {
+                    cli.access = Some(mcp_policy::Access::parse(value.trim()).ok_or_else(|| {
+                        format!("--access: unknown level '{value}' (expected ask, auto or bypass)")
+                    })?)
+                }
+            }
+        } else if arg == "--no-anonymize" || arg == "--no-pii" {
+            cli.anonymize = Some(false);
+        } else if arg == "--anonymize" {
+            cli.anonymize = Some(true);
+        } else if arg == "--demo" {
+            cli.demo = Some(true);
+        } else if arg == "--no-demo" {
+            cli.demo = Some(false);
+        } else if arg == "--dry-run" {
+            cli.dry_run = true;
+        } else if !(arg.starts_with("--") || arg == "-h") && cli.command.is_none() {
+            cli.command = Some(arg.to_string());
+        }
+        i += 1;
+    }
+    Ok(cli)
+}
+
 /// Build the policy config: secure defaults, layered with `config.toml` when
-/// present (`$AGENTCTL_CONFIG`, else `~/.agentctl/config.toml`).
+/// present (`$AGENTCTL_CONFIG`, else `~/.agentctl/config.toml`), then the
+/// command line.
 ///
 /// A config file that exists but does not parse is a hard error — falling back
 /// to defaults would silently *widen* a stricter operator policy.
 fn build_config() -> Result<PolicyConfig, String> {
+    let raw_args: Vec<String> = std::env::args().collect();
+    let cli = parse_cli(&raw_args)?;
     let user_supplied = mcp_policy::config_path().exists();
-    let mut cfg = PolicyConfig::load()?;
+    let mut cfg = PolicyConfig::load_with(cli.access, cli.dry_run)?;
     if !user_supplied {
         // Skeleton defaults: diagnostics plus the browser engine. Its
         // eval/cookies/network tools stay Dangerous-tier and consent-gated.
-        cfg.categories.push(Category::System);
-        cfg.categories.push(Category::Browser);
-    }
-    // Command-line flag overrides for PII/PHI anonymization and active role
-    let mut role_cli: Option<String> = None;
-    let raw_args: Vec<String> = std::env::args().collect();
-    let mut i = 0;
-    while i < raw_args.len() {
-        let arg = &raw_args[i];
-        if arg == "--no-anonymize" || arg == "--no-pii" {
-            cfg.anonymize = false;
-        } else if arg == "--anonymize" {
-            cfg.anonymize = true;
-        } else if arg == "--demo" {
-            cfg.demo = true;
-        } else if arg == "--no-demo" {
-            cfg.demo = false;
-        } else if arg == "--role" && i + 1 < raw_args.len() {
-            role_cli = Some(raw_args[i + 1].clone());
-            i += 1;
-        } else if let Some(stripped) = arg.strip_prefix("--role=") {
-            role_cli = Some(stripped.to_string());
+        // (An `access` level from a flag has every category on already.)
+        for c in [Category::System, Category::Browser] {
+            if !cfg.categories.contains(&c) {
+                cfg.categories.push(c);
+            }
         }
-        i += 1;
+    }
+    // Command-line flag overrides for PII/PHI anonymization and demo mode.
+    if let Some(on) = cli.anonymize {
+        cfg.anonymize = on;
+    }
+    if let Some(on) = cli.demo {
+        cfg.demo = on;
     }
 
     // Validated like the config and environment paths are: a typo must not
@@ -150,8 +234,8 @@ fn build_config() -> Result<PolicyConfig, String> {
         cfg.demo = true;
     }
 
-    // Role precedence: CLI flag > AGENTCTL_ROLE env var > config default_role
-    if let Some(r) = role_cli {
+    // Role precedence: CLI flag > AGENTCTL_ROLE env var > config role
+    if let Some(r) = cli.role {
         cfg.active_role = Some(r);
     } else if let Ok(env_r) = std::env::var("AGENTCTL_ROLE") {
         let trimmed = env_r.trim();
@@ -164,9 +248,16 @@ fn build_config() -> Result<PolicyConfig, String> {
     if let Some(ref role_name) = cfg.active_role {
         if cfg.get_role(role_name).is_none() {
             return Err(format!(
-                "unknown role '{role_name}'. Available built-in roles: readonly (or auditor), qa (or tester), browser, browser-core, operator, admin; or define custom roles in config.toml under [roles.<name>]"
+                "unknown role '{role_name}'. Available built-in roles: readonly, qa, browser, browser-core; or define custom roles in config.toml under [roles.<name>]"
             ));
         }
+    }
+    // A role name that still works but is no longer documented: say what
+    // replaces it. Asked of the final value, since a flag or the environment
+    // may have chosen it.
+    if let Some(warning) = cfg.deprecated_role_note() {
+        tracing::warn!("{warning}");
+        cfg.notes.warnings.push(warning);
     }
 
     Ok(cfg)
@@ -177,34 +268,19 @@ fn build_config() -> Result<PolicyConfig, String> {
 /// glide engine knows. An unknown or missing value is a usage error naming the
 /// accepted ones.
 fn demo_speed_from_args(args: &[String]) -> Result<Option<String>, String> {
-    let mut found = None;
-    let mut i = 0;
-    while i < args.len() {
-        let raw = if args[i] == "--demo-speed" {
-            i += 1;
-            match args.get(i) {
-                Some(v) => v.as_str(),
-                None => "",
-            }
-        } else if let Some(v) = args[i].strip_prefix("--demo-speed=") {
-            v
-        } else {
-            i += 1;
-            continue;
-        };
-        i += 1;
-        let v = raw.trim().to_ascii_lowercase();
-        let known = mcp_policy::DEMO_SPEEDS.contains(&v.as_str())
-            && mcp_input::GlidePreset::from_speed(&v).is_some();
-        if !known {
-            return Err(format!(
-                "--demo-speed: unknown value '{raw}' (expected one of: {})",
-                mcp_policy::DEMO_SPEEDS.join(", ")
-            ));
-        }
-        found = Some(v);
+    let Some(raw) = parse_cli(args)?.demo_speed else {
+        return Ok(None);
+    };
+    let v = raw.trim().to_ascii_lowercase();
+    let known = mcp_policy::DEMO_SPEEDS.contains(&v.as_str())
+        && mcp_input::GlidePreset::from_speed(&v).is_some();
+    if !known {
+        return Err(format!(
+            "--demo-speed: unknown value '{raw}' (expected one of: {})",
+            mcp_policy::DEMO_SPEEDS.join(", ")
+        ));
     }
-    Ok(found)
+    Ok(Some(v))
 }
 
 /// Load config or exit with a clear message (fail-closed).
@@ -1469,6 +1545,84 @@ fn print_audit_help() {
     );
 }
 
+/// The policy in the three ideas the docs use, one line each, for `doctor`:
+/// the access level and where it came from, what the session may touch, and the
+/// stops that hold whatever the level. `dry run` is added when it is on.
+fn policy_summary(cfg: &mcp_policy::PolicyConfig) -> Vec<String> {
+    let access = match cfg.access {
+        Some(a) => format!(
+            "access:          {} ({}): {}",
+            a.as_str(),
+            cfg.notes.access_source.describe(),
+            a.describe()
+        ),
+        None => "access:          not set (default): categories, enable and mode decide; \
+                 set access = \"ask\", \"auto\" or \"bypass\" to use the three levels"
+            .to_string(),
+    };
+    let apps = if cfg.allowed_apps.is_empty() {
+        "apps none".to_string()
+    } else {
+        format!("apps {}", cfg.allowed_apps.join("/"))
+    };
+    // An empty browser allowlist means any public origin, not none, so say so.
+    let origins = if cfg.allowed_origins.is_empty() {
+        "any public".to_string()
+    } else {
+        cfg.allowed_origins.len().to_string()
+    };
+    let scope = format!(
+        "scope:           {} categories, {apps}, fs roots {}, commands {}, hosts {}, \
+         browser origins {origins}",
+        cfg.categories.len(),
+        cfg.fs_roots.len(),
+        cfg.allowed_commands.len(),
+        cfg.allowed_hosts.len(),
+    );
+    let stops = format!(
+        "stops:           kill switch {}, human override {}, foreground {}",
+        cfg.kill_switch_file.display(),
+        if cfg.human_override { "on" } else { "off" },
+        cfg.foreground.as_str(),
+    );
+    let mut lines = vec![access, scope, stops];
+    if cfg.mode == mcp_policy::Mode::DryRun {
+        lines.push(
+            "dry run:         on (reads run; anything that would change something is only reported)"
+                .to_string(),
+        );
+    }
+    lines
+}
+
+/// What loading the config found worth saying, for `doctor`: keys nothing
+/// reads (with the nearest known key) and settings that are older spellings or
+/// do nothing. The same notes were logged at startup.
+fn config_notes_lines(cfg: &mcp_policy::PolicyConfig) -> Vec<String> {
+    let mut lines = Vec::new();
+    if cfg.notes.unknown_keys.is_empty() {
+        lines.push("ignored keys:    none".to_string());
+    } else {
+        let keys: Vec<String> = cfg
+            .notes
+            .unknown_keys
+            .iter()
+            .map(|u| match &u.suggestion {
+                Some(s) => format!("{} (did you mean {s}?)", u.key),
+                None => u.key.clone(),
+            })
+            .collect();
+        lines.push(format!("ignored keys:    {}", keys.join(", ")));
+    }
+    if cfg.notes.warnings.is_empty() {
+        lines.push("config warnings: none".to_string());
+    } else {
+        lines.push("config warnings:".to_string());
+        lines.extend(cfg.notes.warnings.iter().map(|w| format!("  - {w}")));
+    }
+    lines
+}
+
 /// What `foreground` means for this session, in one line for `doctor`.
 fn foreground_summary(cfg: &mcp_policy::PolicyConfig) -> String {
     match cfg.foreground {
@@ -1540,6 +1694,9 @@ fn pid_alive(pid: u32) -> bool {
 fn doctor() {
     let cfg = config_or_exit();
     println!("agentctl doctor");
+    for line in policy_summary(&cfg) {
+        println!("  {line}");
+    }
     println!("  os:              {}", std::env::consts::OS);
     println!("  protocol:        {PROTOCOL_VERSION}");
     println!(
@@ -1581,18 +1738,6 @@ fn doctor() {
         "  screen:          {}",
         screen_summary(mcp_macos::screen_state())
     );
-    match cfg.access {
-        Some(a) => println!(
-            "  access profile:  {} (all categories on; {})",
-            a.as_str(),
-            match a {
-                mcp_policy::Access::Ask => "dangerous actions ask you",
-                mcp_policy::Access::Auto => "no prompts; destructive actions refused",
-                mcp_policy::Access::Bypass => "no prompts; destructive gate OFF",
-            }
-        ),
-        None => println!("  access profile:  none (granular categories/enable)"),
-    }
     println!(
         "  active role:     {} (RBAC profile)",
         cfg.active_role
@@ -1623,6 +1768,9 @@ fn doctor() {
     );
     if cfg.http_enabled && cfg.http_token.is_empty() {
         println!("    -> no http.token set; one is generated per run and printed to stderr");
+    }
+    for line in config_notes_lines(&cfg) {
+        println!("  {line}");
     }
     print_permissions();
     #[cfg(target_os = "macos")]
@@ -1756,12 +1904,14 @@ fn config_print() {
     println!("categories = [{}]", slugs(&cfg));
     println!("enable = {:?}", cfg.enable);
     println!("mode = {}", cfg.mode.as_str());
+    if let Some(a) = cfg.access {
+        println!("access = {:?}", a.as_str());
+    }
     println!("anonymize = {}", cfg.anonymize);
     if let Some(r) = &cfg.active_role {
         println!("active_role = {:?}", r);
     }
     println!("allowed_apps = {:?}", cfg.allowed_apps);
-    println!("max_denials = {}", cfg.max_denials);
     println!("max_consent_prompts = {}", cfg.max_consent_prompts);
     println!("kill_switch_file = {:?}", cfg.kill_switch_file);
     println!("audit_dir = {:?}", cfg.audit_dir);
@@ -1799,7 +1949,10 @@ fn print_help() {
          \x20   help             Show this help\n\
          \n\
          OPTIONS:\n\
-         \x20   --role <ROLE>         Set active RBAC role profile (readonly, qa, browser, browser-core, operator, admin)\n\
+         \x20   --access <LEVEL>      Permission level: ask, auto or bypass. Over a config file that sets access it can only\n\
+         \x20                         move toward ask; bypass needs the flag or the file, not just AGENTCTL_ACCESS\n\
+         \x20   --dry-run             Rehearse: reads run, anything that would change something is only reported\n\
+         \x20   --role <ROLE>         Narrow the session with a role preset (readonly, qa, browser, browser-core)\n\
          \x20   --no-anonymize        Disable outbound/inbound PII/PHI tokenization\n\
          \x20   --no-pii              Alias for --no-anonymize\n\
          \x20   --anonymize           Explicitly enable PII/PHI tokenization (default: enabled)\n\
@@ -1889,6 +2042,220 @@ mod test_cmd_tests {
             assert!(e.contains("--demo-speed"), "{e}");
             for name in mcp_policy::DEMO_SPEEDS {
                 assert!(e.contains(name), "'{name}' missing from: {e}");
+            }
+        }
+    }
+
+    /// A flag that takes a value takes the next argument or `--flag=value`,
+    /// never a command name or another flag, and a missing value is an error.
+    /// `agentctl --role serve` used to run the default command with a role
+    /// named `serve`.
+    #[test]
+    fn value_flags_never_swallow_a_command_and_a_missing_value_is_an_error() {
+        let cli = |v: &[&str]| parse_cli(&s(v));
+        let access = |l| Cli {
+            access: Some(l),
+            ..Cli::default()
+        };
+        // Values taken, in both spellings, before or after the command.
+        for flag in ["--role", "--demo-speed", "--access"] {
+            let value = match flag {
+                "--role" => "qa",
+                "--demo-speed" => "snappy",
+                _ => "ask",
+            };
+            for argv in [
+                vec!["agentctl", flag, value],
+                vec!["agentctl", &format!("{flag}={value}")],
+                vec!["agentctl", flag, value, "doctor"],
+                vec!["agentctl", "doctor", flag, value],
+            ] {
+                let got = cli(&argv).unwrap_or_else(|e| panic!("{argv:?}: {e}"));
+                assert_eq!(
+                    got.command.as_deref(),
+                    argv.contains(&"doctor").then_some("doctor"),
+                    "{argv:?}"
+                );
+                match flag {
+                    "--role" => assert_eq!(got.role.as_deref(), Some(value)),
+                    "--demo-speed" => assert_eq!(got.demo_speed.as_deref(), Some(value)),
+                    _ => assert_eq!(got.access, Some(mcp_policy::Access::Ask)),
+                }
+            }
+        }
+        // The command is still found after flags and their values.
+        assert_eq!(
+            cli(&["agentctl", "--role", "qa", "--demo", "doctor"])
+                .unwrap()
+                .command
+                .as_deref(),
+            Some("doctor")
+        );
+        assert_eq!(cli(&["agentctl"]).unwrap().command, None);
+        assert_eq!(cli(&["agentctl", "--http"]).unwrap().command, None);
+        // A command name is not a value, with the way out spelled in the error.
+        for command in COMMANDS {
+            for flag in ["--role", "--demo-speed", "--access"] {
+                let e = cli(&["agentctl", flag, command]).unwrap_err();
+                assert!(
+                    e.contains(flag)
+                        && e.contains(command)
+                        && e.contains(&format!("{flag}={command}")),
+                    "{e}"
+                );
+            }
+        }
+        // `--role=serve` is the explicit way to name such a role.
+        assert_eq!(
+            cli(&["agentctl", "--role=serve"]).unwrap().role.as_deref(),
+            Some("serve")
+        );
+        // Missing values: at the end, before a flag, empty.
+        for flag in ["--role", "--demo-speed", "--access"] {
+            for argv in [
+                vec!["agentctl", flag],
+                vec!["agentctl", flag, "--demo"],
+                vec!["agentctl", &format!("{flag}=")],
+                vec!["agentctl", "doctor", flag],
+            ] {
+                let e = cli(&argv).unwrap_err();
+                assert!(
+                    e.contains(flag) && e.contains("needs a value"),
+                    "{argv:?}: {e}"
+                );
+            }
+        }
+        // An unknown level is an error naming the choices.
+        for bad in ["yolo", "ASK", "none"] {
+            let e = cli(&["agentctl", "--access", bad]).unwrap_err();
+            assert!(
+                e.contains("--access") && e.contains(bad) && e.contains("ask, auto or bypass"),
+                "{e}"
+            );
+        }
+        // Switches, last one wins.
+        let got = cli(&["agentctl", "--dry-run", "--anonymize", "--no-pii", "--demo"]).unwrap();
+        assert!(got.dry_run);
+        assert_eq!((got.anonymize, got.demo), (Some(false), Some(true)));
+        assert_eq!(
+            cli(&["agentctl", "--access", "bypass", "--access", "auto"]).unwrap(),
+            access(mcp_policy::Access::Auto)
+        );
+    }
+
+    #[test]
+    fn the_summary_names_the_three_ideas_and_where_the_level_came_from() {
+        let mut cfg = mcp_policy::PolicyConfig::default();
+        let lines = policy_summary(&cfg);
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        assert!(
+            lines[0].starts_with("access:") && lines[0].contains("not set"),
+            "{lines:?}"
+        );
+        assert!(
+            lines[1].starts_with("scope:") && lines[1].contains("3 categories"),
+            "{lines:?}"
+        );
+        assert!(lines[1].contains("browser origins any public"), "{lines:?}");
+        assert!(
+            lines[2].starts_with("stops:")
+                && lines[2].contains("kill switch")
+                && lines[2].contains("human override on")
+                && lines[2].contains("foreground allow"),
+            "{lines:?}"
+        );
+        for (level, source, text) in [
+            (
+                mcp_policy::Access::Ask,
+                mcp_policy::AccessSource::File,
+                "config file",
+            ),
+            (
+                mcp_policy::Access::Auto,
+                mcp_policy::AccessSource::Flag,
+                "--access flag",
+            ),
+            (
+                mcp_policy::Access::Bypass,
+                mcp_policy::AccessSource::Env,
+                "AGENTCTL_ACCESS",
+            ),
+        ] {
+            cfg.access = Some(level);
+            cfg.notes.access_source = source;
+            let line = &policy_summary(&cfg)[0];
+            assert!(
+                line.contains(&format!("{} ({text})", level.as_str()))
+                    && line.contains(level.describe()),
+                "{line}"
+            );
+        }
+        cfg.human_override = false;
+        cfg.foreground = mcp_types::Foreground::Never;
+        cfg.allowed_origins = vec!["https://a.example".into()];
+        cfg.allowed_apps = Vec::new();
+        let lines = policy_summary(&cfg);
+        assert!(lines[2].contains("human override off") && lines[2].contains("foreground never"));
+        assert!(lines[1].contains("apps none") && lines[1].contains("browser origins 1"));
+        // Dry run is a fourth line only when it is on.
+        cfg.mode = mcp_policy::Mode::DryRun;
+        let lines = policy_summary(&cfg);
+        assert_eq!(lines.len(), 4);
+        assert!(lines[3].starts_with("dry run:") && lines[3].contains("on"));
+    }
+
+    #[test]
+    fn doctor_lists_ignored_keys_with_suggestions_and_the_other_warnings() {
+        let cfg = mcp_policy::PolicyConfig::from_toml_str("").unwrap();
+        assert_eq!(
+            config_notes_lines(&cfg),
+            vec!["ignored keys:    none", "config warnings: none"]
+        );
+        let cfg = mcp_policy::PolicyConfig::from_toml_str(
+            "[policy]\ncatgories = [\"vision\"]\nfuture = 1\nmax_denials = 5\n[input]\ndemo = true\n",
+        )
+        .unwrap();
+        let lines = config_notes_lines(&cfg).join("\n");
+        assert!(
+            lines.contains("policy.catgories (did you mean policy.categories?)")
+                && lines.contains("policy.future")
+                && !lines.contains("policy.future (did"),
+            "{lines}"
+        );
+        assert!(
+            lines.contains("policy.max_denials has no effect")
+                && lines.contains("input.demo is an older spelling of policy.demo"),
+            "{lines}"
+        );
+    }
+
+    /// The three levels are described in the same words everywhere an operator
+    /// reads about them, so the README, the example config, the threat model
+    /// and `doctor` cannot drift apart.
+    #[test]
+    fn every_document_states_the_three_levels_in_the_same_words() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        for file in ["README.md", "config.example.toml", "docs/threat-model.md"] {
+            let text = std::fs::read_to_string(root.join(file)).unwrap();
+            // The example config wraps lines inside comments, so compare words.
+            let words = |t: &str| {
+                t.replace("\n#", " ")
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            };
+            let text = words(&text);
+            for level in [
+                mcp_policy::Access::Ask,
+                mcp_policy::Access::Auto,
+                mcp_policy::Access::Bypass,
+            ] {
+                assert!(
+                    text.contains(&words(level.describe())),
+                    "{file} must say, for {}: {}",
+                    level.as_str(),
+                    level.describe()
+                );
             }
         }
     }

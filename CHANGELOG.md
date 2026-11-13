@@ -141,7 +141,7 @@ All notable changes to this project are documented here. The format follows
   steps: [{i, tool, ok, ...that step's result, error}]}`. It is not a way around a check: each step is handed
   back to the server's own `dispatch_call` (through a second `Server` over the same input engine, policy and
   audit log), so the policy tier, the role's allowed and denied tools, consent, the hard invariants, the
-  kill switch and the denial budget apply to every step as they do to a call made alone, and every step has
+  kill switch apply to every step as they do to a call made alone, and every step has
   its own audit entry (a `secret: true` step is redacted there). Under `foreground = "never"` the whole batch
   is checked first, so one refused step means no step ran. The kill switch, a human taking the pointer and a
   client cancel are checked between steps; the batch has 30 seconds, and a step still running at the end is
@@ -366,6 +366,28 @@ All notable changes to this project are documented here. The format follows
   (`live_browser_headed_never.rs`, 3 of 3 runs on an unlocked screen). **Not measured:** Safari, Linux, and
   attaching to the Chrome window a person uses every day (its window order). A background tab in a visible browser may be hidden to the page and throttled.
 
+- **`--access <level>` and `AGENTCTL_ACCESS`: choose the permission level when starting the server.** `ask`,
+  `auto` or `bypass`, as `policy.access` in the config file. The strictness order is `ask` < `auto` < `bypass`
+  (`ask` is the most restrictive). When the config file sets `access`, the flag or variable may only move it
+  toward `ask`: asking for a looser level is a startup error that names both values, not a silent ignore.
+  When the file sets nothing, the flag or variable sets the level, except that `bypass` is never taken from
+  the environment alone (an inherited variable is too easy to leave set by accident): it needs
+  `access = "bypass"` in the file or an explicit `--access bypass`. An unknown value is a startup error. When
+  both the flag and the variable are given, the flag stands.
+- **`policy.dry_run = true` and `--dry-run`: rehearse at any level.** Reads run, and anything that would change
+  something reports what it would have done and does not do it, under `ask`, `auto` and `bypass` alike. Dry run
+  can only make a session do less. `mode = "dry_run"` keeps working as the older spelling, and is no longer
+  lost when `access` is set (it used to be overwritten).
+- **`agentctl doctor` prints the policy in three lines**, `access:` (the level, what it means and whether it came
+  from the config file, the `--access` flag or `AGENTCTL_ACCESS`), `scope:` (categories, apps, filesystem
+  roots, commands, hosts, browser origins) and `stops:` (kill switch path, human override, `foreground`), plus
+  `dry run: on` when it is. It also lists, under `ignored keys:`, every config key nothing reads with the
+  nearest key it knows (`policy.catgories (did you mean policy.categories?)`), and under `config warnings:`
+  every older spelling and no-op setting found at load. The same warnings are logged at startup.
+- **`config.example.toml` is reorganised around three ideas**: `access` (the one permission choice), scope (what
+  it may touch) and safety stops, with a "Start here" block of a few lines and everything else under Scope,
+  Safety stops and Advanced. Every setting the loader reads is documented in it, and a test now keeps it so.
+
 ### Changed
 
 - **The pure-Rust OCR engine is `ocrs` 0.14 on `rten` 0.28** (was 0.13 on 0.26). The two ONNX model files are
@@ -395,6 +417,50 @@ All notable changes to this project are documented here. The format follows
   application it resolves to. It still does not gate `get_ui_tree`, `find_elements` or `ui_extract` with
   `app`, which read an app the list does not cover; that is unchanged and recorded in
   `docs/threat-model.md`.
+
+- **With `access` set, `categories` now narrows it instead of being discarded.** Before, writing
+  `categories = ["vision"]` beside `access = "auto"` was silently ignored and every category was on. Now only
+  the categories you list are on (an empty list turns all of them off); leave `categories` out and the level
+  turns every category on, as before. This can only make a session do less, but if you have a stale
+  `categories` line beside `access`, that line now takes effect: remove it, or list what you want. A tool in a
+  category that is not listed is neither advertised in `tools/list` nor callable. Configs without `access` are
+  unchanged byte for byte.
+- **Under `access`, a config that also carries `mode` or `enable` now says so.** Both were always ignored once
+  `access` was set, with no word. Each is now named in a startup warning (`mode = "dry_run"` is not a conflict;
+  it is the older spelling of `dry_run`). Without `access` they work exactly as before and warn about nothing.
+- **When two spellings of one setting disagree, startup stops.** `policy.demo` and `input.demo`,
+  `policy.role` and `policy.default_role`, `[invariants]` and `[policy.invariants]` and the other aliases
+  listed below were read into a hash map, so which one won was arbitrary and could change between runs. Two
+  spellings with the same value are fine (and warn); two with different values are now a startup error naming
+  both.
+- **`agentctl --role serve`, and any flag that takes a value, no longer swallows a command name.** `--role`,
+  `--demo-speed` and `--access` take the next argument or `--flag=value`; a missing value, or a command name
+  where the value should be, is a usage error (`--role=serve` if a role really is called that).
+
+### Deprecated
+
+Each of these still works exactly as before, loads with a startup warning that names what to use, and appears
+under `config warnings:` in `agentctl doctor`. Nothing here is more permissive than it was.
+
+- **Older spellings of one setting** (use the first): `policy.demo` (was `input.demo`, `demo.enabled`),
+  `policy.demo_speed` (was `input.demo_speed`, `demo.speed`), `policy.role` (was `policy.default_role`),
+  `[invariants]` (was `[policy.invariants]`), and in a custom role `require_consent_for` (was
+  `require_consent_for_tiers`, `require_consent_tiers`, `require_consent_for_tools`, `require_consent_tools`).
+- **The roles `operator`, `admin`, `auditor`, `tester` and `superadmin`** are no longer documented and still
+  resolve to the same profiles. `operator` is `access = "ask"`; `admin` and `superadmin` grant nothing, so drop
+  the role; `auditor` is `readonly`; `tester` is `qa`. The documented presets are `readonly`, `qa`, `browser`
+  and `browser-core`. Custom `[roles.<name>]` tables are unchanged and now live in the advanced part of the docs.
+- **`policy.mode` and `policy.enable`** are the older way to say what `access` says. They keep working when
+  `access` is not set; prefer `access`.
+
+### Removed
+
+- **`max_denials` (`policy.max_denials` and `roles.<name>.max_denials`) never did anything, and the denial
+  budget behind it is gone.** The documentation said a session would be aborted after that many denied calls.
+  Nothing ever acted on the count: the call that recorded each denial ignored the answer, so no session was
+  ever aborted. The counter, its plumbing and the `Policy::record_denial` and `denial_count` methods are
+  removed. A config file that still sets the key loads, with a warning that it has no effect and never had;
+  remove the line. Denials are still audited (`decision: "deny"`), and the audit log's schema is unchanged.
 
 ### Fixed
 

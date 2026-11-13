@@ -88,7 +88,7 @@ pub fn build_server_with(
 ///
 /// A step must meet every check a call on its own meets, and the only code
 /// that applies them all (tier, role allow and deny lists, consent, hard
-/// invariants, kill switch, denial budget, audit) is `Server::dispatch_call`.
+/// invariants, kill switch, audit) is `Server::dispatch_call`.
 /// So the batch is handed a second server over the same input engine, the same
 /// policy and the same audit log, and each step is a call to it. It is not a
 /// second policy: nothing here decides anything, and a role, a mode or a

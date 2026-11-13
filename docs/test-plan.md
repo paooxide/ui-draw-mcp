@@ -66,10 +66,10 @@ snapshot/session state.
 | CC-SESS-3 | Use of a `target_id` after its browser disconnects | `NOT_FOUND`, cleanup ran (no leaked CDP connection) |
 | CC-SESS-4 | Two calls mutate the same session (navigate + act) | serialized per-session; no interleaved CDP command corruption |
 
-### 2.3 Policy, budget, kill switch, audit
+### 2.3 Policy, kill switch, audit
 | ID | Scenario | Expected |
 |---|---|---|
-| CC-POL-1 | N concurrent denied calls vs `max_denials` | budget counted atomically; abort triggers exactly once at threshold (no over/under count, no TOCTOU) |
+| CC-POL-1 | (withdrawn) N concurrent denied calls vs `max_denials` | the denial budget was never enforced and has been removed, so there is nothing to count |
 | CC-POL-2 | Kill switch trips while M calls are mid-flight | all M observe cancellation; each returns abort state; no call completes as success post-trip |
 | CC-POL-3 | Concurrent audit writes from many calls | single-writer serializes; JSONL lines intact, no interleaving; total order preserved |
 | CC-POL-4 | Consent prompt pending for call A while call B arrives needing consent | prompts queued/serialized; B cannot consume A's answer; no double-consent |

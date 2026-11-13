@@ -465,29 +465,3 @@ fn documented_known_bypasses() {
         );
     }
 }
-
-/// A role tightens the operator's denial budget; it cannot raise or disable it.
-#[test]
-fn role_cannot_loosen_the_denial_budget() {
-    use mcp_policy::Redactor;
-    let budget_after = |operator: usize, role_max: usize| {
-        let mut cfg = PolicyConfig::from_toml_str(&format!(
-            "[policy]\nmax_denials = {operator}\nrole = \"lenient\"\n[roles.lenient]\nmax_denials = {role_max}\n"
-        ))
-        .expect("config");
-        cfg.categories.clear();
-        let policy = Policy::new(cfg, AuditSink::memory(), Redactor::empty());
-        let mut n = 0;
-        while !policy.record_denial() {
-            n += 1;
-            if n > 100 {
-                return usize::MAX;
-            }
-        }
-        n + 1
-    };
-    assert_eq!(budget_after(5, 50), 5, "role cannot raise it");
-    assert_eq!(budget_after(5, 0), 5, "role cannot disable it");
-    assert_eq!(budget_after(5, 2), 2, "role can lower it");
-    assert_eq!(budget_after(0, 3), 3, "role can impose one");
-}

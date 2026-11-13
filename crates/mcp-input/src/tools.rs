@@ -190,7 +190,7 @@ const BATCH_DETAILS: &str = "`steps` is a list of `{tool, args}`, at most 20. Th
     select_text, ui_fill_form, keyboard_type, keyboard_shortcut, mouse_action, scroll, hover, drag_drop and clipboard_write; \
     anything else, and a step that is not `{tool, args}`, is an INVALID_ARGS error naming the step, before any step runs.\n\n\
     Each step goes through the same gate as a call made on its own: the policy tier, the role's allowed and denied tools, \
-    consent, the hard invariants, the kill switch, the denial budget and the audit log (every step is its own entry, and a \
+    consent, the hard invariants, the kill switch and the audit log (every step is its own entry, and a \
     step flagged `secret` is redacted in it). So a batch can do nothing that the same calls made one at a time could not, \
     and a step the role or `foreground = \"never\"` refuses ends the batch. Under `never` the whole batch is checked first, \
     so one refused step means no step ran. A synthetic personal-data token cannot be passed in a batch; type it with its \

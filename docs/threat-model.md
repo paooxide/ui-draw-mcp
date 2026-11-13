@@ -72,13 +72,27 @@ gate would have refused.
 
 ## 5. Controls
 
+The controls fall into three ideas, the same three the README, `config.example.toml` and `agentctl doctor` use:
+
+1. **`access`: the one permission choice.**
+   - `ask`: act freely; dangerous tools and high-impact actions ask a human
+   - `auto`: unattended; nothing prompts; clearly destructive actions are refused
+   - `bypass`: everything runs; only the kill switch, human override and hard invariants remain
+2. **Scope: what it may touch.** `categories`, `allowed_apps`, `fs.roots`, `terminal.allowed_commands`,
+   `network.allowed_hosts`, `browser.allowed_origins` and the other lists. They mean the same at every level;
+   with `access` set, `categories` narrows it.
+3. **Safety stops.** The kill switch, human override, `foreground` and the hard invariants. Unchanged by the
+   level: they hold under `bypass` too.
+
+The table below lists each control with where it lives. Roles are an optional preset that narrows a session
+further; custom `[roles.<name>]` tables are an advanced option.
+
 | Control | Where | What it stops |
 |---|---|---|
 | Category gate | `mcp-policy::Policy::gate` | Whole capability areas an operator did not enable. Disabled categories are not even advertised in `tools/list`. |
 | Tier gate + `policy.enable` | same | Dangerous tools inside an enabled category. Enabling a category never enables its dangerous tools. |
 | Consent channel | `mcp-policy::consent` | Unattended high-impact actions. Native dialog, default button Deny, timeout denies. Engines *describe* risk; only the core may ask, so nothing approves itself. |
 | Prompt budget | `PromptBudget` | Consent fatigue. Past `max_consent_prompts`, further requests are denied without prompting. |
-| Denial budget | `DenialBudget` | An agent spinning against the gate. |
 | Kill switch | `mcp-policy::KillSwitch` | Everything, immediately. Checked before every policy decision. Trips on the STOP file, or from inside when a human takes the mouse; the reason is recorded and persisted. |
 | Human override | `mcp-input::human_override` + `agentctl::override_watch` | An agent doing the wrong thing while a person is watching. Reaching for the mouse is the reflex people already have, so it is the interrupt worth honouring: while agentctl is driving, a sustained divergence between where the pointer is and where the server put it trips the kill switch, cancels any drag, and posts a notification. Keyboard has no equivalent signal and is out of scope. |
 | Destructive-keystroke gate | `mcp-policy::is_destructive` + `input::screens_as_terminal` | `rm -rf /` typed into a shell. Asks the *live input target*, and an undeterminable target screens as a terminal: unknown destination is not evidence of safety. |
@@ -94,7 +108,7 @@ gate would have refused.
 | Protected package set | `mcp-pkg` | Uninstalling the agent, the package manager, or security tooling. Not configurable. |
 | Argument invariants | `mcp-policy::HardInvariants`, checked in `dispatch_call` before the gate | A protected path or denied domain named anywhere in a call's arguments, even under `access = "bypass"`. Every token of every string, `file:` URLs, URLs with userinfo, paths after symlink resolution. A heuristic over text (§7). |
 | PII token sinks | `Policy::check_token_sink`, before the gate | A tokenized value (`<SSN_1>`) being de-tokenized into a URL, command, file or request. Plaintext is restored only for local input tools; a token anywhere else is refused whatever the profile. Off unless `policy.anonymize`. |
-| Roles | `mcp-policy::role` | One session doing more than its job needs. A role narrows visible tools, can add consent and lower the denial budget; it can never widen, raise or disable anything, and an unknown role setting is a config error. |
+| Roles | `mcp-policy::role` | One session doing more than its job needs. A role narrows visible tools and can add consent; it can never widen anything, and an unknown role setting is a config error. The documented presets are `readonly`, `qa`, `browser` and `browser-core`; `operator`, `admin`, `auditor`, `tester` and `superadmin` still resolve but are deprecated and warn at startup. |
 | Audit log | `mcp-policy::AuditSink` | Nothing, but it is how you find out what happened. Records are hash-chained and Ed25519-signed; with an operator key (`policy.audit_signing_key`, 0600 or the server will not start) `audit verify --pubkey` detects a deleted, reordered, edited or re-signed record. |
 
 **What `foreground = "never"` guarantees, and what it does not.** With `never`, agentctl's own desktop tools
@@ -309,12 +323,35 @@ place. Coordinates read from `capture_screen` or `ocr_region` are screen-global 
 `ui_action` on a ref needs no coordinate at all. XWayland and X11 applications report global bounds.
 
 **`access = "bypass"` is the operator disarming the gate, on purpose.**
-The three permission profiles are a shortcut for enabling every category and dangerous tool. `ask` still
+The three levels are a shortcut for enabling every category (narrowed by `categories` if it is listed) and
+every dangerous tool. `ask` still
 confirms each dangerous action and `auto` refuses destructive ones, but `bypass` turns off consent and the
 destructive-command gate entirely: any tool the agent calls runs. It is never a default, is set only in the
 operator-owned config (which the filesystem jail keeps the agent from editing), and the kill switch and
 human-override still abort in-flight work. It exists because the owner of a machine may legitimately choose
 to run wide-open on it; it is not a control the agent can reach or raise.
+
+*Where the level can come from.* The config file, the `--access` flag, or `AGENTCTL_ACCESS`. The strictness
+order is `ask` < `auto` < `bypass` (ask is the most restrictive). When the file sets `access`, the flag or
+variable can only move it toward `ask`; asking for a looser level is a startup error that says so, never a
+silent ignore. When the file sets nothing, the process's starter is the authority and the flag sets it, except
+that `bypass` is never taken from the environment alone: a variable is too easy to inherit by accident, so
+`bypass` needs the file or an explicit `--access bypass`. `dry_run = true` (or `--dry-run`) works at every
+level and can only make a session do less. The legacy keys `mode` and `enable` are ignored, with a startup
+warning, once `access` is set.
+
+**`browser_eval` is dangerous-tier because a script has the page's authority.** It runs arbitrary JavaScript in
+the page: it can read what the page can read, and make the requests the signed-in session is allowed to make.
+None of that passes through the per-tool checks, for example the origin allowlist, which covers
+`browser_navigate` and not what a script does. The supported way to use it is `access = "ask"`, where each
+call asks a human, or an `auto` or `bypass` the operator chose knowingly. Every call is audited, and the
+`readonly` and `qa` roles refuse it.
+
+**`max_denials` never did anything.** Earlier versions documented a "denial budget" that would end a session
+after that many denied calls. Nothing counted against it; the setting was read and dropped. It has been
+removed, and a config that still carries `policy.max_denials` or `roles.<name>.max_denials` loads with a
+warning. An agent spinning against the gate is bounded by the consent-prompt cap, the per-call timeouts, the
+audit record of every denial, and the kill switch, not by a denial count.
 
 **A provided password is kept out of the log and away from the judge.**
 The owner may hand the agent a password to type. A call flagged `secret: true` (`keyboard_type`,

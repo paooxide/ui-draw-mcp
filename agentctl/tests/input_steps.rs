@@ -490,17 +490,29 @@ async fn secret_text_in_a_step_stays_out_of_every_audit_record() {
     assert!(all.contains("redacted"), "{all}");
 }
 
-/// A denial inside a batch is a denial: it counts against the budget and is
-/// audited, the same as the single call.
+/// A denial inside a batch is a denial: it is audited as one, the same as the
+/// single call.
 #[tokio::test]
-async fn a_denied_step_counts_against_the_denial_budget() {
+async fn a_denied_step_is_audited_as_a_denial_like_the_single_call() {
     let rig = Rig::new(with_role(config(), denying("keyboard_type")));
-    let before = rig.policy.denial_count();
+    let denials = |rig: &Rig| {
+        rig.policy
+            .audit_sink()
+            .memory_records()
+            .iter()
+            .filter(|r| {
+                r["decision"]
+                    .as_str()
+                    .is_some_and(|d| d.starts_with("deny"))
+            })
+            .count()
+    };
+    let before = denials(&rig);
     rig.call("keyboard_type", json!({"text": "x"})).await;
-    let alone = rig.policy.denial_count() - before;
-    let before = rig.policy.denial_count();
+    let alone = denials(&rig) - before;
+    let before = denials(&rig);
     rig.call("input_steps", batch(json!([typed("x")]))).await;
-    assert_eq!(rig.policy.denial_count() - before, alone);
+    assert_eq!(denials(&rig) - before, alone);
     assert!(alone >= 1);
 }
 

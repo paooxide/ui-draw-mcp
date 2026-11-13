@@ -146,3 +146,116 @@ fn documented_vision_values_match_the_defaults() {
     );
     assert_eq!(cfg.vision_max_image_bytes, defaults.vision_max_image_bytes);
 }
+
+/// Every `section.key` the example mentions, as live settings or in comments:
+/// a line `key = ...` (commented or not) belongs to the nearest preceding
+/// `[section]` header (commented or not).
+fn documented_keys() -> std::collections::BTreeSet<String> {
+    let mut found = std::collections::BTreeSet::new();
+    let mut section = String::new();
+    for line in example().lines() {
+        let body = line.trim().trim_start_matches('#').trim();
+        if let Some(name) = body.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+            if !name.is_empty()
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c == '_' || c == '.')
+            {
+                section = name.to_string();
+            }
+            continue;
+        }
+        if let Some((key, _)) = body.split_once('=') {
+            let key = key.trim();
+            if !key.is_empty()
+                && key.chars().all(|c| c.is_ascii_lowercase() || c == '_')
+                && !section.is_empty()
+            {
+                found.insert(format!("{section}.{key}"));
+            }
+        }
+    }
+    found
+}
+
+/// A setting the loader reads but the example never mentions is one nobody can
+/// discover. Every key the loader reads under its one canonical spelling must
+/// appear in the example, live or as a commented line under its own section.
+/// (The older spellings and the keys that do nothing are described in prose.)
+#[test]
+fn every_key_the_loader_reads_is_documented() {
+    let documented = documented_keys();
+    let missing: Vec<&str> = mcp_policy::canonical_config_keys()
+        .into_iter()
+        .filter(|k| !documented.contains(*k))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "config.example.toml does not document: {missing:?}"
+    );
+}
+
+/// The settings of a custom `[roles.<name>]` table.
+#[test]
+fn every_role_setting_is_documented() {
+    let documented = documented_keys();
+    for key in [
+        "description",
+        "allowed_categories",
+        "denied_categories",
+        "allowed_tiers",
+        "allowed_tools",
+        "denied_tools",
+        "require_consent_for",
+    ] {
+        assert!(
+            documented.contains(&format!("roles.support.{key}")),
+            "roles.support.{key} is not documented"
+        );
+    }
+}
+
+/// The older spellings and the no-op key are named in the example, so a
+/// config that carries one can find out what to do.
+#[test]
+fn the_older_spellings_are_explained() {
+    let text = example();
+    for needle in [
+        "max_denials",
+        "input.demo",
+        "demo.enabled",
+        "policy.default_role",
+        "[policy.invariants]",
+        "Older spellings",
+    ] {
+        assert!(text.contains(needle), "{needle}");
+    }
+}
+
+/// Each uncommented level in the example's own words is a config that loads,
+/// and turns on what it says. Guards the commented lines against typos.
+#[test]
+fn each_commented_level_and_dry_run_loads_when_uncommented() {
+    let text = example();
+    for (commented, level) in [
+        ("# access = \"ask\"", mcp_policy::Access::Ask),
+        ("#   access = \"auto\"", mcp_policy::Access::Auto),
+        ("#   access = \"bypass\"", mcp_policy::Access::Bypass),
+    ] {
+        assert!(text.contains(commented), "{commented}");
+        let uncommented = text.replacen(
+            "# access = \"ask\"",
+            &format!("access = \"{}\"", level.as_str()),
+            1,
+        );
+        let cfg = PolicyConfig::from_toml_str(&uncommented).unwrap();
+        assert_eq!(cfg.access, Some(level));
+        // The example's own category list narrows the level it is combined with.
+        assert_eq!(cfg.categories.len(), 5);
+    }
+    let dry = text.replacen("# dry_run = true", "dry_run = true", 1);
+    assert_eq!(
+        PolicyConfig::from_toml_str(&dry).unwrap().mode,
+        Mode::DryRun
+    );
+}
