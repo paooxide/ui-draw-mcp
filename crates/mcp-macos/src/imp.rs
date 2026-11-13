@@ -2834,12 +2834,16 @@ mod tests {
             spent < std::time::Duration::from_secs(3),
             "two readings took {spent:?}"
         );
-        if permissions().accessibility {
-            assert!(facts.frontmost.is_some(), "{facts:?}");
-            // Two readings of an idle screen agree on what is open.
-            assert_eq!(facts.frontmost, again.frontmost);
-        } else {
+        // Two readings of an idle screen agree on what is in front.
+        assert_eq!(facts.frontmost, again.frontmost);
+        // With no frontmost application there is nothing to read the rest
+        // from. That is the case without the grant, and also on a machine
+        // with the grant and no one logged in at a screen: a CI runner
+        // reports Accessibility as trusted and has no frontmost app.
+        if facts.frontmost.is_none() {
             assert_eq!(facts, mcp_input::UiFacts::default());
+        } else {
+            assert!(permissions().accessibility, "{facts:?}");
         }
     }
 
