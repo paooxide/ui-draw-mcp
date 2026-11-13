@@ -243,7 +243,11 @@ pub fn build_stack(cfg: &PolicyConfig) -> (Vec<Arc<dyn ToolModule>>, Wiring) {
                 &engines.allowed_origins,
                 engines.browser_allow_private,
             ))
-            .with_showcase(showcase.clone()),
+            .with_showcase(showcase.clone())
+            // A visible browser can raise windows and take focus; under
+            // `never` and `polite` the engine stops it (see
+            // `mcp_browser::foreground`). `allow` changes nothing.
+            .with_foreground(cfg.foreground),
         );
         let mut browser = BrowserModule::new(browser_backend.clone())
             .with_showcase(showcase)

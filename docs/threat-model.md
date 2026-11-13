@@ -87,7 +87,7 @@ gate would have refused.
 | argv execution | `mcp-proc` | Shell metacharacter injection. No shell unless `allow_shell` is on. |
 | Redaction | `mcp-policy::Redactor` | Secrets in results *and* in the audit log. |
 | No plaintext secret read | `mcp-sec` | Exfiltration of keychain values. The capability does not exist. |
-| Foreground refusal (`input.foreground = "never"`; `"polite"` borrows and returns the desktop) | Tool layer: `mcp-input::tool_refusal`, `mcp-window::tool_refusal`; backend boundary: `mcp-input::ForegroundInput`, `mcp-window::ForegroundWindow`, wired in `agentctl::engines` | Agentctl itself taking the user's pointer, keyboard or foreground while they work. See the note below the table. Config or `AGENTCTL_FOREGROUND` only; roles, `access` profiles and tool arguments cannot change it, and the environment can add `never` but not remove it. |
+| Foreground refusal (`input.foreground = "never"`; `"polite"` borrows and returns the desktop) | Tool layer: `mcp-input::tool_refusal`, `mcp-window::tool_refusal`; backend boundary: `mcp-input::ForegroundInput`, `mcp-window::ForegroundWindow`; the browser engine's own plan in `mcp-browser::foreground`; wired in `agentctl::engines` | Agentctl itself taking the user's pointer, keyboard or foreground while they work. See the note below the table. Config or `AGENTCTL_FOREGROUND` only; roles, `access` profiles and tool arguments cannot change it, and the environment can add `never` but not remove it. |
 | Pinned-target raise-or-refuse | `mcp-macos::ensure_target_frontmost` | Keystrokes landing in the wrong window. Refuses to type if it cannot raise the intended app. |
 | Frame cap | `mcp-core::DEFAULT_MAX_FRAME_BYTES` | Memory exhaustion before any policy runs. |
 | HTTP: loopback bind, bearer token, `Origin` refusal | `mcp-core::http` | Network reachability, unauthenticated access, and drive-by requests from the operator's own browser. |
@@ -116,12 +116,9 @@ promise:
 
 - That an application stays behind. An app may raise itself in answer to an accessibility action it
   accepted, and a launched app may take focus despite the request not to activate it.
-- Anything about the browser engine. `browser_*` tools drive Chrome over DevTools, not through system input,
-  so they never move the pointer, but a visible (headed) browser is another matter: the engine calls
-  `Page.bringToFront` on the first connection to a tab, `browser_tabs` `open` and `activate` bring a tab
-  forward, and a headed `browser_launch` starts a visible window. None of that is gated by `foreground`.
-  It is out of scope here because covering it means changing how the browser engine connects to every tab,
-  a separate change; until then, `headless` is the way to keep a browser out of the user's way.
+- That a visible (headed) browser stays behind other windows. The browser engine is covered, but only
+  *verified* in headless (see **The browser engine under `never` and `polite`** below); the headed case is
+  written as a test that has not yet been run on a real screen, so treat it as intended and unmeasured.
 - Anything about programs the agent starts. `exec` and `pty_*` run arbitrary commands, and a command can
   open an app or send keys (`open`, `osascript`); the command allowlist, not `foreground`, limits that.
 - The clipboard. `clipboard_write` changes what the user will paste; it moves nothing and is not refused.
@@ -129,6 +126,31 @@ promise:
 
 The refusal appears in the audit log as an ordinary `POLICY_DENIED` result for the tool; the log records the
 code, not the message.
+
+**The browser engine under `never` and `polite`.** `browser_*` tools drive Chrome over DevTools, never through
+system input, so only a visible (headed) Chrome can take the foreground, and only through a few operations. With
+`never`, and with `polite` (the browser engine cannot borrow and return the desktop, and a window a browser
+raises stays raised, so it applies `never`'s rule and names `polite` in its refusals): the page is not brought
+to the front on connect or when a screencast starts (`Page.bringToFront` is not sent); `browser_tabs open` and a
+branch's tab are created with `Target.createTarget` `background: true` instead of `/json/new`, which activates
+what it creates; `browser_tabs activate` is refused with `POLICY_DENIED` for a visible browser and allowed for a
+headless one; and launching a visible Chromium, or Safari (which has no headless mode), is refused with
+`POLICY_DENIED` naming `launch.headless: true` and attaching, because a newly started app is activated by the OS
+and no flag was found that prevents it for a directly started Chrome. Attaching to a running Chrome is allowed.
+A page that needs focus (`document.hasFocus()`, `:focus`, focus and blur handlers) gets it from
+`Emulation.setFocusEmulationEnabled`, held by one idle DevTools session per tab for as long as the browser is
+connected: Chrome ends the emulation when the session that set it goes away, so a per-call session would show
+the page a blur at the end of every call, which a first version of this change did, and the tests caught. The
+holder sessions end on `browser_disconnect`. Under `allow` nothing changes. Verified against a real headless
+Chrome: the commands sent are read off the wire (no `Page.bringToFront`, no `Target.activateTarget`, a
+background `createTarget`), and a focus-dependent fixture behaves as a focused page under all three settings.
+**Not verified:** that a visible browser really stays behind other windows, that a background tab renders
+and can be screenshotted (a hidden tab may be throttled), and that attaching to the person's own visible Chrome
+leaves their window order alone. `agentctl/tests/live_browser_headed_never.rs` is written to measure the
+first (Finder frontmost, a throwaway headed Chrome driven under `never`, frontmost sampled throughout) and has
+not been run, because it needs an unlocked screen. Not covered: `browser_record` and `agentctl record` as
+the CLI command, which start a visible browser for a person on purpose, and what a page does to its own window
+(`window.focus()`, `window.open`).
 
 **A locked screen.** Separate from `foreground`, and applied under every setting: while the screen is
 locked, or another user's session has the console, macOS discards posted key and pointer events and the

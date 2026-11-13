@@ -348,6 +348,23 @@ All notable changes to this project are documented here. The format follows
   (logind is on the system bus the input backend does not hold), so it reports unknown and does not block;
   `idle_status` and `doctor` read logind's `LockedHint` alongside GNOME's screen saver.
 
+- **`foreground = "never"` and `"polite"` now cover the browser engine.** Before, a visible (headed) Chrome was
+  outside the setting: the engine sent `Page.bringToFront` on every connect, `browser_tabs open` went through
+  `/json/new` (which activates the tab it makes), and a visible launch started a window. Inventory of what can raise
+  a window or take focus: `Page.bringToFront` on connect and when a screencast starts; `/json/new` and
+  `/json/activate` in `browser_tabs`; `Target.createTarget` for a branch's context; starting Chromium, and
+  Safari through safaridriver. Under `never` (and under `polite`, which applies the same rule because the browser
+  engine cannot borrow and return the desktop) the page is not brought forward (`foregrounded` is false), tabs
+  and branch tabs are created with `background: true`, `browser_tabs activate` is refused for a visible browser,
+  and a visible Chromium or Safari launch is refused, all `POLICY_DENIED` naming `launch.headless: true` and
+  attaching to a running Chrome; headless is unaffected. Focus-dependent pages keep working because one idle
+  DevTools session per tab holds `Emulation.setFocusEmulationEnabled` while the browser is connected (a session
+  per call is not enough: Chrome ends the emulation when any session that set it closes, so the page saw a blur
+  after every call). `allow` is unchanged. Verified against a real headless Chrome by reading the commands off the
+  wire and with a focus fixture (`docs/fixtures/focus_probe.html`). **Unverified:** that a visible browser stays
+  behind other windows; the test for it (`live_browser_headed_never.rs`) is written and has not been run, because
+  it needs an unlocked screen. A background tab in a visible browser may be hidden to the page and throttled.
+
 ### Changed
 
 - **Window, menu, dialog and capture calls that name an `app` act on it without pinning it.** `list_windows`,

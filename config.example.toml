@@ -157,9 +157,17 @@ human_override_grace_ms = 1500
 #            them (macOS) or is refused (Linux). This is for letting an agent
 #            work while you use the machine.
 #
+# Browser tools (CDP): with "never" or "polite" a visible Chrome is not
+# brought forward. The page is not raised on connect, tabs open in the
+# background, and focus emulation keeps pages believing they have focus.
+# `browser_tabs activate` and launching a visible Chromium or Safari are refused
+# (use `launch.headless: true`, or attach to a Chrome that is already running);
+# headless is unaffected. "polite" applies the same rule: the browser engine
+# cannot borrow and return the desktop. Verified in headless; that a visible
+# browser stays behind other windows has not yet been measured on a real screen.
+#
 # It does not stop an app from raising itself in response to an accessibility
-# action, does not cover a visible browser driven by browser_* tools, and does
-# not limit what `exec` can run. See docs/threat-model.md.
+# action, and does not limit what `exec` can run. See docs/threat-model.md.
 #
 # Only this file or AGENTCTL_FOREGROUND can set it: no tool, role or access
 # profile can. The environment can only make it stricter (allow -> polite ->

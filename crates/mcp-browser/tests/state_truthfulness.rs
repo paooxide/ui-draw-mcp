@@ -199,6 +199,7 @@ fn page(body: &str) -> String {
 fn err_text(e: &BrowserError) -> String {
     match e {
         BrowserError::PermissionDenied(m)
+        | BrowserError::Refused(m)
         | BrowserError::NotFound(m)
         | BrowserError::Unsupported(m)
         | BrowserError::Timeout(m)

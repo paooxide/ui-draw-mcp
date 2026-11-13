@@ -9,6 +9,9 @@ mod cdp;
 pub mod challenge;
 mod checkpoint;
 pub mod flow;
+pub mod foreground;
+#[cfg(test)]
+mod foreground_live;
 mod input;
 mod nav;
 mod ocr;

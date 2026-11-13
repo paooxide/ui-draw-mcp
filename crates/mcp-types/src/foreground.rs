@@ -82,6 +82,10 @@ impl Foreground {
 pub struct Refusal {
     /// What was refused, as a noun phrase ("mouse_action click", "launch").
     pub what: String,
+    /// The setting that refused it, as the config spells it. `never` unless an
+    /// engine that has no `polite` form of its own applies `never` under
+    /// `polite` too (see [`Refusal::under`]).
+    pub setting: &'static str,
     /// What this would have done to the user's desktop.
     pub effect: &'static str,
     /// The background-safe way to get the same result, when there is one.
@@ -92,17 +96,26 @@ impl Refusal {
     pub fn new(what: impl Into<String>, effect: &'static str, instead: Option<&str>) -> Self {
         Refusal {
             what: what.into(),
+            setting: "never",
             effect,
             instead: instead.map(str::to_string),
         }
     }
 
+    /// The refusal as the setting `fg` makes it. For an engine that applies
+    /// `never`'s rule under `polite` as well (it cannot borrow the desktop),
+    /// so the message names the setting the operator actually chose.
+    pub fn under(mut self, fg: Foreground) -> Self {
+        self.setting = fg.as_str();
+        self
+    }
+
     /// Says what was refused, why, and that nothing happened.
     pub fn message(&self) -> String {
         format!(
-            "{} was refused and nothing was done: this server runs with foreground = \"never\", \
+            "{} was refused and nothing was done: this server runs with foreground = \"{}\", \
              and this would {}",
-            self.what, self.effect
+            self.what, self.setting, self.effect
         )
     }
 
@@ -190,6 +203,19 @@ mod tests {
         assert!(err.message.contains("foreground = \"never\""));
         assert!(err.message.contains("move the real pointer"));
         assert_eq!(err.suggestion.as_deref(), Some("instead: ui_action click"));
+    }
+
+    #[test]
+    fn a_refusal_names_the_setting_the_operator_chose() {
+        let r = Refusal::new("browser_connect launch", "open a window", None);
+        assert!(r.message().contains("foreground = \"never\""));
+        let r = r.under(Foreground::Polite);
+        assert!(
+            r.message().contains("foreground = \"polite\""),
+            "{}",
+            r.message()
+        );
+        assert!(!r.message().contains("\"never\""));
     }
 
     #[test]

@@ -1086,6 +1086,8 @@ Optionally auto-restores a saved profile. The browser's active tab is brought to
 
 `launch.background_throttling`: a visible (headless=false) browser is started with flags that stop Chrome throttling timers, rendering and screen recording when its window is behind another or covered. Set true to leave Chrome's normal throttling on. Default false. `profile` (top level or under `launch`) is the saved profile name to auto-restore upon connecting.
 
+Under the operator's `foreground = "never"` (or `"polite"`, which this engine treats the same way) a visible browser is not brought forward: the page is not raised on connect ('foregrounded' is false) and focus emulation keeps it believing it has focus. Launching a visible Chromium or Safari is refused with POLICY_DENIED because the OS activates a newly started app: use `launch.headless: true`, or attach to a Chromium that is already running. Headless launches are unaffected.
+
 | Argument | Type | Required | Description |
 |---|---|---|---|
 | `attach` | object |  |  |
@@ -1373,6 +1375,8 @@ A node carries only what is set: ref, tag, role, name, value (what a text field 
 `browser_tabs` · standard tier
 
 List, open (url), activate or close (target_id) tabs of a connected browser.
+
+`open` creates the tab and, normally, brings it to the front. Under the operator's `foreground = "never"` (or `"polite"`) it is created in the background and stays behind; every browser tool takes the `target_id` it returns. `activate` raises the tab's window, so under those settings it is refused with POLICY_DENIED for a visible browser (pass `target_id` to the other tools instead) and allowed for a headless one, which has no window.
 
 | Argument | Type | Required | Description |
 |---|---|---|---|

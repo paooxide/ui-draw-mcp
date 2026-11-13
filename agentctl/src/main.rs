@@ -1480,13 +1480,15 @@ fn foreground_summary(cfg: &mcp_policy::PolicyConfig) -> String {
         mcp_types::Foreground::Polite => format!(
             "polite (an action that needs the pointer, keyboard or foreground waits for {} ms \
              of user idle time, up to {} ms, then gives the pointer and frontmost app back; \
-             the human-override watcher abandons the action instead of tripping the kill switch)",
+             the human-override watcher abandons the action instead of tripping the kill switch; \
+             a visible browser is not brought forward and cannot be launched, as under never)",
             cfg.polite_idle_ms, cfg.polite_max_wait_ms
         ),
         mcp_types::Foreground::Never => {
             let mut s = String::from(
                 "never (no synthetic pointer, key or scroll input; no app or window brought \
-                 forward; launch does not activate)",
+                 forward; launch does not activate; a visible browser is not brought forward \
+                 and cannot be launched)",
             );
             if cfg.demo {
                 s.push_str("; demo has no effect, since no pointer move is allowed");
@@ -1838,6 +1840,7 @@ mod test_cmd_tests {
         cfg.foreground = mcp_types::Foreground::Never;
         let never = foreground_summary(&cfg);
         assert!(never.starts_with("never") && !never.contains("demo"));
+        assert!(never.contains("visible browser"), "{never}");
         cfg.foreground = mcp_types::Foreground::Polite;
         cfg.polite_idle_ms = 900;
         cfg.polite_max_wait_ms = 7_000;
@@ -1848,6 +1851,7 @@ mod test_cmd_tests {
             "{polite}"
         );
         assert!(polite.contains("kill switch"), "{polite}");
+        assert!(polite.contains("visible browser"), "{polite}");
         cfg.foreground = mcp_types::Foreground::Never;
         cfg.demo = true;
         assert!(foreground_summary(&cfg).contains("demo has no effect"));

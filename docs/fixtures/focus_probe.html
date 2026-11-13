@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Focus probe</title>
+  <!--
+    A page that cares whether it has focus, for checking that a browser driven
+    in the background still behaves as a focused one: document.hasFocus(), the
+    :focus style, and focus and blur handlers (element and window). Everything
+    it observed is written into #log as JSON, so a test reads one place.
+  -->
+  <style>
+    body { font-family: sans-serif; padding: 24px; }
+    input { display: block; margin: 12px 0; padding: 6px; outline: 2px solid rgb(200, 200, 200); }
+    input:focus { outline: 3px solid rgb(0, 128, 0); }
+    #go { padding: 8px 16px; }
+  </style>
+</head>
+<body>
+  <h1>Focus probe</h1>
+  <input id="a" aria-label="first field">
+  <input id="b" aria-label="second field">
+  <button id="go">Go</button>
+  <div id="log"></div>
+  <script>
+    var seen = { has_focus_at_load: document.hasFocus(), a_focus: 0, a_blur: 0, b_focus: 0, b_blur: 0,
+                 win_focus: 0, win_blur: 0, clicks: 0, typed: "" };
+    function publish() {
+      seen.has_focus_now = document.hasFocus();
+      seen.active = document.activeElement ? (document.activeElement.id || document.activeElement.tagName) : null;
+      var a = document.getElementById("a");
+      seen.a_outline = getComputedStyle(a).outlineColor;
+      seen.a_matches_focus = a.matches(":focus");
+      document.getElementById("log").textContent = JSON.stringify(seen);
+    }
+    ["a", "b"].forEach(function (id) {
+      var el = document.getElementById(id);
+      el.addEventListener("focus", function () { seen[id + "_focus"]++; publish(); });
+      el.addEventListener("blur", function () { seen[id + "_blur"]++; publish(); });
+      el.addEventListener("input", function () { if (id === "a") seen.typed = el.value; publish(); });
+    });
+    window.addEventListener("focus", function () { seen.win_focus++; publish(); });
+    window.addEventListener("blur", function () { seen.win_blur++; publish(); });
+    document.getElementById("go").addEventListener("click", function () { seen.clicks++; publish(); });
+    publish();
+  </script>
+</body>
+</html>

@@ -365,6 +365,10 @@ impl CdpConn {
     }
 
     async fn send_text(&mut self, text: &str) -> Result<(), BrowserError> {
+        #[cfg(test)]
+        if let Ok(peer) = self.stream.peer_addr() {
+            wire_log::note(peer.port(), text);
+        }
         let payload = text.as_bytes();
         let len = payload.len();
         let mut frame = Vec::with_capacity(len + 14);
@@ -695,5 +699,41 @@ mod tests {
         let key = b64(&seed().to_le_bytes().repeat(2)[..16]);
         assert_eq!(key.len(), 24); // 16 bytes -> 24 base64 chars
         assert!(key.ends_with('='));
+    }
+}
+
+/// What this process has sent over DevTools, by the port of the browser it
+/// went to, so a test can say which commands a flow issued through a real
+/// session. Test builds only: nothing is recorded in the product.
+#[cfg(test)]
+pub(crate) mod wire_log {
+    use std::sync::Mutex;
+
+    use serde_json::Value;
+
+    static SENT: Mutex<Vec<(u16, Value)>> = Mutex::new(Vec::new());
+
+    pub(crate) fn note(port: u16, text: &str) {
+        if let Ok(v) = serde_json::from_str::<Value>(text) {
+            SENT.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push((port, v));
+        }
+    }
+
+    /// Every command sent to the browser on `port`, in order, as
+    /// `(method, params)`.
+    pub(crate) fn sent_to(port: u16) -> Vec<(String, Value)> {
+        SENT.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|(p, _)| *p == port)
+            .filter_map(|(_, v)| {
+                Some((
+                    v.get("method")?.as_str()?.to_string(),
+                    v.get("params").cloned().unwrap_or(Value::Null),
+                ))
+            })
+            .collect()
     }
 }
