@@ -367,6 +367,11 @@ All notable changes to this project are documented here. The format follows
 
 ### Changed
 
+- **The pure-Rust OCR engine is `ocrs` 0.14 on `rten` 0.28** (was 0.13 on 0.26). The two ONNX model files are
+  the same ones as before and pinned by the same SHA-256, so cached models stay valid and nothing is
+  downloaded again; `AGENTCTL_OCR_MODELS` and `AGENTCTL_OCR_MODELS_UNVERIFIED` behave as before. Recognised text
+  was identical on six rendered test pages and recognition time within 3 %. The update also drops three
+  dependencies (`flatbuffers`, `anyhow`, `bitflags` 1.x).
 - **Window, menu, dialog and capture calls that name an `app` act on it without pinning it.** `list_windows`,
   `menu_list`, `handle_dialogs` and the rest resolved `app` through the call that pins, so reading one app's
   menu silently changed which app a later call with no `app` acted on. Only `focus_app` and the
