@@ -917,6 +917,92 @@ pub fn clipboard_write_text(data: &str) -> Result<(), InputError> {
 /// These are physical key positions, so punctuation follows the US layout:
 /// on another layout `cmd+[` presses whatever sits where the US `[` does,
 /// which is what a shortcut bound to a position wants anyway.
+/// The canonical name of a physical key, in `keyboard_shortcut` syntax: the
+/// inverse of [`keycode_for`] over the keys a shortcut can name, for turning a
+/// key a person pressed into a chord. Keys with no name there are `None`.
+pub(crate) fn key_name_for(code: u16) -> Option<&'static str> {
+    const NAMES: &[&str] = &[
+        "a",
+        "b",
+        "c",
+        "d",
+        "e",
+        "f",
+        "g",
+        "h",
+        "i",
+        "j",
+        "k",
+        "l",
+        "m",
+        "n",
+        "o",
+        "p",
+        "q",
+        "r",
+        "s",
+        "t",
+        "u",
+        "v",
+        "w",
+        "x",
+        "y",
+        "z",
+        "0",
+        "1",
+        "2",
+        "3",
+        "4",
+        "5",
+        "6",
+        "7",
+        "8",
+        "9",
+        "return",
+        "tab",
+        "space",
+        "delete",
+        "forwarddelete",
+        "escape",
+        "left",
+        "right",
+        "down",
+        "up",
+        "home",
+        "end",
+        "pageup",
+        "pagedown",
+        "insert",
+        "f1",
+        "f2",
+        "f3",
+        "f4",
+        "f5",
+        "f6",
+        "f7",
+        "f8",
+        "f9",
+        "f10",
+        "f11",
+        "f12",
+        "minus",
+        "equal",
+        "leftbracket",
+        "rightbracket",
+        "backslash",
+        "semicolon",
+        "quote",
+        "comma",
+        "period",
+        "slash",
+        "grave",
+    ];
+    NAMES
+        .iter()
+        .copied()
+        .find(|n| matches!(keycode_for(n), Some((c, false)) if c == code))
+}
+
 fn keycode_for(key: &str) -> Option<(CGKeyCode, bool)> {
     let code: u16 = match key {
         "a" => 0x00,
@@ -1034,6 +1120,24 @@ fn keycode_for(key: &str) -> Option<(CGKeyCode, bool)> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_pressed_key_has_the_name_a_shortcut_would_use() {
+        use super::{key_name_for, keycode_for};
+        assert_eq!(key_name_for(0x24), Some("return"));
+        assert_eq!(key_name_for(0x00), Some("a"));
+        assert_eq!(key_name_for(0x7B), Some("left"));
+        assert_eq!(key_name_for(0x1B), Some("minus"));
+        // The caps lock key has no shortcut name.
+        assert_eq!(key_name_for(0x39), None);
+        // Every name it can give is one a replay can press again.
+        for code in 0u16..0x80 {
+            if let Some(n) = key_name_for(code) {
+                assert_eq!(keycode_for(n).map(|(c, _)| c), Some(code), "{n}");
+                assert!(mcp_input::parse_combo(n, mcp_input::Os::Mac).is_ok(), "{n}");
+            }
+        }
+    }
+
     use super::*;
 
     /// A keyboard event built from the HID source inherits the modifiers the

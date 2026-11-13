@@ -216,13 +216,40 @@ const EFFECTS_DETAILS: &str = "`effects` is added to the result of an action whe
     change inside a window's own contents is not among them. Linux reads the window list, dialogs and the frontmost \
     application only. `effects: false` skips the reads and the wait, and `expect` replaces it with its own delta.";
 
+const RECORD_DETAILS: &str = "Recording listens to the keyboard and mouse through a listen-only event tap (macOS, `kCGEventTapOptionListenOnly`), \
+    which needs the Input Monitoring permission and Accessibility for the app that runs agentctl; without them the call \
+    returns PERM_DENIED naming which and records nothing. It never acts. Each click is resolved through accessibility to the \
+    element under the pointer (role, title, parents up to the window, and the point as a fallback hint); each run of typing \
+    becomes one `type` step on the field that had the focus; chords and non-printing keys become `shortcut` steps; a click \
+    on a menu item keeps its menu path. Text typed into a secure field is cleared as it is read and the step holds only a \
+    `secret_ref`, supplied as `secrets` when the flow runs. Events whose application is not in `allowed_apps` are counted \
+    (`dropped_other_apps`) and not stored; so are events with no readable element (`dropped_unlocated`). A session stops \
+    by itself after `max_seconds` (at most 600) or 4000 events, and a marker file in the state directory makes \
+    `agentctl doctor` report it while it runs. Dangerous tier: it records a person's real input, so it needs to be named in \
+    `policy.enable` and is not available by default. Starting does not arm the human-override watcher, but a recording \
+    that starts within its grace period (1.5 s) of an agent input call is still inside it. Linux has no listen-only tap in \
+    the remote-desktop portal (it can inject input, not observe it), so it returns UNSUPPORTED_OS there; flows written \
+    with `desktop_flow save` replay on both.";
+
+const FLOW_DETAILS: &str = "A flow is a list of steps `{op, locator, text | combo | secret_ref, ...}` kept in `desktop_flows.json` beside the \
+    config. `run` takes a snapshot of each step's application without pinning it, finds the element whose role and title \
+    match and whose parents agree (exact), or whose title merely contains the recorded one or whose surroundings changed \
+    (fuzzy), and performs the step as the ordinary call it stands for: `ui_action` for a click (an accessibility press, so \
+    it can run with the app in the background), `keyboard_type` or `set_value` for text, `keyboard_shortcut` for a chord. \
+    Only when nothing matches does a click fall back to the recorded point with `mouse_action`, which \
+    `foreground = \"never\"` refuses like any pointer action. Two elements that fit equally well are an error, not a guess. \
+    Each step in the result has `matched` (exact, fuzzy or coordinate), `route` (`ax`, `hid` or `pid_event`, as the tool \
+    reported) and the ref used; the first failure stops the run with `failed_at` and what to do. Under `never` the steps \
+    that would use the keyboard are refused before anything runs. `value set` steps are written by hand with `save` \
+    (op `set`); the recorder cannot see a value being set, only keys.";
+
 const EFFECTS_SEE_ALSO: &str = "The result carries `effects` when the action changed something that was seen (a sheet or window opened, \
     focus moved, ...); see ui_action for what it holds and what its absence means. `effects: false` skips it.";
 
 pub struct InputModule {
-    backend: Arc<dyn InputBackend>,
-    arena: Arc<Mutex<SnapshotArena>>,
-    policy: InputPolicy,
+    pub(crate) backend: Arc<dyn InputBackend>,
+    pub(crate) arena: Arc<Mutex<SnapshotArena>>,
+    pub(crate) policy: InputPolicy,
     /// Runs `expect` clauses. `None` where there is no window backend to
     /// observe with, in which case an `expect` is refused rather than ignored.
     verifier: Option<std::sync::Arc<crate::postcondition::Verifier>>,
@@ -232,7 +259,7 @@ pub struct InputModule {
     /// Takes a snapshot when a call names an element before anything has been
     /// observed. `None` where the composition root wired none, in which case
     /// a name needs a prior `get_ui_tree`.
-    observer: Option<Arc<dyn A11yBackend>>,
+    pub(crate) observer: Option<Arc<dyn A11yBackend>>,
     /// Configured cursor glide for demo/showcase movements.
     glide: Mutex<crate::glide::GlideConfig>,
     /// Keys held across calls, shared with the watchdog that releases them.
@@ -240,19 +267,22 @@ pub struct InputModule {
     /// Whether the kill switch is engaged, for the watchdog. The switch also
     /// refuses every later call, `up` included, so a held key could never be
     /// released through the tools once it trips; this is how it still is.
-    halt: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+    pub(crate) halt: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
     /// Reads the facts `effects` compares. `None` where nothing can, in which
     /// case no result carries `effects`.
     probe: Option<Arc<dyn crate::effects::UiProbe>>,
     /// The way back into the server's gate for the steps of `input_steps`.
     /// `None` refuses the batch: running a step any other way would skip the
     /// checks a call on its own gets.
-    relay: Option<Arc<crate::steps::StepRelay>>,
+    pub(crate) relay: Option<Arc<crate::steps::StepRelay>>,
     /// Wall time a batch may spend; [`crate::steps::MAX_BATCH_MS`] outside tests.
     batch_ms: u64,
     /// Set while an `input_steps` batch holds a polite loan, so its steps run
     /// inside that one borrow instead of waiting and restoring each.
     batch_loan: std::sync::atomic::AtomicBool,
+    /// Recording and the flows it makes; empty until the composition root
+    /// wires a listener and a store.
+    pub(crate) rec: crate::record_tools::RecordSupport,
 }
 
 /// What the module holds down.
@@ -315,7 +345,16 @@ impl InputModule {
             relay: None,
             batch_ms: crate::steps::MAX_BATCH_MS,
             batch_loan: std::sync::atomic::AtomicBool::new(false),
+            rec: crate::record_tools::RecordSupport::default(),
         }
+    }
+
+    /// Wire recording and replay of human demonstrations (composition root
+    /// only): the listener, the flow store, the `allowed_apps` a recording is
+    /// held to, and the marker file `agentctl doctor` reads.
+    pub fn with_recording(mut self, rec: crate::record_tools::RecordSupport) -> Self {
+        self.rec = rec;
+        self
     }
 
     /// Shorten the batch's time, so a test need not wait 30 s.
@@ -2938,7 +2977,12 @@ impl InputModule {
         // Held for the whole call, including any `expect` wait: the pointer is
         // ours for that entire window, so a divergence during it is somebody
         // else's hand.
-        let _driving = self.activity.as_ref().map(crate::Activity::begin);
+        // Watching a person is not driving: a recording call must not arm the
+        // human-override watcher, whose point is that the person's hand on the
+        // mouse is the agent's cue to stop, not what is being recorded.
+        let _driving = (name != "desktop_record")
+            .then(|| self.activity.as_ref().map(crate::Activity::begin))
+            .flatten();
 
         // An `expect` clause is parsed *before* the action: discovering the
         // expectation was malformed after clicking is too late to be useful.
@@ -2995,6 +3039,8 @@ impl InputModule {
             "clipboard_write" => self.clipboard_write(&args).await,
             "input_showcase" => self.input_showcase(&args).await,
             "input_steps" => self.input_steps(&args, ctx).await,
+            "desktop_record" => self.desktop_record(&args).await,
+            "desktop_flow" => self.desktop_flow(&args, ctx).await,
             other => Envelope::fail(other, ErrorCode::InvalidArgs, "unknown tool"),
         };
         if let (Some(before), true) = (seen_before, env.ok) {
@@ -3012,6 +3058,7 @@ impl InputModule {
         // batch: one that reached the module and failed has released them, and
         // one the gate refused never touched them, as when called alone.
         let manages_holds = name == "input_steps"
+            || name == "desktop_flow"
             || (name == "keyboard_shortcut"
                 && !matches!(shortcut_action(&args), Ok(HoldAction::Press) | Err(_)));
         if !env.ok && !manages_holds {
@@ -3344,6 +3391,27 @@ impl ToolModule for InputModule {
                     },"required":["tool"]}}
                 },"required":["steps"]}),
             ).details(BATCH_DETAILS),
+            ToolDescriptor::new(
+                "desktop_record",
+                Category::Input,
+                Tier::Dangerous,
+                "Watch a person demonstrate a task and turn it into a desktop_flow: start, stop (name saves it) or status. Keeps what was clicked or typed as what it was (role, title, ancestry), never typed secrets. Only allowed_apps; bounded in time and size. Dangerous tier.",
+                json!({"type":"object","properties":{
+                    "action":{"type":"string","enum":["start","stop","status"],"description":"default status"},
+                    "name":{"type":"string","description":"stop: flow name to save"},
+                    "max_seconds":{"type":"integer","description":"start: stop listening after this long (default 120, at most 600)"}}}),
+            ).details(RECORD_DETAILS),
+            ToolDescriptor::new(
+                "desktop_flow",
+                Category::Input,
+                BATCH_TIER,
+                "Keep and replay recorded desktop flows: list, get, save, delete, run (name, secrets). Run finds each step's element by role, title and ancestry and performs it through the normal tools, so policy and audit see every step; stops at the first failure.",
+                json!({"type":"object","properties":{
+                    "action":{"type":"string","enum":["list","get","save","delete","run"],"description":"default list"},
+                    "name":{"type":"string","description":"the flow"},
+                    "steps":{"type":"array","description":"save: the steps, as desktop_flow get shows them","items":{"type":"object"}},
+                    "secrets":{"type":"object","description":"run: values for the flow's secret_refs, used in memory only"}}}),
+            ).details(FLOW_DETAILS),
         ];
         // The same optional switch on every tool that reports `effects`, added
         // here so the wording cannot drift between them.
@@ -3474,6 +3542,16 @@ async fn watch(
             Err(_) => {}
         }
     }
+}
+
+/// One step of a flow through the gate, bounded to a minute.
+pub(crate) async fn watch_call(
+    dispatch: &dyn crate::steps::StepDispatch,
+    step: &crate::steps::Step,
+    ctx: &CallCtx,
+) -> Envelope {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+    watch(dispatch, step, ctx, deadline).await
 }
 
 /// What `keyboard_shortcut` was asked to do.
@@ -6518,6 +6596,8 @@ mod tests {
                 ]}),
                 Runs,
             ),
+            ("desktop_record", json!({ "action": "status" }), Runs),
+            ("desktop_flow", json!({ "action": "list" }), Runs),
         ]
     }
 
@@ -7097,6 +7177,9 @@ mod tests {
             "clipboard_read",
             "input_showcase",
             "input_steps",
+            // A flow runs recorded steps, and a recording watches a person.
+            "desktop_record",
+            "desktop_flow",
         ];
         for a in &all {
             assert!(

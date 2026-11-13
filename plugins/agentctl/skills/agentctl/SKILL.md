@@ -79,6 +79,9 @@ ones.
    Several actions that need no look in between (fill these fields, then press Save) go in one
    `input_steps` call; it stops at the first failure, every step is checked and logged as if called alone,
    and a step that opens a dialog belongs last, since the next step's `name` would be resolved too early.
+   To repeat a task a person has shown, `desktop_flow` lists, gets and runs flows they recorded with
+   `desktop_record` (which the operator must enable); `run` re-finds each element and goes through the same
+   checks as the tools it calls, and stops at the first step that fails.
 5. Use `keyboard_type`, `keyboard_shortcut` and coordinate `mouse_action` only when there is no
    semantic route. They go to the frontmost window, so confirm focus first. For a drag, `drag_drop` is one
    call; `mouse_action` `down`, `move`, `up` composes one with pauses or a second button. `scroll` with

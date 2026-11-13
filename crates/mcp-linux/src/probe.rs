@@ -73,3 +73,21 @@ impl UiProbe for LinuxBackend {
         facts
     }
 }
+
+/// Recording a person's input is not offered here, and the reason is the
+/// protocol's, not an omission. The `RemoteDesktop` portal lets a client
+/// *inject* pointer and key events and has no call to *receive* them; a
+/// Wayland compositor deliberately gives no client a global view of other
+/// clients' input, and reading evdev devices directly needs the `input` group
+/// or root, which agentctl does not ask for. A flow can still be written with
+/// `desktop_flow save` and replayed through the accessibility tools.
+impl mcp_input::RecordBackend for LinuxBackend {
+    fn start_recording(&self) -> Result<Box<dyn mcp_input::RecordSession>, mcp_input::RecordError> {
+        Err(mcp_input::RecordError::Unsupported(
+            "recording a person's input is not possible on Linux: the remote-desktop portal can send \
+             input but has no way to listen to it, and reading input devices directly would need \
+             root or the input group"
+                .into(),
+        ))
+    }
+}

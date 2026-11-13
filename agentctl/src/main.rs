@@ -1496,6 +1496,30 @@ fn foreground_summary(cfg: &mcp_policy::PolicyConfig) -> String {
     }
 }
 
+/// Whether a desktop recording is running, from the marker file the server
+/// that is recording keeps in the state directory.
+fn recording_summary(cfg: &mcp_policy::PolicyConfig) -> String {
+    let path = cfg
+        .kill_switch_file
+        .parent()
+        .map(|p| p.join(agentctl::engines::RECORDING_MARKER_FILE))
+        .unwrap_or_default();
+    match std::fs::read_to_string(&path) {
+        Err(_) => "none (desktop_record is not listening)".to_string(),
+        Ok(text) => mcp_input::describe_marker(&text, mcp_policy::now_ms(), &pid_alive),
+    }
+}
+
+/// Whether a process with this id exists, by signalling nothing.
+fn pid_alive(pid: u32) -> bool {
+    std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
 fn doctor() {
     let cfg = config_or_exit();
     println!("agentctl doctor");
@@ -1520,6 +1544,7 @@ fn doctor() {
         mcp_policy::config_path().exists()
     );
     println!("  allowed apps:    {}", cfg.allowed_apps.join(", "));
+    println!("  recording:       {}", recording_summary(&cfg));
     println!("  terminal apps:   {} entries", cfg.terminal_apps.len());
     println!(
         "  consent channel: {} ({} mode, max {} prompts)",

@@ -8,6 +8,34 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- **`desktop_record` and `desktop_flow`: record a human demonstration of a desktop task and replay it through the
+  gate.** The desktop twin of `browser_record` / `browser_flow`. `desktop_record` (`start`, `stop` with a `name`
+  to save, `status`) listens to a person's real keyboard and mouse and keeps *what was touched*, not where:
+  for a click, the role, title and parents (up to the window) of the element under the pointer, the point only
+  as a fallback hint, and the menu path for a menu item; a run of typing becomes one `type` step on the field
+  that had the focus (Backspace edits the run); chords and non-printing keys become `shortcut` steps. Text typed
+  into a secure field is cleared as it is read and the step holds a `secret_ref`, supplied as `secrets` at replay,
+  as the browser recorder does. Recording is a dangerous-tier tool (the one tool that reads a person's input, so
+  it must be named in `policy.enable`), an explicit bounded session (at most 600 s, 4000 events, 200 steps), keeps
+  events only for `allowed_apps` and counts the others (`dropped_other_apps`) without storing them, and writes a
+  marker file that makes `agentctl doctor` print `RECORDING ACTIVE` while it runs. On macOS it is a listen-only
+  `CGEventTap` (Input Monitoring plus Accessibility); without them the call is `PERM_DENIED` naming which, and
+  nothing is recorded. On Linux it is `UNSUPPORTED_OS`: the remote-desktop portal can inject input but cannot
+  listen to it. `desktop_flow` (`list`, `get`, `save`, `delete`, `run`) keeps flows in `desktop_flows.json` beside
+  the browser's. `run` takes a snapshot of each step's app without pinning it, finds the element again by role,
+  title and ancestry (exact; fuzzy when the title only contains the recorded one or the surroundings changed;
+  the recorded point only when nothing matches; two equally good candidates are an error, never a guess), and
+  performs the step as the ordinary call it stands for (`ui_action`, `keyboard_type`, `set_value`,
+  `keyboard_shortcut`, `mouse_action`) through the same relay `input_steps` uses, so tier, role, consent,
+  foreground mode and audit see every step as its own call. Each step reports its `route` (`ax`, `hid`,
+  `pid_event`) and `matched`; the first failure stops the run with `failed_at`. A click on a text field replays as
+  `focus` (a text area offers no press), so it can run in the background; under `foreground = "never"` a flow
+  whose steps would use the keyboard is refused before the first runs, and the coordinate fallback is refused
+  like any pointer action. The human-override watcher is untouched: it samples the pointer only while the server is
+  driving, and `desktop_record` does not mark the server as driving. Measured on macOS: a click in a TextEdit
+  scratch document and a typed word recorded as a `textarea` click (exact point kept as a hint) plus a `type` step
+  on the `textarea`, and replayed into a fresh document (matched, route reported, text arrived). `value set` steps
+  are written by hand with `save` (op `set`): the recorder sees keys, not values.
 - **`observe`: a window's tree and, where the tree is thin, its text, in one call.** An agent facing an app it
   cannot read used to chain `get_ui_tree`, `capture_window` and `ocr_region` and then work out which pixel to
   click. `observe` returns the accessibility snapshot with `get_ui_tree`'s own refs (they resolve in

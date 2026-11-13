@@ -139,8 +139,11 @@ impl Scratch {
     }
 }
 
-impl Drop for Scratch {
-    fn drop(&mut self) {
+impl Scratch {
+    /// Close, without saving, every window that was not there when the guard
+    /// began. The rest of `drop` leaves TextEdit as it was found; this is also
+    /// what a test needs between two documents.
+    fn close_new_windows(&self) {
         for title in textedit_windows() {
             if self.before.contains(&title) {
                 continue;
@@ -176,6 +179,12 @@ impl Drop for Scratch {
                  end tell"
             ));
         }
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        self.close_new_windows();
         if !self.was_running && textedit_running() {
             // Nothing of ours is left open, so there is nothing to lose.
             // Asking it to quit politely keeps it from restoring a window the
@@ -2706,4 +2715,214 @@ async fn observe_works_on_a_background_window_under_never() {
         "background TextEdit: ocr.ran={}, marks_image via {}, warning {}",
         data["ocr"]["ran"], data["marks_image"]["via"], data["warning"]
     );
+}
+
+/// A server that may record: `desktop_record` is dangerous-tier, so it has to be
+/// named in `policy.enable`, as an operator would.
+fn recording_client(name: &str) -> InProcClient {
+    let mut cfg = test_policy(&[Category::Vision, Category::Input, Category::Window]);
+    cfg.allowed_apps = vec![APP.to_string()];
+    cfg.enable = vec!["desktop_record".to_string()];
+    // The flow store and the marker live in the test's own state directory.
+    let server = agentctl::build_server(cfg, AuditSink::memory(), Arc::new(NoConsent), name)
+        .expect("server builds");
+    InProcClient::new(server)
+}
+
+/// The text of the front TextEdit document, read through accessibility.
+async fn document_text(c: &InProcClient) -> String {
+    let found = c
+        .ok(
+            "find_elements",
+            json!({ "app": APP, "role": "text field", "limit": 5 }),
+        )
+        .await;
+    let reff = found["elements"][0]["ref"]
+        .as_str()
+        .unwrap_or("@e0")
+        .to_string();
+    let v = c
+        .ok("get_element", json!({ "ref": reff, "property": "value" }))
+        .await;
+    v.to_string()
+}
+
+/// A person's demonstration, replayed. The test itself posts the real events a
+/// person would (a click in the text area, typed letters) while the listen-only
+/// tap is running; that is not a human demonstration, but it is the same events
+/// through the same tap. The recording must hold what was touched (a text
+/// area) and what was typed, not coordinates, and replaying it into a fresh
+/// document must put the text there, through the gate, saying which route acted
+/// and how the element was matched.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_recorded_click_and_typing_replay_into_a_fresh_document() {
+    if !ready() {
+        return;
+    }
+    let textedit = Scratch::begin();
+    let c = recording_client("live-record");
+    c.initialize().await;
+    let word = "Zebraquartz";
+    if scratch_document(&c, "").await.is_none() {
+        return;
+    }
+    let found = c
+        .ok(
+            "find_elements",
+            json!({ "app": APP, "role": "text field", "limit": 5 }),
+        )
+        .await;
+    let area = found["elements"][0]["ref"].as_str().unwrap().to_string();
+
+    let started = c
+        .call(
+            "desktop_record",
+            json!({ "action": "start", "max_seconds": 60 }),
+        )
+        .await;
+    if !started.ok {
+        // Without the permission the call must say which one and record nothing.
+        let err = started.error.expect("an error");
+        eprintln!(
+            "recording not possible here: {} ({:?})",
+            err.message, err.code
+        );
+        assert!(
+            matches!(err.code, ErrorCode::PermDenied | ErrorCode::UnsupportedOs),
+            "{err:?}"
+        );
+        assert!(
+            err.message.contains("Input Monitoring") || err.message.contains("Accessibility"),
+            "{}",
+            err.message
+        );
+        let status = c.ok("desktop_record", json!({ "action": "status" })).await;
+        assert_eq!(
+            status["recording"],
+            json!(false),
+            "a refused start recorded"
+        );
+        return;
+    }
+    let started = started.data.unwrap();
+    assert_eq!(started["apps"], json!([APP]));
+
+    // The marker `agentctl doctor` reads exists while the session runs.
+    let marker = std::env::temp_dir()
+        .join(format!("agentctl-test-{}", std::process::id()))
+        .join(agentctl::engines::RECORDING_MARKER_FILE);
+    assert!(marker.exists(), "no marker while recording");
+
+    if !focused_is_textedit() {
+        let _ = c.call("desktop_record", json!({ "action": "stop" })).await;
+        eprintln!("skipping: focus moved off {APP}");
+        return;
+    }
+    c.ok(
+        "mouse_action",
+        json!({ "type": "click", "ref": &area, "x": 40, "y": 20 }),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    if !focused_is_textedit() {
+        let _ = c.call("desktop_record", json!({ "action": "stop" })).await;
+        eprintln!("skipping: focus moved off {APP}");
+        return;
+    }
+    c.ok("keyboard_type", json!({ "text": word })).await;
+    tokio::time::sleep(Duration::from_millis(700)).await;
+
+    let status = c.ok("desktop_record", json!({ "action": "status" })).await;
+    assert_eq!(status["recording"], json!(true));
+    let stopped = c
+        .ok(
+            "desktop_record",
+            json!({ "action": "stop", "name": "live-flow" }),
+        )
+        .await;
+    assert!(!marker.exists(), "the marker outlived the recording");
+    assert_eq!(stopped["recording"], json!(false));
+    let steps = stopped["flow"]["steps"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    eprintln!(
+        "recorded {} steps from {} events ({} dropped for other apps, {} unlocated)",
+        steps.len(),
+        stopped["events_seen"],
+        stopped["dropped_other_apps"],
+        stopped["dropped_unlocated"]
+    );
+    let typed = steps
+        .iter()
+        .position(|s| s["op"] == "type" && s["text"].as_str().is_some_and(|t| t.contains(word)))
+        .unwrap_or_else(|| {
+            panic!(
+                "no step typed the word; steps: {}",
+                json!(steps).to_string().len()
+            )
+        });
+    let loc = &steps[typed]["locator"];
+    assert_eq!(loc["app"], json!(APP));
+    assert_eq!(
+        loc["role"],
+        json!("textarea"),
+        "typing is located by the field, not a point"
+    );
+    assert!(
+        loc.get("hint").is_none(),
+        "a typed step carries no coordinate"
+    );
+    let clicked = steps[..typed]
+        .iter()
+        .find(|s| s["op"] == "click" && s["locator"]["role"] == "textarea")
+        .expect("the click is a step on the text area");
+    assert_eq!(clicked["locator"]["app"], json!(APP));
+    assert!(
+        clicked["locator"]["hint"]["x"].is_number(),
+        "the point is kept as a hint"
+    );
+
+    // A fresh document: the first one is closed without saving.
+    textedit.close_new_windows();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    if scratch_document(&c, "").await.is_none() {
+        return;
+    }
+    assert!(!document_text(&c).await.contains(word));
+
+    let ran = c
+        .call(
+            "desktop_flow",
+            json!({ "action": "run", "name": "live-flow" }),
+        )
+        .await;
+    let data = ran.data.clone().unwrap_or_default();
+    assert!(
+        ran.ok,
+        "{:?} {}",
+        ran.error.map(|e| e.message),
+        data["steps"]
+    );
+    for row in data["steps"].as_array().unwrap() {
+        assert_eq!(row["ok"], json!(true), "{row}");
+        if row["op"] != "shortcut" {
+            let m = row["matched"].as_str().unwrap_or_default();
+            assert!(m == "exact" || m == "fuzzy", "{row}");
+        }
+        assert!(
+            row["route"].as_str().is_some(),
+            "a step says which route acted: {row}"
+        );
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        document_text(&c).await.contains(word),
+        "the replayed typing did not arrive"
+    );
+    c.ok(
+        "desktop_flow",
+        json!({ "action": "delete", "name": "live-flow" }),
+    )
+    .await;
 }

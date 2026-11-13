@@ -44,7 +44,7 @@ pub(crate) const KAX_ERROR_CANNOT_COMPLETE: AXError = -25204;
 
 #[link(name = "ApplicationServices", kind = "framework")]
 extern "C" {
-    fn AXUIElementCreateSystemWide() -> AXUIElementRef;
+    pub(crate) fn AXUIElementCreateSystemWide() -> AXUIElementRef;
     pub(crate) fn AXUIElementCreateApplication(pid: c_int) -> AXUIElementRef;
     fn AXUIElementCopyAttributeValue(
         element: AXUIElementRef,
@@ -72,7 +72,7 @@ extern "C" {
         element: AXUIElementRef,
         timeout_seconds: f32,
     ) -> AXError;
-    fn AXUIElementGetPid(element: AXUIElementRef, pid: *mut c_int) -> AXError;
+    pub(crate) fn AXUIElementGetPid(element: AXUIElementRef, pid: *mut c_int) -> AXError;
     fn AXIsProcessTrusted() -> Boolean;
     fn AXValueGetValue(value: CFTypeRef, the_type: u32, value_ptr: *mut c_void) -> Boolean;
     fn AXValueCreate(the_type: u32, value_ptr: *const c_void) -> CFTypeRef;
@@ -736,7 +736,7 @@ impl MacosBackend {
 }
 
 /// The AX element for a pid.
-unsafe fn app_element(pid: c_int) -> Option<CFType> {
+pub(crate) unsafe fn app_element(pid: c_int) -> Option<CFType> {
     let app = AXUIElementCreateApplication(pid);
     if app.is_null() {
         None
@@ -1309,7 +1309,7 @@ unsafe fn dict_string(dict: &CFDictionary, key: CFStringRef) -> Option<String> {
 }
 
 /// On-screen GUI apps as `(pid, owner name)`, front-to-back, deduplicated.
-unsafe fn window_owners() -> Vec<(c_int, String)> {
+pub(crate) unsafe fn window_owners() -> Vec<(c_int, String)> {
     let mut out: Vec<(c_int, String)> = Vec::new();
     let Some(arr) = copy_window_info(
         kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements,

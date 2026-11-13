@@ -1201,6 +1201,7 @@ dependencies = [
  "core-foundation",
  "core-foundation-sys",
  "core-graphics",
+ "foreign-types",
  "mcp-a11y",
  "mcp-input",
  "mcp-types",

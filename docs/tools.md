@@ -8,7 +8,7 @@ Tiers gate what an agent may call: `read` and `standard` tools are available ins
 enabled category, while a `dangerous` tool additionally has to be named in
 `policy.enable`. Enabling a category never enables its dangerous tools.
 
-**128 tools across 12 categories.**
+**130 tools across 12 categories.**
 
 | Tool | Category | Tier | Summary |
 |---|---|---|---|
@@ -23,6 +23,8 @@ enabled category, while a `dangerous` tool additionally has to be named in
 | [`ui_extract`](#ui-extract) | vision | read | Extract structured data (tables, forms, lists, or custom schemas) directly from native accessibility trees into JSON without parsing raw tex… |
 | [`clipboard_read`](#clipboard-read) | input | standard | Read the clipboard. |
 | [`clipboard_write`](#clipboard-write) | input | standard | Write the clipboard. |
+| [`desktop_flow`](#desktop-flow) | input | standard | Keep and replay recorded desktop flows: list, get, save, delete, run (name, secrets). |
+| [`desktop_record`](#desktop-record) | input | dangerous | Watch a person demonstrate a task and turn it into a desktop_flow: start, stop (name saves it) or status. |
 | [`drag_drop`](#drag-drop) | input | standard | Press-move-release drag from one point/element to another. |
 | [`get_selection`](#get-selection) | input | standard | Read the text selected in an element (ref or name), or in the focused element when none is given, without changing it. |
 | [`hover`](#hover) | input | standard | Move the pointer over an element (ref or name) or point (reveals tooltips/hover menus). |
@@ -312,6 +314,35 @@ Write the clipboard. For 'image', 'data' is a base64 PNG; for 'files', it is a n
 | `data` | string | yes |  |
 | `format` | one of: text, html, image, files |  |  |
 | `secret` | boolean |  | the text is a password or other secret: keep it out of the audit log and never send it to the judge |
+
+### desktop-flow
+
+`desktop_flow` · standard tier
+
+Keep and replay recorded desktop flows: list, get, save, delete, run (name, secrets). Run finds each step's element by role, title and ancestry and performs it through the normal tools, so policy and audit see every step; stops at the first failure.
+
+A flow is a list of steps `{op, locator, text | combo | secret_ref, ...}` kept in `desktop_flows.json` beside the config. `run` takes a snapshot of each step's application without pinning it, finds the element whose role and title match and whose parents agree (exact), or whose title merely contains the recorded one or whose surroundings changed (fuzzy), and performs the step as the ordinary call it stands for: `ui_action` for a click (an accessibility press, so it can run with the app in the background), `keyboard_type` or `set_value` for text, `keyboard_shortcut` for a chord. Only when nothing matches does a click fall back to the recorded point with `mouse_action`, which `foreground = "never"` refuses like any pointer action. Two elements that fit equally well are an error, not a guess. Each step in the result has `matched` (exact, fuzzy or coordinate), `route` (`ax`, `hid` or `pid_event`, as the tool reported) and the ref used; the first failure stops the run with `failed_at` and what to do. Under `never` the steps that would use the keyboard are refused before anything runs. `value set` steps are written by hand with `save` (op `set`); the recorder cannot see a value being set, only keys.
+
+| Argument | Type | Required | Description |
+|---|---|---|---|
+| `action` | one of: list, get, save, delete, run |  | default list |
+| `name` | string |  | the flow |
+| `secrets` | object |  | run: values for the flow's secret_refs, used in memory only |
+| `steps` | array&lt;object&gt; |  | save: the steps, as desktop_flow get shows them |
+
+### desktop-record
+
+`desktop_record` · dangerous tier
+
+Watch a person demonstrate a task and turn it into a desktop_flow: start, stop (name saves it) or status. Keeps what was clicked or typed as what it was (role, title, ancestry), never typed secrets. Only allowed_apps; bounded in time and size. Dangerous tier.
+
+Recording listens to the keyboard and mouse through a listen-only event tap (macOS, `kCGEventTapOptionListenOnly`), which needs the Input Monitoring permission and Accessibility for the app that runs agentctl; without them the call returns PERM_DENIED naming which and records nothing. It never acts. Each click is resolved through accessibility to the element under the pointer (role, title, parents up to the window, and the point as a fallback hint); each run of typing becomes one `type` step on the field that had the focus; chords and non-printing keys become `shortcut` steps; a click on a menu item keeps its menu path. Text typed into a secure field is cleared as it is read and the step holds only a `secret_ref`, supplied as `secrets` when the flow runs. Events whose application is not in `allowed_apps` are counted (`dropped_other_apps`) and not stored; so are events with no readable element (`dropped_unlocated`). A session stops by itself after `max_seconds` (at most 600) or 4000 events, and a marker file in the state directory makes `agentctl doctor` report it while it runs. Dangerous tier: it records a person's real input, so it needs to be named in `policy.enable` and is not available by default. Starting does not arm the human-override watcher, but a recording that starts within its grace period (1.5 s) of an agent input call is still inside it. Linux has no listen-only tap in the remote-desktop portal (it can inject input, not observe it), so it returns UNSUPPORTED_OS there; flows written with `desktop_flow save` replay on both.
+
+| Argument | Type | Required | Description |
+|---|---|---|---|
+| `action` | one of: start, stop, status |  | default status |
+| `max_seconds` | integer |  | start: stop listening after this long (default 120, at most 600) |
+| `name` | string |  | stop: flow name to save |
 
 ### drag-drop
 

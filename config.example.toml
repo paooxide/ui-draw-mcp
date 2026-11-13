@@ -29,6 +29,14 @@ categories = ["vision", "input", "window", "browser", "system"]
 # Dangerous-tier tools must be named here to be callable at all. This is the
 # operator's pre-approval; in interactive mode a human is *also* asked per call.
 enable = []
+# `desktop_record` is one of them. It listens to your real keyboard and mouse
+# (macOS: a listen-only event tap, needing Input Monitoring and Accessibility for
+# the app that runs agentctl) to turn a demonstration into a replayable
+# `desktop_flow`, so add it only on a machine where you want that:
+#   enable = ["desktop_record"]
+# It keeps events only for the apps in `allowed_apps` below, counts and discards
+# the rest, never keeps text typed into secure fields, stops by itself after at
+# most 10 minutes, and `agentctl doctor` shows "RECORDING ACTIVE" while it runs.
 
 # interactive = ask a human (a native dialog on macOS, zenity on Linux) before risky actions.
 # autonomous  = nobody to ask, so anything needing consent is denied.
@@ -48,7 +56,8 @@ max_consent_prompts = 20
 # Session aborts after this many denials (anti-spin).
 max_denials = 5
 
-# GUI apps the agent may launch or drive.
+# GUI apps the agent may launch or drive, and the only apps a `desktop_record`
+# session keeps events for.
 allowed_apps = ["TextEdit", "Finder"]
 
 # PII/PHI tokenizer. When on, tool results reach the model with names you

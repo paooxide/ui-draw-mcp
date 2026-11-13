@@ -31,6 +31,8 @@ mod ocr;
 #[cfg(target_os = "macos")]
 mod popup;
 #[cfg(target_os = "macos")]
+mod record;
+#[cfg(target_os = "macos")]
 mod sck;
 #[cfg(target_os = "macos")]
 mod vision;

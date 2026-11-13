@@ -61,6 +61,11 @@ pub(crate) const TOOLS: &[(&str, Stance)] = &[
     ("input_showcase", Stance::Refused),
     // A batch is as background-safe as its least safe step: see `by_args`.
     ("input_steps", Stance::ByArgs),
+    // Listening posts nothing and raises nothing.
+    ("desktop_record", Stance::Background),
+    // A flow's steps are the calls above, each judged when it is made; the
+    // ones that can be judged before the first runs are (see `run_flow`).
+    ("desktop_flow", Stance::Background),
 ];
 
 const POINTER: &str = "move the real pointer";

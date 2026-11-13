@@ -160,6 +160,12 @@ pub struct Wiring {
     pub steps: Option<(Arc<dyn ToolModule>, Arc<mcp_input::StepRelay>)>,
 }
 
+/// Where recorded desktop flows are kept, beside the browser's.
+pub const DESKTOP_FLOWS_FILE: &str = "desktop_flows.json";
+
+/// Present while a desktop recording is running; `agentctl doctor` reads it.
+pub const RECORDING_MARKER_FILE: &str = "desktop-recording.json";
+
 /// A probe for the input engine: whether the STOP file exists.
 fn stop_file_probe(file: &std::path::Path) -> Arc<dyn Fn() -> bool + Send + Sync> {
     let file = file.to_path_buf();
@@ -391,7 +397,19 @@ pub fn build_stack(cfg: &PolicyConfig) -> (Vec<Arc<dyn ToolModule>>, Wiring) {
             // although every later call, `up` included, is refused by then.
             // A human taking the mouse reaches the engine through the
             // backend's takeover count instead.
-            .with_halt_probe(stop_file_probe(&cfg.kill_switch_file));
+            .with_halt_probe(stop_file_probe(&cfg.kill_switch_file))
+            // Recorded human demonstrations: kept beside the other state, held
+            // to the applications the operator allows, and visible to
+            // `agentctl doctor` through a marker file while one runs.
+            .with_recording(
+                mcp_input::RecordSupport::new(Some(backend.clone()), allowed_apps.clone())
+                    .with_flows(mcp_input::record::FlowStore::new(
+                        state_dir(cfg).join(DESKTOP_FLOWS_FILE),
+                        100,
+                        mcp_input::record::MAX_RECORD_STEPS,
+                    ))
+                    .with_marker(state_dir(cfg).join(RECORDING_MARKER_FILE)),
+            );
         if engines.demo {
             input = input.with_glide(glide_preset.into());
         }
@@ -503,7 +521,19 @@ pub fn build_stack(cfg: &PolicyConfig) -> (Vec<Arc<dyn ToolModule>>, Wiring) {
             // although every later call, `up` included, is refused by then.
             // A human taking the mouse reaches the engine through the
             // backend's takeover count instead.
-            .with_halt_probe(stop_file_probe(&cfg.kill_switch_file));
+            .with_halt_probe(stop_file_probe(&cfg.kill_switch_file))
+            // Recorded human demonstrations: kept beside the other state, held
+            // to the applications the operator allows, and visible to
+            // `agentctl doctor` through a marker file while one runs.
+            .with_recording(
+                mcp_input::RecordSupport::new(Some(backend.clone()), allowed_apps.clone())
+                    .with_flows(mcp_input::record::FlowStore::new(
+                        state_dir(cfg).join(DESKTOP_FLOWS_FILE),
+                        100,
+                        mcp_input::record::MAX_RECORD_STEPS,
+                    ))
+                    .with_marker(state_dir(cfg).join(RECORDING_MARKER_FILE)),
+            );
         if engines.demo {
             input = input.with_glide(glide_preset.into());
         }

@@ -319,6 +319,27 @@ machine as the log: an actor with the operator's file access can sign whatever t
 Pinning detects tampering by anyone *without* the key; it does not make the host trustworthy. Compliance
 exports describe what the log contains and are not a certification.
 
+**Desktop recording listens to a person's real input.**
+`desktop_record` is dangerous-tier (named in `policy.enable`), because it is the one tool that reads what a
+person types and clicks rather than what an application exposes. On macOS it is a listen-only event tap: it
+cannot change or swallow an event, and it needs Input Monitoring (and Accessibility, to read the element
+under the pointer), so the system's own grant is the first control; without it the call is `PERM_DENIED` and
+records nothing. A session is explicit and bounded (at most 600 s, 4000 events, 200 steps), and a marker
+file in the state directory makes `agentctl doctor` print `RECORDING ACTIVE` while one runs. Each event is
+resolved to its application immediately; one whose application is not in `allowed_apps`, or that cannot be
+resolved, is counted and discarded, not stored. Text typed into a secure field is cleared when it is read,
+by the backend and again by the session, and the step holds a `secret_ref` only. What it cannot know: a
+secret typed into a field the application does not mark secure (a one-time code in a plain text field) is
+recorded verbatim in `desktop_flows.json`, a plain file in the state directory, as the browser recorder's
+equivalent is; and a person's keystrokes between the tap seeing them and the element read are attributed to
+whatever had the focus then. The human-override watcher samples the pointer only while the server is
+driving, so a person's demonstration does not trip the kill switch; it still applies for its 1.5 s grace
+after an agent input call, and `desktop_record` itself never arms it. Replay is not a second path: each step is
+dispatched as the ordinary tool it stands for through the same gate as `input_steps`, so a role that denies
+`keyboard_type`, a consent requirement, `foreground = "never"` and the audit log treat a replayed step as
+the call it is; a flow whose steps the foreground mode would refuse is refused before the first runs. Linux
+has no listen-only route in the remote-desktop portal, so recording is `UNSUPPORTED_OS` there.
+
 **Recorded flows are what the page showed the recorder.**
 `browser_record` never stores a secret field's value: a field is secret by `type=password`, a secret word
 in its name or id, or an `autocomplete` token (`one-time-code`, `*-password`, `cc-*`), and the saved step
