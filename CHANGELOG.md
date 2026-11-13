@@ -98,9 +98,9 @@ All notable changes to this project are documented here. The format follows
   error paths and a dropped call too; the result's `polite` says what was returned (`returned.app`,
   `returned.pointer`) and `waited_ms`. An `input_steps` batch borrows once and restores once. If you move
   the pointer mid-action, the action is abandoned with buttons and keys released and fails with the same
-  retryable error; the app is put back but the pointer is left in your hand. The human-override watcher does
-  not trip the kill switch in this mode (it abandons the action instead); under `allow` it does as before,
-  and the STOP file stops everything in every mode. `AGENTCTL_FOREGROUND` can only tighten (`never` over
+  retryable error; the app is put back but the pointer is left in your hand. The human-override watcher trips
+  the kill switch in this mode exactly as under `allow` (taking the pointer is a stop request in every
+  mode), and the STOP file stops everything in every mode. `AGENTCTL_FOREGROUND` can only tighten (`never` over
   `polite` over `allow`): `polite` from the environment applies over a file's `allow`, and neither `allow`
   nor `polite` loosens a stricter file. Not supported, and refused with the reason: `keyboard_shortcut`
   `action: "down"` (a held key outlives the call, so it cannot be given back), and any call that needs the
@@ -361,9 +361,10 @@ All notable changes to this project are documented here. The format follows
   DevTools session per tab holds `Emulation.setFocusEmulationEnabled` while the browser is connected (a session
   per call is not enough: Chrome ends the emulation when any session that set it closes, so the page saw a blur
   after every call). `allow` is unchanged. Verified against a real headless Chrome by reading the commands off the
-  wire and with a focus fixture (`docs/fixtures/focus_probe.html`). **Unverified:** that a visible browser stays
-  behind other windows; the test for it (`live_browser_headed_never.rs`) is written and has not been run, because
-  it needs an unlocked screen. A background tab in a visible browser may be hidden to the page and throttled.
+  wire and with a focus fixture (`docs/fixtures/focus_probe.html`). **Measured:** a visible Chrome (throwaway
+  profile, attach mode) driven under `never` on macOS left Finder frontmost throughout
+  (`live_browser_headed_never.rs`, 3 of 3 runs on an unlocked screen). **Not measured:** Safari, Linux, and
+  attaching to the Chrome window a person uses every day (its window order). A background tab in a visible browser may be hidden to the page and throttled.
 
 ### Changed
 

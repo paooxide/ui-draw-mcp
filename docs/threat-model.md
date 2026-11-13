@@ -116,9 +116,9 @@ promise:
 
 - That an application stays behind. An app may raise itself in answer to an accessibility action it
   accepted, and a launched app may take focus despite the request not to activate it.
-- That a visible (headed) browser stays behind other windows. The browser engine is covered, but only
-  *verified* in headless (see **The browser engine under `never` and `polite`** below); the headed case is
-  written as a test that has not yet been run on a real screen, so treat it as intended and unmeasured.
+- That a visible (headed) browser stays behind other windows everywhere. The browser engine is covered, and
+  the headed case was measured with Chrome on macOS in attach mode (see **The browser engine under `never` and
+  `polite`** below); Safari, Linux, and attaching to a person's own everyday Chrome are unmeasured.
 - Anything about programs the agent starts. `exec` and `pty_*` run arbitrary commands, and a command can
   open an app or send keys (`open`, `osascript`); the command allowlist, not `foreground`, limits that.
 - The clipboard. `clipboard_write` changes what the user will paste; it moves nothing and is not refused.
@@ -144,11 +144,11 @@ the page a blur at the end of every call, which a first version of this change d
 holder sessions end on `browser_disconnect`. Under `allow` nothing changes. Verified against a real headless
 Chrome: the commands sent are read off the wire (no `Page.bringToFront`, no `Target.activateTarget`, a
 background `createTarget`), and a focus-dependent fixture behaves as a focused page under all three settings.
-**Not verified:** that a visible browser really stays behind other windows, that a background tab renders
-and can be screenshotted (a hidden tab may be throttled), and that attaching to the person's own visible Chrome
-leaves their window order alone. `agentctl/tests/live_browser_headed_never.rs` is written to measure the
-first (Finder frontmost, a throwaway headed Chrome driven under `never`, frontmost sampled throughout) and has
-not been run, because it needs an unlocked screen. Not covered: `browser_record` and `agentctl record` as
+**Measured:** with a visible Chrome (a throwaway profile, attach mode) driven under `never` on macOS, Finder
+stayed frontmost throughout (`agentctl/tests/live_browser_headed_never.rs`: Finder frontmost, frontmost app
+sampled every 50 ms; 3 of 3 runs on an unlocked screen). **Not measured:** Safari, Linux, that a background tab
+renders and can be screenshotted (a hidden tab may be throttled), and that attaching to the person's own
+everyday Chrome leaves their window order alone. Not covered: `browser_record` and `agentctl record` as
 the CLI command, which start a visible browser for a person on purpose, and what a page does to its own window
 (`window.focus()`, `window.open`).
 
@@ -180,8 +180,9 @@ input not counted as the person), up to `input.polite_max_wait_ms` (15000), then
 pointer, acts, and puts both back, on error paths too; a batch (`input_steps`) borrows once for all its
 steps. If the person moves the pointer part way, the action is abandoned (buttons and keys are released) and
 the call fails with the same retryable error; the app is put back but the pointer is left in their hand.
-In this mode the human-override watcher abandons the action instead of tripping the kill switch
-(`agentctl/src/override_watch.rs`); under `allow` it still trips it, and the STOP file stops every call in every mode.
+The human-override watcher also trips the kill switch (`agentctl/src/override_watch.rs`), exactly as under
+`allow`: taking the pointer is a stop request in every mode, and later calls are refused until the STOP file
+is deleted. The STOP file stops every call in every mode.
 
 This is courtesy, not containment:
 

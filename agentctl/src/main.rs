@@ -239,7 +239,6 @@ async fn serve(force_http: bool) -> std::io::Result<()> {
         grace_ms: cfg.human_override_grace_ms,
         ..mcp_input::OverrideConfig::default()
     };
-    let polite = cfg.foreground.is_polite();
     let (server, policy, wiring) =
         agentctl::build_server_with(cfg, audit, consent_provider(), session_id.clone())
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
@@ -254,7 +253,6 @@ async fn serve(force_http: bool) -> std::io::Result<()> {
             policy.clone(),
             wiring.desktop.clone(),
             session_id.clone(),
-            polite,
         );
     }
 
@@ -1480,7 +1478,7 @@ fn foreground_summary(cfg: &mcp_policy::PolicyConfig) -> String {
         mcp_types::Foreground::Polite => format!(
             "polite (an action that needs the pointer, keyboard or foreground waits for {} ms \
              of user idle time, up to {} ms, then gives the pointer and frontmost app back; \
-             the human-override watcher abandons the action instead of tripping the kill switch; \
+             a person taking the pointer mid-action trips the kill switch, as under allow; \
              a visible browser is not brought forward and cannot be launched, as under never)",
             cfg.polite_idle_ms, cfg.polite_max_wait_ms
         ),
@@ -1850,7 +1848,7 @@ mod test_cmd_tests {
             polite.contains("900 ms") && polite.contains("7000 ms"),
             "{polite}"
         );
-        assert!(polite.contains("kill switch"), "{polite}");
+        assert!(polite.contains("trips the kill switch"), "{polite}");
         assert!(polite.contains("visible browser"), "{polite}");
         cfg.foreground = mcp_types::Foreground::Never;
         cfg.demo = true;

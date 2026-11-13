@@ -1,10 +1,10 @@
 //! A visible (headed) Chrome driven under `foreground = "never"` must leave the
 //! person's frontmost app alone.
 //!
-//! STATUS: written, and NOT YET RUN on a real screen. It needs an unlocked
-//! desktop, so until someone has run it, "a headed browser stays in the
-//! background under `never`" is unverified (see `docs/threat-model.md`). What
-//! is verified without a screen is in `mcp-browser/src/foreground_live.rs`
+//! STATUS: run on macOS with an unlocked screen (3 of 3 passes: Finder stayed
+//! frontmost while a visible Chrome was driven under `never`, attach mode).
+//! Not measured: Safari, Linux, and attaching to a person's own everyday Chrome
+//! (see `docs/threat-model.md`). What is verified without a screen is in `mcp-browser/src/foreground_live.rs`
 //! (the commands the engine sends, read off a real session) and
 //! `browser_foreground.rs` (the refusals).
 //!
@@ -107,7 +107,9 @@ impl Throwaway {
 
 impl Drop for Throwaway {
     fn drop(&mut self) {
-        let needle = format!("--user-data-dir={}", self.profile.display());
+        // The profile path alone: a pattern that starts with `--` is read by
+        // pkill as an option, which left the browser running.
+        let needle = self.profile.display().to_string();
         let _ = Command::new("/usr/bin/pkill")
             .args(["-f", &needle])
             .status();
@@ -209,6 +211,8 @@ async fn a_headed_browser_driven_under_never_leaves_the_frontmost_app_alone() {
 
     let mut cfg = test_policy(&[Category::Browser]);
     cfg.foreground = Foreground::Never;
+    // The fixture is served from loopback.
+    cfg.browser_allow_private = true;
     cfg.enable = vec!["browser_eval".to_string()];
     let server = agentctl::build_server(
         cfg,

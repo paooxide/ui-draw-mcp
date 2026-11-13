@@ -146,9 +146,10 @@ human_override_grace_ms = 1500
 #            until you have been idle for polite_idle_ms (up to polite_max_wait_ms,
 #            then it fails with a retryable error and does nothing), borrows
 #            them, and puts the frontmost app and the pointer back. If you
-#            move the mouse mid-action it stops and gives the pointer to you
-#            instead of tripping the kill switch. Courtesy, not containment:
-#            see docs/threat-model.md. Stricter than "allow", looser than "never".
+#            move the mouse mid-action the action is abandoned and the kill
+#            switch trips, exactly as under "allow" (delete the STOP file to
+#            resume). Courtesy, not containment: see docs/threat-model.md.
+#            Stricter than "allow", looser than "never".
 #   "never"  no tool moves the real pointer, posts synthetic key or scroll events,
 #            holds a key, or brings an app or window to the front. Each one is
 #            refused before it runs, with the background-safe alternative if
@@ -163,8 +164,10 @@ human_override_grace_ms = 1500
 # `browser_tabs activate` and launching a visible Chromium or Safari are refused
 # (use `launch.headless: true`, or attach to a Chrome that is already running);
 # headless is unaffected. "polite" applies the same rule: the browser engine
-# cannot borrow and return the desktop. Verified in headless; that a visible
-# browser stays behind other windows has not yet been measured on a real screen.
+# cannot borrow and return the desktop. Verified in headless. A visible Chrome
+# was measured on macOS in attach mode: with Finder frontmost it stayed behind
+# while being driven under "never". Not measured: Safari, Linux, and attaching
+# to the Chrome window you use every day (its window order).
 #
 # It does not stop an app from raising itself in response to an accessibility
 # action, and does not limit what `exec` can run. See docs/threat-model.md.

@@ -19,7 +19,6 @@ pub fn spawn(
     policy: Arc<Policy>,
     desktop: Option<Arc<dyn mcp_desktop::DesktopBackend>>,
     session_id: String,
-    polite: bool,
 ) {
     if !cfg.enabled {
         tracing::debug!("human override is disabled");
@@ -94,17 +93,10 @@ pub fn spawn(
                 // Abandon in-flight work first: a drag must release the button
                 // before the person starts moving the mouse in earnest.
                 input.cancel_pending();
-                // With foreground = "polite" the person taking the pointer is
-                // the expected event, not an emergency: the action in flight
-                // has just been abandoned and its call fails with a retryable
-                // error, and the next call waits for them to be idle again. The
-                // kill switch stays for `allow`, and the STOP file is the hard
-                // stop in every mode.
-                if polite {
-                    tracing::info!(%reason, "polite: the person took the pointer; action abandoned");
-                    detector = Detector::new();
-                    continue;
-                }
+                // Every `foreground` mode trips the switch, `polite` included:
+                // a person taking the pointer mid-action is a stop request, and
+                // polite's idle wait is about not being surprised, not about
+                // being allowed to carry on after they object.
                 policy.trip_kill_switch(&session_id, &reason);
 
                 // Tell the human what just happened and how to undo it. Being

@@ -482,9 +482,8 @@ async fn a_person_taking_the_pointer_mid_action_ends_it_retryably_and_leaves_the
     assert!(!rig.policy.kill_switch_tripped());
 }
 
-/// The kill-switch change, exercised through the real watcher: the same
-/// pointer divergence trips the switch under `allow` and does not under
-/// `polite`, where it abandons the action in flight instead.
+/// The human-override watcher, exercised for real: the same pointer divergence
+/// trips the kill switch under `allow` and under `polite`.
 async fn pointer_taken_by_a_person(foreground: Foreground) -> (bool, Vec<String>) {
     let mut cfg = test_policy(&[Category::Input]);
     cfg.foreground = foreground;
@@ -504,7 +503,6 @@ async fn pointer_taken_by_a_person(foreground: Foreground) -> (bool, Vec<String>
         rig.policy.clone(),
         None,
         "sess".into(),
-        foreground.is_polite(),
     );
     // The server is driving, and has put the pointer at (100, 100)...
     let _driving = rig.activity.begin();
@@ -529,9 +527,9 @@ async fn the_watcher_trips_the_kill_switch_under_allow() {
 }
 
 #[tokio::test]
-async fn the_watcher_abandons_the_action_but_does_not_trip_the_kill_switch_under_polite() {
+async fn the_watcher_abandons_the_action_and_trips_the_kill_switch_under_polite() {
     let (tripped, log) = pointer_taken_by_a_person(Foreground::Polite).await;
-    assert!(!tripped, "polite must not trip the kill switch: {log:?}");
+    assert!(tripped, "polite must trip the kill switch too: {log:?}");
     assert!(
         log.iter().any(|l| l == "cancel_pending"),
         "the in-flight action must still be abandoned: {log:?}"
