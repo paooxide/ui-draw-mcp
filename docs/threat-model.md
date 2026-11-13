@@ -334,9 +334,9 @@ to run wide-open on it; it is not a control the agent can reach or raise.
 *Where the level can come from.* The config file, the `--access` flag, or `AGENTCTL_ACCESS`. The strictness
 order is `ask` < `auto` < `bypass` (ask is the most restrictive). When the file sets `access`, the flag or
 variable can only move it toward `ask`; asking for a looser level is a startup error that says so, never a
-silent ignore. When the file sets nothing, the process's starter is the authority and the flag sets it, except
-that `bypass` is never taken from the environment alone: a variable is too easy to inherit by accident, so
-`bypass` needs the file or an explicit `--access bypass`. `dry_run = true` (or `--dry-run`) works at every
+silent ignore. When the file sets nothing, the process's starter is the authority and the flag sets it. The
+variable alone is refused at every level: a variable is too easy to inherit by accident, and each level turns
+on more than the default. `dry_run = true` (or `--dry-run`) works at every
 level and can only make a session do less. The legacy keys `mode` and `enable` are ignored, with a startup
 warning, once `access` is set.
 

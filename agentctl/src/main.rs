@@ -1950,7 +1950,7 @@ fn print_help() {
          \n\
          OPTIONS:\n\
          \x20   --access <LEVEL>      Permission level: ask, auto or bypass. Over a config file that sets access it can only\n\
-         \x20                         move toward ask; bypass needs the flag or the file, not just AGENTCTL_ACCESS\n\
+         \x20                         move toward ask; AGENTCTL_ACCESS can only tighten a level the file sets\n\
          \x20   --dry-run             Rehearse: reads run, anything that would change something is only reported\n\
          \x20   --role <ROLE>         Narrow the session with a role preset (readonly, qa, browser, browser-core)\n\
          \x20   --no-anonymize        Disable outbound/inbound PII/PHI tokenization\n\

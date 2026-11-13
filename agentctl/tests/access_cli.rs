@@ -73,8 +73,6 @@ fn refused(config: &str, env: &[(&str, &str)], args: &[&str]) -> String {
 fn a_flag_or_environment_level_is_reported_with_where_it_came_from() {
     let line = doctor_access("", &[], &["--access", "ask"]);
     assert!(line.contains("ask (--access flag)"), "{line}");
-    let line = doctor_access("", &[("AGENTCTL_ACCESS", "auto")], &[]);
-    assert!(line.contains("auto (AGENTCTL_ACCESS)"), "{line}");
     let line = doctor_access("[policy]\naccess = \"auto\"\n", &[], &[]);
     assert!(line.contains("auto (config file)"), "{line}");
     let line = doctor_access("", &[], &[]);
@@ -114,12 +112,14 @@ fn a_flag_or_environment_level_cannot_loosen_the_file_and_says_so() {
 }
 
 #[test]
-fn bypass_is_never_taken_from_the_environment_alone() {
-    let e = refused("", &[("AGENTCTL_ACCESS", "bypass")], &["doctor"]);
-    assert!(
-        e.contains("not honoured on its own") && e.contains("--access bypass"),
-        "{e}"
-    );
+fn no_level_is_taken_from_the_environment_alone() {
+    for level in ["ask", "auto", "bypass"] {
+        let e = refused("", &[("AGENTCTL_ACCESS", level)], &["doctor"]);
+        assert!(
+            e.contains("not honoured on its own") && e.contains(&format!("--access {level}")),
+            "{level}: {e}"
+        );
+    }
 }
 
 #[test]

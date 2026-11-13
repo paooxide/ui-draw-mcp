@@ -50,12 +50,11 @@
 #                      and the hard invariants stop it. Your explicit "I take
 #                      responsibility"; never a default.
 #
-# The same choice can be made when starting the server: `agentctl --access auto`
-# or AGENTCTL_ACCESS=auto. When this file sets access, the flag or variable can
-# only move it toward ask (never toward bypass), and loosening is a startup
-# error, not a silent ignore. When it does not, the flag sets it, except that
-# bypass is never taken from the environment alone: put it here or pass
-# `--access bypass`.
+# The same choice can be made when starting the server: `agentctl --access auto`.
+# When this file sets access, the flag or AGENTCTL_ACCESS can only move it toward
+# ask (never toward bypass), and loosening is a startup error, not a silent
+# ignore. When it does not, the flag sets it; AGENTCTL_ACCESS on its own is
+# refused, because a variable is too easy to inherit by accident.
 # access = "ask"
 
 # Rehearse at any level: reads run, anything that would change something only

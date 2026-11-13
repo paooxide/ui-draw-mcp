@@ -456,10 +456,11 @@ fn same_set<T: PartialEq>(a: &[T], b: &[T]) -> bool {
 /// the levels run `ask` < `auto` < `bypass` in how much they let through, and
 /// when the file sets `access` the flag or environment may only move it toward
 /// `ask`. A request that would loosen the file is an error, not a silent
-/// ignore. When the file sets nothing the request sets the level (whoever
-/// starts the process is the authority), except that `bypass` is never taken
-/// from the environment on its own: an inherited variable is too easy to leave
-/// set by accident, so it needs the file or the explicit `--access bypass`.
+/// ignore. When the file sets nothing, the `--access` flag sets the level
+/// (whoever starts the process is the authority), but the environment does
+/// not: every level turns on more than the default does, and an inherited
+/// variable is too easy to leave set by accident. So `AGENTCTL_ACCESS`, like
+/// `AGENTCTL_FOREGROUND`, can only tighten.
 ///
 /// `requested` is `(level, Flag)` or `(level, Env)`.
 pub fn resolve_access(
@@ -483,12 +484,12 @@ pub fn resolve_access(
         )),
         Some(have) if have == want => Ok(Some((have, AccessSource::File))),
         Some(_) => Ok(Some((want, via))),
-        None if want == Access::Bypass && via == AccessSource::Env => Err(
-            "AGENTCTL_ACCESS=bypass is not honoured on its own: an environment variable is too \
-             easy to inherit by accident. Set access = \"bypass\" in the config file, or pass \
-             --access bypass"
-                .to_string(),
-        ),
+        None if via == AccessSource::Env => Err(format!(
+            "AGENTCTL_ACCESS={0} is not honoured on its own: every level turns on more than the \
+             default, and an environment variable is too easy to inherit by accident. Set \
+             access = \"{0}\" in the config file, or pass --access {0}",
+            want.as_str()
+        )),
         None => Ok(Some((want, via))),
     }
 }
@@ -1569,8 +1570,8 @@ mod level_tests {
 
     /// Every file level against every flag or environment level, from each
     /// source. The rule: toward `ask` is allowed, away from it is an error,
-    /// an unset file takes the request, and `bypass` is never taken from the
-    /// environment alone.
+    /// an unset file takes the flag's request, and no level is taken from
+    /// the environment alone.
     #[test]
     fn a_flag_or_environment_level_may_only_tighten_the_files() {
         let files = [None, Some(Ask), Some(Auto), Some(Bypass)];
@@ -1583,12 +1584,12 @@ mod level_tests {
                     match (file, want) {
                         (None, None) => assert_eq!(got, Ok(None), "{label}"),
                         (Some(f), None) => assert_eq!(got, Ok(Some((f, File))), "{label}"),
-                        (None, Some(Bypass)) if via == Env => {
+                        (None, Some(w)) if via == Env => {
                             let e = got.unwrap_err();
                             assert!(
-                                e.contains("AGENTCTL_ACCESS=bypass")
+                                e.contains(&format!("AGENTCTL_ACCESS={}", w.as_str()))
                                     && e.contains("config file")
-                                    && e.contains("--access bypass"),
+                                    && e.contains(&format!("--access {}", w.as_str())),
                                 "{label}: {e}"
                             );
                         }

@@ -319,11 +319,10 @@ Everything in [`config.example.toml`](config.example.toml) belongs to one of thr
 | `bypass` | everything runs; only the kill switch, human override and hard invariants remain | none | gate off; your explicit "I take responsibility" |
 
 `ask` is the safe level: read and act freely, confirm the dangerous. `bypass` is never a default and is set
-only by the operator. The same choice can be made when starting the server, `agentctl --access auto` or
-`AGENTCTL_ACCESS=auto`, with one rule: when the config file sets `access`, a flag or variable can only move it
+only by the operator. The same choice can be made when starting the server, `agentctl --access auto`, with one rule: when the config file sets `access`, a flag or variable can only move it
 toward `ask`, and an attempt to loosen it is a startup error, not a silent ignore. When the file sets nothing,
-the flag sets it, except that `bypass` is never taken from the environment alone (a variable is too easy to
-inherit by accident): it needs the file or `--access bypass`. Add `dry_run = true` (or `--dry-run`) to
+the flag sets it. `AGENTCTL_ACCESS` can only tighten a level the file sets and is never taken on its own (a
+variable is too easy to inherit by accident). Add `dry_run = true` (or `--dry-run`) to
 rehearse at any level: reads run, anything that would change something is only reported.
 
 **2. Scope: what it may touch.** The lists: `categories`, `allowed_apps`, `fs.roots`,

@@ -370,10 +370,10 @@ All notable changes to this project are documented here. The format follows
   `auto` or `bypass`, as `policy.access` in the config file. The strictness order is `ask` < `auto` < `bypass`
   (`ask` is the most restrictive). When the config file sets `access`, the flag or variable may only move it
   toward `ask`: asking for a looser level is a startup error that names both values, not a silent ignore.
-  When the file sets nothing, the flag or variable sets the level, except that `bypass` is never taken from
-  the environment alone (an inherited variable is too easy to leave set by accident): it needs
-  `access = "bypass"` in the file or an explicit `--access bypass`. An unknown value is a startup error. When
-  both the flag and the variable are given, the flag stands.
+  When the file sets nothing, the flag sets the level. The variable does not: every level turns on more than
+  the default, and an inherited variable is too easy to leave set by accident, so `AGENTCTL_ACCESS` on its own
+  is a startup error naming the file and the flag. An unknown value is a startup error. When both the flag and
+  the variable are given, the flag stands.
 - **`policy.dry_run = true` and `--dry-run`: rehearse at any level.** Reads run, and anything that would change
   something reports what it would have done and does not do it, under `ask`, `auto` and `bypass` alike. Dry run
   can only make a session do less. `mode = "dry_run"` keeps working as the older spelling, and is no longer
