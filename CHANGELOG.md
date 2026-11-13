@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-13
+
 ### Added
 
 - **`desktop_record` and `desktop_flow`: record a human demonstration of a desktop task and replay it through the
@@ -1471,7 +1473,9 @@ Field bugs that only a run on real hardware could surface:
 - The destructive-command gate cannot see through shell expansion, and hard links are invisible to path
   resolution. Both are documented in [`SECURITY.md`](SECURITY.md) and asserted by tests.
 
-[Unreleased]: https://github.com/paooxide/ui-draw-mcp/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/paooxide/ui-draw-mcp/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/paooxide/ui-draw-mcp/compare/v0.3.0...v0.4.0
+[0.3.0]: https://github.com/paooxide/ui-draw-mcp/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/paooxide/ui-draw-mcp/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/paooxide/ui-draw-mcp/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/paooxide/ui-draw-mcp/tree/v0.1.0
