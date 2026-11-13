@@ -101,10 +101,10 @@ glibc 2.28 or newer, so RHEL 8, Debian 10, Ubuntu 20.04 and later). Download the
 verify it, and unpack:
 
 ```sh
-curl -LO https://github.com/paooxide/ui-draw-mcp/releases/download/v0.3.0/agentctl-v0.3.0-aarch64-apple-darwin.tar.gz
-curl -LO https://github.com/paooxide/ui-draw-mcp/releases/download/v0.3.0/SHA256SUMS
+curl -LO https://github.com/paooxide/ui-draw-mcp/releases/download/v0.4.0/agentctl-v0.4.0-aarch64-apple-darwin.tar.gz
+curl -LO https://github.com/paooxide/ui-draw-mcp/releases/download/v0.4.0/SHA256SUMS
 shasum -a 256 -c SHA256SUMS --ignore-missing
-tar xzf agentctl-v0.3.0-aarch64-apple-darwin.tar.gz
+tar xzf agentctl-v0.4.0-aarch64-apple-darwin.tar.gz
 ```
 
 The checksum proves the download is intact; the attestation proves who built it. Every archive carries
@@ -112,7 +112,7 @@ signed build provenance, so with the [GitHub CLI](https://cli.github.com) you ca
 repository's release workflow and not from a mirror or a re-upload:
 
 ```sh
-gh attestation verify agentctl-v0.3.0-aarch64-apple-darwin.tar.gz -R paooxide/ui-draw-mcp
+gh attestation verify agentctl-v0.4.0-aarch64-apple-darwin.tar.gz -R paooxide/ui-draw-mcp
 ```
 
 The macOS binaries are signed with a Developer ID (Techbeaver IT Systems LTD) and notarized by Apple, so a
