@@ -206,6 +206,9 @@ impl WindowBackend for ForegroundWindow {
     async fn watch_changes(&self, app: Option<&str>) -> Option<crate::ChangeWatch> {
         self.inner.watch_changes(app).await
     }
+    fn screen_state(&self) -> mcp_types::ScreenState {
+        self.inner.screen_state()
+    }
     fn platform(&self) -> &'static str {
         self.inner.platform()
     }

@@ -1496,6 +1496,23 @@ fn foreground_summary(cfg: &mcp_policy::PolicyConfig) -> String {
     }
 }
 
+/// What the session's lock state means for the tools, in one line for
+/// `doctor`. Pure, so the wording is tested without a screen.
+#[cfg(any(target_os = "macos", test))]
+fn screen_summary(state: mcp_types::ScreenState) -> String {
+    use mcp_types::ScreenState::*;
+    match state {
+        Ready => "ok (unlocked, on the console; key and pointer tools can act)".into(),
+        Locked => "LOCKED: key and pointer tools are refused, because the system discards \
+                   their events; unlock the screen"
+            .into(),
+        OffConsole => "OFF CONSOLE: another user's session has the console, so key and pointer \
+                       tools are refused; switch back to this user"
+            .into(),
+        Unknown => "unknown (the session cannot say); key and pointer tools are not blocked".into(),
+    }
+}
+
 /// Whether a desktop recording is running, from the marker file the server
 /// that is recording keeps in the state directory.
 fn recording_summary(cfg: &mcp_policy::PolicyConfig) -> String {
@@ -1559,6 +1576,11 @@ fn doctor() {
         cfg.human_override_grace_ms
     );
     println!("  foreground:      {}", foreground_summary(&cfg));
+    #[cfg(target_os = "macos")]
+    println!(
+        "  screen:          {}",
+        screen_summary(mcp_macos::screen_state())
+    );
     match cfg.access {
         Some(a) => println!(
             "  access profile:  {} (all categories on; {})",
@@ -1791,6 +1813,23 @@ fn print_help() {
 #[cfg(test)]
 mod test_cmd_tests {
     use super::*;
+
+    #[test]
+    fn doctor_says_when_the_screen_is_locked_or_switched_away() {
+        use mcp_types::ScreenState::*;
+        assert!(screen_summary(Ready).starts_with("ok"));
+        let locked = screen_summary(Locked);
+        assert!(
+            locked.contains("LOCKED") && locked.contains("refused"),
+            "{locked}"
+        );
+        let off = screen_summary(OffConsole);
+        assert!(
+            off.contains("OFF CONSOLE") && off.contains("switch back"),
+            "{off}"
+        );
+        assert!(screen_summary(Unknown).contains("not blocked"));
+    }
 
     #[test]
     fn doctor_reports_the_foreground_mode_and_that_demo_is_inert_under_never() {

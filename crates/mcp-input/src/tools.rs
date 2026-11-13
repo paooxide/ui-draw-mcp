@@ -3451,6 +3451,12 @@ impl ToolModule for InputModule {
                 return refusal.envelope(name);
             }
         }
+        // Before polite waits for the person to go idle: a locked screen
+        // means they are away, and waiting for idle to post into it would
+        // only drop the events later.
+        if let Some(refusal) = crate::screen::tool_screen_refusal(&*self.backend, name, &args) {
+            return refusal;
+        }
         if self.policy.foreground.is_polite() {
             return self.call_politely(name, args, ctx).await;
         }
@@ -3719,6 +3725,9 @@ mod tests {
         focused_reads: std::sync::atomic::AtomicUsize,
         pid_typed: std::sync::Mutex<Vec<(i32, String)>>,
         pid_keys: std::sync::Mutex<Vec<(i32, String)>>,
+        /// What the backend says about the session; unset is `Unknown`. Scripts
+        /// what the tool layer is told, not what an OS does with the events.
+        screen: std::sync::Mutex<Option<mcp_types::ScreenState>>,
     }
 
     impl MockBackend {
@@ -3929,6 +3938,9 @@ mod tests {
         }
         fn platform(&self) -> &'static str {
             "mock"
+        }
+        fn screen_state(&self) -> mcp_types::ScreenState {
+            (*self.screen.lock().unwrap()).unwrap_or(mcp_types::ScreenState::Unknown)
         }
     }
 
@@ -7413,5 +7425,179 @@ mod tests {
             env.data.unwrap()["steps"][0]["effects"],
             json!({"retitled": {"from": "a", "to": "b"}})
         );
+    }
+
+    // ---- a locked screen -----------------------------------------------------
+
+    fn locked_module(state: mcp_types::ScreenState) -> (InputModule, Arc<MockBackend>) {
+        let (module, backend, _) = test_module();
+        *backend.screen.lock().unwrap() = Some(state);
+        (module, backend)
+    }
+
+    /// Every way of posting key or pointer events is refused with the lock
+    /// named, and nothing reaches the backend: the call is not attempted and
+    /// reported as done.
+    #[tokio::test]
+    async fn a_locked_screen_refuses_every_call_that_would_post_input() {
+        use mcp_types::ScreenState::{Locked, OffConsole};
+        let calls = [
+            ("mouse_action", json!({"type": "click", "x": 5, "y": 5})),
+            ("hover", json!({"x": 5, "y": 5})),
+            ("scroll", json!({"x": 5, "y": 5, "direction": "down"})),
+            (
+                "drag_drop",
+                json!({"from": {"x": 1, "y": 1}, "to": {"x": 9, "y": 9}}),
+            ),
+            ("keyboard_type", json!({"text": "hello"})),
+            ("keyboard_shortcut", json!({"combo": "cmd+s"})),
+            (
+                "keyboard_shortcut",
+                json!({"combo": "shift", "action": "down"}),
+            ),
+            (
+                "input_steps",
+                json!({"steps": [
+                    {"tool": "set_value", "args": {"ref": "@e1", "text": "a"}},
+                    {"tool": "keyboard_type", "args": {"text": "b"}},
+                ]}),
+            ),
+        ];
+        for state in [Locked, OffConsole] {
+            let (module, backend) = locked_module(state);
+            for (tool, args) in &calls {
+                let env = call(&module, tool, args.clone()).await;
+                let err = env
+                    .error
+                    .unwrap_or_else(|| panic!("{tool} was not refused"));
+                assert_eq!(err.code, ErrorCode::ActionFailed, "{tool}");
+                assert!(
+                    err.message.contains("nothing was done"),
+                    "{tool}: {}",
+                    err.message
+                );
+                assert!(
+                    err.suggestion
+                        .as_deref()
+                        .unwrap_or_default()
+                        .starts_with("retryable"),
+                    "{tool}: {err:?}"
+                );
+            }
+            // Even the batch's first step, which posts nothing, did not run.
+            assert!(untouched(&backend));
+        }
+    }
+
+    /// What posts nothing is not this check's to refuse: accessibility
+    /// actions, value writes, the clipboard and a key release.
+    #[tokio::test]
+    async fn a_locked_screen_leaves_calls_that_post_nothing_alone() {
+        let (module, backend) = locked_module(mcp_types::ScreenState::Locked);
+        let env = call(
+            &module,
+            "ui_action",
+            json!({"ref": "@e1", "action": "click"}),
+        )
+        .await;
+        assert!(env.ok, "{env:?}");
+        let env = call(&module, "set_value", json!({"ref": "@e1", "text": "x"})).await;
+        assert!(env.ok, "{env:?}");
+        assert_eq!(backend.actions.lock().unwrap().len(), 1);
+        assert_eq!(backend.values.lock().unwrap().len(), 1);
+        let env = call(
+            &module,
+            "keyboard_shortcut",
+            json!({"combo": "shift", "action": "up"}),
+        )
+        .await;
+        assert_ne!(
+            env.error.map(|e| e.code),
+            Some(ErrorCode::ActionFailed),
+            "a release must not be refused"
+        );
+    }
+
+    /// Unknown and ready sessions act as they always did.
+    #[tokio::test]
+    async fn an_unlocked_or_unknown_session_is_not_refused() {
+        for state in [
+            mcp_types::ScreenState::Ready,
+            mcp_types::ScreenState::Unknown,
+        ] {
+            let (module, backend) = locked_module(state);
+            let env = call(
+                &module,
+                "mouse_action",
+                json!({"type": "click", "x": 5, "y": 5}),
+            )
+            .await;
+            assert!(env.ok, "{state:?}: {env:?}");
+            assert!(!backend.pointer.lock().unwrap().is_empty());
+        }
+    }
+
+    /// Polite waits for the person to be idle before it borrows; a locked
+    /// screen means they are away, so it refuses at once instead of waiting
+    /// and then posting into the void, and no polite report is attached.
+    #[tokio::test]
+    async fn polite_refuses_a_locked_screen_without_waiting() {
+        let (module, backend) = locked_module(mcp_types::ScreenState::Locked);
+        let module = InputModule {
+            policy: InputPolicy {
+                foreground: mcp_types::Foreground::Polite,
+                polite: crate::polite::PoliteConfig {
+                    idle_ms: 60_000,
+                    max_wait_ms: 60_000,
+                },
+                ..module.policy.clone()
+            },
+            ..module
+        };
+        let started = std::time::Instant::now();
+        let env = call(
+            &module,
+            "mouse_action",
+            json!({"type": "click", "x": 5, "y": 5}),
+        )
+        .await;
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        let err = env.error.expect("refused");
+        assert_eq!(err.code, ErrorCode::ActionFailed);
+        assert!(err.message.contains("screen is locked"), "{}", err.message);
+        assert!(
+            env.data.is_none(),
+            "no polite report on a call that never borrowed"
+        );
+        assert!(untouched(&backend));
+    }
+
+    /// The backend boundary: a post that got past the tool layer (a route it
+    /// did not foresee) still fails, and a release still succeeds.
+    #[tokio::test]
+    async fn the_screen_guard_refuses_each_posting_method_and_forwards_the_rest() {
+        let backend = Arc::new(MockBackend::default());
+        *backend.screen.lock().unwrap() = Some(mcp_types::ScreenState::Locked);
+        let g = crate::ScreenGuardInput::new(backend.clone());
+        let failed = |r: Result<(), InputError>| matches!(r, Err(InputError::Failed(m)) if m.contains("screen is locked"));
+        assert!(failed(g.type_text("x").await));
+        assert!(failed(g.key_combo("cmd+s").await));
+        assert!(failed(g.key_down("a").await));
+        assert!(failed(g.mouse(MouseKind::Click, 1.0, 1.0, None, &[]).await));
+        assert!(failed(g.scroll_at(1.0, 1.0, ScrollDir::Down, 1, &[]).await));
+        assert!(failed(g.hover(1.0, 1.0).await));
+        assert!(failed(g.drag((0.0, 0.0), &[(1.0, 1.0)], &[], 0, 0).await));
+        assert!(failed(g.type_text_to_pid(7, "x").await));
+        assert!(failed(g.key_combo_to_pid(7, "cmd+s").await));
+        assert!(untouched(&backend));
+        assert!(backend.pid_typed.lock().unwrap().is_empty());
+        g.key_up("a").await.unwrap();
+        assert_eq!(backend.key_events.lock().unwrap().as_slice(), ["up:a"]);
+        g.set_value(1, "v").await.unwrap();
+        assert_eq!(g.screen_state(), mcp_types::ScreenState::Locked);
+        // Unlocked: everything passes through.
+        *backend.screen.lock().unwrap() = Some(mcp_types::ScreenState::Ready);
+        g.type_text("x").await.unwrap();
+        assert_eq!(backend.typed.lock().unwrap().len(), 1);
     }
 }

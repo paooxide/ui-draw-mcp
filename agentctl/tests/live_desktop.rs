@@ -30,7 +30,7 @@ const APPS: [&str; 2] = ["TextEdit", "Calculator"];
 
 fn ready() -> bool {
     if !live_gui_enabled() {
-        eprintln!("skipping: set AGENTCTL_LIVE_GUI=1 (and leave AGENTCTL_SKIP_LIVE unset) to run");
+        eprintln!("skipping: the GUI suite is off here (needs AGENTCTL_LIVE_GUI=1, AGENTCTL_SKIP_LIVE unset and an unlocked screen)");
         return false;
     }
     if !mcp_macos::permissions().accessibility {

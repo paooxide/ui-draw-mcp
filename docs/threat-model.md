@@ -130,6 +130,16 @@ promise:
 The refusal appears in the audit log as an ordinary `POLICY_DENIED` result for the tool; the log records the
 code, not the message.
 
+**A locked screen.** Separate from `foreground`, and applied under every setting: while the screen is
+locked, or another user's session has the console, macOS discards posted key and pointer events and the
+post reports success. Every call that posts such events (the `hid` and `pid_event` routes, and the window
+calls that raise an app) is refused first with a retryable `ACTION_FAILED`, at the tool layer and again at the
+input backend, and `polite` does not wait for idle first. This protects the report ("done" is never said for an
+event the system threw away); it is not a security boundary, and it does not stop reads, which return what the
+locked session shows (little: the accessibility tree is the bare application, capture fails). A display that
+is only asleep, unlocked, is not treated as blocking. On Linux the state is not readable from the input
+backend, so nothing is refused there.
+
 **Keys sent to a background app by process.** With the app pinned (`focus_app`, `activate: false`) and not
 frontmost, `keyboard_type` and `keyboard_shortcut` post their key events to that process alone
 (`input: "pid_event"`), so under `never` they are allowed: measured on macOS, they arrived in TextEdit

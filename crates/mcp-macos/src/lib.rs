@@ -35,9 +35,13 @@ mod record;
 #[cfg(target_os = "macos")]
 mod sck;
 #[cfg(target_os = "macos")]
+mod session;
+#[cfg(target_os = "macos")]
 mod vision;
 #[cfg(target_os = "macos")]
 pub use imp::{permissions, MacosBackend, Permissions};
+#[cfg(target_os = "macos")]
+pub use session::screen_state;
 
 #[cfg(all(test, target_os = "macos"))]
 mod permission_tests {

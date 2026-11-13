@@ -366,7 +366,7 @@ pub fn build_stack(cfg: &PolicyConfig) -> (Vec<Arc<dyn ToolModule>>, Wiring) {
         };
         // Everything that can post input or raise a window is handed the
         // guarded form of the backend; perception keeps the plain one.
-        let input_backend = guard_input(backend.clone(), cfg.foreground);
+        let input_backend = guard_screen(guard_input(backend.clone(), cfg.foreground));
         let window_backend = guard_window(backend.clone(), cfg.foreground);
         // The postcondition verifier shares the wait evaluator with wait_for,
         // so `expect` and an explicit wait cannot disagree about when the UI
@@ -451,7 +451,7 @@ pub fn build_stack(cfg: &PolicyConfig) -> (Vec<Arc<dyn ToolModule>>, Wiring) {
         // `play_audio` is bounded by the same roots as the filesystem engine:
         // an agent able to name any path could use the speakers to read out a
         // file it was never allowed to open.
-        let desktop_backend = Arc::new(MacosDesktop::new());
+        let desktop_backend = Arc::new(MacosDesktop::new().with_screen(mcp_macos::screen_state));
         modules.push(Arc::new(DesktopModule::new(
             desktop_backend.clone(),
             audio_roots,
@@ -493,7 +493,7 @@ pub fn build_stack(cfg: &PolicyConfig) -> (Vec<Arc<dyn ToolModule>>, Wiring) {
         };
         // Everything that can post input or raise a window is handed the
         // guarded form of the backend; perception keeps the plain one.
-        let input_backend = guard_input(backend.clone(), cfg.foreground);
+        let input_backend = guard_screen(guard_input(backend.clone(), cfg.foreground));
         let window_backend = guard_window(backend.clone(), cfg.foreground);
         let evaluator = mcp_window::WaitEvaluator::new(window_backend.clone(), backend.clone())
             .with_judge(judge.clone());
@@ -598,6 +598,15 @@ fn guard_input(
     } else {
         backend
     }
+}
+
+/// Whatever `foreground` made of the input backend, behind the check that
+/// refuses to post into a session that cannot receive it (locked screen,
+/// session switched away). Applied under every setting: a locked screen
+/// discards the events whether or not the operator minds the foreground.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn guard_screen(backend: Arc<dyn mcp_input::InputBackend>) -> Arc<dyn mcp_input::InputBackend> {
+    Arc::new(mcp_input::ScreenGuardInput::new(backend))
 }
 
 /// As [`guard_input`], for the window backend.

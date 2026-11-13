@@ -310,6 +310,13 @@ pub trait WindowBackend: Send + Sync {
     async fn watch_changes(&self, _app: Option<&str>) -> Option<ChangeWatch> {
         None
     }
+    /// Whether this session can receive synthetic input and take a window
+    /// forward: false while the screen is locked or another user's session
+    /// has the console. See `InputBackend::screen_state`; the default is
+    /// "unknown", which never refuses.
+    fn screen_state(&self) -> mcp_types::ScreenState {
+        mcp_types::ScreenState::Unknown
+    }
     fn platform(&self) -> &'static str;
 }
 

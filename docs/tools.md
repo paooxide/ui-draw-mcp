@@ -49,7 +49,7 @@ enabled category, while a `dangerous` tool additionally has to be named in
 | [`menu_list`](#menu-list) | window | read | Enumerate an app's menu bar: titles, enabled state, and the keyboard equivalent of each item. |
 | [`menu_open`](#menu-open) | window | standard | Open a menu-bar menu by title path, e.g. |
 | [`wait_for`](#wait-for) | window | read | Block until the UI settles: text appears, a window appears, text is gone, or an element takes focus. |
-| [`idle_status`](#idle-status) | desktop | read | Seconds since the last human input, whether the screen is locked, and whether someone is plausibly present. |
+| [`idle_status`](#idle-status) | desktop | read | Seconds since the last human input, whether the screen is locked, whether the session can receive synthetic input at all (input_state: ok, locked, off_console or unknown), and whether someone is plausibly present. |
 | [`lock_screen`](#lock-screen) | desktop | standard | Lock the session. |
 | [`media_control`](#media-control) | desktop | standard | Transport control for the running media player. |
 | [`notify_user`](#notify-user) | desktop | standard | Post a desktop notification. |
@@ -842,7 +842,7 @@ Block until the UI settles: text appears, a window appears, text is gone, or an 
 
 `idle_status` · read tier
 
-Seconds since the last human input, whether the screen is locked, and whether someone is plausibly present. Check before anything that would interrupt.
+Seconds since the last human input, whether the screen is locked, whether the session can receive synthetic input at all (input_state: ok, locked, off_console or unknown), and whether someone is plausibly present. Check before anything that would interrupt. While the screen is locked, key and pointer tools are refused, because the system would discard the events.
 
 No arguments.
 

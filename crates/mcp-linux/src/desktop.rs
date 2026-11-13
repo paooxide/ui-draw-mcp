@@ -14,6 +14,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use mcp_desktop::{DesktopBackend, DesktopError, IdleStatus, MediaAction, PowerAction};
+use mcp_types::ScreenState;
 use serde_json::{json, Value};
 use tokio::sync::OnceCell;
 use zbus::zvariant::OwnedValue;
@@ -94,6 +95,22 @@ impl LinuxDesktop {
             .get_or_try_init(zbus::Connection::system)
             .await
             .map_err(|e| DesktopError::Failed(format!("system bus: {e}")))
+    }
+
+    /// `LockedHint` of the calling process's own logind session, or `None`
+    /// when the system bus, logind or the property is not there.
+    async fn logind_locked_hint(&self) -> Option<bool> {
+        let conn = self.system().await.ok()?;
+        let p = self
+            .proxy(
+                conn,
+                "org.freedesktop.login1",
+                "/org/freedesktop/login1/session/auto",
+                "org.freedesktop.login1.Session",
+            )
+            .await
+            .ok()?;
+        p.get_property::<bool>("LockedHint").await.ok()
     }
 
     async fn proxy<'a>(
@@ -221,7 +238,11 @@ impl DesktopBackend for LinuxDesktop {
                 "idle time needs Mutter's IdleMonitor, which this session does not offer: {e}"
             ))
         })?;
-        let locked = match self
+        // Two sources, because neither is on every desktop: GNOME's screen
+        // saver answers on GNOME, logind's `LockedHint` on any systemd
+        // session whose desktop sets it. The system bus connection is the one
+        // power control already holds.
+        let gnome = match self
             .proxy(
                 conn,
                 "org.gnome.ScreenSaver",
@@ -230,17 +251,19 @@ impl DesktopBackend for LinuxDesktop {
             )
             .await
         {
-            Ok(p) => p
-                .call::<_, _, bool>("GetActive", &())
-                .await
-                .unwrap_or(false),
-            Err(_) => false,
+            Ok(p) => p.call::<_, _, bool>("GetActive", &()).await.ok(),
+            Err(_) => None,
         };
+        let logind = self.logind_locked_hint().await;
+        let state = ScreenState::from_lock_hints(&[gnome, logind]);
+        let locked = state == ScreenState::Locked;
         let idle_seconds = ms / 1000;
         Ok(IdleStatus {
             idle_seconds,
             locked,
-            user_present: !locked && idle_seconds < 300,
+            screen_locked: locked,
+            input_state: state.label(),
+            user_present: !state.blocks_input() && idle_seconds < 300,
         })
     }
 

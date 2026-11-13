@@ -359,6 +359,16 @@ pub trait InputBackend: Send + Sync {
     async fn user_idle_ms(&self) -> Option<u64> {
         None
     }
+    /// Whether this session can receive synthetic input at all. While the
+    /// screen is locked, or another user's session has the console, the
+    /// system discards posted key and pointer events and the post still
+    /// succeeds, so the tool layer asks first and refuses rather than report
+    /// an action that went nowhere. The default is "unknown", which never
+    /// refuses: a backend that has no way to ask must not be taken for a
+    /// locked screen.
+    fn screen_state(&self) -> mcp_types::ScreenState {
+        mcp_types::ScreenState::Unknown
+    }
     /// The frontmost app and the pointer position now.
     async fn desk_state(&self) -> DeskState {
         DeskState::default()

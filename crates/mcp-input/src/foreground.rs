@@ -590,6 +590,9 @@ impl InputBackend for ForegroundInput {
     fn takeover_generation(&self) -> u64 {
         self.inner.takeover_generation()
     }
+    fn screen_state(&self) -> mcp_types::ScreenState {
+        self.inner.screen_state()
+    }
 }
 
 #[cfg(test)]

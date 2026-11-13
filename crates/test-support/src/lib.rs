@@ -130,13 +130,66 @@ pub fn skip_live() -> bool {
     std::env::var_os("AGENTCTL_SKIP_LIVE").is_some_and(|v| v != "0")
 }
 
+/// The desktop session's state, as the product itself reads it. `Unknown`
+/// where there is no reader (Linux), which never skips anything.
+pub fn screen_state() -> mcp_types::ScreenState {
+    #[cfg(target_os = "macos")]
+    {
+        mcp_macos::screen_state()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        mcp_types::ScreenState::Unknown
+    }
+}
+
 /// GUI suites additionally need an explicit opt-in.
 ///
 /// These steal window focus and type into a real application. A plain
 /// `cargo test` on a machine someone is using must never do that, so
 /// `AGENTCTL_LIVE_GUI=1` is required on top of the live gate.
+///
+/// They also need a session that can receive synthetic input. With the screen
+/// locked the system discards every posted key and pointer event, so a GUI
+/// test would fail on its first assertion for a reason that has nothing to do
+/// with the code under test; it is skipped here, with the reason printed.
 pub fn live_gui_enabled() -> bool {
-    !skip_live() && std::env::var_os("AGENTCTL_LIVE_GUI").is_some_and(|v| v == "1")
+    let opted_in = std::env::var_os("AGENTCTL_LIVE_GUI").is_some_and(|v| v == "1");
+    match gui_gate(skip_live(), opted_in, screen_state()) {
+        GuiGate::Open => true,
+        GuiGate::Off => false,
+        GuiGate::Blocked(why) => {
+            eprintln!("skipping: {why}");
+            false
+        }
+    }
+}
+
+/// What stands between a GUI test and running.
+#[derive(Debug, PartialEq, Eq)]
+pub enum GuiGate {
+    Open,
+    /// Not asked for: the live gate is closed or `AGENTCTL_LIVE_GUI=1` is not
+    /// set. Silent, as it always was; the caller says how to turn it on.
+    Off,
+    /// Asked for, but the session cannot take synthetic input.
+    Blocked(String),
+}
+
+/// The decision behind [`live_gui_enabled`], pure so it is tested without a
+/// screen or the environment.
+pub fn gui_gate(skip_live: bool, opted_in: bool, state: mcp_types::ScreenState) -> GuiGate {
+    if skip_live || !opted_in {
+        GuiGate::Off
+    } else if state.blocks_input() {
+        GuiGate::Blocked(format!(
+            "the desktop session is {} and the system discards synthetic input while it is; \
+             unlock the screen and run again",
+            state.label()
+        ))
+    } else {
+        GuiGate::Open
+    }
 }
 
 /// A config for suites that need to reach engines: autonomous (nothing can
@@ -166,6 +219,22 @@ mod tests {
         let real = PolicyConfig::default().kill_switch_file;
         assert_ne!(p.kill_switch_file, real);
         assert!(p.kill_switch_file.starts_with(std::env::temp_dir()));
+    }
+
+    #[test]
+    fn a_locked_or_switched_away_session_closes_the_gui_gate_with_a_reason() {
+        use mcp_types::ScreenState::*;
+        assert_eq!(gui_gate(false, true, Ready), GuiGate::Open);
+        assert_eq!(gui_gate(false, true, Unknown), GuiGate::Open);
+        for s in [Locked, OffConsole] {
+            match gui_gate(false, true, s) {
+                GuiGate::Blocked(why) => assert!(why.contains(s.label()), "{why}"),
+                other => panic!("{s:?}: {other:?}"),
+            }
+        }
+        // Not asked for: silent, whatever the session is.
+        assert_eq!(gui_gate(true, true, Locked), GuiGate::Off);
+        assert_eq!(gui_gate(false, false, Locked), GuiGate::Off);
     }
 
     #[test]

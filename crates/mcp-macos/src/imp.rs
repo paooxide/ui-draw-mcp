@@ -909,6 +909,10 @@ impl InputBackend for MacosBackend {
         Route::Ax
     }
 
+    fn screen_state(&self) -> mcp_types::ScreenState {
+        crate::session::screen_state()
+    }
+
     async fn selection(&self, node_id: Option<u64>) -> Result<Selection, InputError> {
         unsafe {
             if let Some(id) = node_id {
@@ -2377,6 +2381,10 @@ async fn open_app(app: &str, background: bool) -> Result<(), WindowError> {
 
 #[async_trait]
 impl WindowBackend for MacosBackend {
+    fn screen_state(&self) -> mcp_types::ScreenState {
+        crate::session::screen_state()
+    }
+
     async fn list_windows(&self, app_name: Option<&str>) -> Result<Vec<WindowInfo>, WindowError> {
         unsafe {
             let rows = self.window_rows()?;

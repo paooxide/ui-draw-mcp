@@ -628,9 +628,22 @@ impl ToolModule for WindowModule {
                 return refusal.envelope(name);
             }
         }
-        if self.foreground.is_polite()
-            && crate::foreground::tool_refusal(&*self.backend, name, &args).is_some()
-        {
+        // What polite borrows the desktop for is what needs the session to
+        // be live: raising an app, opening a menu. While the screen is locked
+        // the person is away, so it is refused rather than waited for.
+        let raises = crate::foreground::tool_refusal(&*self.backend, name, &args).is_some();
+        // The allowlist answers first: an app the operator excluded is a
+        // policy refusal whatever the screen is doing, and `dispatch` says so.
+        let named_app_excluded = args
+            .get("app")
+            .and_then(Value::as_str)
+            .is_some_and(|a| !self.app_allowed(a));
+        if raises && !named_app_excluded {
+            if let Some(r) = mcp_types::screen_refusal(self.backend.screen_state(), name) {
+                return r.envelope(name);
+            }
+        }
+        if self.foreground.is_polite() && raises {
             return self.call_politely(name, args, ctx).await;
         }
         self.dispatch(name, args, ctx).await
@@ -949,6 +962,9 @@ mod named_app_tests {
         asked: Mutex<Vec<String>>,
         /// What a name resolves to, when it is not the name itself.
         resolves: Option<(&'static str, &'static str)>,
+        /// What it says about the session: scripts what the tool layer is
+        /// told, not what an OS does.
+        screen: Mutex<Option<mcp_types::ScreenState>>,
     }
 
     impl Desk {
@@ -957,6 +973,7 @@ mod named_app_tests {
                 pin: Mutex::new(None),
                 asked: Mutex::new(Vec::new()),
                 resolves: None,
+                screen: Mutex::new(None),
             }
         }
         fn note(&self, what: String) {
@@ -1080,6 +1097,9 @@ mod named_app_tests {
         }
         fn platform(&self) -> &'static str {
             "desk"
+        }
+        fn screen_state(&self) -> mcp_types::ScreenState {
+            (*self.screen.lock().unwrap()).unwrap_or(mcp_types::ScreenState::Unknown)
         }
     }
 
@@ -1302,5 +1322,47 @@ mod named_app_tests {
             serde_json::to_value(WindowState::Offscreen).unwrap(),
             "offscreen"
         );
+    }
+
+    /// A locked screen refuses the calls that raise an app (they would be
+    /// answered with nothing on screen) and leaves reads and the quiet pin.
+    #[tokio::test]
+    async fn a_locked_screen_refuses_raising_and_leaves_reads_alone() {
+        let desk = Arc::new(Desk::new());
+        *desk.screen.lock().unwrap() = Some(mcp_types::ScreenState::Locked);
+        let m = module(&desk);
+        for (tool, args) in [
+            ("focus_app", json!({"app": "TextEdit"})),
+            ("menu_open", json!({"app": "TextEdit", "path": ["File"]})),
+            (
+                "control_window",
+                json!({"app": "TextEdit", "action": "focus"}),
+            ),
+        ] {
+            let env = call(&m, tool, args).await;
+            let err = env
+                .error
+                .unwrap_or_else(|| panic!("{tool} was not refused"));
+            assert_eq!(err.code, ErrorCode::ActionFailed, "{tool}");
+            assert!(
+                err.message.contains("screen is locked"),
+                "{tool}: {}",
+                err.message
+            );
+        }
+        assert!(desk.asked().is_empty(), "{:?}", desk.asked());
+        let env = call(&m, "list_windows", json!({"app": "TextEdit"})).await;
+        assert!(env.ok, "{env:?}");
+        let env = call(
+            &m,
+            "focus_app",
+            json!({"app": "TextEdit", "activate": false}),
+        )
+        .await;
+        assert!(env.ok, "{env:?}");
+        // Unlocked, the same raising call goes through.
+        *desk.screen.lock().unwrap() = Some(mcp_types::ScreenState::Ready);
+        let env = call(&m, "focus_app", json!({"app": "TextEdit"})).await;
+        assert!(env.ok, "{env:?}");
     }
 }

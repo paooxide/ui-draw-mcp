@@ -325,6 +325,29 @@ All notable changes to this project are documented here. The format follows
   taken, so the `screencapture` half of a window read, and a window on another Space (none was open when
   this was written), are untested.
 
+- **A locked screen is reported, not acted on.** While the lock screen is up (or another user's session has the
+  console after fast user switching) macOS discards the key and pointer events a program posts, and the post
+  itself still succeeds, so the `hid` route reported an action as done that never arrived. Two live tests showed
+  it: typed text never appeared and the HID idle clock did not move. Every call that would post key or pointer
+  events now checks the session first (`CGSessionCopyCurrentDictionary`: `CGSSessionScreenIsLocked`,
+  `kCGSSessionOnConsoleKey`, a local lookup) and fails before anything runs with `ACTION_FAILED` ("the screen is
+  locked ... nothing was done", suggestion beginning `retryable:`). That covers `mouse_action`, `hover`, `scroll`,
+  `drag_drop`, `keyboard_type`, `keyboard_shortcut` (a key release is let through), an `input_steps` batch
+  containing any of them (refused whole, so no earlier step half-runs), the per-process `pid_event` route, and
+  the window calls that raise an app (`focus_app`, `menu_open`, ...). Under `foreground = "polite"` it refuses at
+  once instead of waiting for idle and then posting into the void. The same check sits at the input backend
+  boundary, so a path the tool layer did not foresee fails too. Measured with the screen locked: `list_windows`
+  and `menu_list` still answer, `get_ui_tree` and `observe` return `ok` with only the application root
+  (flagged `partial`, with a hint that blames slowness), `capture_screen` fails ("no displays"), and
+  `capture_window` and `ocr_region` fail (ScreenCaptureKit -3811, then `screencapture` "could not create image
+  from rect"); the accessibility actions `ui_action` / `set_value` are not refused but were not exercised while
+  locked. A display that is only asleep with the screen unlocked is not treated as blocking: whether a posted
+  event wakes it is not documented and could not be measured. `agentctl doctor` prints a `screen:` line
+  (ok, LOCKED, OFF CONSOLE or unknown), `idle_status` gains `screen_locked` and `input_state`, and the GUI
+  live suites now skip, saying why, when the screen is locked. On Linux the input engine has no cheap reader
+  (logind is on the system bus the input backend does not hold), so it reports unknown and does not block;
+  `idle_status` and `doctor` read logind's `LockedHint` alongside GNOME's screen saver.
+
 ### Changed
 
 - **Window, menu, dialog and capture calls that name an `app` act on it without pinning it.** `list_windows`,
@@ -351,6 +374,10 @@ All notable changes to this project are documented here. The format follows
   `docs/threat-model.md`.
 
 ### Fixed
+
+- **`idle_status` never reported a locked screen on macOS.** It looked for `CGSSessionScreenIsLocked` with
+  `ioreg -k`, which matches nothing (the key lives inside `IOConsoleUsers`), so `locked` was always `false`,
+  including while the screen was locked. It now reads the session dictionary.
 
 - **macOS: `launch` right after `close_app` failed with "could not launch".** The closed app was still known to
   LaunchServices for a moment and `open -a` answered error -600, so an agent that closed TextEdit and opened it
